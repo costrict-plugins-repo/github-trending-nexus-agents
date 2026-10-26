@@ -1,0 +1,149 @@
+/**
+ * nexus-agents/mcp - Repository Analyze Types
+ *
+ * Input/output types for the repo_analyze MCP tool.
+ *
+ * @module mcp/tools/repo-analyze-types
+ * (Source: Issue #1074)
+ */
+
+import { z } from 'zod';
+
+// ============================================================================
+// Input Schema
+// ============================================================================
+
+export const RepoAnalyzeInputSchema = z.object({
+  /** GitHub repository in "owner/name" format or full URL. */
+  repo: z
+    .string()
+    .min(1)
+    .refine(
+      (v) => !v.includes('://') || /^https?:\/\//i.test(v),
+      'Only HTTP/HTTPS URLs are allowed'
+    )
+    .describe('GitHub repository in "owner/name" format (e.g., "cloudfoundry/korifi") or full URL'),
+  /**
+   * Currently a no-op: the handler ignores this flag and always runs the full
+   * analysis. Both values resolve to identical behavior; retained for input-shape
+   * stability until a distinct shallow path is implemented.
+   */
+  depth: z
+    .enum(['shallow', 'deep'])
+    .optional()
+    .default('shallow')
+    .describe(
+      'Currently a no-op — the handler always runs the full analysis (both values identical)'
+    ),
+});
+
+export type RepoAnalyzeInput = z.infer<typeof RepoAnalyzeInputSchema>;
+
+// ============================================================================
+// Output Types
+// ============================================================================
+
+/** Structured analysis of a GitHub repository. */
+export interface RepoAnalysis {
+  /** Repository name with owner (e.g., "owner/repo"). */
+  readonly name: string;
+  /** Primary programming language. */
+  readonly language: string | null;
+  /** Detected framework (e.g., "express", "react", "spring-boot"). */
+  readonly framework: string | null;
+  /** Package manager (e.g., "npm", "pip", "maven", "cargo"). */
+  readonly packageManager: string | null;
+  /** CI provider (e.g., "github-actions", "concourse", "jenkins"). */
+  readonly ciProvider: string | null;
+  /** Security tooling detected in the repo. */
+  readonly securityTooling: readonly string[];
+  /** Whether the repo has a Dockerfile. */
+  readonly hasDockerfile: boolean;
+  /** Whether the repo has Helm charts. */
+  readonly hasHelmCharts: boolean;
+  /** Whether the repo has a Makefile. */
+  readonly hasMakefile: boolean;
+  /**
+   * Whether the repo has tests. Only meaningful when {@link testsMeasured} is
+   * true — `false` alone cannot distinguish "no tests" from "no probe for this
+   * language" (#6018).
+   */
+  readonly hasTests: boolean;
+  /**
+   * Whether test detection had a rule for this repo's language (#6018).
+   *
+   * REQUIRED, not optional, so the compiler names every producer. Before this,
+   * `hasTests: false` was emitted for any language the JS-shaped probes did not
+   * cover, and a Rust workspace with 1385 `#[test]` functions reported
+   * "No test directory detected" — a default wearing the costume of a
+   * measurement. When this is false the gap list stays silent rather than
+   * asserting an absence nobody checked.
+   */
+  readonly testsMeasured: boolean;
+
+  /**
+   * Whether `.github/workflows/` was actually listed (#6035).
+   *
+   * REQUIRED, not optional: an optional flag lets a construction site omit it
+   * and inherit the confident default, which is the shape that produced the
+   * bug. False ⇒ CI-level security tooling is unmeasured, and the SAST gap is
+   * reported as unverified rather than asserted.
+   */
+  readonly workflowsMeasured: boolean;
+  /** License type (e.g., "MIT", "Apache-2.0"). */
+  readonly license: string | null;
+  /** Repository description. */
+  readonly description: string | null;
+  /** Default branch name. */
+  readonly defaultBranch: string;
+  /** Star count. */
+  readonly stars: number;
+  /** Top-level directory listing. */
+  readonly topLevelEntries: readonly string[];
+  /** Identified gaps or missing best practices. */
+  readonly gaps: readonly string[];
+}
+
+/**
+ * What was learned about `.github/` when looking for CODEOWNERS (#6018).
+ *
+ * Lives here rather than beside its only caller so the type has a real
+ * cross-module consumer: the producer/consumer gate reads a same-file caller as
+ * no consumer at all, and suppressing that with a marker would be claiming the
+ * export is unused-for-now when it is simply in the wrong file.
+ */
+export interface CodeownersLookup {
+  /** Names inside `.github/`, when it could be listed. */
+  readonly entries?: readonly string[];
+  /** Whether `.github/` was actually listed. False ⇒ a root miss is unmeasured. */
+  readonly listed?: boolean;
+}
+
+/* ---------------------------------------------------------------------------
+ * Moved here from repo-analyze.ts in #6035.
+ *
+ * Not cosmetic: the producer/consumer gate reads a same-file caller as NO
+ * consumer, so a type declared and used only inside repo-analyze.ts is flagged
+ * as a dead export however heavily that file uses it. Living in the sibling
+ * types module its consumer already imports makes the relationship real rather
+ * than asserted -- the same move CodeownersLookup needed in #6019.
+ * ------------------------------------------------------------------------- */
+
+/** What each secondary listing observed. Optional at the boundary, resolved once. */
+export interface RepoListings {
+  readonly dotGithubEntries?: readonly string[];
+  readonly dotGithubListed?: boolean;
+  readonly workflowsMeasured?: boolean;
+}
+
+/** What the listings observed, as `identifyGaps` needs it. */
+export interface GapObservations {
+  readonly codeowners?: CodeownersLookup;
+  readonly workflowsMeasured?: boolean;
+}
+
+export type ExecFileFn = (
+  cmd: string,
+  args: string[],
+  options?: { timeout?: number }
+) => Promise<{ stdout: string }>;

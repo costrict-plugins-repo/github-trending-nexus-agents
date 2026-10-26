@@ -1,0 +1,453 @@
+/**
+ * nexus-agents/scm - GitHub Provider Trait Implementations
+ *
+ * Implements IScmReviewer and IScmUserInfo trait interfaces for GitHub.
+ * Uses `gh api` for REST API access to get detailed data.
+ *
+ * @module scm/github-provider-traits
+ * (Source: Issue #1136 — Centralized SCM Provider Module)
+ */
+
+import type { Result } from '../core/index.js';
+import { ok, err, createLogger, getErrorMessage } from '../core/index.js';
+import type {
+  IScmReviewer,
+  IScmUserInfo,
+  ScmPullRequestDetail,
+  ScmIssueDetail,
+  ScmCommentDetail,
+  ScmReviewDecision,
+  ScmUserMetadata,
+  ScmFileChange,
+} from './types.js';
+import { ScmError } from './types.js';
+import { GitHubProvider } from './github-provider.js';
+import { CLI_SUBPROCESS_TIMEOUTS } from '../config/timeouts.js';
+
+const logger = createLogger({ component: 'GitHubProviderTraits' });
+
+// ============================================================================
+// gh API JSON types (internal)
+// ============================================================================
+
+interface GhApiPrJson {
+  number: number;
+  title: string;
+  body: string | null;
+  html_url: string;
+  user: { login: string };
+  author_association: string;
+  base: { ref: string };
+  head: { ref: string; sha: string };
+  draft: boolean;
+  labels: Array<{ name: string }>;
+  additions: number;
+  deletions: number;
+}
+
+interface GhApiFileJson {
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  patch?: string;
+  previous_filename?: string;
+}
+
+interface GhApiIssueJson {
+  number: number;
+  title: string;
+  body: string | null;
+  user: { login: string };
+  author_association: string;
+  state: string;
+  html_url: string;
+  labels: Array<{ name: string }>;
+  created_at: string;
+}
+
+interface GhApiCommentJson {
+  id: number;
+  body: string;
+  user: { login: string };
+  author_association: string;
+  created_at: string;
+}
+
+interface GhApiUserJson {
+  login: string;
+  name: string | null;
+  company: string | null;
+  followers: number;
+  following: number;
+  public_repos: number;
+  created_at: string;
+}
+
+// ============================================================================
+// gh API executor
+// ============================================================================
+
+/**
+ * Resolves a GitHub token from env vars or `gh auth token`.
+ * Caches the result to avoid repeated subprocess calls.
+ */
+let cachedGhToken: string | undefined | null = null;
+let ghTokenPromise: Promise<string | undefined> | undefined;
+
+/** Reset the cached token (for testing). */
+export function resetGhTokenCache(): void {
+  cachedGhToken = null;
+  ghTokenPromise = undefined;
+}
+
+async function resolveGhToken(): Promise<string | undefined> {
+  if (cachedGhToken !== null) return cachedGhToken;
+
+  ghTokenPromise ??= resolveGhTokenImpl().finally(() => {
+    ghTokenPromise = undefined;
+  });
+  return ghTokenPromise;
+}
+
+async function resolveGhTokenImpl(): Promise<string | undefined> {
+  const envToken = process.env['GITHUB_TOKEN'] ?? process.env['GH_TOKEN'];
+  if (envToken !== undefined && envToken.length > 0) {
+    cachedGhToken = envToken;
+    return envToken;
+  }
+
+  try {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const exec = promisify(execFile);
+    const { stdout } = await exec('gh', ['auth', 'token'], { timeout: 5_000 });
+    const token = stdout.trim();
+    cachedGhToken = token.length > 0 ? token : undefined;
+  } catch {
+    cachedGhToken = undefined;
+  }
+  return cachedGhToken;
+}
+
+/** Page size for paginated list endpoints; GitHub's maximum, and its default is 30. */
+const GH_API_PAGE_SIZE = 100;
+
+async function execGhApiRaw(args: readonly string[]): Promise<Result<string, ScmError>> {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const exec = promisify(execFile);
+
+  // Inject token into subprocess environment to prevent keyring access failures
+  const token = await resolveGhToken();
+  const env = token !== undefined ? { ...process.env, GH_TOKEN: token } : undefined;
+
+  try {
+    const { stdout } = await exec('gh', [...args], {
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: CLI_SUBPROCESS_TIMEOUTS.ghCommandMs,
+      ...(env !== undefined ? { env } : {}),
+    });
+    return ok(stdout.trim());
+  } catch (error) {
+    const execError = error as { message: string; stderr?: string };
+    return err(
+      new ScmError(`gh api failed: ${execError.message}`, 'github', undefined, {
+        endpoint: args[1] ?? '',
+        stderr: execError.stderr,
+      })
+    );
+  }
+}
+
+async function execGhApi(endpoint: string, method?: string): Promise<Result<string, ScmError>> {
+  const args = ['api', endpoint];
+  if (method !== undefined) args.push('--method', method);
+  return execGhApiRaw(args);
+}
+
+/**
+ * Fetch EVERY page of a `gh api` list endpoint, as one object per line.
+ *
+ * A bare `gh api <list-endpoint>` returns GitHub's default first page of 30 and
+ * discards the `Link` cursor, so `getPullRequestDetail` saw at most 30 changed
+ * files of any PR and `listCommentDetails` at most the 30 OLDEST comments —
+ * both returned `ok(...)` with nothing to say a page had been left behind. The
+ * review pipeline then computed `reviewCoverage: 'full'` against that truncated
+ * denominator and posted "30 of 30 files reviewed" on a 120-file PR.
+ *
+ * `--paginate` alone is not enough: on a JSON-array endpoint it concatenates one
+ * array per page, which is not valid JSON. `--slurp` would fix that but landed
+ * in gh 2.51 and this repo runs against 2.45. `--jq '.[]'` emits one compact
+ * object per line across all pages, which parses on every version.
+ */
+async function execGhApiList<T>(endpoint: string): Promise<Result<T[], ScmError>> {
+  const separator = endpoint.includes('?') ? '&' : '?';
+  const result = await execGhApiRaw([
+    'api',
+    `${endpoint}${separator}per_page=${String(GH_API_PAGE_SIZE)}`,
+    '--paginate',
+    '--jq',
+    '.[]',
+  ]);
+  if (!result.ok) return result;
+
+  // An endpoint with no items yields empty stdout. `''.split('\n')` is `['']`,
+  // so the filter is what keeps "no comments" from parsing as one bad line.
+  const lines = result.value.split('\n').filter((l) => l.trim() !== '');
+  try {
+    return ok(lines.map((l) => JSON.parse(l) as T));
+  } catch (error) {
+    return err(
+      new ScmError(
+        `gh api returned unparseable page data: ${getErrorMessage(error)}`,
+        'github',
+        undefined,
+        {
+          endpoint,
+        }
+      )
+    );
+  }
+}
+
+// ============================================================================
+// Mappers
+// ============================================================================
+
+function mapFileChange(raw: GhApiFileJson): ScmFileChange {
+  const statusMap: Record<string, ScmFileChange['status']> = {
+    added: 'added',
+    removed: 'removed',
+    modified: 'modified',
+    renamed: 'renamed',
+    copied: 'copied',
+    changed: 'changed',
+    unchanged: 'unchanged',
+  };
+  const status = statusMap[raw.status] ?? 'unknown';
+  return {
+    filename: raw.filename,
+    status,
+    ...(status === 'unknown' ? { rawStatus: raw.status } : {}),
+    additions: raw.additions,
+    deletions: raw.deletions,
+    ...(raw.patch !== undefined ? { patch: raw.patch } : {}),
+    ...(raw.previous_filename !== undefined ? { previousFilename: raw.previous_filename } : {}),
+  };
+}
+
+// ============================================================================
+// GitHubReviewer — implements IScmReviewer
+// ============================================================================
+
+/**
+ * GitHub-specific reviewer that adds PR detail and review capabilities
+ * to a GitHubProvider. Implements IScmReviewer trait.
+ *
+ * @example
+ * ```typescript
+ * const provider = createGitHubProvider('owner/repo');
+ * const reviewer = new GitHubReviewer(provider);
+ * const detail = await reviewer.getPullRequestDetail(42);
+ * ```
+ */
+export class GitHubReviewer implements IScmReviewer {
+  constructor(private readonly provider: GitHubProvider) {}
+
+  async getPullRequestDetail(prNumber: number): Promise<Result<ScmPullRequestDetail, ScmError>> {
+    const repo = this.provider.repo;
+    logger.debug('Getting PR detail', { repo, prNumber });
+
+    const prResult = await execGhApi(`repos/${repo}/pulls/${String(prNumber)}`);
+    if (!prResult.ok) return prResult;
+
+    const filesResult = await execGhApiList<GhApiFileJson>(
+      `repos/${repo}/pulls/${String(prNumber)}/files`
+    );
+    if (!filesResult.ok) return filesResult;
+    const files = filesResult.value;
+
+    try {
+      const pr = JSON.parse(prResult.value) as GhApiPrJson;
+
+      return ok({
+        number: pr.number,
+        title: pr.title,
+        body: pr.body ?? '',
+        author: pr.user.login,
+        base: pr.base.ref,
+        head: pr.head.ref,
+        url: pr.html_url,
+        draft: pr.draft,
+        authorAssociation: pr.author_association,
+        labels: pr.labels.map((l) => l.name),
+        files: files.map(mapFileChange),
+        additions: pr.additions,
+        deletions: pr.deletions,
+        headSha: pr.head.sha,
+      });
+    } catch {
+      return err(new ScmError('Failed to parse PR detail JSON', 'github'));
+    }
+  }
+
+  async createReview(
+    prNumber: number,
+    body: string,
+    decision: ScmReviewDecision
+  ): Promise<Result<void, ScmError>> {
+    const repo = this.provider.repo;
+    const eventMap: Record<ScmReviewDecision, string> = {
+      approve: 'APPROVE',
+      request_changes: 'REQUEST_CHANGES',
+      comment: 'COMMENT',
+    };
+
+    logger.info('Creating review', { repo, prNumber, decision });
+
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const exec = promisify(execFile);
+
+    try {
+      await exec(
+        'gh',
+        [
+          'api',
+          `repos/${repo}/pulls/${String(prNumber)}/reviews`,
+          '--method',
+          'POST',
+          '-f',
+          `body=${body}`,
+          '-f',
+          `event=${eventMap[decision]}`,
+        ],
+        { maxBuffer: 10 * 1024 * 1024, timeout: CLI_SUBPROCESS_TIMEOUTS.ghCommandMs }
+      );
+      return ok(undefined);
+    } catch (error) {
+      const execError = error as { message: string };
+      return err(new ScmError(`Failed to create review: ${execError.message}`, 'github'));
+    }
+  }
+
+  async getIssueDetail(issueNumber: number): Promise<Result<ScmIssueDetail, ScmError>> {
+    const repo = this.provider.repo;
+    logger.debug('Getting issue detail', { repo, issueNumber });
+
+    const result = await execGhApi(`repos/${repo}/issues/${String(issueNumber)}`);
+    if (!result.ok) return result;
+
+    try {
+      const raw = JSON.parse(result.value) as GhApiIssueJson;
+      return ok({
+        number: raw.number,
+        title: raw.title,
+        body: raw.body ?? '',
+        labels: raw.labels.map((l) => l.name),
+        author: raw.user.login,
+        createdAt: raw.created_at,
+        authorAssociation: raw.author_association,
+        state: raw.state,
+        url: raw.html_url,
+      });
+    } catch {
+      return err(new ScmError('Failed to parse issue detail JSON', 'github'));
+    }
+  }
+
+  async listCommentDetails(
+    issueNumber: number
+  ): Promise<Result<readonly ScmCommentDetail[], ScmError>> {
+    const repo = this.provider.repo;
+    logger.debug('Listing comment details', { repo, issueNumber });
+
+    const result = await execGhApiList<GhApiCommentJson>(
+      `repos/${repo}/issues/${String(issueNumber)}/comments`
+    );
+    if (!result.ok) return result;
+
+    try {
+      const comments = result.value;
+      return ok(
+        comments.map((c) => ({
+          id: c.id,
+          body: c.body,
+          author: c.user.login,
+          createdAt: c.created_at,
+          authorAssociation: c.author_association,
+        }))
+      );
+    } catch {
+      return err(new ScmError('Failed to parse comment details JSON', 'github'));
+    }
+  }
+}
+
+// ============================================================================
+// GitHubUserInfo — implements IScmUserInfo
+// ============================================================================
+
+/**
+ * GitHub-specific user info provider. Implements IScmUserInfo trait.
+ */
+export class GitHubUserInfo implements IScmUserInfo {
+  async fetchUserMetadata(username: string): Promise<Result<ScmUserMetadata, ScmError>> {
+    logger.debug('Fetching user metadata', { username });
+
+    const result = await execGhApi(`users/${username}`);
+    if (!result.ok) return result;
+
+    try {
+      const raw = JSON.parse(result.value) as GhApiUserJson;
+      return ok({
+        login: raw.login,
+        name: raw.name,
+        company: raw.company,
+        followers: raw.followers,
+        following: raw.following,
+        publicRepos: raw.public_repos,
+        createdAt: raw.created_at,
+      });
+    } catch {
+      return err(new ScmError('Failed to parse user metadata JSON', 'github'));
+    }
+  }
+}
+
+// ============================================================================
+// Factory — compose provider with traits
+// ============================================================================
+
+/**
+ * Creates a full-capability GitHub provider with all traits.
+ *
+ * Returns an object that implements IScmProvider & IScmReviewer & IScmUserInfo.
+ * Consumers can narrow the type to only the traits they need.
+ *
+ * @example
+ * ```typescript
+ * const provider = createFullGitHubProvider('owner/repo');
+ * // Use as ReviewCapableProvider
+ * const detail = await provider.getPullRequestDetail(42);
+ * // Use as IScmUserInfo
+ * const user = await provider.fetchUserMetadata('octocat');
+ * ```
+ */
+export function createFullGitHubProvider(
+  repo: string
+): GitHubProvider & IScmReviewer & IScmUserInfo {
+  const base = new GitHubProvider(repo);
+  const reviewer = new GitHubReviewer(base);
+  const userInfo = new GitHubUserInfo();
+
+  // Compose all trait methods onto the provider
+  return Object.assign(base, {
+    getPullRequestDetail: reviewer.getPullRequestDetail.bind(reviewer),
+    createReview: reviewer.createReview.bind(reviewer),
+    getIssueDetail: reviewer.getIssueDetail.bind(reviewer),
+    listCommentDetails: reviewer.listCommentDetails.bind(reviewer),
+    fetchUserMetadata: userInfo.fetchUserMetadata.bind(userInfo),
+  });
+}

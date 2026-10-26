@@ -1,0 +1,175 @@
+---
+title: Release-changeset publish race runbook
+description: Symptom, diagnostic, and fix for the version-skip publish race that bit us 2026-05-04 (jumped 2.64 → 2.67 on npm, skipping 2.65 and 2.66).
+diataxis: how-to
+audience: project
+tier: 2
+keywords: [release, changesets, publish, race, npm, version-skew]
+---
+
+# Release-changeset publish race runbook
+
+## Symptom
+
+`packages/nexus-agents/package.json` reports a higher version than `npm view nexus-agents version` returns. Releases on npm appear to skip one or more minor versions even though the changeset PR for those versions was merged.
+
+Example (2026-05-04):
+
+```
+npm published: 2.64.0 → 2.67.0
+package.json bumps that never published: 2.65.0, 2.66.0
+```
+
+The CHANGELOG accumulates everything correctly; only the npm tarball publishes are missed.
+
+## Diagnostic check
+
+Run this any time a `chore(release): version packages` PR has just merged but you're not sure if the publish actually happened:
+
+```bash
+LOCAL=$(jq -r '.version' packages/nexus-agents/package.json)
+PUBLISHED=$(npm view nexus-agents version)
+echo "package.json: $LOCAL"
+echo "npm latest:   $PUBLISHED"
+[ "$LOCAL" = "$PUBLISHED" ] && echo "OK: in sync" || echo "SKEW: package.json ahead of npm"
+```
+
+If `LOCAL > PUBLISHED`, the publish step did not run on the merge of the most recent release PR. (`changesets/action` re-entered PR mode instead of publish mode.)
+
+## Root cause
+
+`changesets/action` v2 selects one of four cases per push to `main`, on a plain
+switch over what `@changesets/read` finds in `.changeset/` (verified against the
+pinned source in #4626):
+
+1. **Publish mode** — **no** pending changesets → runs `pnpm release` and publishes to npm. This is the _only_ branch that publishes.
+2. **PR-update mode** — non-empty changesets exist → consumes them on the side branch, force-pushes `changeset-release/main`, updates the open release PR.
+3. **All-empty** — changesets exist but every one declares zero releases → logs `All changesets are empty; not creating PR` and returns. **No publish and no PR.**
+4. **No changesets, no publish script** — returns.
+
+Case 3 is easy to miss and is the one behind the stall in #4646: an empty
+changeset (`pnpm changeset --empty`) is a file with no releases, so it suppresses
+publishing without producing a release PR to clear it.
+
+The race: between the moment a release PR is opened and the moment it merges, **other PRs on `main` add new changesets**. When the release PR squash-merges, only the changesets it knew about are deleted from `main`. The new changesets are still there. The post-merge release run sees them, enters PR-update mode, creates a _new_ release PR for the _next_ version, and **skips publishing the just-bumped version**.
+
+This compounds: every subsequent merge of a non-release PR adds another changeset; every subsequent release-PR merge re-races; every release run continues in PR-update mode.
+
+## Inverse variant — npm AHEAD of package.json (2026-05-14)
+
+The symptom above is `package.json` _ahead_ of npm. The **inverse** also happens:
+
+```
+npm latest:   2.73.0
+package.json: 2.72.0   ← repo BEHIND npm
+```
+
+Seen 2026-05-14: 2.73.0 was published to npm, but its `chore(release): version packages` PR (#2538) was **never merged**, so `main` stayed at 2.72.0 while npm moved ahead. The likely triggers:
+
+- A `workflow_dispatch` manual publish run from the `changeset-release/main` branch (which carries the bumped `package.json`) instead of `main`.
+- A "Version Packages" PR that sits open for days while unrelated PRs land — it goes stale and is easy to forget.
+
+**Recovery:** merge the open "Version Packages" PR. It bumps `package.json` to match npm and consumes the pending changesets. `changeset publish` is idempotent, so the post-merge release run does not re-publish the existing version — it just reconciles the repo.
+
+**Now guarded against** (release-cycle hardening):
+
+- `release.yml` → **`Detect npm-ahead version skew`** step fails the release run loudly when `npm latest > package.json`, so the skew can't sit unnoticed for days.
+- `release.yml` → **`manual-publish` job** has a `Guard — main only` step that fails any `workflow_dispatch` publish triggered from a non-`main` ref.
+- `ci.yml` → **`Changeset Presence`** required check (`scripts/check-changeset.ts`) fails any PR that touches `packages/nexus-agents/src/**` without adding a changeset — eliminating the changeset debt that makes "Version Packages" PRs balloon and go stale in the first place.
+
+## Fix
+
+### Automatic (already in workflow as of #2382 / PR #2383)
+
+`.github/workflows/release.yml` has a step `Detect publish-race version skew (#2382)` that runs after `changesets/action` when it did **not** publish. It checks three gates:
+
+1. `local_version > published_version` (version skew exists)
+2. **No** pending `.changeset/*.md` files (the version commit landed cleanly)
+3. (implicit) Concurrency lock prevents racing publishes
+
+If all three hold, the step runs `pnpm release` to force-publish the local version. Downstream SBOM upload, attest-build-provenance, and CycloneDX steps fire on either `steps.changesets.outputs.published == 'true'` or `steps.fallback-publish.outputs.published == 'true'`, so the recovery path produces the same supply-chain artifacts as the happy path.
+
+### Wrong-branch variant — fallback published from `changeset-release/main` (2026-05-14, #2696)
+
+A second, worse failure mode of that same fallback step. **Symptom:** npm marches forward version-by-version on every changeset-bearing feature merge, but **no git tags and no GitHub Releases** are created — SBOM upload and provenance attestation silently skip too. Seen 2026-05-14: 2.68.0–2.76.0 all reached npm with no tag and no Release; the GitHub Releases list stopped at 2.67.0.
+
+**Root cause.** In PR-update mode, `changesets/action` runs `changeset version` on a `changeset-release/main` branch and **leaves the working tree checked out on that branch** — `package.json` shows the _next_ bumped version and `.changeset/` is already consumed. The `Detect publish-race version skew` step then read `package.json` and `.changeset/` straight from the working tree, so on **every** changeset-bearing feature merge it saw "version ahead of npm, no pending changesets" and force-published the next version — straight off `changeset-release/main`, before the "Version Packages" PR was ever merged. Because the fallback bypasses `changesets/action`, `changeset publish` created the git tag only _locally_ (never pushed) and no GitHub Release was created at all.
+
+**Fix (this doc's companion PR).** The fallback step now runs `git checkout "$GITHUB_SHA"` first, pinning the entire skew check + publish to the triggering `main` commit — it can no longer see the changeset-release branch's state. And when it does legitimately force-publish, it now pushes the git tag and creates the GitHub Release itself (with the version's `CHANGELOG.md` section as notes), restoring the tag + Release + SBOM trail that `changesets/action` would have produced.
+
+**Backfill.** Tags + Releases for the versions published without them are restored separately — see #2696.
+
+### The stalled loop — repo ahead by several versions, every run green
+
+Under sustained merge activity the "next merge closes the loop" premise never
+holds: each version-PR merge bumps `package.json`, the release run finds a
+changeset a feature PR landed in the meantime, stands down, and a fresh version
+PR opens. On 2026-08-26 npm went 4.23.0 → 4.26.1 while 4.24.0, 4.25.0, 4.25.1
+and 4.26.0 were never published, and six consecutive release runs reported
+success (#5077). The tell in a run is `Generate CycloneDX SBOM` skipped with
+`Detect publish-race version skew` printing the stand-down warning.
+
+Nothing is lost — the eventual publish carries everything — but the npm version
+history has holes, and until #5077 nothing reported the condition. The
+procedure under Prevention (merge the regenerated version PR alone) is what
+unsticks it.
+
+### Manual recovery (if the automatic fallback is somehow disabled)
+
+From `main` with `npm` credentials:
+
+```bash
+git checkout main
+git pull
+pnpm install
+pnpm build
+pnpm release       # runs `changeset publish` against current package.json
+```
+
+`changeset publish` is idempotent — if a version already exists on npm, it errors gracefully without re-publishing or affecting other versions.
+
+**Staged-publish window (#6500).** npm stages a publish for up to ~17 minutes before `npm view` (and changesets' "not found in registry" check) can see it; a release run inside that window gets `E409 ... Cannot publish over previously staged version "X"`. `scripts/release-publish.ts` exits 0 with a `::warning::` when every failure is exactly that E409 for the local `package.json` version (any other failure stays red); that run creates no tag or GitHub Release, because the run that staged the version already did.
+
+**Post-publish tarball availability measurement (#6525).** Following publish (including the staged-E409 forgiveness path), the release workflow runs `scripts/await-published-tarball.ts`. It polls the registry tarball URL (`https://registry.npmjs.org/nexus-agents/-/nexus-agents-<version>.tgz`) until HTTP 200 is returned (up to 30 minutes), writes the measured delay into the GitHub Actions Job Summary, and fails with `::error::` if the tarball fails to appear before timeout.
+
+After publishing, manually upload the SBOM and attest provenance if needed:
+
+```bash
+TAG="nexus-agents@$(jq -r '.version' packages/nexus-agents/package.json)"
+gh release upload "$TAG" sbom.cdx.json --clobber
+```
+
+## Prevention
+
+The race is rare. To minimize the chance of triggering it:
+
+- **Every shippable-source PR carries its own changeset.** Enforced by the `Changeset Presence` CI gate (`scripts/check-changeset.ts`) — a PR touching `packages/nexus-agents/src/**` fails CI without a `.changeset/*.md`. This is the structural fix: no changeset debt means the "Version Packages" PR reflects one batch at a time and never balloons.
+- **Merge the "Version Packages" PR alone, after it has been regenerated.** A version PR is a snapshot of the changesets that existed when the action wrote it. Merging a stale one bumps `package.json` while a changeset is still on `main`, which is exactly the state the fallback stands down for — the merge publishes nothing (#5077). The procedure that closes the loop:
+  1. Merge the feature PRs.
+  2. Wait for the action to update the version PR so it consumes every changeset now on `main` — the release log says `updating found pull request #NNNN`.
+  3. Merge that version PR, and merge nothing else until its release run finishes.
+  4. Verify `npm view nexus-agents version` equals `packages/nexus-agents/package.json` before the next merge.
+
+  Step 2 is the one that gets skipped. A stale version PR is also how npm gets ahead of `main` when the inverse race fires (see the inverse-variant section above).
+
+- **Never publish directly from inside `.publish-stage/` (`#6494`).** The stale-stage check (`scripts/check-publish-stage.ts`) is wired into the source manifest's `prepublishOnly` lifecycle hook at the package root (`packages/nexus-agents/`). The staged manifest deliberately strips `prepublishOnly` so consumer installs never execute it. Consequently, changing into `packages/nexus-agents/.publish-stage/` and running `npm publish` or `pnpm publish` bypasses the stale-stage verification and risks publishing stale bytes from a prior commit or interrupted build. Publishing must always be performed via `pnpm release` from the repository root or via the automated GitHub Actions `release` / `manual-publish` jobs, which re-stage at HEAD before publishing.
+- **Never `workflow_dispatch` a publish from a non-`main` ref.** The `manual-publish` job's `Guard — main only` step now fails this, but the discipline still matters.
+- **Watch for the symptom early**: after merging a release PR, if `npm view nexus-agents version` still shows the old version after ~5 minutes, check for the skew. The `Detect publish-race version skew` step auto-recovers `package.json`-ahead; the `Detect npm-ahead version skew` step fails loudly on the inverse.
+
+## The Version Packages PR is ungated (#6770)
+
+No `pull_request` check evaluates the "Version Packages" PR. `changesets/action` opens it with `secrets.GITHUB_TOKEN`, and GitHub starts no workflow for an event that token created. Every `pull_request` workflow on that PR, `npm-verify.yml` included, ends `failure` with zero jobs. The status rollup is empty. A readiness check of the form "zero failures, zero pending" is vacuously true there. Treat an empty rollup on a version PR as **ungated**, not green.
+
+This stays true until #6788 lands: the owner opens the PR with a GitHub App or PAT token (option A).
+
+Until then, the pre-publish gate lives in `release.yml`. The `publish-smoke` job runs before the `release` job on every push to `main`. It smokes only when the run will publish, which means zero non-empty pending changesets at the pushed commit and a `nexus-agents` or `nexus-memory` version that npm does not have yet. It packs the tarball the way `pnpm release` does (Node 24, npm 11, `pnpm build`, `scripts/stage-publish.ts`). It then installs the tarball in clean containers (`ignore-scripts`, `npm12-strict`, `pnpm`) through `.github/actions/tarball-smoke`, the same action `npm-verify.yml` uses. The smoke checks `--version`, `--help`, `doctor`, the MCP handshake, SQLite and the native grammars. A failure skips the `release` job, so nothing is published. When `nexus-memory` is ahead, the job also packs its tarball with `pnpm pack`, the packing its publish uses. It installs that tarball into a clean project and imports the entry point, which must export `getMemoryRegistry`. If `npm view` fails for either package, the job fails rather than skipping the smoke. The `manual-publish` `workflow_dispatch` job is not gated by this job.
+
+## See also
+
+- `#2382` — original ops issue documenting the race.
+- `PR #2383` — workflow fallback implementation.
+- `#2696` — the wrong-branch fallback variant: fallback published off `changeset-release/main`, skipping tags + Releases for 2.68.0–2.76.0.
+- `.github/workflows/release.yml` — the actual workflow definition (skew-detection steps + `manual-publish` guard).
+- `.github/workflows/ci.yml` — the `Changeset Presence` required check.
+- `scripts/check-changeset.ts` — the changeset-presence gate.
+- `package.json` `release` script — runs `pnpm build`, then `scripts/stage-publish.ts` (which builds the staged package with bundled dependencies, #6481), then `scripts/release-publish.ts`, which runs `changeset publish` under `npm_config_node_linker=hoisted` (#6500).

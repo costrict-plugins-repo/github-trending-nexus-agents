@@ -1,0 +1,745 @@
+/* eslint-disable max-lines -- 404 lines, cohesive single-tool module per governance */
+/**
+ * nexus-agents/mcp - Research Discover Tool
+ *
+ * MCP tool for discovering new research papers and repos from external sources.
+ * Searches arXiv, GitHub, and other sources for relevant research.
+ *
+ * @module mcp/tools/research-discover
+ * (Source: Research System Enhancement - Phase 1C)
+ */
+
+import { z } from 'zod';
+import type { McpServer } from '../sdk-types.js';
+import type { ILogger } from '../../core/index.js';
+import {
+  getErrorMessage,
+  createLogger,
+  formatZodError,
+  getTimeProvider,
+  getRandomProvider,
+} from '../../core/index.js';
+import { normalizeTopicToCanonical } from '../../research/topic-aliases.js';
+import { withToolError } from '../middleware/tool-error-handler.js';
+import {
+  registerStructuredTool,
+  toolStructuredError,
+  structuredToolSuccess,
+  type ToolResult,
+  type BaseMcpToolDeps,
+} from './tool-result.js';
+
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { loadPapersRegistry } from '../../cli/research-helpers.js';
+import {
+  discoverGitHubRepos,
+  discoverGoogleAI,
+  discoverMetaFAIR,
+  discoverMicrosoftResearch,
+  discoverDeepMind,
+  discoverArxiv,
+} from '../../cli/research-helpers-sources.js';
+import {
+  discoverSemanticScholar,
+  discoverPapersWithCode,
+  discoverOpenAlex,
+} from '../../cli/research-helpers-sources-academic.js';
+import { getToolMemory } from './tool-memory.js';
+import {
+  getOutcomeStore,
+  categorizeOutcomeErrorMessage,
+} from '../../orchestration/outcomes/index.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+import { throwIfAborted } from '../../adapters/abort-utils.js';
+
+/** The `AbortError` message when a caller's signal stops discovery (#6747). */
+const DISCOVERY_ABORTED = 'Research discovery aborted';
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+/** Maximum results to return per source. */
+const MAX_RESULTS_PER_SOURCE = 20;
+
+/** Default relevance threshold when filtering is enabled. */
+const DEFAULT_RELEVANCE_THRESHOLD = 0.3;
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+/** Source type for discovery. */
+export type DiscoverySource =
+  | 'arxiv'
+  | 'github'
+  | 'google_ai'
+  | 'meta_fair'
+  | 'microsoft'
+  | 'deepmind'
+  | 'semantic_scholar'
+  | 'papers_with_code'
+  | 'openalex'
+  | 'all';
+
+/** A discovered research item. */
+export interface DiscoveredItem {
+  /** Source type */
+  source: string;
+  /** Item title */
+  title: string;
+  /** URL to the item */
+  url: string;
+  /** Brief description */
+  description: string;
+  /** Whether this item already exists in the registry */
+  alreadyInRegistry: boolean;
+  /** Discovery date */
+  discoveredAt: string;
+  /** Relevance score (0-1) relative to the search topic */
+  relevanceScore?: number;
+}
+
+// =============================================================================
+// SCHEMAS
+// =============================================================================
+
+/**
+ * Input schema for research_discover tool.
+ */
+export const ResearchDiscoverInputSchema = z.object({
+  topic: z
+    .string()
+    .min(1)
+    .max(200)
+    .describe('Research topic to search for (e.g., "multi-agent orchestration")'),
+  source: z
+    .enum([
+      'arxiv',
+      'github',
+      'google_ai',
+      'meta_fair',
+      'microsoft',
+      'deepmind',
+      'semantic_scholar',
+      'papers_with_code',
+      'openalex',
+      'all',
+    ])
+    .optional()
+    .default('all')
+    .describe(
+      'Source to search: arxiv, github, google_ai, meta_fair, microsoft, deepmind, semantic_scholar, papers_with_code, openalex, or all'
+    ),
+  maxResults: z
+    .number()
+    .min(1)
+    .max(MAX_RESULTS_PER_SOURCE)
+    .optional()
+    .default(10)
+    .describe('Maximum results to return'),
+  sinceDate: z
+    .string()
+    .optional()
+    .describe('Only return results after this date (YYYY-MM-DD format)'),
+  relevanceThreshold: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .default(DEFAULT_RELEVANCE_THRESHOLD)
+    .describe(
+      'Minimum relevance score (0-1) to include in results. Higher values filter more aggressively.'
+    ),
+});
+
+/**
+ * Type for validated research discover input.
+ */
+export type ResearchDiscoverInput = z.infer<typeof ResearchDiscoverInputSchema>;
+
+// =============================================================================
+// DEPS
+// =============================================================================
+
+/**
+ * Dependencies for research_discover tool.
+ */
+export type ResearchDiscoverDeps = BaseMcpToolDeps;
+
+// =============================================================================
+// RESPONSE
+// =============================================================================
+
+/**
+ * Response from research_discover tool.
+ */
+export interface ResearchDiscoverResponse {
+  /** Topic that was searched */
+  topic: string;
+  /** Sources queried */
+  sourcesQueried: string[];
+  /** Sources that failed during discovery */
+  failedSources: string[];
+  /** Discovered items */
+  items: DiscoveredItem[];
+  /** Total items found (before filtering) */
+  totalFound: number;
+  /**
+   * Items already in registry (filtered out).
+   *
+   * Meaningful ONLY when `registryConsulted` is true. When the registry could
+   * not be read this is 0 because nothing could be matched, not because nothing
+   * matched.
+   */
+  alreadyInRegistry: number;
+  /**
+   * Whether the papers registry was actually read (#5925).
+   *
+   * `false` means the dedup pass did not run: every item is reported as new
+   * regardless of what the registry holds. Required rather than optional so
+   * every construction site has to answer, and so a caller cannot silently
+   * inherit a default.
+   */
+  registryConsulted: boolean;
+  /** New items not yet in registry */
+  newItems: number;
+  /** Items filtered out by relevance threshold */
+  filteredByRelevance: number;
+}
+
+// =============================================================================
+// DISCOVERY PROVIDERS
+// =============================================================================
+
+/**
+ * Gets existing arXiv IDs from the registry, and says whether it managed to
+ * read it (#5925).
+ *
+ * `loadPapersRegistry` returns `!ok` on a `validatePath` denial or any
+ * readFile/parseYaml throw — an unscaffolded `docs/`, `NEXUS_NO_SCAFFOLD`, or
+ * malformed YAML. Returning a bare empty Set for that case made every
+ * discovered item look new: `alreadyInRegistry: 0` and `newItems: <all>`,
+ * byte-identical to "the registry was read and nothing matched". A caller
+ * acting on that — the documented next step is `research_add` — re-adds papers
+ * that are already catalogued.
+ */
+async function getExistingArxivIds(): Promise<{ ids: Set<string>; consulted: boolean }> {
+  const result = await loadPapersRegistry();
+  if (!result.ok) return { ids: new Set(), consulted: false };
+  return { ids: new Set(Object.keys(result.value.papers)), consulted: true };
+}
+
+/** Extract arXiv ID from a URL string. */
+function extractArxivId(url: string): string {
+  return url.match(/(\d{4}\.\d{4,5})/)?.[1] ?? '';
+}
+
+/** Converts source provider results to DiscoveredItems. */
+function toDiscoveredItems(
+  sources: Array<{
+    source: string;
+    title: string;
+    url: string;
+    description: string;
+    discoveredAt: string;
+  }>
+): DiscoveredItem[] {
+  return sources.map((s) => ({
+    source: s.source,
+    title: s.title,
+    url: s.url,
+    description: s.description,
+    alreadyInRegistry: false,
+    discoveredAt: s.discoveredAt,
+  }));
+}
+
+/** Result of an extended source query — distinguishes API failure from zero results. */
+interface ExtendedSourceResult {
+  items: DiscoveredItem[];
+  failed: boolean;
+}
+
+/** Discovers from extended sources using the source providers. */
+async function discoverFromExtendedSource(
+  source: string,
+  input: ResearchDiscoverInput,
+  logger: ILogger,
+  signal: AbortSignal | undefined
+): Promise<ExtendedSourceResult> {
+  const { topic, maxResults, sinceDate } = input;
+  let result;
+  switch (source) {
+    case 'google_ai':
+      result = await discoverGoogleAI(topic, maxResults, sinceDate, signal);
+      break;
+    case 'meta_fair':
+      result = await discoverMetaFAIR(topic, maxResults, sinceDate, signal);
+      break;
+    case 'microsoft':
+      result = await discoverMicrosoftResearch(topic, maxResults, sinceDate, signal);
+      break;
+    case 'deepmind':
+      result = await discoverDeepMind(topic, maxResults, sinceDate, signal);
+      break;
+    case 'semantic_scholar':
+      result = await discoverSemanticScholar(topic, maxResults, signal);
+      break;
+    case 'papers_with_code':
+      result = await discoverPapersWithCode(topic, maxResults, signal);
+      break;
+    case 'openalex':
+      result = await discoverOpenAlex(topic, maxResults, undefined, signal);
+      break;
+    default:
+      return { items: [], failed: true };
+  }
+  if (!result.ok) {
+    logger.warn(`${source} discovery failed`, {
+      source,
+      errorCode: result.error.code,
+      error: result.error.message,
+    });
+    return { items: [], failed: true };
+  }
+  return { items: toDiscoveredItems(result.value), failed: false };
+}
+
+// =============================================================================
+// RELEVANCE SCORING
+// =============================================================================
+
+/**
+ * Computes a relevance score (0-1) for a discovered item relative to the search topic.
+ * Uses keyword matching against title and description, with title matches weighted higher.
+ *
+ * Exported for testability.
+ */
+export function computeRelevanceScore(item: DiscoveredItem, topic: string): number {
+  // Distinct keywords ≥3 chars. Dedupe so a repeated word doesn't skew the denominator.
+  const keywords = [
+    ...new Set(
+      topic
+        .toLowerCase()
+        .split(/[\s,;+\-/]+/)
+        .filter((w) => w.length >= 3)
+    ),
+  ];
+
+  if (keywords.length === 0) return 1.0; // No keywords to filter against
+
+  const titleLower = item.title.toLowerCase();
+  const descLower = item.description.toLowerCase();
+
+  let matched = 0; // keyword present in title OR description
+  let titleHits = 0; // keyword present in title
+
+  for (const keyword of keywords) {
+    const inTitle = titleLower.includes(keyword);
+    if (inTitle || descLower.includes(keyword)) matched++;
+    if (inTitle) titleHits++;
+  }
+
+  // Score by COVERAGE — the fraction of distinct topic keywords present — rather
+  // than the old `weightedMatches / (keywords.length * 3)`, which required every
+  // keyword in both title AND description and so drove every item below
+  // threshold for long/compound topics (#3541). Title hits get a bounded bonus
+  // so title matches still outrank description-only matches.
+  const coverage = matched / keywords.length;
+  const titleFraction = titleHits / keywords.length;
+  return Math.min(1.0, coverage * 0.8 + titleFraction * 0.2);
+}
+
+/** Scores and filters items by relevance, returning sorted results. Exported for testability. */
+export function filterByRelevance(
+  items: DiscoveredItem[],
+  topic: string,
+  threshold: number
+): DiscoveredItem[] {
+  const scored = items.map((item) => ({
+    ...item,
+    relevanceScore: computeRelevanceScore(item, topic),
+  }));
+
+  return scored
+    .filter((item) => item.relevanceScore >= threshold)
+    .sort((a, b) => b.relevanceScore - a.relevanceScore);
+}
+
+// =============================================================================
+// ORCHESTRATION
+// =============================================================================
+
+/** Mark arXiv items that already exist in registry. */
+function markExistingItems(items: DiscoveredItem[], existingIds: Set<string>): void {
+  for (const item of items) {
+    if (item.source !== 'arxiv') continue;
+    const arxivId = extractArxivId(item.url);
+    if (arxivId !== '') item.alreadyInRegistry = existingIds.has(`arxiv-${arxivId}`);
+  }
+}
+
+/**
+ * arXiv-based org sources that no longer have author filters.
+ * When `source: 'all'`, these are skipped because they'd return identical
+ * results to the main `arxiv` source (arXiv doesn't support affiliation search).
+ * When queried individually, they still work via a single arXiv call.
+ */
+const ARXIV_ORG_SOURCES = new Set(['google_ai', 'meta_fair', 'microsoft', 'deepmind']);
+
+/** Independent academic sources with their own APIs. */
+const INDEPENDENT_SOURCES = ['semantic_scholar', 'papers_with_code', 'openalex'] as const;
+
+/** Accumulated query results. */
+interface QueryAccumulator {
+  sources: string[];
+  failedSources: string[];
+  items: DiscoveredItem[];
+}
+
+/** Query a single extended source and accumulate results. */
+async function queryExtendedSource(
+  src: string,
+  input: ResearchDiscoverInput,
+  logger: ILogger,
+  acc: QueryAccumulator,
+  signal: AbortSignal | undefined
+): Promise<void> {
+  throwIfAborted(signal, DISCOVERY_ABORTED);
+  acc.sources.push(src);
+  try {
+    const result = await discoverFromExtendedSource(src, input, logger, signal);
+    if (result.failed) acc.failedSources.push(src);
+    acc.items = acc.items.concat(result.items);
+  } catch (error: unknown) {
+    acc.failedSources.push(src);
+    logger.warn('Source discovery failed', { source: src, error: getErrorMessage(error) });
+  }
+}
+
+/**
+ * Query all requested sources and collect items. `signal` (#6747) ends the
+ * fetch in flight and starts no further source: the call rejects with an
+ * `AbortError` rather than returning a partial set as if it were complete.
+ */
+async function queryAllSources(
+  input: ResearchDiscoverInput,
+  logger: ILogger,
+  signal: AbortSignal | undefined
+): Promise<QueryAccumulator> {
+  const acc: QueryAccumulator = { sources: [], failedSources: [], items: [] };
+  const isAll = input.source === 'all';
+  const shouldQuery = (src: string): boolean => isAll || input.source === src;
+
+  if (shouldQuery('arxiv')) {
+    throwIfAborted(signal, DISCOVERY_ABORTED);
+    acc.sources.push('arxiv');
+    const r = await discoverArxiv(input.topic, input.maxResults, input.sinceDate, signal);
+    if (r.ok) acc.items = acc.items.concat(toDiscoveredItems(r.value));
+    else {
+      acc.failedSources.push('arxiv');
+      logger.warn('arxiv discovery failed', { error: r.error.message });
+    }
+  }
+
+  // Org sources: skip when 'all' (identical to arxiv); query individually
+  for (const src of ARXIV_ORG_SOURCES) {
+    if (!isAll && input.source === src) {
+      await queryExtendedSource(src, input, logger, acc, signal);
+    }
+  }
+
+  if (shouldQuery('github')) {
+    throwIfAborted(signal, DISCOVERY_ABORTED);
+    acc.sources.push('github');
+    const r = await discoverGitHubRepos(input.topic, input.maxResults, signal);
+    if (r.ok) acc.items = acc.items.concat(toDiscoveredItems(r.value));
+    else {
+      acc.failedSources.push('github');
+      logger.warn('github discovery failed', { error: r.error.message });
+    }
+  }
+
+  for (const src of INDEPENDENT_SOURCES) {
+    if (shouldQuery(src)) await queryExtendedSource(src, input, logger, acc, signal);
+  }
+  // The last source may have been cut short: its failure is the abort's, not the source's.
+  throwIfAborted(signal, DISCOVERY_ABORTED);
+  return acc;
+}
+
+/** Runs discovery across selected sources. */
+/**
+ * Discover research items + record telemetry. The single canonical
+ * implementation for both the MCP `research_discover` tool and the CLI
+ * `research discover` subcommand (#2640 Phase 3).
+ *
+ * Combines:
+ *   - Topic normalization to canonical form (#1576 Wave 4)
+ *   - Multi-source fan-out via `queryAllSources` (arxiv + extended providers)
+ *   - Dedup against the registry via `getExistingArxivIds`
+ *   - Relevance-threshold filtering via `filterByRelevance`
+ *   - Outcome telemetry via `recordDiscoverySuccess` (best-effort)
+ *
+ * Callers render the structured `ResearchDiscoverResponse` however suits
+ * their context (MCP → `toolSuccessStructured`, CLI → terminal output).
+ *
+ * `signal` (#6747), when given, ends the source fetch in flight and stops the
+ * fan-out; the call then rejects with an `AbortError` and records nothing.
+ */
+export async function executeDiscovery(
+  rawInput: ResearchDiscoverInput,
+  logger: ILogger,
+  signal?: AbortSignal
+): Promise<ResearchDiscoverResponse> {
+  // Normalize topic to canonical form (Issue #1576 Wave 4)
+  const input: ResearchDiscoverInput = {
+    ...rawInput,
+    topic: normalizeTopicToCanonical(rawInput.topic),
+  };
+  const registry = await getExistingArxivIds();
+  const {
+    sources: sourcesToQuery,
+    failedSources,
+    items: allItems,
+  } = await queryAllSources(input, logger, signal);
+  markExistingItems(allItems, registry.ids);
+
+  const totalFound = allItems.length;
+  const inRegistry = allItems.filter((i) => i.alreadyInRegistry).length;
+
+  // Apply relevance filtering to remove off-topic results
+  const threshold = input.relevanceThreshold;
+  const relevantItems = filterByRelevance(
+    allItems.filter((i) => !i.alreadyInRegistry),
+    input.topic,
+    threshold
+  ).slice(0, input.maxResults);
+
+  const filteredOut = totalFound - inRegistry - relevantItems.length;
+  if (filteredOut > 0) {
+    logger.debug('Filtered out irrelevant results', {
+      threshold,
+      filteredOut,
+      remaining: relevantItems.length,
+    });
+  }
+
+  const response: ResearchDiscoverResponse = {
+    topic: input.topic,
+    sourcesQueried: sourcesToQuery,
+    failedSources,
+    items: relevantItems,
+    totalFound,
+    alreadyInRegistry: inRegistry,
+    registryConsulted: registry.consulted,
+    newItems: relevantItems.length,
+    filteredByRelevance: filteredOut,
+  };
+  // Best-effort session-memory recording (#2640 Phase 3 — was previously
+  // only invoked from the MCP handler; now baked into the core so CLI
+  // delegations get it for free).
+  recordDiscoverySuccess(response.topic, response.newItems, response.sourcesQueried);
+  return response;
+}
+
+// =============================================================================
+// Memory Recording (Issue #753)
+// =============================================================================
+
+/** Records successful research discovery. Best-effort. */
+function recordDiscoverySuccess(topic: string, newItems: number, sources: string[]): void {
+  try {
+    const memory = getToolMemory();
+    memory.recordLearning({
+      pattern: `Research discovery: ${String(newItems)} new items for "${topic}"`,
+      context: `sources=${sources.join(',')}`,
+      confidence: 0.7,
+      source: 'research-discover',
+    });
+    void memory.runPromotionPipeline().catch((error: unknown) => {
+      createLogger({ tool: 'research-discover' }).warn('Promotion pipeline failed', { error });
+    });
+  } catch (error: unknown) {
+    createLogger({ tool: 'research-discover' }).warn('Failed to record successful discovery', {
+      error: getErrorMessage(error),
+      topic,
+    });
+  }
+}
+
+/** Records discovery outcome (success or failure) to the outcome store. Best-effort. */
+function recordDiscoveryOutcome(success: boolean, durationMs: number, errorMsg?: string): void {
+  try {
+    if (!success && errorMsg !== undefined) {
+      const memory = getToolMemory();
+      memory.recordError({
+        error: `Research discovery failed: ${errorMsg.slice(0, 150)}`,
+        solution: 'Check network access and source availability',
+        filePattern: 'mcp/tools/research-discover',
+      });
+    }
+    const store = getOutcomeStore();
+    store.append({
+      id: `research-discover-${String(getTimeProvider().now())}-${getRandomProvider().random().toString(36).slice(2, 8)}`,
+      // #5034: NOT `DEFAULT_CLI`. This tool does not know which CLI served the
+      // work — `model` below is a synthetic label — and hardcoding 'claude'
+      // credited or debited claude in the routing learner on every run.
+      // `'unknown'` is the schema's own unattributed value, which the bandit's
+      // warm-start partitions out instead of replaying (#4935). #5020 fixed
+      // two of these four writers; this is the remainder.
+      cli: 'unknown',
+      category: 'research',
+      model: 'research-discover',
+      success,
+      durationMs,
+      timestamp: new Date().toISOString(),
+      source: 'manual',
+      ...(!success && errorMsg !== undefined
+        ? {
+            failureCategory: categorizeOutcomeErrorMessage(errorMsg),
+            errorMessage: errorMsg.slice(0, 500),
+          }
+        : {}),
+    });
+  } catch (storeErr: unknown) {
+    createLogger({ tool: 'research-discover' }).debug(
+      'Failed to record discovery outcome to store',
+      {
+        error: storeErr instanceof Error ? storeErr.message : String(storeErr),
+      }
+    );
+  }
+}
+
+// =============================================================================
+// MCP TOOL
+// =============================================================================
+
+/**
+ * Creates the core handler logic for research_discover tool.
+ */
+function createResearchDiscoverHandler(deps: ResearchDiscoverDeps) {
+  return async (args: unknown, ctx: HandlerContext): Promise<ToolResult> => {
+    const validationResult = ResearchDiscoverInputSchema.safeParse(args);
+    if (!validationResult.success) {
+      return toolStructuredError({
+        errorCategory: 'validation',
+        message: `Validation error: ${formatZodError(validationResult.error)}`,
+      });
+    }
+
+    ctx.logger.debug('Discovering research', {
+      topic: validationResult.data.topic,
+      source: validationResult.data.source,
+    });
+
+    const logger = deps.logger ?? createLogger({ tool: 'research_discover' });
+    const startMs = Date.now();
+    const response = await withToolError('Discovery failed', logger, async () => {
+      const result = await executeDiscovery(validationResult.data, logger);
+      // recordDiscoverySuccess is now baked into executeDiscovery (#2640).
+      return structuredToolSuccess(z.object(RESEARCH_DISCOVER_OUTPUT_SCHEMA), result);
+    });
+    const durationMs = Date.now() - startMs;
+    if (response.isError === true) {
+      const errorText = response.content[0]?.text ?? 'unknown error';
+      recordDiscoveryOutcome(false, durationMs, errorText);
+    } else {
+      recordDiscoveryOutcome(true, durationMs);
+    }
+    return response;
+  };
+}
+
+/**
+ * Registers the research_discover tool with the MCP server.
+ *
+ * @category MCP
+ * @param server - MCP server instance
+ * @param deps - Tool dependencies
+ */
+// eslint-disable-next-line max-lines-per-function -- single cohesive registration: schema + handler + wrapping + register; +4 lines for #2648 annotations tipped past 50.
+export function registerResearchDiscoverTool(server: McpServer, deps: ResearchDiscoverDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'research_discover' });
+  const toolSchema = {
+    topic: z.string().min(1).max(200).describe('Research topic to search for'),
+    source: z
+      .enum([
+        'arxiv',
+        'github',
+        'google_ai',
+        'meta_fair',
+        'microsoft',
+        'deepmind',
+        'semantic_scholar',
+        'papers_with_code',
+        'openalex',
+        'all',
+      ])
+      .optional()
+      .describe('Source to search'),
+    maxResults: z.number().min(1).max(MAX_RESULTS_PER_SOURCE).optional().describe('Max results'),
+    sinceDate: z.string().optional().describe('Only results after this date (YYYY-MM-DD)'),
+    relevanceThreshold: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe('Minimum relevance score (0-1) to include results. Higher = stricter filtering.'),
+  };
+
+  const description =
+    'Discover new research papers and repositories from external sources. ' +
+    'Searches arXiv, GitHub, and other sources. Filters out items already in the registry.';
+
+  const secureHandler = createSecureHandler(createResearchDiscoverHandler(deps), {
+    toolName: 'research_discover',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const timeoutMs = getToolTimeout('research_discover', deps.security);
+  const wrappedHandler = wrapToolWithTimeout('research_discover', secureHandler, {
+    timeoutMs,
+    logger,
+  });
+
+  registerStructuredTool(
+    server,
+    'research_discover',
+    {
+      description,
+      inputSchema: toolSchema,
+      outputSchema: RESEARCH_DISCOVER_OUTPUT_SCHEMA,
+      annotations: getToolAnnotations('research_discover'),
+    },
+    toSdkCallback(wrappedHandler)
+  );
+  logger.info('Registered research_discover tool with secure handler and timeout protection');
+}
+
+// Permissive shape — handler returns ResearchDiscoverResponse with topic,
+// sourcesQueried, failedSources, items, totalFound, alreadyInRegistry,
+// registryConsulted, newItems, filteredByRelevance (#2340 batch 3). Items vary
+// per source so `items` is array-of-unknown. Hoisted out of the registration fn
+// for the max-lines-per-function gate.
+//
+// This must list EVERY field the handler returns: the #5045 test asserts the
+// returned content satisfies the declared outputSchema, and it caught
+// `registryConsulted` missing here (#5925). A field present in the response but
+// absent from this schema is a tool whose declared contract understates what it
+// actually sends.
+const RESEARCH_DISCOVER_OUTPUT_SCHEMA = {
+  topic: z.string().optional(),
+  sourcesQueried: z.array(z.string()).optional(),
+  failedSources: z.array(z.string()).optional(),
+  items: z.array(z.unknown()).optional(),
+  totalFound: z.number().optional(),
+  alreadyInRegistry: z.number().optional(),
+  registryConsulted: z.boolean().optional(),
+  newItems: z.number().optional(),
+  filteredByRelevance: z.number().optional(),
+};

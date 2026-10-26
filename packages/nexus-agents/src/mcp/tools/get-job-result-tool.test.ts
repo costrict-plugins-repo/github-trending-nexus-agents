@@ -1,0 +1,343 @@
+/**
+ * Tests for `get_job_result`'s abandoned-job disclosure (#4976).
+ *
+ * @module mcp/tools/get-job-result-tool.test
+ */
+
+import { createHash } from 'node:crypto';
+import { z } from 'zod';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { registerGetJobResultTool } from './get-job-result-tool.js';
+import { writeJobPending, writeJobComplete, heartbeatJob } from '../jobs/job-result-store.js';
+import { resetNexusDataDirCache } from '../../config/nexus-data-dir.js';
+import { initTaskState, updateStage, appendResult } from '../../context/structured-task-state.js';
+import { extractPlanFailureEvidence } from '../jobs/job-plan-failure-evidence.js';
+import { writeJobFailed } from '../jobs/job-result-store.js';
+import { toolStructuredError } from './tool-result.js';
+import { FAKE_PASSWORD } from '../../testing/test-secrets.js';
+import { RateLimiter } from '../middleware/rate-limiter.js';
+
+type SdkCallback = (args: unknown) => Promise<{ content: readonly { text: string }[] }>;
+
+/**
+ * Drives the callback the tool actually registers, through the secure-handler
+ * and timeout wrappers it really runs behind — not an exported inner function.
+ * A response shape asserted anywhere short of here is not the one a caller
+ * receives.
+ */
+async function envelope(jobId: string): Promise<Record<string, unknown>> {
+  let registered: SdkCallback | undefined;
+  const server = {
+    registerTool: (_name: string, _config: unknown, callback: SdkCallback): void => {
+      registered = callback;
+    },
+  };
+  // A real limiter, generously sized: the point is to exercise the wrappers,
+  // not to be throttled by them.
+  registerGetJobResultTool(server as never, {
+    rateLimiter: new RateLimiter({ capacity: 100, refillRate: 100 }),
+  });
+  if (registered === undefined) throw new Error('get_job_result registered no callback');
+  const result = await registered({ jobId });
+  return JSON.parse(result.content[0]?.text ?? '{}') as Record<string, unknown>;
+}
+
+describe('get_job_result abandoned disclosure (#4976)', () => {
+  // The record is durable; the work is a detached in-process promise. A crash
+  // mid-body leaves `pending` forever — `writeJobPending` refuses to overwrite
+  // — so a poller waits on work that no longer exists. Before this, the
+  // response said `pending` and nothing else.
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-gjr-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+  });
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('returns redacted evidence with digests bound to actual RPC-delivered bytes (#7424)', async () => {
+    const jobId = 'dp-rpc-evidence';
+    const evidence = extractPlanFailureEvidence(
+      'run_dev_pipeline',
+      toolStructuredError({
+        errorCategory: 'business',
+        message: 'Plan rejected',
+        detail: {
+          completed: false,
+          planStatus: 'unapproved',
+          plan: FAKE_PASSWORD,
+          planVoteProposal: `Exact proposal: ${FAKE_PASSWORD}`,
+        },
+      }),
+      { jobId, dispatchId: '00000000-0000-4000-8000-000000000742', producerVersion: 'dev' }
+    );
+    expect(evidence).toBeDefined();
+    writeJobFailed(jobId, 'run_dev_pipeline', 'Plan rejected', undefined, {
+      failureEvidence: evidence,
+    });
+    const body = await envelope(jobId);
+    const actual = z
+      .object({
+        record: z.object({
+          status: z.literal('failed'),
+          failureEvidence: z.object({
+            plan: z.object({
+              text: z.string(),
+              retainedBytes: z.number(),
+              retainedSha256: z.string(),
+            }),
+            proposal: z.object({
+              text: z.string(),
+              retainedBytes: z.number(),
+              retainedSha256: z.string(),
+            }),
+          }),
+        }),
+      })
+      .parse(body);
+    for (const text of [
+      actual.record.failureEvidence.plan,
+      actual.record.failureEvidence.proposal,
+    ]) {
+      expect(text.text).not.toContain(FAKE_PASSWORD);
+      expect(Buffer.byteLength(text.text, 'utf8')).toBe(text.retainedBytes);
+      expect(createHash('sha256').update(text.text).digest('hex')).toBe(text.retainedSha256);
+    }
+  });
+
+  it('does not flag a freshly dispatched job', () => {
+    writeJobPending('job-fresh', 'orchestrate');
+
+    return envelope('job-fresh').then((body) => {
+      expect(body['found']).toBe(true);
+      expect(body).not.toHaveProperty('abandoned');
+    });
+  });
+
+  it('does not flag a settled job', () => {
+    // The pair that matters most: a `complete` record must never be called
+    // abandoned however old it is, or the field becomes noise.
+    writeJobComplete('job-done', 'orchestrate', { ok: true });
+
+    return envelope('job-done').then((body) => {
+      expect(body).not.toHaveProperty('abandoned');
+    });
+  });
+
+  it('tells the poller to stop waiting once the guard has elapsed', async () => {
+    // Seam test. `isAbandonedJob` is unit-tested; whether the registered tool
+    // surfaces it is a separate question, and the join is where six other
+    // defects hid today.
+    writeJobPending('job-stale', 'orchestrate');
+    const stale = new Date(Date.now() - 3_600_000 - 60_000).toISOString();
+    const path = join(tmpDir, 'jobs', 'result-job-stale.json');
+    const { readFileSync, writeFileSync } = await import('node:fs');
+    const record = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    writeFileSync(path, JSON.stringify({ ...record, createdAt: stale }));
+
+    const body = await envelope('job-stale');
+
+    expect(body['abandoned']).toBe(true);
+    expect(String(body['errorMessage'])).toMatch(/dispatch again|no longer|gone/i);
+  });
+});
+
+describe('get_job_result producer-version disclosure (#5008)', () => {
+  // The tool's own `_meta['nexus-agents/build']` names the READER's build.
+  // After a mid-session install that is not the build that ran the job, so
+  // the response has to carry the record's own stamp — and say whether that
+  // stamp measures anything.
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+  const FIXTURE_VERSION = '9.9.9-fixture';
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-gjr-version-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+  });
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('surfaces the recorded producerVersion and marks a real version measured', async () => {
+    writeJobComplete('job-pv-real', 'orchestrate', { ok: true }, FIXTURE_VERSION);
+
+    const body = await envelope('job-pv-real');
+    const record = body['record'] as Record<string, unknown>;
+
+    expect(record['producerVersion']).toBe(FIXTURE_VERSION);
+    expect(body['producerVersionMeasured']).toBe(true);
+    expect(body['producerVersionSource']).toBe('sidecar');
+  });
+
+  it('names the task-state source, whose synthesized record never carries a version', async () => {
+    // Under default NEXUS_JOB_RESULT_SOURCE (or task_state) the record is adapted
+    // from the task-state log, which has no producer version. Reporting only
+    // `measured: false` would read as "pre-field record" — a third meaning
+    // for absence. The source disambiguates.
+    initTaskState({
+      taskId: 'orch-pv-ts',
+      stage: 'planning',
+      decisions: [],
+      blockers: [],
+      position: { currentStep: 'init' },
+      updatedAt: '2026-05-01T00:00:00Z',
+    });
+    updateStage('orch-pv-ts', 'complete', '2026-05-01T00:05:00Z');
+    appendResult('orch-pv-ts', { ok: true }, '2026-05-01T00:05:01Z');
+
+    const body = await envelope('orch-pv-ts');
+    const record = body['record'] as Record<string, unknown>;
+
+    expect(body['found']).toBe(true);
+    expect(body['producerVersionSource']).toBe('task_state');
+    expect(body['producerVersionMeasured']).toBe(false);
+    expect(record).not.toHaveProperty('producerVersion');
+  });
+
+  it('prefers sidecar when NEXUS_JOB_RESULT_SOURCE is explicitly set to sidecar', async () => {
+    const originalSource = process.env['NEXUS_JOB_RESULT_SOURCE'];
+    process.env['NEXUS_JOB_RESULT_SOURCE'] = 'sidecar';
+    try {
+      initTaskState({
+        taskId: 'orch-pv-sidecar-opt',
+        stage: 'complete',
+        decisions: [],
+        blockers: [],
+        position: { currentStep: 'init' },
+        updatedAt: '2026-05-01T00:00:00Z',
+      });
+      appendResult('orch-pv-sidecar-opt', { ok: false }, '2026-05-01T00:05:01Z');
+      writeJobComplete('orch-pv-sidecar-opt', 'orchestrate', { ok: true }, FIXTURE_VERSION);
+
+      const body = await envelope('orch-pv-sidecar-opt');
+      const record = body['record'] as Record<string, unknown>;
+
+      expect(body['producerVersionSource']).toBe('sidecar');
+      expect(record['producerVersion']).toBe(FIXTURE_VERSION);
+    } finally {
+      if (originalSource === undefined) delete process.env['NEXUS_JOB_RESULT_SOURCE'];
+      else process.env['NEXUS_JOB_RESULT_SOURCE'] = originalSource;
+    }
+  });
+
+  it("marks a 'dev' producer unmeasured — two local builds both read 'dev'", async () => {
+    writeJobComplete('job-pv-dev', 'orchestrate', { ok: true }, 'dev');
+
+    const body = await envelope('job-pv-dev');
+    const record = body['record'] as Record<string, unknown>;
+
+    expect(record['producerVersion']).toBe('dev');
+    expect(body['producerVersionMeasured']).toBe(false);
+  });
+
+  it('marks a legacy record (no field) unmeasured rather than defaulting a value', async () => {
+    const legacy = {
+      v: 1,
+      jobId: 'job-pv-legacy',
+      toolName: 'orchestrate',
+      status: 'complete',
+      createdAt: '2026-08-01T00:00:00.000Z',
+      completedAt: '2026-08-01T00:01:00.000Z',
+      result: { ok: true },
+    };
+    mkdirSync(join(tmpDir, 'jobs'), { recursive: true });
+    writeFileSync(join(tmpDir, 'jobs', 'result-job-pv-legacy.json'), JSON.stringify(legacy));
+
+    const body = await envelope('job-pv-legacy');
+    const record = body['record'] as Record<string, unknown>;
+
+    expect(body['found']).toBe(true);
+    expect(record).not.toHaveProperty('producerVersion');
+    expect(body['producerVersionMeasured']).toBe(false);
+  });
+
+  it('does not claim a measurement for an unknown jobId', async () => {
+    const body = await envelope('job-pv-missing');
+    expect(body['found']).toBe(false);
+    expect(body).not.toHaveProperty('producerVersionMeasured');
+    expect(body).not.toHaveProperty('producerVersionSource');
+  });
+});
+
+describe('get_job_result heartbeat disclosure (#6162)', () => {
+  // A poller reading `pending` cannot tell slow from stuck. `runAsJob` hands
+  // the body a `progress()` heartbeat that stamps `lastProgressAt` on the
+  // pending record; the tool has to surface it from BOTH result sources, or a
+  // `NEXUS_JOB_RESULT_SOURCE=task_state` reader would see the stamp vanish.
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+  const originalSource = process.env['NEXUS_JOB_RESULT_SOURCE'];
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-gjr-heartbeat-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    delete process.env['NEXUS_JOB_RESULT_SOURCE'];
+    resetNexusDataDirCache();
+  });
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    if (originalSource === undefined) delete process.env['NEXUS_JOB_RESULT_SOURCE'];
+    else process.env['NEXUS_JOB_RESULT_SOURCE'] = originalSource;
+    resetNexusDataDirCache();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('surfaces lastProgressAt from the sidecar source', async () => {
+    writeJobPending('job-hb-sidecar', 'orchestrate');
+    heartbeatJob('job-hb-sidecar', '2026-09-16T12:34:56.000Z');
+
+    const body = await envelope('job-hb-sidecar');
+    const record = body['record'] as Record<string, unknown>;
+
+    expect(body['producerVersionSource']).toBe('sidecar');
+    expect(record['status']).toBe('pending');
+    expect(record['lastProgressAt']).toBe('2026-09-16T12:34:56.000Z');
+  });
+
+  it('surfaces lastProgressAt from the task_state source, which itself records no heartbeat', async () => {
+    process.env['NEXUS_JOB_RESULT_SOURCE'] = 'task_state';
+    initTaskState({
+      taskId: 'orch-hb-ts',
+      stage: 'executing',
+      decisions: [],
+      blockers: [],
+      position: { currentStep: 'run' },
+      dispatch: 'async',
+      updatedAt: '2026-05-01T00:00:00Z',
+    });
+    writeJobPending('orch-hb-ts', 'orchestrate');
+    heartbeatJob('orch-hb-ts', '2026-05-01T00:07:00.000Z');
+
+    const body = await envelope('orch-hb-ts');
+    const record = body['record'] as Record<string, unknown>;
+
+    expect(body['producerVersionSource']).toBe('task_state');
+    expect(record['status']).toBe('pending');
+    expect(record['lastProgressAt']).toBe('2026-05-01T00:07:00.000Z');
+  });
+
+  it('empty case: a pending job that never heartbeat has no lastProgressAt — absence is not a stamp', async () => {
+    writeJobPending('job-hb-none', 'orchestrate');
+    const body = await envelope('job-hb-none');
+    expect(body['record']).not.toHaveProperty('lastProgressAt');
+  });
+});

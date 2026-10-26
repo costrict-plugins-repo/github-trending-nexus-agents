@@ -1,0 +1,2229 @@
+/**
+ * Tests for the authentic vote-record store (#3897, model revised #3927): a
+ * completed vote persists a self-hashed record carrying the proposal hash +
+ * decision + per-voter summary + monotonic `sequence`. The record is append-only
+ * and round-trips, persisted sequences increment, tampering is detected as a
+ * `hash_mismatch`, and the ledger survives a simulated concurrent-branch merge
+ * (duplicate sequence → benign fork, not a failure).
+ *
+ * @module audit/vote-record-store.test
+ */
+
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import type { ILogger } from '../core/index.js';
+import { UNREADABLE_RECORD_PREFIX, serializeValidatedRecord } from './ledger-append.js';
+import { isAbsolute, join, resolve } from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { getNexusDataDir, nexusDataPath } from '../config/nexus-data-dir.js';
+import { findRepoRoot } from '../config/repo-root-detection.js';
+
+import type { ConsensusResult, Vote } from '../consensus/types.js';
+import type { AgentVoteResult, VoterRole } from '../cli/vote-types.js';
+import { retryErroredRoles } from '../cli/voter-retry.js';
+
+// #3991: the store now resolves the runtime ledger via nexusDataPath (governance
+// category) instead of findRepoRoot. Mock the resolver so each test pins the
+// data root without touching the real homedir/sandbox/repo layout.
+vi.mock('../config/nexus-data-dir.js', () => ({
+  getNexusDataDir: vi.fn(() => '/data-root/.nexus-agents'),
+  nexusDataPath: vi.fn((...segments: string[]) =>
+    ['/data-root/.nexus-agents', ...segments].join('/')
+  ),
+  previewNexusDataPath: vi.fn((...segments: string[]) =>
+    ['/data-root/.nexus-agents', ...segments].join('/')
+  ),
+}));
+
+import type { VoteRecord } from './vote-record.js';
+import {
+  MAX_VOTER_REASONING_CHARS,
+  VoteRecordSchema,
+  VoterSummarySchema,
+  computeVoteRecordHash,
+  verifyVoteRecordSet,
+} from './vote-record.js';
+import { computeReasoningDigest } from './reasoning-commitment.js';
+import {
+  VOTE_RECORDS_PATH_ENV,
+  VOTE_RECORDS_REL_PATH,
+  buildVoteRecord,
+  type BuildVoteRecordInput,
+  persistVoteRecord,
+  parseVoteRecordsText,
+  readVoteRecords,
+  resolveVoteRecordsPath,
+} from './vote-record-store.js';
+
+/**
+ * The tier every record with at least one responding voter is built on since
+ * #6263: the builder commits to each stored reasoning with a salted digest
+ * (`reasoningNonce` + `reasoningDigest`), and that voter key outranks every
+ * tier below it. The per-field assertions beside each of these are what still
+ * pin the older tiers' FIELDS; the ordering of the tiers below 1.13 is only
+ * observable on a panel with no responding voter (see the 1.13 block).
+ */
+const BUILT_TIER = '1.13';
+
+/** A 32-byte value as lowercase hex — the shape of `reasoningNonce` and `reasoningDigest`. */
+const HEX_256 = /^[0-9a-f]{64}$/;
+
+function vote(decision: Vote['decision'], confidence: number): Vote {
+  return { decision, confidence, reasoning: 'because' };
+}
+
+function agentVote(
+  role: VoterRole,
+  decision: Vote['decision'],
+  source: AgentVoteResult['source'] = 'llm'
+): AgentVoteResult {
+  return { role, vote: vote(decision, 0.8), processingTimeMs: 10, source };
+}
+
+function consensusResult(overrides: Partial<ConsensusResult> = {}): ConsensusResult {
+  const now = '2026-06-15T00:00:00.000Z';
+  return {
+    proposalId: 'p-1',
+    proposal: { title: 'T', description: 'D', algorithm: 'higher_order' },
+    outcome: 'approved',
+    votes: new Map(),
+    voteCounts: { approve: 2, reject: 1, abstain: 0, total: 3 },
+    approvalPercentage: 66.7,
+    quorumReached: true,
+    startedAt: now,
+    closedAt: now,
+    durationMs: 5,
+    ...overrides,
+  };
+}
+
+const votes: readonly AgentVoteResult[] = [
+  agentVote('architect', 'approve'),
+  agentVote('security', 'approve'),
+  agentVote('catfish', 'reject'),
+];
+
+describe('buildVoteRecord', () => {
+  it.each([true, false])(
+    'persists per-seat option re-ask resolution %s in schema 1.14, hash-covered',
+    (resolved) => {
+      const seat = {
+        ...agentVote('architect', 'approve'),
+        optionReask: { resolved },
+        ...(resolved ? { selectedOption: 'A' } : {}),
+      };
+      const record = buildVoteRecord({
+        id: 'option-reask',
+        proposal: 'Choose A or B',
+        strategy: 'simple_majority',
+        result: consensusResult(),
+        votes: [seat],
+        declaredOptions: ['A', 'B'],
+        resolvedDecision: resolved ? 'approved' : 'rejected',
+        sequence: 0,
+        previousHash: undefined,
+      });
+      expect(record.version).toBe('1.14');
+      expect(record.voters[0]).toHaveProperty('optionReask', { resolved });
+      if (resolved) expect(record.voters[0]).toHaveProperty('selectedOption', 'A');
+      else expect(record.voters[0]).not.toHaveProperty('selectedOption');
+      expect(record.optionCoverage).toEqual({
+        approverCount: 1,
+        selectedCount: resolved ? 1 : 0,
+        unattributedApprovals: resolved ? 0 : 1,
+      });
+      const read = parseVoteRecordsText(serializeValidatedRecord(VoteRecordSchema, record, 'vote'));
+      expect(read.records).toEqual([record]);
+      expect(read.invalidLines).toEqual([]);
+      expect(verifyVoteRecordSet(read.records)).toEqual({ ok: true, recordCount: 1 });
+      const tampered = {
+        ...record,
+        voters: [{ ...record.voters[0]!, optionReask: { resolved: !resolved } }],
+      };
+      expect(computeVoteRecordHash(tampered)).not.toBe(record.hash);
+    }
+  );
+
+  it('persists first-pass option selections with no re-ask marker', () => {
+    const record = buildVoteRecord({
+      id: 'first-option',
+      proposal: 'Choose A or B',
+      strategy: 'simple_majority',
+      result: consensusResult(),
+      votes: [{ ...agentVote('architect', 'approve'), selectedOption: 'A' }],
+      declaredOptions: ['A', 'B'],
+      resolvedDecision: 'approved',
+      sequence: 0,
+      previousHash: undefined,
+    });
+    expect(record.version).toBe('1.14');
+    expect(record.voters[0]).toHaveProperty('selectedOption', 'A');
+    expect(record.voters[0]).not.toHaveProperty('optionReask');
+    const tampered = { ...record, voters: [{ ...record.voters[0]!, selectedOption: 'B' }] };
+    expect(computeVoteRecordHash(tampered)).not.toBe(record.hash);
+  });
+
+  it('carries the proposal hash, decision, counts, per-voter summary, and a sequence', () => {
+    const record = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-1',
+      proposal: 'Promote loop X to enforce',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+    });
+    // 1.13 since #6263: every live voter's reasoning is stored AND committed
+    // to with a salted digest, which is the latest voter field. The
+    // optionTally/optionCoverage assertions below are what test those fields'
+    // presence.
+    expect(record.version).toBe(BUILT_TIER);
+    expect(record.sequence).toBe(0); // default first sequence
+    expect(record.decision).toBe('approved');
+    expect(record.proposalHash).toHaveLength(64);
+    expect(record.approvalPercentage).toBeCloseTo(66.7);
+    expect(record.voteCounts).toEqual({ approve: 2, reject: 1, abstain: 0, total: 3 });
+    // #5373: the stored grounds travel with each entry; #6263: so does the
+    // salted commitment to them (the nonce is random, so its shape is pinned
+    // here and its binding to the text in the 1.13 block).
+    const committed = {
+      reasoning: 'because',
+      reasoningNonce: expect.stringMatching(HEX_256) as unknown as string,
+      reasoningDigest: expect.stringMatching(HEX_256) as unknown as string,
+    };
+    expect(record.voters).toEqual([
+      { role: 'architect', decision: 'approve', confidence: 0.8, ...committed },
+      { role: 'security', decision: 'approve', confidence: 0.8, ...committed },
+      { role: 'catfish', decision: 'reject', confidence: 0.8, ...committed },
+    ]);
+    expect(verifyVoteRecordSet([record])).toEqual({ ok: true, recordCount: 1 });
+  });
+
+  it('records a resolved no_quorum even when the engine outcome was approved (#4986)', () => {
+    // The absolute_quorum void: `resolveVoteDecision` returns no_quorum while
+    // `result.outcome` stays 'approved' and `result.policyReason` is never set,
+    // so `errorVoided` is false. Deriving from the outcome recorded a genuine
+    // approval for a vote the tool reported as no_quorum.
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: 'no_quorum',
+      id: 'vote-void',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult({ outcome: 'approved' }),
+      votes,
+    });
+
+    expect(record.decision).toBe('no_quorum');
+  });
+
+  it('does not call an approved-but-voided vote approved (#4986)', () => {
+    // The fallback's own asymmetry: the `errorVoided` check used to sit BELOW
+    // the approved short-circuit, so it could only ever rescue a `rejected`.
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-voided-approved',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult({ outcome: 'approved' }),
+      votes,
+      errorVoided: true,
+    });
+
+    expect(record.decision).toBe('no_quorum');
+  });
+
+  it('does not record a timed-out panel as a rejection (#4986)', () => {
+    // `ProposalStatus` carries `timeout`/`pending`/`voting`/`closed`. The old
+    // everything-else-is-rejected default attributed a verdict to voters who
+    // never gave one.
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-timeout',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult({ outcome: 'timeout', quorumReached: false }),
+      votes,
+    });
+
+    expect(record.decision).toBe('no_quorum');
+  });
+
+  it('still records a genuine rejection as rejected', () => {
+    // The pair that keeps the change above from swallowing real rejections.
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-rejected',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult({ outcome: 'rejected' }),
+      votes,
+    });
+
+    expect(record.decision).toBe('rejected');
+  });
+
+  it('omits optionTally and stays on 1.2 when no voter declared an option (#4452)', () => {
+    const record = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-noopt',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+    });
+    expect(record.optionTally).toBeUndefined();
+    expect(record.version).toBe(BUILT_TIER); // #5373 reasoning, #6263 its digest
+    expect(verifyVoteRecordSet([record])).toEqual({ ok: true, recordCount: 1 });
+  });
+
+  it('derives optionTally from selectedOption and bumps the schema (#4452, #4472)', () => {
+    // The defect this fixes: voteCounts says approve:2 for BOTH a genuine
+    // agreement and a split across options. The tally distinguishes them.
+    const withOptions = votes.map((v, i) => ({
+      ...v,
+      selectedOption: i === 0 ? 'A' : i === 1 ? 'A' : 'C',
+    }));
+    const record = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-opt',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes: withOptions,
+    });
+    // #4472: a tally now always travels with its coverage, so a record
+    // carrying one is 1.4. Historical 1.3 records still verify.
+    expect(record.version).toBe('1.14'); // per-seat selections outrank coverage
+    // The fixture's third voter is catfish(reject) and was assigned 'C'. Only
+    // approvers count — this expectation previously asserted `C: 1`, encoding
+    // the very defect e2e validation later surfaced in a live record.
+    expect(record.optionTally).toEqual([{ option: 'A', count: 2 }]);
+    expect(verifyVoteRecordSet([record])).toEqual({ ok: true, recordCount: 1 });
+  });
+
+  it('tallies only approvers, matching the population the verdict was computed over', () => {
+    // Found by e2e validation: a REJECTING voter named an option, and the
+    // record counted it. The threshold is evaluated over approvers only, so a
+    // record whose tally includes rejecters describes a different population
+    // than the verdict it accompanies — and disagrees with its own
+    // optionCoverage, which was already approvers-only.
+    const mixed: readonly AgentVoteResult[] = [
+      { ...agentVote('architect', 'approve'), selectedOption: 'A' },
+      { ...agentVote('catfish', 'reject'), selectedOption: 'B' },
+      { ...agentVote('security', 'abstain'), selectedOption: 'B' },
+    ];
+    const record = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-mixed',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes: mixed,
+    });
+
+    // 'B' came from a rejecter and must not appear.
+    expect(record.optionTally).toEqual([{ option: 'A', count: 1 }]);
+
+    // The tally and the coverage must describe the same population.
+    const tallied = (record.optionTally ?? []).reduce((n, t) => n + t.count, 0);
+    expect(tallied).toBe(record.optionCoverage?.selectedCount);
+    expect(record.voters.filter((v) => v.selectedOption !== undefined)).toHaveLength(tallied);
+    expect(record.voters.filter((v) => v.decision !== 'approve')).toEqual([
+      expect.not.objectContaining({ selectedOption: expect.anything() }),
+      expect.not.objectContaining({ selectedOption: expect.anything() }),
+    ]);
+  });
+
+  it('records selection coverage so a diluted share reads as partial (#4472)', () => {
+    // Two approvers select, one approves without a usable selection. The
+    // tally alone would show A:2 with no hint that a third approver's choice
+    // was never measured.
+    const partial = votes.map((v, i) => ({
+      ...v,
+      ...(i < 2 ? { selectedOption: 'A' } : {}),
+    }));
+    const record = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-coverage',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes: partial,
+    });
+
+    const approvers = partial.filter((v) => v.vote.decision === 'approve').length;
+    expect(record.optionCoverage).toEqual({
+      approverCount: approvers,
+      selectedCount: 2,
+      unattributedApprovals: approvers - 2,
+    });
+    expect(verifyVoteRecordSet([record])).toEqual({ ok: true, recordCount: 1 });
+  });
+
+  it('orders the tally deterministically regardless of voter arrival order (#4452)', () => {
+    // The array is hash-covered, so two vote sets differing only in order must
+    // not produce different hashes. Since #6263 every built record also
+    // carries a fresh per-entry nonce whose digest is hashed, so two builds
+    // never share a hash; the
+    // comparison holds the nonces constant by re-hashing the second payload
+    // with the first's voter entries, leaving the tally as the only variable.
+    const mk = (opts: readonly string[]): VoteRecord =>
+      buildVoteRecord({
+        // #4986: these fixtures exercise the fallback derivation.
+        declaredOptions: undefined,
+        resolvedDecision: undefined,
+        id: 'vote-ord',
+        recordedAt: '2026-06-15T00:00:00.000Z',
+        proposal: 'p',
+        strategy: 'higher_order',
+        result: consensusResult(),
+        votes: votes.map((v, i) => ({ ...v, selectedOption: opts[i] as string })),
+      });
+    const first = mk(['A', 'C', 'A']);
+    const { hash: _second, ...reordered } = mk(['C', 'A', 'A']);
+    expect(reordered.optionTally).toEqual(first.optionTally);
+    expect(computeVoteRecordHash({ ...reordered, voters: first.voters })).toBe(first.hash);
+  });
+
+  it('excludes error-source voters from the per-voter summary', () => {
+    const record = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-1',
+      proposal: 'p',
+      strategy: 'simple_majority',
+      result: consensusResult(),
+      votes: [...votes, agentVote('pm', 'abstain', 'error')],
+    });
+    expect(record.voters.map((v) => v.role)).not.toContain('pm');
+  });
+
+  it('persists no_quorum (not rejected) for an error-policy short-circuit, matching the response (#4053)', () => {
+    const record = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-sc',
+      proposal: 'p',
+      strategy: 'simple_majority',
+      // short-circuit shape: 1 approver surfaced, no quorum, error-voided.
+      result: consensusResult({
+        outcome: 'rejected',
+        quorumReached: false,
+        approvalPercentage: 100,
+      }),
+      votes: [
+        agentVote('scope_steward', 'approve'),
+        agentVote('architect', 'abstain', 'error'),
+        agentVote('security', 'abstain', 'error'),
+      ],
+      errorVoided: true,
+    });
+    expect(record.decision).toBe('no_quorum');
+  });
+
+  it('keeps rejected for a genuine quorum-reached rejection (#4053)', () => {
+    const record = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-rej',
+      proposal: 'p',
+      strategy: 'simple_majority',
+      result: consensusResult({ outcome: 'rejected', quorumReached: true, approvalPercentage: 20 }),
+      votes: [agentVote('architect', 'reject'), agentVote('security', 'reject')],
+      errorVoided: false,
+    });
+    expect(record.decision).toBe('rejected');
+  });
+});
+
+describe('persistVoteRecord', () => {
+  let dir: string;
+  let filePath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'vote-records-'));
+    filePath = join(dir, 'governance', 'vote-records.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a maximal abstaining voter entry carries every applicable producer field (#6057)', () => {
+    // The schema-only failure mode is a compile error now; this pins the
+    // builder side: a vote that is retried AND clipped produces an entry whose
+    // key set equals the applicable producer fields in the schema. An abstaining
+    // seat cannot carry the approval-only selectedOption field (#4495).
+    // One past the cap, derived from the constant: a literal that happened to
+    // sit under it produced a fixture that was not clipped at all.
+    const clipped = 'x'.repeat(MAX_VOTER_REASONING_CHARS + 1);
+    const written = persistVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-maximal',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes: [
+        {
+          ...votes[0]!,
+          retried: true,
+          // #6091/#6094: the seat's model and the unverifiable marker.
+          model: 'codex-5.3',
+          // #6967: the model the adapter reported serving.
+          servedModel: 'codex-5.3-mini',
+          // #4495: supplementary option evidence on the maximal schema fixture.
+          selectedOption: 'A',
+          optionReask: { resolved: true },
+          source: 'unverifiable',
+          unverifiableSignal: 'stderr',
+          // #6115: where the seat was assigned, and that it answered elsewhere.
+          assignedCli: 'claude',
+          fallback: { fromCli: 'claude', fromModel: 'claude-opus', reason: 'capacity' },
+          // #6246: what the per-role retry replaced.
+          retriedFrom: { source: 'error', error: 'Vote parsing failed', errorTruncated: true },
+          vote: {
+            ...votes[0]!.vote,
+            decision: 'abstain',
+            reasoning: clipped,
+            conditions: ['Read the artifact before approval'],
+          },
+        },
+      ],
+      filePath,
+    });
+    expect(written).toBeDefined();
+    const entry = written!.voters[0]!;
+    // Pin the optional fields individually so a fixture that stops
+    // exercising one is named, not just "key sets differ".
+    expect(entry.retried).toBe(true);
+    expect(entry.reasoningTruncated).toBe(true);
+    expect(entry.model).toBe('codex-5.3');
+    expect(entry.unverifiable).toBe(true);
+    expect(entry.assignedCli).toBe('claude');
+    expect(entry.fallback).toEqual({
+      fromCli: 'claude',
+      fromModel: 'claude-opus',
+      reason: 'capacity',
+    });
+    expect(entry.retriedFrom).toEqual({
+      source: 'error',
+      error: 'Vote parsing failed',
+      errorTruncated: true,
+    });
+    expect(entry.servedModel).toBe('codex-5.3-mini');
+    // Previously credited a selection to this abstention; only approvers select.
+    expect(entry).not.toHaveProperty('selectedOption');
+    expect(entry.optionReask).toEqual({ resolved: true });
+    expect(entry.conditions).toEqual(['Read the artifact before approval']);
+    expect(Object.keys(entry).sort()).toEqual(
+      Object.keys(VoterSummarySchema.shape)
+        .filter((key) => key !== 'selectedOption')
+        .sort()
+    );
+  });
+
+  it('the returned record and the line on disk serialize IDENTICALLY (#6054)', () => {
+    // The guard's first version re-emitted Zod's rebuilt object, which reorders
+    // keys to schema order; the builder emits `ratifies` BEFORE the option
+    // fields while the schema declares it after `panelCoverage`, so a record
+    // carrying both diverged on disk while the hash (a projection) stayed green.
+    // Assert the bytes, not the hash — and with a fixture Zod would really
+    // reorder: a minimal one matched schema order by accident and let the
+    // mutation survive.
+    const written = persistVoteRecord({
+      declaredOptions: ['A', 'B'],
+      resolvedDecision: 'approved',
+      ratifies: 'loop-x',
+      id: 'vote-bytes',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+      filePath,
+    });
+    expect(written).toBeDefined();
+    expect(readFileSync(filePath, 'utf-8')).toBe(JSON.stringify(written) + '\n');
+  });
+
+  it("REFUSES to write the source checkout's tracked ledger from a test run (#6070)", () => {
+    // `governance/vote-records.jsonl` is tracked and read by the authority-tier
+    // promotion gate as its ratification evidence. A fabricated line that
+    // self-hashes correctly would pass that gate, so the write THROWS (not
+    // `undefined` — the guard runs before the try, or a swallowed guard would
+    // hide the mistake it exists to surface) and the file's bytes are untouched.
+    const root = findRepoRoot(process.cwd());
+    if (root === null) throw new Error('test must run inside the source checkout');
+    const tracked = join(root, VOTE_RECORDS_REL_PATH);
+    const bytesBefore = statSync(tracked).size;
+    process.env[VOTE_RECORDS_PATH_ENV] = tracked;
+    try {
+      expect(() =>
+        persistVoteRecord({
+          declaredOptions: undefined,
+          resolvedDecision: undefined,
+          id: 'vote-guard',
+          proposal: 'guard fixture — must never reach the tracked ledger',
+          strategy: 'higher_order',
+          result: consensusResult(),
+          votes,
+        })
+      ).toThrow(/#4415/);
+    } finally {
+      delete process.env['NEXUS_VOTE_RECORDS_PATH'];
+    }
+    expect(statSync(tracked).size).toBe(bytesBefore);
+  });
+
+  it('the refusal names a throwaway path, not the env var that reached the ledger (#6081)', () => {
+    // `NEXUS_VOTE_RECORDS_PATH` is the very variable that pointed at the
+    // tracked file, and `persistVoteRecord` has no `repoPath` option. A remedy
+    // of "set NEXUS_VOTE_RECORDS_PATH" sends the reader back into the same
+    // refusal; the message has to say WHERE to point it instead.
+    const root = findRepoRoot(process.cwd());
+    if (root === null) throw new Error('test must run inside the source checkout');
+    process.env[VOTE_RECORDS_PATH_ENV] = join(root, VOTE_RECORDS_REL_PATH);
+    let message = '';
+    try {
+      persistVoteRecord({
+        declaredOptions: undefined,
+        resolvedDecision: undefined,
+        id: 'vote-guard-remedy',
+        proposal: 'guard fixture — must never reach the tracked ledger',
+        strategy: 'higher_order',
+        result: consensusResult(),
+        votes,
+      });
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    } finally {
+      delete process.env['NEXUS_VOTE_RECORDS_PATH'];
+    }
+    expect(message).toMatch(/#4415/);
+    expect(message).toMatch(/throwaway path such as a temp directory/);
+    expect(message).toMatch(/Point NEXUS_VOTE_RECORDS_PATH \(or the explicit filePath\)/);
+    expect(message).not.toMatch(/or set NEXUS_VOTE_RECORDS_PATH/);
+    expect(message).not.toMatch(/repoPath/);
+  });
+
+  it('still writes to any other absolute path from the env override (#6070)', () => {
+    process.env[VOTE_RECORDS_PATH_ENV] = filePath;
+    try {
+      const written = persistVoteRecord({
+        declaredOptions: undefined,
+        resolvedDecision: undefined,
+        id: 'vote-elsewhere',
+        proposal: 'p',
+        strategy: 'higher_order',
+        result: consensusResult(),
+        votes,
+      });
+      expect(written).toBeDefined();
+      expect(readFileSync(filePath, 'utf-8')).toBe(JSON.stringify(written) + '\n');
+    } finally {
+      delete process.env['NEXUS_VOTE_RECORDS_PATH'];
+    }
+  });
+
+  it('REFUSES to append a record the read schema would reject (#6054)', () => {
+    // `id: ''` violates `VoteRecordSchema`'s `id: z.string().min(1)`. Before the
+    // guard this was APPENDED, reported as written, and then invisible on read —
+    // a line in `invalidLines` that no non-test consumer reads. The chain moved
+    // past it, so it could never be repaired. The #6049 shape, structurally.
+    const warn = vi.fn();
+    const logger = { warn, info: vi.fn(), debug: vi.fn(), error: vi.fn() } as unknown as ILogger;
+    const written = persistVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: '',
+      proposal: 'Promote loop X to enforce',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+      filePath,
+      logger,
+    });
+
+    expect(written).toBeUndefined();
+    // Nothing durable: not even an unreadable line.
+    expect(existsSync(filePath) ? readFileSync(filePath, 'utf-8') : '').toBe('');
+    // The caller's log names the field, not merely "write failed".
+    const messages = warn.mock.calls.map((c) => JSON.stringify(c));
+    expect(messages.some((m) => m.includes(UNREADABLE_RECORD_PREFIX) && m.includes('id'))).toBe(
+      true
+    );
+  });
+
+  it('persists a self-hashed record that round-trips through read', () => {
+    const written = persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-1',
+      proposal: 'Promote loop X to enforce',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+      filePath,
+    });
+    expect(written).toBeDefined();
+
+    const { records, invalidLines } = readVoteRecords(filePath);
+    expect(invalidLines).toEqual([]);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toEqual(written);
+  });
+
+  it('assigns an incrementing sequence and an advisory previousHash on append', () => {
+    const first = persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-1',
+      proposal: 'first',
+      strategy: 'higher_order',
+      result: consensusResult({ outcome: 'rejected', approvalPercentage: 20 }),
+      votes,
+      filePath,
+    });
+    const second = persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-2',
+      proposal: 'second',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+      filePath,
+    });
+
+    const { records } = readVoteRecords(filePath);
+    expect(records).toHaveLength(2);
+    expect(records[0]!.sequence).toBe(0);
+    expect(records[1]!.sequence).toBe(1);
+    expect(records[0]!.previousHash).toBeUndefined();
+    // previousHash is advisory (set to the prior tip) but NOT verified.
+    expect(records[1]!.previousHash).toBe(first!.hash);
+    expect(second!.sequence).toBe(1);
+    expect(verifyVoteRecordSet(records)).toEqual({ ok: true, recordCount: 2 });
+  });
+
+  it('detects tampering with a persisted line (decision flip) via set verification', () => {
+    persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-1',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult({ outcome: 'rejected', approvalPercentage: 20 }),
+      votes,
+      filePath,
+    });
+
+    // Forge the committed artifact: flip rejected → approved on the raw line.
+    const raw = readFileSync(filePath, 'utf-8');
+    writeFileSync(filePath, raw.replace('"decision":"rejected"', '"decision":"approved"'), 'utf-8');
+
+    const { records } = readVoteRecords(filePath);
+    expect(records).toHaveLength(1);
+    expect(records[0]!.decision).toBe('approved'); // the forged value is present...
+    const result = verifyVoteRecordSet(records);
+    expect(result.ok).toBe(false); // ...but verification rejects it
+    if (!result.ok) expect(result.reason).toBe('hash_mismatch');
+  });
+
+  it('survives a simulated two-branch concurrent merge (merge=union) as a benign fork', () => {
+    // Branch base: one record at sequence 0.
+    persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-base',
+      proposal: 'base proposal',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+      filePath,
+    });
+    const baseRaw = readFileSync(filePath, 'utf-8');
+
+    // Two branches each fork from the same tip and append THEIR OWN sequence-1
+    // record (each computed the same max sequence = 0 → next = 1).
+    const branchA = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-A',
+      proposal: 'branch A proposal',
+      strategy: 'higher_order',
+      result: consensusResult({ approvalPercentage: 71 }),
+      votes,
+      sequence: 1,
+    });
+    const branchB = buildVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-B',
+      proposal: 'branch B proposal',
+      strategy: 'higher_order',
+      result: consensusResult({ outcome: 'rejected', approvalPercentage: 33 }),
+      votes,
+      sequence: 1,
+    });
+
+    // Simulate what `merge=union` produces: base line + both branch lines.
+    writeFileSync(filePath, baseRaw, 'utf-8');
+    appendFileSync(filePath, JSON.stringify(branchA) + '\n', 'utf-8');
+    appendFileSync(filePath, JSON.stringify(branchB) + '\n', 'utf-8');
+
+    const { records, invalidLines } = readVoteRecords(filePath);
+    expect(invalidLines).toEqual([]);
+    expect(records).toHaveLength(3);
+
+    const result = verifyVoteRecordSet(records);
+    expect(result.ok).toBe(true); // a concurrent fork is NOT a failure
+    if (result.ok) {
+      expect(result.recordCount).toBe(3);
+      expect(result.forks).toEqual([1]); // the duplicated sequence is surfaced
+    }
+  });
+
+  it("skips persistence when every vote is simulated is the caller's job; store itself writes given real votes", () => {
+    const written = persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-1',
+      proposal: 'p',
+      strategy: 'simple_majority',
+      result: consensusResult(),
+      votes,
+      filePath,
+    });
+    expect(written).toBeDefined();
+  });
+});
+
+describe('vote-record path resolution via nexusDataPath (#3991, design vote 7-0)', () => {
+  let dir: string;
+  let dataRoot: string;
+  let envFilePath: string;
+  let optsFilePath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'vote-records-env-'));
+    dataRoot = join(dir, 'data-root', '.nexus-agents');
+    envFilePath = join(dir, 'env', 'vote-records.jsonl');
+    optsFilePath = join(dir, 'opts', 'vote-records.jsonl');
+    // Default mock: nexusDataPath roots under a real temp data dir so persists
+    // actually write. getNexusDataDir returns the same root for the in-data-dir
+    // traversal validation in resolveVoteRecordsPath().
+    vi.mocked(getNexusDataDir).mockReturnValue(dataRoot);
+    vi.mocked(nexusDataPath).mockImplementation((...segments: string[]) =>
+      join(dataRoot, ...segments)
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs(); // restore any process.env mutations made via vi.stubEnv
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('honors the env-var override path when no opts.filePath is given', () => {
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, envFilePath);
+    expect(resolveVoteRecordsPath()).toBe(envFilePath);
+
+    const written = persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-env',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+    });
+    expect(written).toBeDefined();
+
+    const { records, invalidLines } = readVoteRecords(envFilePath);
+    expect(invalidLines).toEqual([]);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toEqual(written);
+    // The default nexusDataPath location was NOT used.
+    expect(
+      readVoteRecords(join(dataRoot, 'governance', 'vote-records.jsonl')).records
+    ).toHaveLength(0);
+  });
+
+  it('returns an absolute override unchanged (#3963)', () => {
+    // envFilePath is already absolute → returned verbatim (resolve is a no-op).
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, envFilePath);
+    const resolved = resolveVoteRecordsPath();
+    expect(resolved).toBe(envFilePath);
+    expect(isAbsolute(resolved as string)).toBe(true);
+  });
+
+  it('resolves a RELATIVE override to an absolute path against cwd (#3963)', () => {
+    // A relative override is resolved against cwd to an absolute path rather than
+    // written verbatim. Use a value that stays under cwd so it is NOT rejected by
+    // the path-traversal guard.
+    const rel = 'governance/custom-vote-records.jsonl';
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, rel);
+    const resolved = resolveVoteRecordsPath();
+    expect(resolved).toBe(resolve(rel));
+    expect(isAbsolute(resolved as string)).toBe(true);
+    expect(resolved).not.toBe(rel);
+  });
+
+  it('rejects (fail-closed) a relative override that escapes cwd via `..` (security #3991)', () => {
+    // A relative override resolving outside cwd is a path-traversal attempt → the
+    // resolver returns undefined rather than writing astray.
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, '../../../../../../tmp/evil-vote-records.jsonl');
+    expect(resolveVoteRecordsPath()).toBeUndefined();
+  });
+
+  it('treats an empty/whitespace env var as unset (falls through to nexusDataPath)', () => {
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, '   ');
+    // Post-#3991 the fall-through is the canonical data-dir path, NOT undefined.
+    expect(resolveVoteRecordsPath()).toBe(join(dataRoot, 'governance', 'vote-records.jsonl'));
+  });
+
+  it('falls through to nexusDataPath(governance, ...) when no override is set', () => {
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, undefined);
+    const resolved = resolveVoteRecordsPath();
+    expect(resolved).toBe(join(dataRoot, 'governance', 'vote-records.jsonl'));
+    expect(vi.mocked(nexusDataPath)).toHaveBeenCalledWith('governance', 'vote-records.jsonl');
+  });
+
+  it('lets opts.filePath take precedence over the env var', () => {
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, envFilePath);
+
+    const written = persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-opts',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+      filePath: optsFilePath,
+    });
+    expect(written).toBeDefined();
+
+    // Written to opts path, not the env path.
+    expect(readVoteRecords(optsFilePath).records).toHaveLength(1);
+    expect(readVoteRecords(envFilePath).records).toHaveLength(0);
+  });
+
+  it('#3991 regression: global install (no override, cwd not a repo) resolves a valid .nexus-agents path and persists there', () => {
+    // The pre-#3991 bug: resolveVoteRecordsPath() returned undefined when cwd was
+    // not a repo and no override was set → the producer silently skipped. Now the
+    // canonical resolver always yields a writable data-dir path, so a persist
+    // writes a record there.
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, undefined);
+    const resolved = resolveVoteRecordsPath();
+    expect(resolved).toBeDefined();
+    expect(resolved).toBe(join(dataRoot, 'governance', 'vote-records.jsonl'));
+
+    const written = persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-global',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+    });
+    expect(written).toBeDefined();
+    const { records } = readVoteRecords(resolved as string);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toEqual(written);
+  });
+
+  it('routes under a per-repo .nexus-agents/governance/ location when nexusDataPath does (NEXUS_REPO_PREFERRED)', () => {
+    // Simulate nexusDataPath choosing the per-repo tier: the resolved path sits
+    // under <repo>/.nexus-agents/governance/, which differs from getNexusDataDir
+    // (the homedir root). The store's defense-in-depth validation must still
+    // accept it via the `.nexus-agents/governance/` segment check.
+    const repoGovDir = join(dir, 'repo', '.nexus-agents', 'governance');
+    vi.mocked(nexusDataPath).mockImplementation((...segments: string[]) =>
+      join(dir, 'repo', '.nexus-agents', ...segments)
+    );
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, undefined);
+    const resolved = resolveVoteRecordsPath();
+    expect(resolved).toBe(join(repoGovDir, 'vote-records.jsonl'));
+
+    const written = persistVoteRecord({
+      // #4986: these fixtures exercise the fallback derivation.
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      id: 'vote-repo',
+      proposal: 'p',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes,
+    });
+    expect(written).toBeDefined();
+    expect(readVoteRecords(resolved as string).records).toHaveLength(1);
+  });
+
+  it('does not throw on a fail-closed resolution; persist returns undefined', () => {
+    // Force resolveVoteRecordsPath() to fail closed: nexusDataPath returns a path
+    // that neither sits under getNexusDataDir nor contains the canonical
+    // .nexus-agents/governance/ segment → defense-in-depth rejects it.
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, undefined);
+    vi.mocked(nexusDataPath).mockReturnValue('/somewhere/else/governance/vote-records.jsonl');
+    vi.mocked(getNexusDataDir).mockReturnValue('/data-root/.nexus-agents');
+    expect(resolveVoteRecordsPath()).toBeUndefined();
+
+    let written: ReturnType<typeof persistVoteRecord>;
+    expect(() => {
+      written = persistVoteRecord({
+        declaredOptions: undefined,
+        resolvedDecision: undefined,
+        id: 'vote-none',
+        proposal: 'p',
+        strategy: 'higher_order',
+        result: consensusResult(),
+        votes,
+      });
+    }).not.toThrow();
+    expect(written!).toBeUndefined();
+  });
+});
+
+describe('declared options survive into the record even when nothing was selected (#6049)', () => {
+  // The record used to infer "were there options?" from "did anyone pick one?".
+  // So a panel that unanimously APPROVED while every selection failed
+  // matchDeclaredOption persisted as `decision: rejected, approvalPercentage:
+  // 100` with NO option fields at all -- and an auditor filtering
+  // `optionTally !== undefined` to find multi-option votes skipped the very case
+  // most worth reviewing.
+  const OPTIONS = ['A - do it', 'B - do not'];
+
+  function approversWithNoSelection(): readonly AgentVoteResult[] {
+    return [agentVote('architect', 'approve'), agentVote('security', 'approve')];
+  }
+
+  function withSelection(role: VoterRole, option: string): AgentVoteResult {
+    return { ...agentVote(role, 'approve'), selectedOption: option };
+  }
+
+  it('records coverage when options were declared and NOTHING was selected', () => {
+    const record = buildVoteRecord({
+      id: 'v-1',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: approversWithNoSelection(),
+      declaredOptions: OPTIONS,
+      resolvedDecision: 'rejected',
+      sequence: 1,
+      previousHash: undefined,
+    });
+
+    expect(record.optionCoverage).toEqual({
+      approverCount: 2,
+      selectedCount: 0,
+      unattributedApprovals: 2,
+    });
+    // An EMPTY tally, not an absent one: "declared, nothing attributable" is a
+    // measurement. An absent field is what made the case invisible.
+    expect(record.optionTally).toEqual([]);
+  });
+
+  it('an auditor filtering for multi-option votes now finds that case', () => {
+    // The consequence that made this worth fixing, asserted directly.
+    const record = buildVoteRecord({
+      id: 'v-2',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: approversWithNoSelection(),
+      declaredOptions: OPTIONS,
+      resolvedDecision: 'rejected',
+      sequence: 1,
+      previousHash: undefined,
+    });
+    expect(record.optionTally).toBeDefined();
+  });
+
+  it('an ordinary yes/no vote still carries NEITHER field — the pair', () => {
+    // Without this, emitting coverage unconditionally would pass the tests above
+    // while pushing every plain vote off the pre-1.3 hash projection.
+    const record = buildVoteRecord({
+      id: 'v-3',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes,
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      sequence: 1,
+      previousHash: undefined,
+    });
+    expect(record.optionTally).toBeUndefined();
+    expect(record.optionCoverage).toBeUndefined();
+    // Not asserting version '1.2' here: this fixture's voters carry reasoning,
+    // which is 1.6 by the ladder in `recordVersion` and has nothing to do with
+    // options. The claim under test is that NEITHER option field appears.
+  });
+
+  it('a normal multi-option vote is unchanged', () => {
+    const record = buildVoteRecord({
+      id: 'v-4',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: [withSelection('architect', 'A - do it'), withSelection('security', 'A - do it')],
+      declaredOptions: OPTIONS,
+      resolvedDecision: 'approved',
+      sequence: 1,
+      previousHash: undefined,
+    });
+    expect(record.optionTally).toEqual([{ option: 'A - do it', count: 2 }]);
+    expect(record.optionCoverage?.selectedCount).toBe(2);
+    expect(record.optionCoverage?.unattributedApprovals).toBe(0);
+  });
+
+  it('an empty declared-options array is treated as no options', () => {
+    // `options: []` cannot produce a selection, so it is not a multi-option vote.
+    const record = buildVoteRecord({
+      id: 'v-5',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes,
+      declaredOptions: [],
+      resolvedDecision: 'approved',
+      sequence: 1,
+      previousHash: undefined,
+    });
+    expect(record.optionCoverage).toBeUndefined();
+  });
+});
+
+describe('every record the builder writes must read back and verify (#6049, the seam)', () => {
+  // The seam that let #6049's first attempt ship a regression: the new tests
+  // asserted on the IN-MEMORY return of buildVoteRecord, and none round-tripped
+  // through the schema. `optionTally: []` appended to the ledger fine and then
+  // failed `parseVoteRecordsText` with `too_small, minimum 1` -- so the case the
+  // fix exists to preserve became the one no reader could see. Parsing alone is
+  // not enough either: optionTally is appended to the CANONICAL HASH payload
+  // when defined, so the hash path needs exercising too.
+  function roundTrip(record: VoteRecord): {
+    parsed: number;
+    invalid: number;
+    verified: boolean;
+  } {
+    const line = JSON.stringify(record);
+    const { records, invalidLines } = parseVoteRecordsText(line + '\n');
+    return {
+      parsed: records.length,
+      invalid: invalidLines.length,
+      verified: verifyVoteRecordSet(records).ok,
+    };
+  }
+
+  function build(
+    declaredOptions: readonly string[] | undefined,
+    v: readonly AgentVoteResult[]
+  ): VoteRecord {
+    return buildVoteRecord({
+      id: 'rt-1',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: v,
+      declaredOptions,
+      resolvedDecision: 'rejected',
+      // Sequence 0: verifyVoteRecordSet requires 0..maxSeq with no gap, so a
+      // lone record at sequence 1 fails as a `sequence_gap` -- an omission
+      // signal, not a hash one. The fixture must model a real ledger tip.
+      sequence: 0,
+      previousHash: undefined,
+    });
+  }
+
+  it('declared options with NO parseable selection round-trips and verifies', () => {
+    // The exact record the first attempt made unreadable.
+    const record = build(
+      ['A - do it', 'B - do not'],
+      [agentVote('architect', 'approve'), agentVote('security', 'approve')]
+    );
+    expect(record.optionTally).toEqual([]);
+    expect(roundTrip(record)).toEqual({ parsed: 1, invalid: 0, verified: true });
+  });
+
+  it('a normal multi-option vote round-trips and verifies', () => {
+    const record = build(
+      ['A', 'B'],
+      [
+        { ...agentVote('architect', 'approve'), selectedOption: 'A' },
+        { ...agentVote('security', 'approve'), selectedOption: 'A' },
+      ]
+    );
+    expect(roundTrip(record)).toEqual({ parsed: 1, invalid: 0, verified: true });
+  });
+
+  it('an ordinary yes/no vote round-trips and verifies', () => {
+    const record = build(undefined, votes);
+    expect(record.optionTally).toBeUndefined();
+    expect(roundTrip(record)).toEqual({ parsed: 1, invalid: 0, verified: true });
+  });
+});
+
+describe('a retried voter seat is visible in the record (#6050)', () => {
+  // `voter-retry.ts:58` has set `retried: true` on every recovered seat since it
+  // was written, and `vote-types.ts:126` states why: the flag is "what makes the
+  // recovery visible instead of indistinguishable from a clean first attempt".
+  // It had ONE producer and ZERO consumers -- both summarizers and the record
+  // dropped it -- so the record said "answered cleanly" for a panel that needed
+  // a retry to reach quorum.
+  function retriedVote(role: VoterRole): AgentVoteResult {
+    return { ...agentVote(role, 'approve'), retried: true };
+  }
+
+  function build(v: readonly AgentVoteResult[]): VoteRecord {
+    return buildVoteRecord({
+      id: 'rt-1',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: v,
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      sequence: 0,
+      previousHash: undefined,
+    });
+  }
+
+  it('carries retried on the recovered seat and NOT on the others', () => {
+    const record = build([retriedVote('security'), agentVote('architect', 'approve')]);
+    const security = record.voters.find((v) => v.role === 'security');
+    const architect = record.voters.find((v) => v.role === 'architect');
+    expect(security?.retried).toBe(true);
+    expect(architect?.retried).toBeUndefined();
+  });
+
+  it('a clean panel carries no retried key anywhere — the pair', () => {
+    // Without this, setting it unconditionally would pass the test above while
+    // making every clean record claim a retry that never happened.
+    const record = build([agentVote('architect', 'approve'), agentVote('security', 'approve')]);
+    expect(record.voters.every((v) => v.retried === undefined)).toBe(true);
+  });
+
+  it('the record round-trips and VERIFIES with a retried seat', () => {
+    // #6049's lesson: parsing is not enough. VoterSummarySchema is .strict(),
+    // so an unknown key makes the line unreadable; and the voter entries are
+    // rebuilt field-by-field for the canonical hash, so a field the hash does
+    // not carry is attested-but-unstored.
+    const record = build([retriedVote('security'), agentVote('architect', 'approve')]);
+    const { records, invalidLines } = parseVoteRecordsText(JSON.stringify(record) + '\n');
+    expect(invalidLines).toHaveLength(0);
+    expect(records).toHaveLength(1);
+    expect(verifyVoteRecordSet(records).ok).toBe(true);
+    expect(records[0]?.voters.find((v) => v.role === 'security')?.retried).toBe(true);
+  });
+
+  it('editing a retried seat to a clean one MOVES the hash', () => {
+    // The property that makes the flag evidence rather than decoration: without
+    // it, a retried seat could be edited to a clean one and the chain would
+    // still verify.
+    //
+    // Hashed DIRECTLY, holding everything else constant. Comparing two records
+    // built by `build()` passed even with the hash coverage removed, because
+    // those records also differ in `version` (1.7 vs 1.2) and version is itself
+    // hashed -- the assertion was satisfied by the wrong field.
+    const withRetry = build([retriedVote('security')]);
+    const { hash: _ignored, ...payload } = withRetry;
+    const cleaned = {
+      ...payload,
+      voters: payload.voters.map(({ retried: _dropped, ...rest }) => rest),
+    };
+    expect(computeVoteRecordHash(payload)).not.toBe(computeVoteRecordHash(cleaned));
+  });
+
+  it('carries `retried` on the seat; the record is on the built tier', () => {
+    const record = build([retriedVote('security')]);
+    expect(record.voters[0]?.retried).toBe(true);
+    expect(record.version).toBe(BUILT_TIER);
+  });
+});
+
+describe('schema 1.8: the seat carries its model and an unverifiable marker (#6091, #6094)', () => {
+  function build(v: readonly AgentVoteResult[]): VoteRecord {
+    return buildVoteRecord({
+      id: 'rt-18',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: v,
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      sequence: 0,
+      previousHash: undefined,
+    });
+  }
+
+  function withModel(role: VoterRole, model: string): AgentVoteResult {
+    return { ...agentVote(role, 'approve'), model };
+  }
+
+  function unverifiableVote(role: VoterRole): AgentVoteResult {
+    return {
+      ...agentVote(role, 'abstain', 'unverifiable'),
+      model: 'codex-5.3',
+      unverifiableSignal: 'reasoning',
+    };
+  }
+
+  it('records the registry model id the seat ran on', () => {
+    const record = build([
+      withModel('architect', 'claude-sonnet'),
+      agentVote('security', 'approve'),
+    ]);
+    expect(record.voters.find((v) => v.role === 'architect')?.model).toBe('claude-sonnet');
+    // A seat whose result carried no model records none — absence stays absent.
+    expect(record.voters.find((v) => v.role === 'security')?.model).toBeUndefined();
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('never records the pending-detection placeholder as a model', () => {
+    const record = build([withModel('architect', 'pending-detection')]);
+    expect(record.voters[0]?.model).toBeUndefined();
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('marks an unverifiable seat, keeps its entry, and records it as abstain', () => {
+    const record = build([unverifiableVote('devex'), agentVote('architect', 'approve')]);
+    const devex = record.voters.find((v) => v.role === 'devex');
+    expect(devex?.unverifiable).toBe(true);
+    expect(devex?.decision).toBe('abstain');
+    expect(devex?.model).toBe('codex-5.3');
+    expect(record.voters.find((v) => v.role === 'architect')?.unverifiable).toBeUndefined();
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('an unverifiable seat is NOT an errored seat: panelCoverage stays absent', () => {
+    // It answered and has a voter entry; the flag on that entry is what says
+    // what kind of answer it was. `panelCoverage` names seats that never
+    // returned one.
+    expect(build([unverifiableVote('devex')]).panelCoverage).toBeUndefined();
+  });
+
+  it('a record with a model hashes differently from the same record without it', () => {
+    const withIt = build([withModel('architect', 'claude-sonnet')]);
+    const { hash: _h, ...payload } = withIt;
+    const stripped = {
+      ...payload,
+      voters: payload.voters.map(({ model: _m, ...rest }) => rest),
+    };
+    expect(computeVoteRecordHash(payload)).not.toBe(computeVoteRecordHash(stripped));
+  });
+
+  it('a 1.8 record round-trips through serializeValidatedRecord and verifies', () => {
+    const record = build([unverifiableVote('devex'), withModel('architect', 'claude-sonnet')]);
+    const line = serializeValidatedRecord(VoteRecordSchema, record, 'vote');
+    expect(line).toBe(JSON.stringify(record) + '\n');
+    const { records, invalidLines } = parseVoteRecordsText(line);
+    expect(invalidLines).toHaveLength(0);
+    expect(records[0]?.version).toBe(BUILT_TIER);
+    expect(records[0]?.voters.find((v) => v.role === 'devex')?.unverifiable).toBe(true);
+    expect(verifyVoteRecordSet(records).ok).toBe(true);
+  });
+
+  it('a retried seat with no model still round-trips and verifies under the 1.8 schema', () => {
+    const record = build([{ ...agentVote('security', 'approve'), retried: true }]);
+    expect(record.version).toBe(BUILT_TIER);
+    const { records, invalidLines } = parseVoteRecordsText(
+      serializeValidatedRecord(VoteRecordSchema, record, 'vote')
+    );
+    expect(invalidLines).toHaveLength(0);
+    expect(records[0]?.voters[0]?.model).toBeUndefined();
+    expect(verifyVoteRecordSet(records).ok).toBe(true);
+  });
+});
+
+describe('schema 1.9: the seat carries its assigned CLI and any fallback (#6115)', () => {
+  // Three consecutive 7-seat panels answered every seat on one gemini model
+  // while the round-robin had assigned claude to three and codex to two. The
+  // live result learned to say so in #6150; this is the record half. Without
+  // it a 1.8 record shows `model: gemini-3.1-pro-preview` on seven seats and
+  // nothing that says five of them were meant to answer elsewhere.
+  function build(v: readonly AgentVoteResult[]): VoteRecord {
+    return buildVoteRecord({
+      id: 'rt-19',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: v,
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      sequence: 0,
+      previousHash: undefined,
+    });
+  }
+
+  /** A seat that answered where it was assigned. */
+  function nativeSeat(role: VoterRole, cli: string, model: string): AgentVoteResult {
+    return { ...agentVote(role, 'approve'), assignedCli: cli, cli, model };
+  }
+
+  /** A seat assigned to `from` that fell over to gemini (#3587). */
+  function fallenSeat(role: VoterRole, from: string, fromModel?: string): AgentVoteResult {
+    return {
+      ...agentVote(role, 'approve'),
+      assignedCli: from,
+      cli: 'gemini',
+      model: 'gemini-3.1-pro-preview',
+      fallback: {
+        fromCli: from,
+        ...(fromModel !== undefined ? { fromModel } : {}),
+        reason: 'capacity',
+      },
+    };
+  }
+
+  it('records the assigned CLI on every seat that carries one', () => {
+    const record = build([
+      nativeSeat('architect', 'gemini', 'gemini-3.1-pro-preview'),
+      agentVote('security', 'approve'),
+    ]);
+    expect(record.voters.find((v) => v.role === 'architect')?.assignedCli).toBe('gemini');
+    // A seat whose result carried no assignment records none — absence stays absent.
+    expect(record.voters.find((v) => v.role === 'security')?.assignedCli).toBeUndefined();
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('records the fallback exactly as the live result stated it, fromModel present-only', () => {
+    const record = build([fallenSeat('devex', 'claude', 'claude-opus'), fallenSeat('pm', 'codex')]);
+    expect(record.voters.find((v) => v.role === 'devex')?.fallback).toEqual({
+      fromCli: 'claude',
+      fromModel: 'claude-opus',
+      reason: 'capacity',
+    });
+    const pm = record.voters.find((v) => v.role === 'pm')?.fallback;
+    expect(pm).toEqual({ fromCli: 'codex', reason: 'capacity' });
+    expect(pm !== undefined && 'fromModel' in pm).toBe(false);
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('a seat with a fallback but no assignedCli carries the fallback alone', () => {
+    const { assignedCli: _a, ...noAssignment } = fallenSeat('devex', 'claude');
+    const record = build([noAssignment]);
+    expect(record.voters[0]?.fallback).toEqual({ fromCli: 'claude', reason: 'capacity' });
+    expect(record.voters[0]?.assignedCli).toBeUndefined();
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('a seat with a model, no assignment and no fallback carries the model alone', () => {
+    const record = build([{ ...agentVote('architect', 'approve'), model: 'claude-sonnet' }]);
+    expect(record.voters[0]?.model).toBe('claude-sonnet');
+    expect(record.voters[0]?.assignedCli).toBeUndefined();
+    expect(record.voters[0]?.fallback).toBeUndefined();
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('a record with a fallback hashes differently from the same record without it', () => {
+    const withIt = build([fallenSeat('devex', 'claude', 'claude-opus')]);
+    const { hash: _h, ...payload } = withIt;
+    const stripped = {
+      ...payload,
+      voters: payload.voters.map(({ fallback: _f, ...rest }) => rest),
+    };
+    expect(computeVoteRecordHash(payload)).not.toBe(computeVoteRecordHash(stripped));
+  });
+
+  it('a 1.9 record round-trips through serializeValidatedRecord and verifies', () => {
+    const record = build([
+      fallenSeat('devex', 'claude', 'claude-opus'),
+      nativeSeat('architect', 'gemini', 'gemini-3.1-pro-preview'),
+    ]);
+    const line = serializeValidatedRecord(VoteRecordSchema, record, 'vote');
+    expect(line).toBe(JSON.stringify(record) + '\n');
+    const { records, invalidLines } = parseVoteRecordsText(line);
+    expect(invalidLines).toHaveLength(0);
+    expect(records[0]?.version).toBe(BUILT_TIER);
+    expect(records[0]?.voters.find((v) => v.role === 'devex')?.fallback?.reason).toBe('capacity');
+    expect(records[0]?.voters.find((v) => v.role === 'architect')?.assignedCli).toBe('gemini');
+    expect(verifyVoteRecordSet(records).ok).toBe(true);
+  });
+
+  it('a seat with a model and no assignment still round-trips and verifies under the 1.9 schema', () => {
+    const record = build([{ ...agentVote('security', 'approve'), model: 'claude-sonnet' }]);
+    expect(record.version).toBe(BUILT_TIER);
+    const { records, invalidLines } = parseVoteRecordsText(
+      serializeValidatedRecord(VoteRecordSchema, record, 'vote')
+    );
+    expect(invalidLines).toHaveLength(0);
+    expect(records[0]?.voters[0]?.assignedCli).toBeUndefined();
+    expect(records[0]?.voters[0]?.fallback).toBeUndefined();
+    expect(verifyVoteRecordSet(records).ok).toBe(true);
+  });
+
+  it('a PERSISTED record for a vote whose live result carried a fallback carries it', () => {
+    // The #6115 defect, end to end: the seat the live result says fell over
+    // reaches the ledger line with the fallback on it, and reads back.
+    const dir = mkdtempSync(join(tmpdir(), 'vote-records-19-'));
+    const filePath = join(dir, 'governance', 'vote-records.jsonl');
+    try {
+      const written = persistVoteRecord({
+        declaredOptions: undefined,
+        resolvedDecision: 'approved',
+        id: 'vote-fallback',
+        proposal: 'p',
+        strategy: 'supermajority',
+        result: consensusResult(),
+        votes: [
+          fallenSeat('devex', 'codex'),
+          nativeSeat('architect', 'gemini', 'gemini-3.1-pro-preview'),
+        ],
+        filePath,
+      });
+      expect(written).toBeDefined();
+      expect(written?.voters.find((v) => v.role === 'devex')?.fallback).toEqual({
+        fromCli: 'codex',
+        reason: 'capacity',
+      });
+      expect(written?.voters.find((v) => v.role === 'devex')?.assignedCli).toBe('codex');
+      const { records } = readVoteRecords(filePath);
+      expect(records[0]?.voters.find((v) => v.role === 'devex')?.fallback).toEqual({
+        fromCli: 'codex',
+        reason: 'capacity',
+      });
+      expect(verifyVoteRecordSet(records).ok).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('ratifiesPr PR-ratification binding (#5130 step 1, schema 1.10)', () => {
+  const binding = { pr: 6200, headSha: '0123456789abcdef0123456789abcdef01234567' };
+
+  it('buildVoteRecord carries the binding verbatim and the record verifies', () => {
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      id: 'vote-ratify-pr',
+      proposal: 'Ratify PR #6200',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes,
+      ratifiesPr: binding,
+    });
+    expect(record.version).toBe(BUILT_TIER);
+    expect(record.ratifiesPr).toEqual(binding);
+    // Both bindings may coexist: `ratifies` is the authority-ladder subject.
+    expect(record.ratifies).toBeUndefined();
+    expect(verifyVoteRecordSet([record])).toEqual({ ok: true, recordCount: 1 });
+  });
+
+  it('a BOUND record from a whole panel carries panelCoverage (0 errored), so the gate can require it (#6213)', () => {
+    // An unbound whole panel omits the field to keep the pre-1.5 projection
+    // (`panel-coverage.test.ts`). A bound record is 1.10 by construction, has
+    // no older projection to keep, and the ratification gate refuses a bound
+    // record whose coverage is absent — absence must not read as whole.
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      id: 'vote-ratify-pr-whole',
+      proposal: 'Ratify PR #6200',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes,
+      ratifiesPr: binding,
+    });
+    expect(record.panelCoverage).toEqual({
+      requested: 3,
+      responded: 3,
+      errored: 0,
+      erroredRoles: [],
+    });
+    expect(record.version).toBe(BUILT_TIER);
+    expect(verifyVoteRecordSet([record])).toEqual({ ok: true, recordCount: 1 });
+    // The coverage is inside the hash: dropping it changes the hash.
+    const { panelCoverage: _coverage, hash: _hash, ...withoutCoverage } = record;
+    expect(computeVoteRecordHash(withoutCoverage)).not.toBe(record.hash);
+  });
+
+  it('omitting the binding leaves the record with no ratifiesPr key at all', () => {
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      id: 'vote-plain',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes,
+    });
+    expect(record.version).toBe(BUILT_TIER);
+    expect('ratifiesPr' in record).toBe(false);
+  });
+
+  it('persistVoteRecord writes the binding to disk and it reads back hash-verified', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vote-records-pr-'));
+    const filePath = join(dir, 'vote-records.jsonl');
+    try {
+      const written = persistVoteRecord({
+        declaredOptions: undefined,
+        resolvedDecision: 'approved',
+        id: 'vote-ratify-pr-disk',
+        proposal: 'Ratify PR #6200',
+        strategy: 'supermajority',
+        result: consensusResult(),
+        votes,
+        ratifiesPr: binding,
+        filePath,
+      });
+      expect(written?.ratifiesPr).toEqual(binding);
+      const { records, invalidLines } = readVoteRecords(filePath);
+      expect(invalidLines).toEqual([]);
+      expect(records).toHaveLength(1);
+      expect(records[0]?.ratifiesPr).toEqual(binding);
+      expect(records[0]?.version).toBe(BUILT_TIER);
+      expect(verifyVoteRecordSet(records).ok).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('REFUSES to persist a binding the read schema rejects — an abbreviated sha never becomes durable (#6054)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vote-records-pr-bad-'));
+    const filePath = join(dir, 'vote-records.jsonl');
+    try {
+      const warn = vi.fn();
+      const logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() } as unknown as ILogger;
+      const written = persistVoteRecord({
+        declaredOptions: undefined,
+        resolvedDecision: 'approved',
+        id: 'vote-ratify-pr-short',
+        proposal: 'Ratify PR #6200',
+        strategy: 'supermajority',
+        result: consensusResult(),
+        votes,
+        ratifiesPr: { pr: 6200, headSha: 'abc1234' },
+        filePath,
+        logger,
+      });
+      expect(written).toBeUndefined();
+      expect(existsSync(filePath)).toBe(false);
+      expect(warn).toHaveBeenCalledWith(
+        'Failed to persist authentic vote record',
+        expect.objectContaining({ error: expect.stringContaining(UNREADABLE_RECORD_PREFIX) })
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('errorPolicy — the policy the panel ran under (#6211, schema 1.11)', () => {
+  it('buildVoteRecord carries the policy verbatim and the record verifies', () => {
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      id: 'vote-policy',
+      proposal: 'Ratify PR #6211',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes,
+      errorPolicy: 'absolute_quorum',
+    });
+    expect(record.version).toBe(BUILT_TIER);
+    expect(record.errorPolicy).toBe('absolute_quorum');
+    expect(verifyVoteRecordSet([record])).toEqual({ ok: true, recordCount: 1 });
+  });
+
+  it('a record carrying both the PR binding and the policy carries both', () => {
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      id: 'vote-policy-bound',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes,
+      ratifiesPr: { pr: 6211, headSha: '0123456789abcdef0123456789abcdef01234567' },
+      errorPolicy: 'reduce_denominator',
+    });
+    expect(record.version).toBe(BUILT_TIER);
+    expect(record.ratifiesPr?.pr).toBe(6211);
+    expect(record.errorPolicy).toBe('reduce_denominator');
+  });
+
+  it('omitting the policy leaves the record with no errorPolicy key at all', () => {
+    const record = buildVoteRecord({
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      id: 'vote-plain',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes,
+    });
+    expect(record.version).toBe(BUILT_TIER);
+    expect('errorPolicy' in record).toBe(false);
+  });
+
+  it('persistVoteRecord writes the policy to disk and it reads back hash-verified', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vote-records-policy-'));
+    const filePath = join(dir, 'vote-records.jsonl');
+    try {
+      const written = persistVoteRecord({
+        declaredOptions: undefined,
+        resolvedDecision: 'approved',
+        id: 'vote-policy-disk',
+        proposal: 'p',
+        strategy: 'unanimous',
+        result: consensusResult(),
+        votes,
+        errorPolicy: 'fail_closed',
+        filePath,
+      });
+      expect(written?.errorPolicy).toBe('fail_closed');
+      const { records, invalidLines } = readVoteRecords(filePath);
+      expect(invalidLines).toEqual([]);
+      expect(records).toHaveLength(1);
+      expect(records[0]?.errorPolicy).toBe('fail_closed');
+      expect(records[0]?.version).toBe(BUILT_TIER);
+      expect(verifyVoteRecordSet(records).ok).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('schema 1.12: a recovered seat carries what it was retried from (#6246)', () => {
+  // On the #6241 ratification panel the catfish seat's first pass errored on
+  // two response-parse failures and the retry came back unverifiable. The
+  // record said `retried: true, unverifiable: true` — both true of the seat
+  // that was recorded — and nothing joined them to the parse errors in the
+  // log. This is the record half of the join; `voter-retry.ts` is the live half.
+  const PARSE_FAILURE =
+    'Vote parsing failed: Vote response parsing failed: Unexpected end of JSON input';
+
+  function build(
+    v: readonly AgentVoteResult[],
+    errorPolicy?: VoteRecord['errorPolicy']
+  ): VoteRecord {
+    return buildVoteRecord({
+      id: 'rt-112',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: v,
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      sequence: 0,
+      previousHash: undefined,
+      ...(errorPolicy !== undefined ? { errorPolicy } : {}),
+    });
+  }
+
+  /** A seat the per-role retry recovered from an errored first pass. */
+  function recoveredSeat(role: VoterRole): AgentVoteResult {
+    return {
+      ...agentVote(role, 'reject'),
+      retried: true,
+      retriedFrom: { source: 'error', error: PARSE_FAILURE },
+    };
+  }
+
+  it('carries retriedFrom on the recovered seat, rebuilt in canonical order, and NOT on the others', () => {
+    const record = build([recoveredSeat('catfish'), agentVote('architect', 'approve')]);
+    const catfish = record.voters.find((v) => v.role === 'catfish');
+    expect(catfish?.retriedFrom).toEqual({ source: 'error', error: PARSE_FAILURE });
+    expect(Object.keys(catfish?.retriedFrom ?? {})).toEqual(['source', 'error']);
+    const architect = record.voters.find((v) => v.role === 'architect');
+    expect(architect !== undefined && 'retriedFrom' in architect).toBe(false);
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('a clean panel carries no retriedFrom key anywhere — the pair', () => {
+    const record = build([agentVote('architect', 'approve'), agentVote('security', 'approve')]);
+    expect(record.voters.some((v) => 'retriedFrom' in v)).toBe(false);
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('retriedFrom is orthogonal to retried: a retried seat with no carried cause carries none', () => {
+    const record = build([{ ...agentVote('pm', 'approve'), retried: true }]);
+    expect(record.voters[0]?.retried).toBe(true);
+    expect('retriedFrom' in (record.voters[0] ?? {})).toBe(false);
+    expect(record.version).toBe(BUILT_TIER);
+  });
+
+  it('a record carrying both the policy and a carried cause carries both', () => {
+    const record = build([recoveredSeat('catfish')], 'absolute_quorum');
+    expect(record.version).toBe(BUILT_TIER);
+    expect(record.errorPolicy).toBe('absolute_quorum');
+  });
+
+  it('a 1.12 record round-trips through serializeValidatedRecord and verifies', () => {
+    const record = build([recoveredSeat('catfish'), agentVote('architect', 'approve')]);
+    const line = serializeValidatedRecord(VoteRecordSchema, record, 'vote');
+    expect(line).toBe(JSON.stringify(record) + '\n');
+    const { records, invalidLines } = parseVoteRecordsText(line);
+    expect(invalidLines).toHaveLength(0);
+    expect(records[0]?.version).toBe(BUILT_TIER);
+    expect(records[0]?.voters.find((v) => v.role === 'catfish')?.retriedFrom).toEqual({
+      source: 'error',
+      error: PARSE_FAILURE,
+    });
+    expect(verifyVoteRecordSet(records).ok).toBe(true);
+  });
+
+  it('end to end: the real retry feeds the real recorder, and the row reads back from disk', async () => {
+    // The #6241 shape, run through the two production seams in sequence: the
+    // per-role retry replaces an errored catfish seat with an unverifiable
+    // one, `persistVoteRecord` writes the merged panel, and the ledger line
+    // read back names BOTH the seat's final state and what it recovered from.
+    const firstPass: readonly AgentVoteResult[] = [
+      agentVote('architect', 'approve'),
+      { ...agentVote('catfish', 'abstain', 'error'), error: PARSE_FAILURE },
+    ];
+    const merged = await retryErroredRoles(
+      firstPass,
+      () =>
+        Promise.resolve([
+          {
+            ...agentVote('catfish', 'abstain', 'unverifiable'),
+            unverifiableSignal: 'reasoning' as const,
+          },
+        ]),
+      { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as ILogger,
+      0
+    );
+    const dir = mkdtempSync(join(tmpdir(), 'vote-records-112-'));
+    const filePath = join(dir, 'governance', 'vote-records.jsonl');
+    try {
+      const written = persistVoteRecord({
+        declaredOptions: undefined,
+        resolvedDecision: 'approved',
+        id: 'vote-retried-from',
+        proposal: 'p',
+        strategy: 'supermajority',
+        result: consensusResult(),
+        votes: merged,
+        filePath,
+      });
+      expect(written?.version).toBe(BUILT_TIER);
+      const { records, invalidLines } = readVoteRecords(filePath);
+      expect(invalidLines).toEqual([]);
+      const catfish = records[0]?.voters.find((v) => v.role === 'catfish');
+      expect(catfish?.retried).toBe(true);
+      expect(catfish?.unverifiable).toBe(true);
+      expect(catfish?.retriedFrom).toEqual({ source: 'error', error: PARSE_FAILURE });
+      expect(verifyVoteRecordSet(records).ok).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('schema 1.13: the builder commits to each stored reasoning with a salted digest (#6263)', () => {
+  // The producer half of #5748 step 1. Every responding voter's entry carries
+  // a fresh `reasoningNonce` and `reasoningDigest = sha256(nonce ‖ reasoning)`
+  // over the text AS STORED (clipped), so the commitment is re-openable from
+  // the record alone. The hash folds the digest only; text and nonce (the
+  // opening) travel outside it (#6274 panel 1).
+  function build(
+    v: readonly AgentVoteResult[],
+    extra: Partial<Pick<BuildVoteRecordInput, 'errorPolicy' | 'ratifiesPr'>> = {}
+  ): VoteRecord {
+    return buildVoteRecord({
+      id: 'digest-113',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: v,
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      sequence: 0,
+      previousHash: undefined,
+      ...extra,
+    });
+  }
+
+  it('every responding voter carries a fresh 64-hex nonce and the digest of nonce ‖ stored reasoning', () => {
+    const record = build([agentVote('architect', 'approve'), agentVote('security', 'reject')]);
+    expect(record.version).toBe('1.13');
+    expect(record.voters).toHaveLength(2);
+    for (const v of record.voters) {
+      expect(v.reasoningNonce).toMatch(HEX_256);
+      expect(v.reasoningDigest).toBe(computeReasoningDigest(v.reasoningNonce!, v.reasoning!));
+    }
+    // Per ENTRY, not per record: two seats with identical text must not share
+    // a nonce, or the digests would reveal that the texts are equal.
+    expect(record.voters[0]!.reasoningNonce).not.toBe(record.voters[1]!.reasoningNonce);
+    expect(record.voters[0]!.reasoningDigest).not.toBe(record.voters[1]!.reasoningDigest);
+    expect(verifyVoteRecordSet([record])).toEqual({ ok: true, recordCount: 1 });
+  });
+
+  it('the digest is over the CLIPPED text the record stores, so the commitment opens from the record alone', () => {
+    const long = 'y'.repeat(MAX_VOTER_REASONING_CHARS + 1);
+    const record = build([
+      { ...agentVote('catfish', 'reject'), vote: { ...vote('reject', 0.8), reasoning: long } },
+    ]);
+    const v = record.voters[0]!;
+    expect(v.reasoningTruncated).toBe(true);
+    expect(v.reasoning).toHaveLength(MAX_VOTER_REASONING_CHARS);
+    expect(v.reasoningDigest).toBe(computeReasoningDigest(v.reasoningNonce!, v.reasoning!));
+    expect(v.reasoningDigest).not.toBe(computeReasoningDigest(v.reasoningNonce!, long));
+    expect(verifyVoteRecordSet([record]).ok).toBe(true);
+  });
+
+  it('an errored seat has no entry and therefore no commitment; an empty reasoning is committed to as the empty string', () => {
+    const record = build([
+      agentVote('architect', 'abstain', 'error'),
+      { ...agentVote('pm', 'approve'), vote: { ...vote('approve', 0.8), reasoning: '' } },
+    ]);
+    expect(record.voters).toHaveLength(1);
+    const pm = record.voters[0]!;
+    expect(pm.reasoning).toBe('');
+    expect(pm.reasoningDigest).toBe(computeReasoningDigest(pm.reasoningNonce!, ''));
+  });
+
+  it('a 1.13 record round-trips through serializeValidatedRecord, reads back and verifies', () => {
+    const record = build([agentVote('architect', 'approve')], { errorPolicy: 'absolute_quorum' });
+    const line = serializeValidatedRecord(VoteRecordSchema, record, 'vote');
+    expect(line).toBe(JSON.stringify(record) + '\n');
+    const { records, invalidLines } = parseVoteRecordsText(line);
+    expect(invalidLines).toHaveLength(0);
+    expect(records[0]?.version).toBe('1.13');
+    expect(records[0]?.voters[0]?.reasoningNonce).toBe(record.voters[0]!.reasoningNonce);
+    expect(verifyVoteRecordSet(records)).toEqual({ ok: true, recordCount: 1 });
+  });
+
+  it('editing the stored text on disk without re-committing is caught on read-back verification', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vote-records-113-'));
+    const filePath = join(dir, 'governance', 'vote-records.jsonl');
+    try {
+      const written = persistVoteRecord({
+        declaredOptions: undefined,
+        resolvedDecision: 'approved',
+        id: 'vote-digest',
+        proposal: 'p',
+        strategy: 'supermajority',
+        result: consensusResult(),
+        votes: [agentVote('architect', 'approve')],
+        filePath,
+      });
+      expect(written?.version).toBe('1.13');
+      const line = readFileSync(filePath, 'utf-8');
+      // The record hash does not see the text (the property step 2 rests on),
+      // so a naive edit leaves `hash` intact — and the commitment check is
+      // what still refuses it.
+      writeFileSync(filePath, line.replace('"reasoning":"because"', '"reasoning":"because!"'));
+      const { records, invalidLines } = readVoteRecords(filePath);
+      expect(invalidLines).toEqual([]);
+      expect(records[0]?.voters[0]?.reasoning).toBe('because!');
+      expect(records[0]?.hash).toBe(written!.hash);
+      const result = verifyVoteRecordSet(records);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe('hash_mismatch');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a panel with NO responding voter has nothing to commit to and stays on the tier its record-level fields imply', () => {
+    // The only place the ordering of the tiers below 1.13 is still observable
+    // through the producer: no voter entry, so no digest, so the record-level
+    // rule decides.
+    const allErrored = [agentVote('architect', 'abstain', 'error')];
+    expect(build(allErrored).version).toBe('1.5');
+    expect(build(allErrored, { ratifiesPr: { pr: 1, headSha: '0'.repeat(40) } }).version).toBe(
+      '1.10'
+    );
+    expect(build(allErrored, { errorPolicy: 'absolute_quorum' }).version).toBe('1.11');
+  });
+});
+
+describe('gateway-served voter model reader (#6951)', () => {
+  function build(servedModel?: string, model = 'gemini-2.5-pro'): VoteRecord {
+    const record = buildVoteRecord({
+      id: 'served-model',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      votes: [{ ...agentVote('architect', 'approve'), model }],
+    });
+    const voters = record.voters.map((voter) => ({
+      ...voter,
+      ...(servedModel !== undefined ? { servedModel } : {}),
+    }));
+    const withServingModel = { ...record, voters };
+    return { ...withServingModel, hash: computeVoteRecordHash(withServingModel) };
+  }
+
+  it('reads a distinct reported model through the strict schema and verifies its hash', () => {
+    const record = build('claude-sonnet-4-6');
+    const parsed = parseVoteRecordsText(JSON.stringify(record));
+    expect(parsed.invalidLines).toEqual([]);
+    expect(parsed.records).toEqual([record]);
+    expect(verifyVoteRecordSet(parsed.records).ok).toBe(true);
+    expect(parsed.records[0]?.voters[0]).toMatchObject({
+      model: 'gemini-2.5-pro',
+      servedModel: 'claude-sonnet-4-6',
+    });
+  });
+
+  it('accepts a reported model identical to the configured model', () => {
+    const record = build('gemini-2.5-pro');
+    expect(parseVoteRecordsText(JSON.stringify(record)).records).toEqual([record]);
+  });
+
+  it('writes the adapter-reported served model beside the configured one (#6967)', () => {
+    const record = buildVoteRecord({
+      id: 'writer',
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      votes: [
+        { ...agentVote('architect', 'approve'), model: 'gemini-2.5-pro', servedModel: 'sonnet' },
+        { ...agentVote('security', 'approve'), model: 'gemini-2.5-pro' },
+      ],
+    });
+    expect(record.voters[0]).toMatchObject({ model: 'gemini-2.5-pro', servedModel: 'sonnet' });
+    // Not reported stays absent: the configured model is never copied in.
+    expect(record.voters[1]).not.toHaveProperty('servedModel');
+    expect(verifyVoteRecordSet([record]).ok).toBe(true);
+    const voters = record.voters.map(({ servedModel: _s, ...rest }) => rest);
+    expect(verifyVoteRecordSet([{ ...record, voters }])).toMatchObject({
+      ok: false,
+      reason: 'hash_mismatch',
+    });
+  });
+
+  it.each<unknown>([
+    '',
+    'x'.repeat(201),
+    'claude sonnet',
+    'claude\n',
+    'claude<script>',
+    // Wrong types from adapter output must not throw in the warning path (#6992 panel).
+    null,
+    42,
+    { model: 'sonnet' },
+  ])('omits a reported value the reader would reject, with a warning (%j)', (servedModel) => {
+    const dir = mkdtempSync(join(tmpdir(), 'served-model-invalid-'));
+    try {
+      const filePath = join(dir, 'governance', 'vote-records.jsonl');
+      const warn = vi.fn();
+      const logger: ILogger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn,
+        error: vi.fn(),
+        child: vi.fn(),
+        setLevel: vi.fn(),
+      };
+      const written = persistVoteRecord({
+        id: 'invalid-served',
+        proposal: 'p',
+        strategy: 'supermajority',
+        result: consensusResult(),
+        declaredOptions: undefined,
+        resolvedDecision: 'approved',
+        // Adapter output is untyped at runtime; the cast models that boundary.
+        votes: [
+          {
+            ...agentVote('architect', 'approve'),
+            model: 'gemini-2.5-pro',
+            servedModel: servedModel as string,
+          },
+        ],
+        filePath,
+        logger,
+      });
+      expect(written).toBeDefined();
+      expect(written!.voters[0]).not.toHaveProperty('servedModel');
+      expect(written!.voters[0]?.model).toBe('gemini-2.5-pro');
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('servedModel'),
+        expect.objectContaining({ role: 'architect' })
+      );
+      const parsed = readVoteRecords(filePath);
+      expect(parsed.invalidLines).toEqual([]);
+      expect(verifyVoteRecordSet(parsed.records).ok).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['1.12', '1.13'] as const)(
+    'hash-covers adding, changing, and removing servedModel on version %s',
+    (version) => {
+      const built = build('claude-sonnet-4-6');
+      const voters = built.voters.map(({ reasoningNonce, reasoningDigest, ...voter }) =>
+        version === '1.12' ? voter : { ...voter, reasoningNonce, reasoningDigest }
+      );
+      const unhashed = { ...built, version, voters };
+      const record = { ...unhashed, hash: computeVoteRecordHash(unhashed) };
+      expect(VoteRecordSchema.safeParse(record).success).toBe(true);
+      expect(verifyVoteRecordSet([record]).ok).toBe(true);
+      const voter = record.voters[0]!;
+      const { servedModel: _served, ...bare } = voter;
+      for (const changed of [bare, { ...voter, servedModel: 'gpt-5' }]) {
+        expect(verifyVoteRecordSet([{ ...record, voters: [changed] }])).toMatchObject({
+          ok: false,
+          reason: 'hash_mismatch',
+        });
+      }
+      const legacy = { ...record, voters: [bare] };
+      const legacyHash = computeVoteRecordHash(legacy);
+      expect(
+        verifyVoteRecordSet([
+          { ...legacy, hash: legacyHash, voters: [{ ...bare, servedModel: 'gpt-5' }] },
+        ])
+      ).toMatchObject({ ok: false, reason: 'hash_mismatch' });
+    }
+  );
+
+  it.each([{ servedModel: null }, { servedModel: 123 }, { servedModel: {} }, { servedModel: [] }])(
+    'rejects wrong-type servedModel with a named reason ($servedModel)',
+    ({ servedModel }) => {
+      const record = build();
+      const malformed = { ...record, voters: [{ ...record.voters[0], servedModel }] };
+      const parsed = VoteRecordSchema.safeParse(malformed);
+      expect(parsed.success).toBe(false);
+      if (parsed.success) throw new Error('Wrong-type servedModel was accepted');
+      expect(parsed.error.issues).toContainEqual(
+        expect.objectContaining({
+          path: ['voters', 0, 'servedModel'],
+          message: 'servedModel_invalid',
+        })
+      );
+      expect(parseVoteRecordsText(JSON.stringify(malformed))).toMatchObject({
+        records: [],
+        invalidLines: [1],
+      });
+    }
+  );
+
+  it.each([
+    '',
+    'x'.repeat(201),
+    'claude sonnet',
+    'claude\n',
+    'claude\r',
+    'claude\t',
+    'claude\u0000',
+    'claude<script>',
+    'clä ude',
+    'claude\\sonnet',
+  ])('rejects malformed servedModel with a named reason (%j)', (servedModel) => {
+    const record = build(servedModel);
+    const parsed = VoteRecordSchema.safeParse(record);
+    expect(parsed.success).toBe(false);
+    if (parsed.success) throw new Error('Malformed servedModel was accepted');
+    expect(parsed.error.issues).toContainEqual(
+      expect.objectContaining({
+        path: ['voters', 0, 'servedModel'],
+        message: 'servedModel_invalid',
+      })
+    );
+    expect(parseVoteRecordsText(JSON.stringify(record))).toMatchObject({
+      records: [],
+      invalidLines: [1],
+    });
+  });
+
+  it.each(['x'.repeat(200), 'vendor/model.name_1:variant@tag+revision-2', 'sonnet'])(
+    'accepts bounded conservative identifiers (%s)',
+    (servedModel) => {
+      expect(
+        VoterSummarySchema.safeParse({
+          role: 'architect',
+          decision: 'approve',
+          confidence: 0.9,
+          servedModel,
+        }).success
+      ).toBe(true);
+    }
+  );
+
+  it('verifies origin/main builder records with byte-identical serialization and hashes', () => {
+    // Written by origin/main's builder AND projection at 6a81a84ad7eefb3a19747c6e6d69ce534c8cb19e.
+    const bytes = readFileSync(
+      new URL('./fixtures/served-model-legacy.jsonl', import.meta.url),
+      'utf-8'
+    );
+    const parsed = parseVoteRecordsText(bytes);
+    expect(parsed.invalidLines).toEqual([]);
+    expect(parsed.records).toHaveLength(2);
+    expect(verifyVoteRecordSet(parsed.records).ok).toBe(true);
+    for (const line of bytes.trimEnd().split('\n')) {
+      const original = JSON.parse(line) as VoteRecord;
+      expect(serializeValidatedRecord(VoteRecordSchema, original, 'vote')).toBe(line + '\n');
+    }
+    for (const record of parsed.records) {
+      expect(computeVoteRecordHash(record)).toBe(record.hash);
+      expect(record.voters[0]).not.toHaveProperty('servedModel');
+    }
+  });
+
+  it('verifies a ratification record written by the main-branch servedModel writer (#6990)', () => {
+    // Written by origin/main's buildVoteRecord + serializeValidatedRecord at
+    // 7b5566851c (#6992, the writer). release/9.0 must read what main writes,
+    // or a governor-path PR into it fails ratification on its own ledger.
+    const bytes = readFileSync(
+      new URL('./fixtures/served-model-main-writer.jsonl', import.meta.url),
+      'utf-8'
+    );
+    const parsed = parseVoteRecordsText(bytes);
+    expect(parsed.invalidLines).toEqual([]);
+    expect(parsed.records).toHaveLength(1);
+    const [record] = parsed.records;
+    if (record === undefined) throw new Error('fixture record missing');
+    expect(record.ratifiesPr).toEqual({ pr: 6990, headSha: 'a'.repeat(40) });
+    expect(record.voters.map((v) => v.servedModel)).toEqual([
+      'claude-fable-5-20260901',
+      'gpt-6.1-sol',
+      undefined,
+    ]);
+    expect(computeVoteRecordHash(record)).toBe(record.hash);
+    expect(verifyVoteRecordSet(parsed.records).ok).toBe(true);
+    // The served model is hash-covered here too: editing it is detected.
+    const voters = record.voters.map((v, i) => (i === 0 ? { ...v, servedModel: 'gpt-5' } : v));
+    expect(verifyVoteRecordSet([{ ...record, voters }])).toMatchObject({
+      ok: false,
+      reason: 'hash_mismatch',
+    });
+  });
+});

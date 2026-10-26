@@ -1,0 +1,245 @@
+# Claims Registry
+#
+# Machine-verifiable inventory of the substantive claims README.md / ARCHITECTURE.md
+# make about the system. Validated by the Zod schema in
+# packages/nexus-agents/src/governance/claims-registry.ts and checked against live
+# source by `pnpm claims:check` (see scripts/claims-check.ts).
+#
+# Each entry:
+#   id            stable kebab-case id (never reused)
+#   claim         human-readable claim, <=25 words
+#   subject       repo-root-relative doc that makes the claim
+#   status        verified | partial | aspirational | stale
+#   evidenceType  test | gate | eval-artifact | adr | source
+#   verification  { method, path, expected?, symbol? }  -- how a script proves it
+#   lastVerified  YYYY-MM-DD this entry was last manually confirmed
+#   caveat        optional note surfaced in reports (use for `partial`)
+#
+# Adding a claim: pick the narrowest verification method that proves it, point
+# `path` at the live source of truth, and run `pnpm claims:check`.
+# Source: Issue #3824, #3825, #3826 (2026-06-09 claims audit).
+
+version: 1
+
+claims:
+  - id: mcp-tool-count
+    claim: 'README states the system exposes 47 MCP tools.'
+    subject: README.md
+    status: verified
+    evidenceType: source
+    verification:
+      method: manifest-tool-count
+      path: packages/nexus-agents/src/mcp/tools/tool-manifest.ts
+      expected: 47
+      # #3877: also assert the README prose still says 47, not just the source.
+      subjectContains: '47 MCP tools'
+    lastVerified: '2026-07-06'
+
+  - id: npm-readme-tool-count
+    claim: 'The published npm README states the system exposes 47 MCP tools.'
+    # The npm-rendered package README is a SEPARATE file from the root README; it
+    # drifted to a stale "42 MCP tools" (caught 2026-06-21). Guarding it here so
+    # claims:check enforces the count on the npm-facing doc too, instead of a
+    # fragile symlink to the root README (whose repo-relative links break on npm).
+    subject: packages/nexus-agents/README.md
+    status: verified
+    evidenceType: source
+    verification:
+      method: manifest-tool-count
+      path: packages/nexus-agents/src/mcp/tools/tool-manifest.ts
+      expected: 47
+      subjectContains: '47 MCP tools'
+    lastVerified: '2026-07-06'
+
+  - id: ecosystem-readme-tool-count
+    claim: 'ECOSYSTEM.md states the test repos exercise subsets of 47 MCP tools.'
+    # Added #5309 after ECOSYSTEM.md was found carrying a stale "46 MCP tools"
+    # while every other live doc and the manifest said 47. Same drift, and the
+    # same remedy, as `npm-readme-tool-count` above — which exists because
+    # packages/nexus-agents/README.md had drifted to "42". Two independent docs
+    # drifting the same way is the argument for registering the count wherever
+    # it is stated, rather than only where someone remembered to look.
+    subject: ECOSYSTEM.md
+    status: verified
+    evidenceType: source
+    verification:
+      method: manifest-tool-count
+      path: packages/nexus-agents/src/mcp/tools/tool-manifest.ts
+      expected: 47
+      subjectContains: '47 MCP tools'
+    lastVerified: '2026-09-04'
+
+  - id: consensus-strategy-count
+    claim: 'README advertises five consensus strategy names backed by the live voting strategy union.'
+    subject: README.md
+    status: verified
+    evidenceType: source
+    verification:
+      method: enum-member-count
+      path: packages/nexus-agents/src/mcp/tools/consensus-vote-types.ts
+      symbol: VotingStrategy
+      expected: 5
+      # #3877: README capabilities table prose must still advertise "5 strategies".
+      subjectContains: '5 strategies'
+    lastVerified: '2026-10-05'
+    caveat: >-
+      Five names, four distinct strategies: opinion_wise and higher_order are
+      aliases (Issue #514). README prose must keep the alias explicit.
+
+  - id: expert-type-count
+    claim: 'README states there are 12 built-in expert types.'
+    subject: README.md
+    status: verified
+    evidenceType: source
+    verification:
+      method: enum-member-count
+      path: packages/nexus-agents/src/agents/experts/expert-config.ts
+      symbol: BuiltInExpertTypeSchema
+      expected: 12
+      # #3877: README capabilities table must still state "12 built-in expert types".
+      subjectContains: '12 built-in expert types'
+    lastVerified: '2026-06-16'
+
+  # #3882: reworded to match docs/security/audit-hash-chain-threat-model.md §7 —
+  # the chain is tamper-evident, NOT tamper-proof / immutable against a
+  # write-capable adversary. Downgraded to `partial` with a caveat; evidence is
+  # now the threat-model ADR, and the README prose checked is the honest
+  # "tamper-evident" phrasing, not the removed word "immutable".
+  - id: hash-chained-audit
+    claim: 'Audit trail is hash-chained and tamper-evident (not tamper-proof), verifiable via verifyChain.'
+    subject: README.md
+    status: partial
+    evidenceType: adr
+    verification:
+      method: file-contains
+      path: packages/nexus-agents/src/audit/audit-chain-verify.ts
+      expected: 'export function verifyChain'
+      subjectContains: 'Tamper-evident hash-chained'
+    lastVerified: '2026-06-17'
+    caveat: >-
+      Tamper-EVIDENT, not tamper-PROOF / immutable. computeEventHash
+      (audit-chain-verify.ts) is a KEYLESS SHA-256 over only
+      {id,timestamp,category,action,outcome,actor,previousHash} (plus the
+      tier-transition payload for tier.* events, #3921) — partial-schema
+      coverage, so a write-capable adversary can truncate/fork/rewrite-and-rehash
+      undetectably. verifyChain (audit-chain-verify.ts) only detects post-hoc
+      in-place edits. See docs/security/audit-hash-chain-threat-model.md §7
+      (and #3874).
+
+  - id: verify-audit-chain-tool
+    claim: 'A verify_audit_chain MCP tool exposes audit-chain integrity verification.'
+    subject: README.md
+    status: verified
+    evidenceType: source
+    verification:
+      method: file-contains
+      path: packages/nexus-agents/src/mcp/tools/tool-manifest.ts
+      expected: "name: 'verify_audit_chain'"
+      # #3877: README must still advertise the tool by name.
+      subjectContains: 'verify_audit_chain'
+    lastVerified: '2026-06-16'
+
+  # #3879: was `file-exists` on a directory — passed even if LinUCB + TOPSIS
+  # were deleted. Now requires BOTH algorithms present in the real router code.
+  - id: closed-loop-routing
+    claim: 'Closed-loop routing scores candidates with LinUCB plus TOPSIS.'
+    subject: README.md
+    status: verified
+    evidenceType: source
+    verification:
+      # LinUCB (LinUCBBandit) and Topsis (TopsisRouter) are the real router
+      # symbols; the README prose says "LinUCB + TOPSIS". Both must be live code,
+      # not just a comment — #3879.
+      method: source-contains-all
+      path: packages/nexus-agents/src/cli-adapters/composite-router.ts
+      expected: 'LinUCB,Topsis'
+      subjectContains: 'LinUCB + TOPSIS'
+    lastVerified: '2026-06-16'
+
+  - id: standalone-cli-roadmap
+    claim: 'Standalone CLI mode (Phase 2) is roadmap, not yet shipped.'
+    subject: ARCHITECTURE.md
+    status: aspirational
+    evidenceType: source
+    verification:
+      method: roadmap-status
+      path: ARCHITECTURE.md
+      expected: '| Phase 2 | v2.3.0  | Standalone CLI Mode      | -      |'
+    lastVerified: '2026-06-16'
+
+  - id: rest-gateway-roadmap
+    claim: 'REST API gateway (Phase 3) is roadmap, not yet shipped.'
+    subject: ARCHITECTURE.md
+    status: aspirational
+    evidenceType: source
+    verification:
+      method: roadmap-status
+      path: ARCHITECTURE.md
+      expected: '| Phase 3 | v3.0.0  | REST API + Full Hybrid   | -      |'
+    lastVerified: '2026-06-16'
+
+  # Epic D / #3844: per-loop promotion-criteria entries. Each records the
+  # ASPIRATIONAL→VERIFIED transition path for a loop: the PROMOTION itself is
+  # aspirational (not yet earned — no record in authority-tier-evidence.yaml), but
+  # the CRITERION (the evidence bar a promotion must meet, per ADR-0017's schema)
+  # is now VERIFIED-as-documented in docs/governance/loop-promotion-criteria.md.
+  # The transition becomes a real promotion only when the evidence + ratification
+  # land (see the doc's mechanical checklist). evidenceType: adr — the criterion
+  # is grounded in ADR-0017's evidence-threshold schema.
+  # method: file-exists with subjectContains — the doc IS the artifact, and
+  # subjectContains (#3877) asserts the criterion prose stays in the doc via a
+  # plain substring match (no comment-stripping, robust over Markdown).
+  - id: tune-loop-demotion-criterion
+    claim: 'The tune loop (bounded enforce) has a documented automatic-demotion criterion (envelope breach / regression).'
+    subject: docs/governance/loop-promotion-criteria.md
+    status: verified
+    evidenceType: adr
+    verification:
+      method: file-exists
+      path: docs/governance/loop-promotion-criteria.md
+      subjectContains: 'Demotion triggers (automatic, no ratification)'
+    lastVerified: '2026-06-16'
+
+  - id: auto-remediation-promotion-criterion
+    claim: 'Auto-remediation audit-to-enforce promotion criterion is documented per the ADR schema (would-block rate, evalN, precision, recall, soak).'
+    subject: docs/governance/loop-promotion-criteria.md
+    status: aspirational
+    evidenceType: adr
+    verification:
+      method: file-exists
+      path: docs/governance/loop-promotion-criteria.md
+      subjectContains: 'the **would-block rate**'
+    lastVerified: '2026-06-16'
+
+  - id: knn-weighting-promotion-criterion
+    claim: 'KNN research-maturity weighting promotion is gated on a similarity-controlled, stable, significant success-rate lift, else kill-option.'
+    subject: docs/governance/loop-promotion-criteria.md
+    status: aspirational
+    evidenceType: adr
+    verification:
+      method: file-exists
+      path: docs/governance/loop-promotion-criteria.md
+      subjectContains: 'similarity-controlled success-rate lift'
+    lastVerified: '2026-06-16'
+
+  - id: learned-selection-promotion-criterion
+    claim: 'Learned selection rules promotion is gated on a measured win over the hand-written rules.'
+    subject: docs/governance/loop-promotion-criteria.md
+    status: aspirational
+    evidenceType: adr
+    verification:
+      method: file-exists
+      path: docs/governance/loop-promotion-criteria.md
+      subjectContains: 'the **routing-decision win rate**'
+    lastVerified: '2026-06-16'
+
+  - id: clawguard-promotion-criterion
+    claim: 'ClawGuard has no audit-to-enforce promotion path: retired as an enforcement mechanism (#5022), with tool authorization consolidated on PolicyFirewall.'
+    subject: docs/governance/loop-promotion-criteria.md
+    status: verified
+    evidenceType: adr
+    verification:
+      method: file-exists
+      path: docs/governance/loop-promotion-criteria.md
+      subjectContains: 'RETIRED as a promotion path'
+    lastVerified: '2026-08-27'

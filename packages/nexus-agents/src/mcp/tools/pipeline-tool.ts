@@ -1,0 +1,488 @@
+/**
+ * run_pipeline MCP Tool (#1736, Phase 3)
+ *
+ * Single unified entry point for all pipeline types. Auto-detects
+ * the appropriate pipeline template based on task analysis, or
+ * accepts an explicit template override.
+ *
+ * @module mcp/tools/pipeline-tool
+ */
+
+import { z } from 'zod';
+import { VotingStrategySchema } from './consensus-vote-types.js';
+import { asyncDispatchInputDefaultSync } from './async-dispatch-input.js';
+import * as fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import type { McpServer } from '../sdk-types.js';
+import { createLogger, getErrorMessage, formatZodError, type ILogger } from '../../core/index.js';
+import { runAdaptiveOrchestrator, classifyTask } from '../../pipeline/adaptive-orchestrator.js';
+import { checkSimulationAllowed, simulationDeniedResult } from './simulation-guard.js';
+import { resolveInsideRoot } from '../../security/safe-path.js';
+import type { AdaptiveOrchestratorResult } from '../../pipeline/adaptive-orchestrator.js';
+import { measureInputSanitization } from './pipeline-input-sanitization.js';
+import { planVoteVerdictFields } from './dev-pipeline-output.js';
+import type { VoteResult } from '../../pipeline/dev-pipeline.js';
+import { PIPELINE_STATE_KEYS } from '../../pipeline/stage-types.js';
+import { createAgentStages, type AgentExecutorConfig } from '../../pipeline/agent-executor.js';
+import type { AgentBudgetConfig } from '../../pipeline/budget-guard.js';
+import { isBudgetEnforcementEnabled, resolveEnforcedRunBudget } from '../../pipeline/run-budget.js';
+import { getTemplate } from '../../pipeline/templates.js';
+import {
+  createDevStageRegistry,
+  createGreenfieldStageRegistry,
+  createAuditStageRegistry,
+} from '../../pipeline/stage-wrappers.js';
+import { listTemplateIds } from '../../pipeline/templates.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { measuredTrustTier } from '../middleware/request-context.js';
+import {
+  toolStructuredError,
+  structuredToolSuccess,
+  type BaseMcpToolDeps,
+  type ToolResult,
+} from './tool-result.js';
+// #3730 / epic #2631: async-mode dispatch via the shared `runAsJob` helper.
+import { runAsJob } from '../jobs/run-as-job.js';
+
+/**
+ * Discoverability hint (#3730) appended to sync run_pipeline error/timeout
+ * envelopes. A real multi-stage adaptive run can exceed the 900s MCP request
+ * timeout; async mode is the durable escape hatch.
+ */
+const PIPELINE_ASYNC_HINT =
+  'A full run_pipeline run can exceed the synchronous MCP request timeout. ' +
+  "Retry with `dispatch: 'async'` to get a jobId immediately, then poll " +
+  'get_job_result({ jobId }) for the result.';
+
+// ============================================================================
+// Input Schema
+// ============================================================================
+
+export const PipelineInputSchema = z.object({
+  /** The task to execute. */
+  task: z
+    .string()
+    .min(5)
+    .max(10000)
+    .describe('Task description — pipeline template auto-selected based on content'),
+  /** Path to a spec file (.md, .yaml) to use as task input. */
+  specFile: z
+    .string()
+    .max(500)
+    .optional()
+    .describe('Path to a spec file — content prepended to task for greenfield projects'),
+  /** Override template — see `listTemplateIds()` for the canonical list (#2728). Auto-detected if omitted. */
+  template: z
+    .string()
+    .max(50)
+    .optional()
+    .describe(`Pipeline template override. Available: ${listTemplateIds().join(', ')}`),
+  /** Voting strategy for consensus stages. */
+  votingStrategy: VotingStrategySchema.optional().describe(
+    'Voting strategy for plan approval. simple_majority (default), supermajority (67%), unanimous, higher_order (Bayesian), opinion_wise'
+  ),
+  /** Use 3 agents instead of 7 for faster voting. */
+  quickMode: z
+    .boolean()
+    .default(false)
+    .describe('Use 3 agents instead of 7 for faster consensus voting'),
+  /**
+   * Deadline for EACH stage in milliseconds (min 30s, max 600s), not a budget
+   * for the whole run (#6730). Replaces every stage's default, the vote's
+   * included; clamped to the `pipeline` class guard.
+   */
+  timeoutMs: z
+    .number()
+    .int()
+    .min(30_000)
+    .max(600_000)
+    .optional()
+    .describe(
+      'Max time for EACH stage in ms (30000-600000), not for the whole run; applies to every stage, the vote included. Default: the vote stage gets the multi-LLM panel guard (900000 unless overridden), other stages 120000'
+    ),
+  /** Stop after planning/voting (no implementation). */
+  dryRun: z.boolean().default(false).describe('Stop after vote stage (no implementation)'),
+  /**
+   * Dispatch mode (#3730). `sync` (default) runs the pipeline inline and
+   * returns the result — but a real multi-stage adaptive run can exceed the
+   * 900s MCP request timeout. `async` returns a `{ status: 'pending', jobId }`
+   * envelope immediately and runs the pipeline in the background; poll
+   * `get_job_result({ jobId })` for the result. Ignored when `dryRun` is true
+   * (plan+vote completes fast, so dry runs always stay sync).
+   */
+  ...asyncDispatchInputDefaultSync('Ignored for dryRun.'),
+  /** TESTS ONLY — random output, must not be used for real decisions. (#2319) */
+  simulateVotes: z
+    .boolean()
+    .default(false)
+    .describe('TESTS ONLY — random output, must not be used for real decisions (#2319)'),
+});
+
+export type PipelineInput = z.infer<typeof PipelineInputSchema>;
+
+// ============================================================================
+// Output Formatting
+// ============================================================================
+
+function buildOutput(
+  result: AdaptiveOrchestratorResult,
+  simulated: boolean
+): Record<string, unknown> {
+  return {
+    success: result.success,
+    templateId: result.templateId,
+    selectionMethod: result.selectionMethod,
+    taskClassification: result.taskClassification,
+    stepsExecuted: result.stepsExecuted,
+    durationMs: result.durationMs,
+    error: result.error ?? null,
+    // #5812-adjacent (pipeline sweep): a dryRun truncates the template at
+    // `dryRunStopAfter`, so `success: true` with `templateId: 'dev'` used to be
+    // byte-identical whether qa and security ran or were sliced away. Say which.
+    ...(result.dryRun === true ? { dryRun: true } : {}),
+    // #7240: the terminal vote is the dry run's result, not just ledger output.
+    ...dryRunVoteFields(result),
+    stagesPlanned: result.stagesPlanned,
+    stagesRun: result.stagesRun,
+    // #4170: stamped only on an explicit NEXUS_ALLOW_SIMULATE=1 opt-in run so
+    // a random demo panel can never pass as a real decision.
+    ...(simulated ? { simulated: true } : {}),
+    // Rate limit awareness (#1802)
+    rateLimitHint:
+      result.error?.toLowerCase().includes('rate limit') === true
+        ? 'Consider using quickMode or increasing delay between pipeline runs'
+        : undefined,
+  };
+}
+
+/** Vote evidence crosses the graph's untyped state boundary. */
+const VoteEvidenceSchema = z.object({
+  approvalPercentage: z.number(),
+  voteRecordId: z.string().optional(),
+});
+const VoteResultSchema = z.discriminatedUnion('kind', [
+  VoteEvidenceSchema.extend({ kind: z.literal('approved') }),
+  VoteEvidenceSchema.extend({ kind: z.literal('rejected'), feedback: z.string() }),
+  VoteEvidenceSchema.extend({ kind: z.literal('no_quorum'), reason: z.string() }),
+]);
+
+/** Narrow successful and failed vote evidence using the same contract. */
+function isVoteResult(value: unknown): value is VoteResult {
+  return VoteResultSchema.safeParse(value).success;
+}
+
+/** Read the nested vote from either successful state or failed-stage evidence. */
+function voteFromState(state: Readonly<Record<string, unknown>> | undefined): unknown {
+  const output = state?.[PIPELINE_STATE_KEYS.VOTE_RESULT];
+  return output !== null && typeof output === 'object' && 'vote' in output
+    ? output.vote
+    : undefined;
+}
+
+/** Project successful or failed votes using the sibling tool's evidence formatter. */
+function dryRunVoteFields(result: AdaptiveOrchestratorResult): Record<string, unknown> {
+  if (result.dryRun !== true) return {};
+  const failedVote = voteFromState(result.errorDetail);
+  const stateVote = voteFromState(result.finalState);
+  const vote = isVoteResult(failedVote)
+    ? failedVote
+    : isVoteResult(stateVote)
+      ? stateVote
+      : undefined;
+  if (vote === undefined) return {};
+  // A fail-closed infrastructure crash has no record: its sentinel 0 is unmeasured.
+  const measured = vote.kind !== 'no_quorum' || vote.voteRecordId !== undefined;
+  return planVoteVerdictFields({
+    planVoteDecision: vote.kind,
+    ...(measured ? { planVoteApprovalPercentage: vote.approvalPercentage } : {}),
+    ...(vote.voteRecordId !== undefined ? { planVoteRecordId: vote.voteRecordId } : {}),
+    ...(vote.kind === 'no_quorum' ? { planVoteReason: vote.reason } : {}),
+    ...(vote.kind === 'rejected' ? { planVoteFeedback: vote.feedback } : {}),
+  });
+}
+
+// ============================================================================
+// Input Resolution
+// ============================================================================
+
+/**
+ * Resolve task text — prepend spec file content if provided.
+ *
+ * Async because spec files can be large and the previous synchronous read
+ * blocked libuv for the duration, stalling concurrent MCP requests (#2354).
+ */
+async function resolveTask(task: string, specFile: string | undefined): Promise<string> {
+  if (specFile === undefined) return task;
+  // Path traversal guard — restrict to the cwd subtree, following symlinks.
+  const resolved = resolveInsideRoot(specFile);
+  if (resolved === null) {
+    throw new Error(`Path traversal denied: specFile must be within ${process.cwd()}`);
+  }
+  try {
+    const specContent = await fs.promises.readFile(resolved, 'utf-8');
+    return `${specContent}\n\n---\n\n${task}`;
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`Spec file not found: ${resolved}`);
+    }
+    throw err;
+  }
+}
+
+/** Fallback stage count when the effective template can't be resolved. */
+const DEFAULT_STAGE_COUNT = 6;
+
+/**
+ * Estimate-relative per-run token budget (#3262), gated behind
+ * `NEXUS_BUDGET_ENFORCE` through the shared {@link resolveEnforcedRunBudget}
+ * — `run_workflow` resolves through the same function (#4754). The dry-run
+ * estimator is per-CALL, so the run is approximated as one call per stage of
+ * the effective template.
+ */
+function resolveRunBudget(
+  task: string,
+  templateId: string | undefined,
+  logger: ILogger
+): AgentBudgetConfig | undefined {
+  if (!isBudgetEnforcementEnabled()) return undefined;
+  const effectiveId = templateId ?? classifyTask(task).pipelineType;
+  const template = getTemplate(effectiveId) ?? getTemplate('general');
+  return resolveEnforcedRunBudget({
+    estimateText: task,
+    callCount: template?.stages.length ?? DEFAULT_STAGE_COUNT,
+    logger,
+    logContext: { template: effectiveId },
+  });
+}
+
+/** Select the appropriate stage registry based on template or auto-detection. */
+function selectStageRegistry(
+  template: string | undefined,
+  task: string,
+  agentStages: ReturnType<typeof createAgentStages>
+): Map<string, import('../../pipeline/stage-types.js').IPipelineStage> {
+  // Use explicit template or auto-detect from task content
+  const effectiveTemplate = template ?? classifyTask(task).pipelineType;
+
+  if (effectiveTemplate === 'greenfield') {
+    return createGreenfieldStageRegistry(agentStages);
+  }
+  if (effectiveTemplate === 'audit') {
+    return createAuditStageRegistry();
+  }
+  return createDevStageRegistry(agentStages);
+}
+
+// ============================================================================
+// Tool Registration
+// ============================================================================
+
+// Templates listed dynamically so a new entry in PIPELINE_TEMPLATES can't
+// drift this description (#2728 — previously hardcoded the pre-`general`
+// 4-template list).
+const RUN_PIPELINE_DESCRIPTION = `Single unified entry point for all pipeline templates (${listTemplateIds().join('/')}). Auto-detects template from task content or accepts an explicit override. Supports dispatch: 'async' (non-dryRun runs) — returns a jobId immediately; poll get_job_result.`;
+
+/**
+ * Run the adaptive pipeline for a plain goal string with default settings
+ * (auto-detected template, non-simulated). The strategy executor the unified
+ * `run` entry point dispatches to for the `pipeline` and `research` strategies
+ * (#3575). Mirrors {@link runPipelineHandler} minus arg parsing.
+ */
+export async function runPipelineForGoal(
+  goal: string,
+  logger: ILogger = createLogger({ tool: 'run_pipeline' }),
+  /** `run`'s async-job cancel signal (#6305): checked before every super-step. */
+  signal?: AbortSignal
+): Promise<AdaptiveOrchestratorResult> {
+  const budget = resolveRunBudget(goal, undefined, logger);
+  const agentStages = createAgentStages({
+    budget,
+    // Plain-goal pipeline/research strategies have no HandlerContext.
+    inputSanitization: 'unmeasured',
+  });
+  const stages = selectStageRegistry(undefined, goal, agentStages);
+  return runAdaptiveOrchestrator(goal, { stages, ...(signal !== undefined ? { signal } : {}) });
+}
+
+/** Per-run settings {@link executePipelineBody} hands to the orchestrator. */
+interface PipelineRunOptions {
+  readonly templateId: string | undefined;
+  readonly dryRun: boolean;
+  readonly simulated: boolean;
+  /** The caller's `timeoutMs`: a deadline for EACH stage (#6730). */
+  readonly stageTimeoutMs: number | undefined;
+  /** `cancel_job`'s signal on the async path (#6305); absent on the sync path. */
+  readonly signal?: AbortSignal;
+}
+
+/** The run settings a validated input asks for (the signal is added per path). */
+function pipelineRunOptions(input: PipelineInput, simulated: boolean): PipelineRunOptions {
+  return {
+    templateId: input.template,
+    dryRun: input.dryRun,
+    simulated,
+    stageTimeoutMs: input.timeoutMs,
+  };
+}
+
+/**
+ * Run the adaptive-orchestrator body + shape the structured success envelope.
+ * The sync handler awaits this inline; the async dispatcher backgrounds it via
+ * {@link runAsJob}. `task` + `stages` are resolved by the sync prelude in
+ * {@link runPipelineHandler} so only the (long) orchestrator body runs in the
+ * background (#3730).
+ */
+async function executePipelineBody(
+  task: string,
+  stages: ReturnType<typeof selectStageRegistry>,
+  run: PipelineRunOptions
+): Promise<ToolResult> {
+  const { templateId, dryRun, simulated, stageTimeoutMs, signal } = run;
+  const result = await runAdaptiveOrchestrator(task, {
+    stages,
+    templateId,
+    dryRun,
+    stageTimeoutMs,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  const output = buildOutput(result, simulated);
+  // #4363 caller audit: `toolSuccessStructured` nests the payload under
+  // `structuredContent`, so a `success: false` run left the ToolResult's own
+  // root clean and slipped past both the caller and `runAsJob`'s fail-closed
+  // check — the job recorded `complete` for a pipeline that failed. Hoist the
+  // verdict to the root, the same way run_graph_workflow does.
+  if (!result.success) {
+    return toolStructuredError({
+      errorCategory: 'business',
+      message: result.error ?? `Pipeline '${result.templateId}' did not complete successfully`,
+      detail: output,
+    });
+  }
+  return structuredToolSuccess(z.record(z.string(), z.unknown()), output);
+}
+
+/** Wire caller observations and pipeline execution modes into the agent stages. */
+function createPipelineAgentStages(
+  input: PipelineInput,
+  config: AgentExecutorConfig
+): ReturnType<typeof createAgentStages> {
+  return createAgentStages({
+    dryRun: input.dryRun,
+    simulateVotes: input.simulateVotes,
+    votingStrategy: input.votingStrategy,
+    quickMode: input.quickMode,
+    ...config,
+  });
+}
+
+/** Validates input, runs the adaptive orchestrator, and shapes the result. */
+async function runPipelineHandler(
+  args: unknown,
+  logger: ILogger,
+  callerTrustTier: string | undefined,
+  sanitization: Pick<AgentExecutorConfig, 'inputSanitization' | 'inputSanitizationCounts'>
+): Promise<ToolResult> {
+  const parsed = PipelineInputSchema.safeParse(args);
+  if (!parsed.success) {
+    return toolStructuredError({
+      errorCategory: 'validation',
+      message: `Invalid input: ${formatZodError(parsed.error)}`,
+    });
+  }
+  const input = parsed.data;
+  // #4170: simulateVotes fails CLOSED outside test runners — BEFORE the try
+  // block (its catch categorizes as `internal`) and BEFORE the async dispatch
+  // (sync and async modes must reject identically).
+  let simulated = false;
+  if (input.simulateVotes) {
+    const simCheck = checkSimulationAllowed('run_pipeline', logger);
+    if (!simCheck.allowed) return simulationDeniedResult(simCheck.reason);
+    simulated = simCheck.optedIn;
+  }
+
+  try {
+    // Sync prelude — fast: input resolution + stage wiring. Only the
+    // orchestrator BODY backgrounds in async mode (#3730).
+    const task = await resolveTask(input.task, input.specFile);
+    const agentStages = createPipelineAgentStages(input, {
+      callerTrustTier,
+      ...sanitization,
+      budget: resolveRunBudget(task, input.template, logger),
+    });
+    const stages = selectStageRegistry(input.template, task, agentStages);
+    const body = pipelineRunOptions(input, simulated);
+
+    // #3730: async dispatch for real (non-dryRun) runs — a full adaptive
+    // pipeline can exceed the 900s MCP request timeout. dryRun ALWAYS stays
+    // sync (plan+vote completes fast). run_pipeline has no sessionId, so a
+    // fresh `rp-<uuid>` jobId is always minted (no idempotency surface).
+    // Returns `{ status: 'pending', jobId }` immediately.
+    if (input.dispatch === 'async' && !input.dryRun) {
+      return runAsJob<PipelineInput, ToolResult>({
+        toolName: 'run_pipeline',
+        input,
+        freshJobId: () => `rp-${randomUUID()}`,
+        // #5393 / #6305: arity 3 — the graph executor checks the signal before every
+        // super-step, so a cancel stops the run at the next stage boundary.
+        run: (_jobId, _input, signal) => executePipelineBody(task, stages, { ...body, signal }),
+        logger,
+      });
+    }
+
+    return await executePipelineBody(task, stages, body);
+  } catch (error: unknown) {
+    // #3730 discoverability: a sync run that times out (or otherwise fails
+    // mid-pipeline) should point the caller at async mode — the durable fix
+    // for runs that exceed the request timeout.
+    return toolStructuredError({
+      errorCategory: 'internal',
+      message: `${PIPELINE_ASYNC_HINT} Pipeline error: ${getErrorMessage(error)}`,
+    });
+  }
+}
+
+/**
+ * Register the run_pipeline MCP tool.
+ *
+ * Routed through the standard `createSecureHandler → wrapToolWithTimeout →
+ * toSdkCallback` chain like every other tool (#2824): the bare-callback
+ * registration it used before had no rate-limiting, no abort-signal /
+ * progress-token plumbing, and surfaced a `ZodError` on bad input as a raw
+ * JSON-RPC `-32603` instead of a structured `validation` envelope.
+ */
+export function registerPipelineTool(server: McpServer, deps: BaseMcpToolDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'run_pipeline' });
+  // The context-aware form records caller authentication separately from
+  // the sanitizer's observation of the handler input (#4733).
+  const secureHandler = createSecureHandler(
+    // Optional chaining is deliberate, not defensive noise: a handler invoked
+    // without a context has genuinely NOT measured a tier, and that flows to
+    // UNMEASURED_TRUST_TIER rather than to a default. Absence stays absence.
+    (args: unknown, ctx?: HandlerContext) =>
+      runPipelineHandler(
+        args,
+        logger,
+        ctx && measuredTrustTier(ctx.requestContext),
+        measureInputSanitization(ctx)
+      ),
+    { toolName: 'run_pipeline', rateLimiter: deps.rateLimiter, logger }
+  );
+  const timeoutMs = getToolTimeout('run_pipeline', deps.security);
+  const wrapped = wrapToolWithTimeout('run_pipeline', secureHandler, { timeoutMs, logger });
+
+  server.registerTool(
+    'run_pipeline',
+    {
+      description: RUN_PIPELINE_DESCRIPTION,
+      inputSchema: PipelineInputSchema.shape,
+      annotations: getToolAnnotations('run_pipeline'),
+    },
+    toSdkCallback(wrapped)
+  );
+  logger.info('Registered run_pipeline tool');
+}
+
+/** Test-only surface — do not import in production code. */
+export const _testing = { resolveTask };

@@ -1,0 +1,792 @@
+/**
+ * CLI Orchestration Fitness Score — real filesystem analysis.
+ * Penalizes duplicate paths, hidden behavior, non-determinism, poor
+ * observability, config sprawl, cross-layer coupling. Rewards canonical
+ * paths, determinism, telemetry, CLI ergonomics, governance.
+ * @module governance/fitness-score
+ */
+
+/* eslint-disable max-lines -- cohesive fitness calculator (governance allows 400-600) */
+
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createLogger, type ILogger } from '../core/index.js';
+import {
+  DETERMINISM_EXCLUDES,
+  TEST_FILE_EXCLUDES,
+  countFiles,
+  countMockGuardSites,
+  countPatternInDir,
+  fileContains,
+} from './source-scan.js';
+
+/** Find package root by walking up from current dir to find package.json with our name */
+function findPkgRoot(): string {
+  let dir = import.meta.dirname;
+  for (let i = 0; i < 10; i++) {
+    const pkgPath = join(dir, 'package.json');
+    if (existsSync(pkgPath)) {
+      const content = readFileSync(pkgPath, 'utf-8');
+      if (content.includes('"nexus-agents"')) return dir;
+    }
+    dir = join(dir, '..');
+  }
+  return join(import.meta.dirname, '../..');
+}
+
+const PKG_ROOT = findPkgRoot();
+const SRC_ROOT = join(PKG_ROOT, 'src');
+const REPO_ROOT = join(PKG_ROOT, '../..');
+const DOCS_ROOT = join(REPO_ROOT, 'docs');
+
+// =========================================================================
+// Public types
+// =========================================================================
+
+/**
+ * Individual fitness dimension scores.
+ */
+export interface FitnessDimensions {
+  /** Penalty: duplicate paths to same workflow (0-20, higher = better) */
+  readonly canonicalPaths: number;
+  /** Penalty: hidden/magic behavior (0-15, higher = better) */
+  readonly explicitBehavior: number;
+  /** Reward: deterministic execution (0-15, higher = better) */
+  readonly determinism: number;
+  /** Reward: observability coverage (0-15, higher = better) */
+  readonly observability: number;
+  /** Penalty: config surface area (0-10, higher = better) */
+  readonly configSimplicity: number;
+  /** Penalty: cross-layer coupling (0-10, higher = better) */
+  readonly layerSeparation: number;
+  /** Reward: CLI ergonomics (0-10, higher = better) */
+  readonly operatorErgonomics: number;
+  /** Reward: governance injection (0-5, higher = better) */
+  readonly governanceIntegration: number;
+}
+
+/**
+ * The closed set of known fitness dimensions. Use this (not a free string) when
+ * validating a dimension carried in untrusted/serialized data — e.g. a finding's
+ * `dimension` flowing into a signal payload (#3227, findings-as-data).
+ */
+export type FitnessDimension = keyof FitnessDimensions;
+
+/**
+ * Maximum points each dimension can score — the SINGLE SOURCE OF TRUTH for
+ * per-dimension maxima (#3227). {@link FitnessScoreCalculator.registerDefaultChecks}
+ * registers each check with `FITNESS_DIMENSION_MAX[dimension]` so the registered
+ * `maxPoints` can never silently drift from this table, and downstream consumers
+ * (e.g. the per-dimension fitness-remediation signal) compute a below-target
+ * threshold as a fraction of the dimension's OWN max rather than a global floor.
+ *
+ * The maxima sum to 100 (the `score` range). Mirrors the `0-N` ranges documented
+ * on each {@link FitnessDimensions} field.
+ */
+export const FITNESS_DIMENSION_MAX: Readonly<Record<FitnessDimension, number>> = {
+  canonicalPaths: 20,
+  explicitBehavior: 15,
+  determinism: 15,
+  observability: 15,
+  configSimplicity: 10,
+  layerSeparation: 10,
+  operatorErgonomics: 10,
+  governanceIntegration: 5,
+};
+
+/**
+ * Detailed fitness audit result.
+ */
+export interface FitnessAudit {
+  /** Overall score (0-100) */
+  readonly score: number;
+  /** Individual dimension scores */
+  readonly dimensions: FitnessDimensions;
+  /** Specific findings */
+  readonly findings: readonly FitnessFinding[];
+  /** Timestamp of audit */
+  readonly timestamp: string;
+  /** Version/commit reference */
+  readonly version: string;
+  /**
+   * Whether the audit actually ran against the nexus-agents source tree (#3621).
+   * `false` is the "could not audit from here" sentinel (e.g. run from the global
+   * npm install, where the bundled `src/` lacks `cli-adapters/`): the score is a
+   * meaningless 0, NOT a real low-fitness result. Consumers (e.g.
+   * improvement_review) MUST NOT treat a `false` audit's score as a signal.
+   * Absent/`true` → a genuine audit.
+   */
+  readonly auditable?: boolean;
+}
+
+/**
+ * Whether an audit's score is a real measurement rather than the
+ * "could not audit from here" sentinel (#3621).
+ *
+ * Exported as one predicate because the guard was applied by
+ * `detectFitnessSignals` and missed by `emitFitnessDeclinedSignal`, which was
+ * handed the same audit object and emitted `signal.fitness_declined` with the
+ * sentinel's score of 0 — a tech-debt signal claiming catastrophic fitness for
+ * a repo that was never audited (#5014). Two consumers of one rule should not
+ * each carry their own copy of it.
+ */
+export function isAuditableScore(audit: Pick<FitnessAudit, 'auditable'>): boolean {
+  return audit.auditable !== false;
+}
+
+/**
+ * Individual finding from audit.
+ */
+export interface FitnessFinding {
+  /** Dimension affected */
+  readonly dimension: keyof FitnessDimensions;
+  /** Issue severity: 'info' | 'warning' | 'critical' */
+  readonly severity: 'info' | 'warning' | 'critical';
+  /** Description */
+  readonly description: string;
+  /** Points deducted */
+  readonly pointsDeducted: number;
+  /** Location in code (optional) */
+  readonly location?: string;
+  /** Suggested fix (optional) */
+  readonly suggestion?: string;
+}
+
+/**
+ * Fitness check definition.
+ */
+interface FitnessCheck {
+  readonly dimension: keyof FitnessDimensions;
+  readonly maxPoints: number;
+  readonly name: string;
+  readonly check: () => FitnessCheckResult;
+}
+
+/**
+ * Result of a single fitness check.
+ */
+interface FitnessCheckResult {
+  readonly score: number;
+  readonly findings: FitnessFinding[];
+}
+
+/** Clamp score to [0, max]. */
+function clamp(score: number, max: number): number {
+  return Math.max(0, Math.min(max, score));
+}
+
+/**
+ * CLI Orchestration Fitness Score calculator.
+ */
+export class FitnessScoreCalculator {
+  private readonly logger: ILogger;
+  private readonly checks: FitnessCheck[] = [];
+
+  constructor(logger?: ILogger) {
+    this.logger = logger ?? createLogger({ component: 'FitnessScoreCalculator' });
+    this.registerDefaultChecks();
+  }
+
+  /** Register default fitness checks. */
+  private registerDefaultChecks(): void {
+    // maxPoints is sourced from FITNESS_DIMENSION_MAX (the single source of truth,
+    // #3227) so a registered check's max can never drift from the published table.
+    const reg = (
+      dimension: keyof FitnessDimensions,
+      name: string,
+      check: () => FitnessCheckResult
+    ): void => {
+      this.checks.push({ dimension, maxPoints: FITNESS_DIMENSION_MAX[dimension], name, check });
+    };
+    reg('canonicalPaths', 'Canonical Paths', () => this.checkCanonicalPaths());
+    reg('explicitBehavior', 'Explicit Behavior', () => this.checkExplicitBehavior());
+    reg('determinism', 'Determinism', () => this.checkDeterminism());
+    reg('observability', 'Observability', () => this.checkObservability());
+    reg('configSimplicity', 'Config Simplicity', () => this.checkConfigSimplicity());
+    reg('layerSeparation', 'Layer Separation', () => this.checkLayerSeparation());
+    reg('operatorErgonomics', 'Operator Ergonomics', () => this.checkOperatorErgonomics());
+    reg('governanceIntegration', 'Governance Integration', () => this.checkGovernanceIntegration());
+  }
+
+  /** Run full fitness audit. */
+  audit(version: string): FitnessAudit {
+    const findings: FitnessFinding[] = [];
+    const dimensions: Record<string, number> = {};
+
+    // #2716 — the audit's existsSync checks look at SRC_ROOT-relative paths
+    // (cli-adapters/composite-router.ts, cli/doctor.ts, etc). When run from
+    // an `npm install -g nexus-agents` copy, SRC_ROOT points at the installed
+    // package's `src/` which only contains workflow templates — not the full
+    // source tree. Result: every existsSync returns false and the audit
+    // emits a parade of fictional "missing" findings against a healthy
+    // source tree. (`npx nexus-agents fitness-audit` from a repo root hits
+    // this path because npx resolves to the GLOBAL bin, not the local
+    // workspace bundle.) Bail with a clear single-finding result instead.
+    const cliAdaptersDir = join(SRC_ROOT, 'cli-adapters');
+    if (!existsSync(cliAdaptersDir)) {
+      return this.notSourceRepoResult(version);
+    }
+
+    for (const check of this.checks) {
+      this.logger.debug(`Running fitness check: ${check.name}`);
+      const result = check.check();
+      dimensions[check.dimension] = result.score;
+      findings.push(...result.findings);
+    }
+
+    const score = Object.values(dimensions).reduce((sum, val) => sum + val, 0);
+    this.logger.info('Fitness audit complete', { score, version });
+
+    // Build a strictly-typed FitnessDimensions instead of `as unknown as` cast
+    // (#1913 Class G). If a check skipped a dimension it defaults to 0,
+    // making it explicit rather than UB.
+    const safeDim = (k: keyof FitnessDimensions): number => dimensions[k] ?? 0;
+    const typedDimensions: FitnessDimensions = {
+      canonicalPaths: safeDim('canonicalPaths'),
+      explicitBehavior: safeDim('explicitBehavior'),
+      determinism: safeDim('determinism'),
+      observability: safeDim('observability'),
+      configSimplicity: safeDim('configSimplicity'),
+      layerSeparation: safeDim('layerSeparation'),
+      operatorErgonomics: safeDim('operatorErgonomics'),
+      governanceIntegration: safeDim('governanceIntegration'),
+    };
+
+    return {
+      score,
+      dimensions: typedDimensions,
+      findings,
+      timestamp: new Date().toISOString(),
+      version,
+      auditable: true,
+    };
+  }
+
+  /**
+   * Return when the runtime SRC_ROOT doesn't look like the nexus-agents
+   * source tree (#2716). One finding, score 0 — distinct from "the source
+   * tree is broken" because every existsSync would falsely report missing.
+   */
+  private notSourceRepoResult(version: string): FitnessAudit {
+    const finding: FitnessFinding = {
+      dimension: 'governanceIntegration',
+      severity: 'info',
+      description:
+        'fitness-audit must run against the nexus-agents source repo, ' +
+        `but ${SRC_ROOT}/cli-adapters does not exist. You are likely ` +
+        'running the installed npm package via `npx nexus-agents`, which ' +
+        'ships only the bundled dist/. Clone the source repo and run ' +
+        '`node packages/nexus-agents/dist/cli.js fitness-audit` (or invoke ' +
+        '`pnpm fitness-audit` from the workspace root).',
+      pointsDeducted: 0,
+    };
+    return {
+      score: 0,
+      dimensions: {
+        canonicalPaths: 0,
+        explicitBehavior: 0,
+        determinism: 0,
+        observability: 0,
+        configSimplicity: 0,
+        layerSeparation: 0,
+        operatorErgonomics: 0,
+        governanceIntegration: 0,
+      },
+      findings: [finding],
+      timestamp: new Date().toISOString(),
+      version,
+      auditable: false,
+    };
+  }
+
+  // =========================================================================
+  // Individual Checks — real filesystem analysis
+  // =========================================================================
+
+  /**
+   * Check canonical paths: penalize duplicate router implementations.
+   *
+   * Counts files in `cli-adapters/` matching `/router\.ts$/`. Five exist, each
+   * a distinct CompositeRouter stage:
+   *   1. composite-router — pipeline orchestrator
+   *   2. budget-router — budget/cost filtering
+   *   3. zero-router — hard-constraint exclusion
+   *   4. preference-router — user/task preference application
+   *   5. topsis-router — TOPSIS multi-criteria scoring
+   *
+   * The documented chain is Task → BudgetRouter → ZeroRouter →
+   * PreferenceRouter → TopsisRouter → LinUCB → Model. LinUCB is
+   * `linucb-bandit.ts`, which this pattern does not count. The full stage order,
+   * including QualityConstraint and CategoryOverride, is in the
+   * `composite-router.ts` header.
+   *
+   * Why the threshold is 6: #2063 raised it from 5 to fit a sixth file,
+   * agreement-cascade-router, which was never wired into routing and was
+   * deleted in #6688. The threshold was left at 6, so it now allows one file
+   * of headroom over the five above. Only a count ABOVE the threshold costs
+   * points.
+   */
+  private checkCanonicalPaths(): FitnessCheckResult {
+    const findings: FitnessFinding[] = [];
+    let score = 20;
+
+    const routerCount = countFiles(join(SRC_ROOT, 'cli-adapters'), /router\.ts$/);
+    const ROUTER_COUNT_THRESHOLD = 6;
+    if (routerCount > ROUTER_COUNT_THRESHOLD) {
+      const excess = routerCount - ROUTER_COUNT_THRESHOLD;
+      const deduction = Math.min(5, excess);
+      score -= deduction;
+      findings.push(
+        this.finding(
+          'canonicalPaths',
+          'warning',
+          `${String(routerCount)} router implementations found (target: <=${String(ROUTER_COUNT_THRESHOLD)})`,
+          deduction,
+          'Consolidate duplicate routers into CompositeRouter'
+        )
+      );
+    }
+
+    if (existsSync(join(SRC_ROOT, 'cli-adapters/composite-router.ts'))) {
+      score += 2;
+    } else {
+      score -= 3;
+      findings.push(
+        this.finding(
+          'canonicalPaths',
+          'critical',
+          'CompositeRouter missing — no unified routing entry point',
+          3
+        )
+      );
+    }
+
+    score = this.checkOrchestratorInterface(score, findings);
+
+    return { score: clamp(score, 20), findings };
+  }
+
+  /** Sub-check for IOrchestrator interface and adapter wiring. */
+  private checkOrchestratorInterface(score: number, findings: FitnessFinding[]): number {
+    const orchPath = join(SRC_ROOT, 'core/types/orchestrator.ts');
+    if (existsSync(orchPath) && fileContains(orchPath, /interface IOrchestrator/)) {
+      score += 3;
+    } else {
+      score -= 2;
+      findings.push(
+        this.finding('canonicalPaths', 'warning', 'No IOrchestrator interface in core/types', 2)
+      );
+    }
+
+    const adapterPath = join(SRC_ROOT, 'orchestration/orchestrator-adapters.ts');
+    if (existsSync(adapterPath) && fileContains(adapterPath, /TechLeadAdapter|PuppeteerAdapter/)) {
+      score += 2;
+    }
+
+    return score;
+  }
+
+  /**
+   * Check explicit behavior: penalize hidden/magic behavior.
+   *
+   * Implementation is intentionally filesystem-signal-based (no AST parse).
+   * The `NEXUS_ALLOW_MOCK_ORCHESTRATION` guard and magic-routing pattern
+   * grep capture the observable failure modes that historically slipped
+   * past review. AST-based detection of implicit fallbacks was considered
+   * but not pursued — it would significantly widen this function's
+   * footprint and the filesystem signals already catch the recurring
+   * regressions. Revisit only if a new class of hidden-behavior bug
+   * surfaces that this grep-over-source approach can't catch.
+   */
+  private checkExplicitBehavior(): FitnessCheckResult {
+    const findings: FitnessFinding[] = [];
+    let score = 15;
+
+    // Check: mock orchestration requires explicit env var opt-in
+    const mockGuardCount = countMockGuardSites(SRC_ROOT);
+    if (mockGuardCount === 0) {
+      score -= 3;
+      findings.push(
+        this.finding(
+          'explicitBehavior',
+          'warning',
+          'No NEXUS_ALLOW_MOCK_ORCHESTRATION guard found — mock fallback may be implicit',
+          3,
+          'Require explicit env var for mock orchestration'
+        )
+      );
+    }
+
+    // Check: magic routing patterns (delegate without explicit capability match)
+    const magicRouting = countPatternInDir(
+      SRC_ROOT,
+      /\.ts$/,
+      /fallback.*=.*true|implicitRoute/g,
+      DETERMINISM_EXCLUDES
+    );
+    if (magicRouting > 5) {
+      const deduction = Math.min(3, Math.floor(magicRouting / 3));
+      score -= deduction;
+      findings.push(
+        this.finding(
+          'explicitBehavior',
+          'info',
+          `${String(magicRouting)} implicit fallback/routing patterns detected`,
+          deduction
+        )
+      );
+    }
+
+    return { score: clamp(score, 15), findings };
+  }
+
+  /** Check determinism: penalize unseeded random and raw Date.now(). */
+  private checkDeterminism(): FitnessCheckResult {
+    const findings: FitnessFinding[] = [];
+    let score = 15;
+
+    score = this.checkRandomDeterminism(score, findings);
+    score = this.checkTimeDeterminism(score, findings);
+
+    return { score: clamp(score, 15), findings };
+  }
+
+  /** Sub-check for Math.random() and injectable random provider. */
+  private checkRandomDeterminism(score: number, findings: FitnessFinding[]): number {
+    const randomCount = countPatternInDir(
+      SRC_ROOT,
+      /\.ts$/,
+      /Math\.random\(\)/g,
+      DETERMINISM_EXCLUDES
+    );
+    if (randomCount > 10) {
+      const deduction = Math.min(5, Math.floor(randomCount / 5));
+      score -= deduction;
+      findings.push(
+        this.finding(
+          'determinism',
+          'warning',
+          `${String(randomCount)} unseeded Math.random() calls in production code`,
+          deduction,
+          'Use getRandomProvider() for injectable randomness'
+        )
+      );
+    } else if (randomCount === 0) {
+      score += 2;
+    }
+
+    if (existsSync(join(SRC_ROOT, 'core/random-provider.ts'))) {
+      score += 1;
+    }
+    const randomUsage = countPatternInDir(
+      SRC_ROOT,
+      /\.ts$/,
+      /getRandomProvider\(\)/g,
+      DETERMINISM_EXCLUDES
+    );
+    if (randomUsage > 5) {
+      score += 1;
+    }
+
+    return score;
+  }
+
+  /** Sub-check for Date.now() and injectable time provider. */
+  private checkTimeDeterminism(score: number, findings: FitnessFinding[]): number {
+    const dateNowCount = countPatternInDir(
+      SRC_ROOT,
+      /\.ts$/,
+      /Date\.now\(\)/g,
+      DETERMINISM_EXCLUDES
+    );
+    if (dateNowCount > 50) {
+      score -= 2;
+      findings.push(
+        this.finding(
+          'determinism',
+          'info',
+          `${String(dateNowCount)} Date.now() calls in production code`,
+          2,
+          'Use getTimeProvider() for injectable time'
+        )
+      );
+    }
+
+    if (existsSync(join(SRC_ROOT, 'core/time-provider.ts'))) {
+      score += 1;
+    }
+    const timeUsage = countPatternInDir(
+      SRC_ROOT,
+      /\.ts$/,
+      /getTimeProvider\(\)/g,
+      DETERMINISM_EXCLUDES
+    );
+    if (timeUsage > 10) {
+      score += 1;
+    }
+
+    return score;
+  }
+
+  /** Check observability: reward tracing, logging, and audit coverage. */
+  private checkObservability(): FitnessCheckResult {
+    const findings: FitnessFinding[] = [];
+    let score = 15;
+
+    if (existsSync(join(SRC_ROOT, 'observability/swarm-observer.ts'))) {
+      score += 3;
+    } else {
+      score -= 3;
+      findings.push(
+        this.finding(
+          'observability',
+          'warning',
+          'No SwarmObserver found',
+          3,
+          'Add observability/swarm-observer.ts'
+        )
+      );
+    }
+
+    if (existsSync(join(SRC_ROOT, 'core/trace.ts'))) {
+      score += 2;
+    }
+
+    const loggerCount = countPatternInDir(SRC_ROOT, /\.ts$/, /createLogger\(/g);
+    if (loggerCount > 50) {
+      score += 2;
+    } else {
+      findings.push(
+        this.finding(
+          'observability',
+          'info',
+          `Only ${String(loggerCount)} createLogger() calls (target: >50)`,
+          0
+        )
+      );
+    }
+
+    if (existsSync(join(SRC_ROOT, 'audit'))) {
+      score += 2;
+    }
+
+    return { score: clamp(score, 15), findings };
+  }
+
+  /** Check config simplicity: penalize excessive schema sprawl. */
+  private checkConfigSimplicity(): FitnessCheckResult {
+    const findings: FitnessFinding[] = [];
+    let score = 10;
+
+    const schemaCount = countFiles(join(SRC_ROOT, 'config'), /schema.*\.ts$/);
+    if (schemaCount > 10) {
+      score -= 2;
+      findings.push(
+        this.finding(
+          'configSimplicity',
+          'info',
+          `${String(schemaCount)} config schemas (target: <=10)`,
+          2,
+          'Consolidate related schemas'
+        )
+      );
+    } else {
+      score += 1;
+    }
+
+    if (existsSync(join(SRC_ROOT, 'config/config-loader.ts'))) {
+      score += 2;
+    }
+    if (existsSync(join(SRC_ROOT, 'config/config-manager.ts'))) {
+      score += 1;
+    }
+
+    return { score: clamp(score, 10), findings };
+  }
+
+  /** Check layer separation: penalize cross-layer imports. */
+  private checkLayerSeparation(): FitnessCheckResult {
+    const findings: FitnessFinding[] = [];
+    let score = 10;
+
+    const adapterAgentImports = countPatternInDir(
+      join(SRC_ROOT, 'adapters'),
+      /\.ts$/,
+      /from ['"]\.\.\/agents\//g,
+      TEST_FILE_EXCLUDES
+    );
+    if (adapterAgentImports > 0) {
+      const deduction = Math.min(5, adapterAgentImports);
+      score -= deduction;
+      findings.push(
+        this.finding(
+          'layerSeparation',
+          'warning',
+          `${String(adapterAgentImports)} adapter->agent import violations`,
+          deduction,
+          'Adapters should not import from agents layer'
+        )
+      );
+    } else {
+      score += 2;
+    }
+
+    const coreMcpImports = countPatternInDir(
+      join(SRC_ROOT, 'core'),
+      /\.ts$/,
+      /from ['"]\.\.\/mcp\//g,
+      TEST_FILE_EXCLUDES
+    );
+    if (coreMcpImports > 0) {
+      const deduction = Math.min(3, coreMcpImports);
+      score -= deduction;
+      findings.push(
+        this.finding(
+          'layerSeparation',
+          'critical',
+          `${String(coreMcpImports)} core->MCP import violations`,
+          deduction,
+          'Core must not depend on MCP layer'
+        )
+      );
+    } else {
+      score += 1;
+    }
+
+    return { score: clamp(score, 10), findings };
+  }
+
+  /** Check operator ergonomics: reward rich CLI commands. */
+  private checkOperatorErgonomics(): FitnessCheckResult {
+    const findings: FitnessFinding[] = [];
+    let score = 10;
+
+    const commandCount = countFiles(join(SRC_ROOT, 'cli'), /\.ts$/);
+    if (commandCount >= 20) {
+      score += 3;
+    } else {
+      findings.push(
+        this.finding(
+          'operatorErgonomics',
+          'info',
+          `${String(commandCount)} CLI commands (target: >=20)`,
+          0
+        )
+      );
+    }
+
+    score = this.checkCliCommands(score, findings);
+
+    return { score: clamp(score, 10), findings };
+  }
+
+  /** Sub-check for essential CLI commands (doctor, setup, demo, config). */
+  private checkCliCommands(score: number, findings: FitnessFinding[]): number {
+    const commands: Array<[string, string, number]> = [
+      ['cli/doctor.ts', 'Doctor command', 2],
+      ['cli/setup-command.ts', 'Setup wizard', 2],
+      ['cli/demo-command.ts', 'Demo command', 1],
+      ['cli/config-command.ts', 'Config command', 1],
+    ];
+
+    for (const [path, name, bonus] of commands) {
+      if (existsSync(join(SRC_ROOT, path))) {
+        score += bonus;
+      } else {
+        findings.push(this.finding('operatorErgonomics', 'info', `Missing ${name} (${path})`, 0));
+      }
+    }
+
+    return score;
+  }
+
+  /** Check governance integration: policy firewall, rate limiter, docs. */
+  private checkGovernanceIntegration(): FitnessCheckResult {
+    const findings: FitnessFinding[] = [];
+    let score = 5;
+
+    score = this.checkGovernanceDocs(score, findings);
+    score = this.checkGovernanceInfra(score, findings);
+
+    return { score: clamp(score, 5), findings };
+  }
+
+  /** Sub-check for governance documentation artifacts. */
+  private checkGovernanceDocs(score: number, findings: FitnessFinding[]): number {
+    if (!existsSync(join(REPO_ROOT, 'CLAUDE.md'))) {
+      score -= 3;
+      findings.push(
+        this.finding('governanceIntegration', 'critical', 'No CLAUDE.md governance document', 3)
+      );
+    } else {
+      score += 1;
+    }
+
+    if (existsSync(join(DOCS_ROOT, 'architecture/wiring-graph.json'))) {
+      score += 1;
+    }
+
+    if (existsSync(join(DOCS_ROOT, 'adr'))) {
+      score += 1;
+    } else {
+      findings.push(this.finding('governanceIntegration', 'info', 'No ADR directory', 0));
+    }
+
+    return score;
+  }
+
+  /** Sub-check for governance runtime infrastructure. */
+  private checkGovernanceInfra(score: number, findings: FitnessFinding[]): number {
+    const hasPolicyFirewall =
+      countPatternInDir(join(SRC_ROOT, 'security'), /\.ts$/, /PolicyGate|policyFirewall/g) > 0;
+    if (hasPolicyFirewall) {
+      score += 1;
+    } else {
+      findings.push(
+        this.finding(
+          'governanceIntegration',
+          'warning',
+          'No policy firewall detected in security layer',
+          0
+        )
+      );
+    }
+
+    const hasRateLimiter = countPatternInDir(SRC_ROOT, /\.ts$/, /RateLimiter|rateLimiter/g) > 0;
+    if (hasRateLimiter) {
+      score += 1;
+    }
+
+    return score;
+  }
+
+  /** Helper to create a FitnessFinding with defaults. */
+  private finding(
+    dimension: keyof FitnessDimensions,
+    severity: FitnessFinding['severity'],
+    description: string,
+    pointsDeducted: number,
+    suggestion?: string
+  ): FitnessFinding {
+    const base: FitnessFinding = { dimension, severity, description, pointsDeducted };
+    if (suggestion !== undefined) {
+      return { ...base, suggestion };
+    }
+    return base;
+  }
+}
+
+/**
+ * Create a fitness score calculator.
+ */
+export function createFitnessScoreCalculator(logger?: ILogger): FitnessScoreCalculator {
+  return new FitnessScoreCalculator(logger);
+}
+
+/**
+ * Quick function to get current fitness score.
+ */
+export function calculateFitnessScore(version: string): FitnessAudit {
+  const calculator = createFitnessScoreCalculator();
+  return calculator.audit(version);
+}

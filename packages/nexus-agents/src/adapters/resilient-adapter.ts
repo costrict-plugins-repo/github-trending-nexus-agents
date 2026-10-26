@@ -1,0 +1,544 @@
+import type { ExecutionAccessMode } from '../core/types/model.js';
+import { queryModelAccessMode } from './access-mode-support.js';
+import { withTimeout } from '../utils/async-utils.js';
+import { CLI_SUBPROCESS_TIMEOUTS } from '../config/timeouts.js';
+import { raceAbort, throwIfAborted } from './abort-utils.js';
+/**
+ * Resilient Model Adapter
+ *
+ * Transparent proxy implementing IModelAdapter with lazy detection,
+ * automatic failover on circuit breaker events, and observable health.
+ *
+ * Key design: ResilientAdapter IS an IModelAdapter. Every existing consumer
+ * works unchanged. The health/failover API lives on IResilientAdapter for
+ * dashboard and monitoring consumers only.
+ *
+ * @module adapters/resilient-adapter
+ * (Source: Issue #811 - Resilient model adapter architecture)
+ */
+
+import type {
+  IModelAdapter,
+  CompletionRequest,
+  CompletionResponse,
+  StreamChunk,
+  ModelCapability,
+} from '../core/types/model.js';
+import type { Result } from '../core/result.js';
+import { ok, err } from '../core/result.js';
+import { ModelError, ConfigError } from '../core/errors.js';
+import type { ILogger } from '../core/index.js';
+import { getTimeProvider, getRandomProvider } from '../core/index.js';
+import { getErrorMessage, createLogger } from '../core/index.js';
+import { UNRESOLVED_MODEL_ID } from '../config/model-equivalence.js';
+
+import { createAutoAdapter, type AdapterSelection } from './auto-adapter.js';
+import { isCallerCancelled } from './abort-utils.js';
+import { ensureGatewayDiscovered, gatewayDiscoveryGeneration } from './gateway-rediscovery.js';
+import {
+  isRateLimitLikeError,
+  isDurableCapacityError,
+  toRateLimitError,
+  recordRateLimitEvent,
+} from './rate-limit-detector.js';
+import type { CliName, EndpointArmId } from '../cli-adapters/types.js';
+import { isEndpointArmId } from '../cli-adapters/types.js';
+import type {
+  IResilientAdapter,
+  AdapterHealthInfo,
+  ResilientAdapterConfig,
+} from './resilient-adapter-types.js';
+import type { CircuitStateChangeEvent } from '../cli-adapters/circuit-breaker-types.js';
+import type { CircuitBreakerRegistry } from '../cli-adapters/circuit-breaker.js';
+import { mapModelErrorToCategory } from '../cli-adapters/circuit-breaker.js';
+import { breakerKeys } from '../cli-adapters/breaker-key.js';
+import { getGlobalEventBus } from '../core/event-bus.js';
+
+// ============================================================================
+// Factory
+// ============================================================================
+
+/**
+ * Creates a resilient adapter with lazy detection and automatic failover.
+ *
+ * @example
+ * ```typescript
+ * const adapter = createResilientAdapter({ logger });
+ * // No detection at creation time — detection happens on first use
+ * const result = await adapter.complete(request); // triggers detection
+ * ```
+ */
+export function createResilientAdapter(config?: ResilientAdapterConfig): IResilientAdapter {
+  return new ResilientAdapter(config);
+}
+
+// ============================================================================
+// Implementation
+// ============================================================================
+
+/**
+ * Resilient adapter proxy. Implements IModelAdapter transparently.
+ */
+export class ResilientAdapter implements IResilientAdapter {
+  private readonly logger: ILogger;
+  private currentAdapter: IModelAdapter | undefined;
+  private currentSelection: AdapterSelection | undefined;
+  private hasEverDetected = false;
+  private health: AdapterHealthInfo | undefined;
+  private preferredCli: CliName | undefined;
+  private readonly failoverCallbacks = new Set<(info: AdapterHealthInfo) => void>();
+  private circuitBreakerRegistry: CircuitBreakerRegistry | undefined;
+  private circuitListener: ((event: CircuitStateChangeEvent) => void) | undefined;
+  private disposed = false;
+  private readonly defaultCliTimeoutMs: number | undefined;
+  /** Inflight detection promise for coalescing concurrent calls (Issue #1423). */
+  private detectionPromise: Promise<IModelAdapter | undefined> | undefined;
+  /** The {@link gatewayDiscoveryGeneration} the current selection was made under (#6659). */
+  private detectedAtGeneration = 0;
+
+  constructor(config?: ResilientAdapterConfig) {
+    this.logger = config?.logger ?? createLogger({ component: 'resilient-adapter' });
+    this.preferredCli = config?.preferredCli;
+    this.defaultCliTimeoutMs = config?.defaultCliTimeoutMs;
+
+    // #4659: arm at construction. The previous `attach`-only API was not on
+    // IResilientAdapter, so neither production construction site could reach
+    // it and the breaker never fired.
+    if (config?.circuitBreakerRegistry !== undefined) {
+      this.attachCircuitBreakerRegistry(config.circuitBreakerRegistry);
+    }
+  }
+
+  // --- IModelAdapter properties (forwarded) ---
+
+  /**
+   * Before detection a CLI-pinned proxy identifies as the CLI it was asked
+   * for (`cli-<name>`, the id its detected `CliToModelAdapter` will carry);
+   * an unpinned proxy stays `resilient-proxy`.
+   *
+   * #6119: the voter fallover (#3587) keys seats by this id and skips a seat
+   * whose key equals the fallback's. When codex never detected, the pinned
+   * seat and the unpinned default were BOTH `resilient-proxy`, so the seat was
+   * read as "already on the fallback" and errored instead of falling over.
+   */
+  get providerId(): string {
+    if (this.currentAdapter !== undefined) return this.currentAdapter.providerId;
+    return this.preferredCli === undefined ? 'resilient-proxy' : `cli-${this.preferredCli}`;
+  }
+
+  get modelId(): string {
+    return this.currentAdapter?.modelId ?? UNRESOLVED_MODEL_ID;
+  }
+
+  get capabilities(): readonly ModelCapability[] {
+    return this.currentAdapter?.capabilities ?? [];
+  }
+
+  /**
+   * The gateway arm of the adapter currently serving this proxy, when a
+   * gateway model serves it (#6604 family slots); otherwise undefined. A
+   * telemetry writer handed this proxy reads it (`isGatewayModelAdapter`) to
+   * price the call by the gateway's `NEXUS_GATEWAY_COST` declaration instead
+   * of a list price.
+   */
+  get gatewayArm(): EndpointArmId | undefined {
+    const arm: unknown = (this.currentAdapter as { gatewayArm?: unknown } | undefined)?.gatewayArm;
+    return typeof arm === 'string' && isEndpointArmId(arm) ? arm : undefined;
+  }
+
+  /** Resolve current serving evidence; cancellation stops waiting, not underlying discovery. */
+  async supportsAccessMode(
+    mode: ExecutionAccessMode,
+    signal?: AbortSignal
+  ): Promise<boolean | undefined> {
+    throwIfAborted(signal, 'Access-mode detection aborted');
+    const selected = await withTimeout(
+      raceAbort(this.ensureAdapter(), signal),
+      CLI_SUBPROCESS_TIMEOUTS.spawnMs,
+      'Access-mode detection unavailable'
+    );
+    throwIfAborted(signal, 'Access-mode detection aborted');
+    if (!selected.ok || selected.value === undefined) return undefined;
+    return queryModelAccessMode(selected.value, mode, signal);
+  }
+
+  // --- IModelAdapter methods ---
+
+  async complete(request: CompletionRequest): Promise<Result<CompletionResponse, ModelError>> {
+    const adapter = await this.ensureAdapter();
+    if (adapter === undefined) {
+      return err(new ModelError('No model adapter available'));
+    }
+    const result = await adapter.complete(request);
+    if (!result.ok) {
+      if (isRateLimitLikeError(result.error)) {
+        const rlError = toRateLimitError(result.error, adapter.providerId);
+        recordRateLimitEvent({
+          provider: adapter.providerId,
+          timestamp: getTimeProvider().now(),
+          retryAfterMs: rlError.retryAfterMs,
+        });
+        this.logger.warn('Rate limit detected', {
+          provider: adapter.providerId,
+          retryAfterMs: rlError.retryAfterMs,
+        });
+      }
+      this.recordBreakerFailure(adapter, result.error);
+    }
+    return result;
+  }
+
+  async *stream(request: CompletionRequest): AsyncIterable<StreamChunk> {
+    const adapter = await this.ensureAdapter();
+    if (adapter === undefined) {
+      // #3105: error like complete() rather than yielding an empty stream — a
+      // silent-empty stream masks "no adapter available" as a clean empty
+      // completion, so streamWithFallback can't tell failure from a
+      // legitimately-empty result.
+      throw new ModelError('No model adapter available');
+    }
+    yield* adapter.stream(request);
+  }
+
+  async countTokens(text: string): Promise<number> {
+    const adapter = await this.ensureAdapter();
+    if (adapter === undefined) {
+      return 0;
+    }
+    return adapter.countTokens(text);
+  }
+
+  validateConfig(): Result<void, ConfigError> {
+    if (this.currentAdapter !== undefined) {
+      return this.currentAdapter.validateConfig();
+    }
+    // Before first use, config is trivially valid
+    return ok(undefined);
+  }
+
+  // --- IResilientAdapter methods ---
+
+  getHealth(): AdapterHealthInfo | undefined {
+    return this.health;
+  }
+
+  async refresh(): Promise<void> {
+    this.currentAdapter = undefined;
+    this.currentSelection = undefined;
+    this.detectionPromise = undefined;
+    await this.ensureAdapter();
+  }
+
+  setPreferredCli(cli: CliName | undefined): void {
+    this.preferredCli = cli;
+    this.currentAdapter = undefined;
+    this.currentSelection = undefined;
+  }
+
+  onFailover(cb: (info: AdapterHealthInfo) => void): () => void {
+    this.failoverCallbacks.add(cb);
+    return () => {
+      this.failoverCallbacks.delete(cb);
+    };
+  }
+
+  /**
+   * Attach a circuit breaker registry for automatic failover.
+   * When the current adapter's circuit opens, the cached adapter
+   * is cleared so the next call triggers re-detection.
+   */
+  /** The registry arming failover, or undefined if this adapter is unarmed (#4659). */
+  getCircuitBreakerRegistry(): CircuitBreakerRegistry | undefined {
+    return this.circuitBreakerRegistry;
+  }
+
+  attachCircuitBreakerRegistry(registry: CircuitBreakerRegistry): void {
+    this.detachCircuitBreakerRegistry();
+    this.circuitBreakerRegistry = registry;
+    this.circuitListener = (event: CircuitStateChangeEvent) => {
+      this.handleCircuitStateChange(event);
+    };
+    registry.addGlobalStateChangeListener(this.circuitListener);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.detachCircuitBreakerRegistry();
+    this.failoverCallbacks.clear();
+  }
+
+  // --- Private methods ---
+
+  private async ensureAdapter(): Promise<IModelAdapter | undefined> {
+    // #6659: the shared acquisition seam re-discovers a gateway that was down
+    // at boot (backoff-bounded, one shared attempt; a no-op unless armed).
+    // Once one is found, an adapter detected before it re-detects ONCE, so the
+    // default and the family slots move onto the gateway. Not a failover: the
+    // adapter left behind did not fail.
+    // An adapter that already serves calls never waits on discovery: it fires
+    // the attempt and keeps serving, and the generation check below switches
+    // it on a LATER call. Only an adapter with nothing to serve yet waits,
+    // since the discovery may be what gives it something (#6671 review).
+    if (this.currentAdapter === undefined) {
+      await ensureGatewayDiscovered();
+    } else {
+      void ensureGatewayDiscovered();
+    }
+    if (
+      this.currentAdapter !== undefined &&
+      this.detectedAtGeneration !== gatewayDiscoveryGeneration()
+    ) {
+      this.currentAdapter = undefined;
+      this.currentSelection = undefined;
+      this.hasEverDetected = false;
+    }
+    if (this.currentAdapter !== undefined) {
+      return this.currentAdapter;
+    }
+    // Coalesce concurrent detection calls into a single probe (Issue #1423)
+    this.detectionPromise ??= this.detectAdapter().finally(() => {
+      this.detectionPromise = undefined;
+    });
+    return this.detectionPromise;
+  }
+
+  private async detectAdapter(): Promise<IModelAdapter | undefined> {
+    // Read BEFORE detecting: a discovery that lands mid-detection leaves this
+    // selection tagged stale, so the next call re-detects instead of keeping it.
+    const generation = gatewayDiscoveryGeneration();
+    try {
+      this.logger.info('Detecting model adapter (lazy)');
+      const config = {
+        logger: this.logger,
+        ...(this.preferredCli !== undefined && { preferredCli: this.preferredCli }),
+        ...(this.defaultCliTimeoutMs !== undefined && {
+          defaultCliTimeoutMs: this.defaultCliTimeoutMs,
+        }),
+      };
+      const selection = await createAutoAdapter(config);
+      this.applySelection(selection);
+      this.detectedAtGeneration = generation;
+      return this.currentAdapter;
+    } catch (error) {
+      const message = getErrorMessage(error);
+      this.logger.warn('No model adapter available', { error: message });
+      this.health = {
+        source: 'api',
+        state: 'unavailable',
+        selectedAt: new Date(),
+        failoverCount: this.health?.failoverCount ?? 0,
+        lastError: message,
+      };
+      return undefined;
+    }
+  }
+
+  private applySelection(selection: AdapterSelection): void {
+    const isFailover = this.hasEverDetected;
+    // #4670: capture the OUTGOING health before it is overwritten below. The
+    // failover signal is about the adapter we are leaving — `unhealthyCliFrom`
+    // reads `payload.source` as "which CLI is unhealthy" — and that state was
+    // being destroyed one statement before `emitFailover` read it.
+    const outgoingHealth = this.health;
+    this.currentAdapter = selection.adapter;
+    this.currentSelection = selection;
+    this.hasEverDetected = true;
+
+    const source = mapSelectionSource(selection);
+    const failoverCount = (this.health?.failoverCount ?? 0) + (isFailover ? 1 : 0);
+
+    this.health = {
+      source,
+      state: 'healthy',
+      selectedAt: new Date(),
+      failoverCount,
+      ...(selection.modelVerified !== undefined && { modelVerified: selection.modelVerified }),
+    };
+
+    this.logger.info('Adapter selected', {
+      source: selection.source,
+      name: selection.name,
+      model: selection.adapter.modelId,
+      provider: selection.adapter.providerId,
+      failover: isFailover,
+    });
+
+    if (isFailover) {
+      // The state/source describe the adapter we LEFT; `failoverCount` is a
+      // run-level counter, so it carries the post-increment value.
+      this.emitFailover(
+        outgoingHealth === undefined ? undefined : { ...outgoingHealth, failoverCount }
+      );
+    }
+  }
+
+  /**
+   * Record a direct-API failure to the circuit breaker so API adapters get the
+   * same degradation/failover learning that CLI subprocess failures get (#3423).
+   *
+   * The shared internal key policy preserves selected CLI slots, prefixes API
+   * vendor names, and isolates gateway endpoints by slot (#7070).
+   *
+   * A CLI selection is NOT recorded here (#6712). Its CLI adapter's retry loop
+   * (`executeCliRetryLoop`) has already recorded the failure in the same
+   * registry under its route key, with the category taken from
+   * the CliError code. Recording it again counted every CLI failure twice (the
+   * second time usually as `unknown`), so the breaker opened at about half its
+   * configured threshold. Only a direct-API selection, which has no inner
+   * recorder, is recorded by this layer.
+   *
+   * Rate-limit failures are deliberately skipped here: they are already recorded
+   * by the `recordRateLimitEvent` telemetry branch in `complete()`, and the
+   * breaker counts rate limits as failures by default
+   * (`countRateLimitsAsFailures`), so recording them again would double-count.
+   *
+   * Security (#3422 constraint): the logged payload carries only `provider` and
+   * `category` — never `error.message`, the request, or the ModelError object,
+   * any of which could embed credentials.
+   */
+  private recordBreakerFailure(adapter: IModelAdapter, error: ModelError): void {
+    if (this.circuitBreakerRegistry === undefined || this.currentSelection === undefined) {
+      return;
+    }
+    // #6712: the CLI adapter's retry loop owns recording for a CLI selection.
+    if (this.currentSelection.source === 'cli') return;
+
+    // #6691: a call its caller cancelled (cancel_job) is not a health signal.
+    if (isCallerCancelled(error)) return;
+
+    const category = mapModelErrorToCategory(error);
+    // Skip rate limits: already accounted for by the rate-limit telemetry branch
+    // (and the breaker counts them by default). Check BOTH the mapped category
+    // AND the telemetry predicate — their rate-limit pattern lists differ
+    // (`isRateLimitLikeError` matches "quota exceeded"/"throttl"/… that
+    // `categorizeError` does not), so a code-less MODEL_ERROR could otherwise
+    // fire the telemetry branch yet fall through to a counted failure here,
+    // double-counting against the threshold (#3423 review).
+    // #5359: a DURABLE capacity cap is excluded from this exemption. The
+    // exemption is right for a transient throttle — an ordinary panel trips a
+    // per-minute limit while plenty of quota remains, and opening a breaker on
+    // that would empty the candidate pool for a condition clearing within the
+    // minute. It is wrong for an exhausted credential, which does not clear:
+    // never counting it means the breaker never opens, so every subsequent call
+    // pays the same futile retries against the same dead key.
+    const breaker = this.circuitBreakerRegistry.getArmBreaker(
+      breakerKeys.forArm({
+        name: this.currentSelection.name,
+        model: adapter.modelId,
+        gatewayArm: this.gatewayArm,
+      })
+    );
+    if (isDurableCapacityError(error)) {
+      breaker.recordFailure(category);
+      this.logger.warn('Durable capacity cap recorded to circuit breaker', {
+        provider: adapter.providerId,
+        category,
+      });
+      return;
+    }
+
+    if (category === 'rate_limit' || isRateLimitLikeError(error)) {
+      return;
+    }
+
+    breaker.recordFailure(category);
+
+    this.logger.warn('API failure recorded to circuit breaker', {
+      provider: adapter.providerId,
+      category,
+    });
+  }
+
+  private handleCircuitStateChange(event: CircuitStateChangeEvent): void {
+    if (event.newState !== 'open') return;
+
+    const selection = this.currentSelection;
+    if (
+      selection === undefined ||
+      breakerKeys.forArm({
+        name: selection.name,
+        model: this.currentAdapter?.modelId,
+        gatewayArm: this.gatewayArm,
+      }) !== event.armId
+    ) {
+      return; // Not our current adapter
+    }
+
+    this.logger.warn('Current adapter circuit opened, clearing cache for re-detection', {
+      cli: event.cliName,
+      reason: event.reason,
+    });
+
+    this.currentAdapter = undefined;
+    this.currentSelection = undefined;
+
+    if (this.health !== undefined) {
+      this.health = {
+        ...this.health,
+        state: 'degraded',
+        lastError: event.reason,
+      };
+    }
+  }
+
+  /**
+   * Emit the failover signal describing the adapter we failed AWAY FROM (#4670).
+   *
+   * This used to read `this.health`, which `applySelection` had just replaced
+   * with the incoming adapter's `state: 'healthy'`. So every `adapter.failover`
+   * payload said healthy, `unhealthyCliFrom` (`observability/failover-signals.ts`)
+   * returned undefined for all of them, and `signal.swarm_unhealthy` was never
+   * produced by this — the more reliable of its two producers.
+   *
+   * An undefined outgoing health emits NOTHING rather than falling back to the
+   * current one. Falling back would silently restore the old behaviour, and a
+   * failover whose prior state we cannot describe is not evidence that the
+   * prior adapter was healthy.
+   */
+  private emitFailover(outgoingHealth: AdapterHealthInfo | undefined): void {
+    const info = outgoingHealth;
+    if (info === undefined) return;
+
+    for (const cb of this.failoverCallbacks) {
+      try {
+        cb(info);
+      } catch (error: unknown) {
+        this.logger.debug('Failover callback error', { error: getErrorMessage(error) });
+      }
+    }
+
+    try {
+      const eventBus = getGlobalEventBus();
+      eventBus.emit({
+        eventId: `failover-${getTimeProvider().now().toString(36)}-${getRandomProvider().random().toString(36).slice(2, 8)}`,
+        timestamp: new Date().toISOString(),
+        topic: 'adapter.failover',
+        payload: info,
+      });
+    } catch (error: unknown) {
+      this.logger.debug('CollaborationEventBus emit failed during failover', {
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private detachCircuitBreakerRegistry(): void {
+    if (this.circuitBreakerRegistry !== undefined && this.circuitListener !== undefined) {
+      this.circuitBreakerRegistry.removeGlobalStateChangeListener(this.circuitListener);
+    }
+    this.circuitBreakerRegistry = undefined;
+    this.circuitListener = undefined;
+  }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function mapSelectionSource(selection: AdapterSelection): CliName | 'api' {
+  if (selection.source === 'cli') {
+    return selection.name as CliName;
+  }
+  return 'api';
+}

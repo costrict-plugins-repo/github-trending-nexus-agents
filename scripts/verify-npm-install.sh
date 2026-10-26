@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# Verify a clean `npm install -g nexus-agents` produces a working CLI + MCP
+# server. Designed to run inside Dockerfile.npm-verify but also works on bare
+# metal. Each phase fails fast with a clear marker so CI logs are scannable.
+#
+# Usage:
+#   scripts/verify-npm-install.sh                          # verify latest published
+#   scripts/verify-npm-install.sh 2.29.0                   # pin to specific version
+#   scripts/verify-npm-install.sh /path/to/package.tgz     # verify local tarball
+#                                                          # (catches packaging bugs
+#                                                          # before publish — see #1841)
+#
+# Exit codes:
+#   0 — all smoke tests passed
+#   1 — install failed
+#   2 — binary not on PATH
+#   3 — version mismatch or unknown install mode
+#   4 — --help missing core commands
+#   5 — doctor command failed
+#   6 — MCP stdio handshake failed
+#   7 — SQLite unusable after a scripts-blocked install (#5388)
+#   8 — node:sqlite experimental warning leaked to users (#5392)
+#   9 — ast-grep native grammars unusable / polyglot scanner found nothing (#5427)
+#  10 — the package manager blocked, ignored or asked about a dependency install
+#        script (#6481): pnpm 12 in a terminal stalls on that prompt, npm 12 under
+#        strict-allow-scripts fails; the published tarball bundles those deps
+#  11 — installed public TypeScript consumer or its pinned toolchain failed
+set -euo pipefail
+
+VERSION="${1:-latest}"
+EXPECTED_VERSION="${EXPECTED_NEXUS_VERSION:-}"  # optional pin
+INSTALL_MODE="${NEXUS_VERIFY_INSTALL_MODE:-ignore-scripts}"
+
+step() { printf '\n========== %s ==========\n' "$*"; }
+fail() { printf '❌ %s\n' "$*" >&2; exit "${2:-1}"; }
+ok()   { printf '✅ %s\n' "$*"; }
+
+read_installed_version() {
+  local raw_version
+  raw_version=$(nexus-agents --version 2>&1 | tr -d '\r' | tail -1 || true)
+  INSTALLED_VERSION=$(printf '%s' "$raw_version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+  if [[ -z "$INSTALLED_VERSION" ]]; then
+    fail "--version did not contain a semver after install: '$raw_version'" 3
+  fi
+}
+
+resolve_requested_version() {
+  local version_output
+  if [[ -f "$VERSION" ]]; then
+    if ! version_output=$(tar -xOf "$VERSION" package/package.json 2>&1); then
+      printf '%s\n' "$version_output" >&2
+      fail "could not read package.json from tarball: $VERSION" 3
+    fi
+    REQUESTED_VERSION=$(printf '%s' "$version_output" | node -e '
+      let input = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", (chunk) => { input += chunk; });
+      process.stdin.on("end", () => { process.stdout.write(JSON.parse(input).version); });
+    ')
+  elif [[ "$VERSION" == "latest" ]]; then
+    if ! version_output=$(npm view nexus-agents version); then
+      fail "could not resolve requested version: $INSTALL_SPEC" 3
+    fi
+    REQUESTED_VERSION="$version_output"
+  else
+    if ! version_output=$(npm view "$INSTALL_SPEC" version); then
+      fail "could not resolve requested version: $INSTALL_SPEC" 3
+    fi
+    REQUESTED_VERSION=$(printf '%s' "$version_output" | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  fi
+  if [[ -z "$REQUESTED_VERSION" ]]; then
+    fail "requested package version did not contain a semver" 3
+  fi
+}
+
+case "$INSTALL_MODE" in
+  ignore-scripts | default | npm12 | npm12-strict | update | pnpm) ;;
+  *) fail "unknown install mode: $INSTALL_MODE" 3 ;;
+esac
+
+# #6481. Output of the install step for the modes whose package manager gates
+# dependency install scripts. Any blocked/ignored/approval line means a real
+# user's install either stalled (pnpm 12 prompts in a terminal) or failed (npm
+# 12 strict-allow-scripts), so it is a failure here, not a warning.
+INSTALL_LOG=$(mktemp)
+assert_no_blocked_scripts() {
+  local hits
+  hits=$(grep -E 'install scripts blocked|install-scripts|ESTRICTALLOWSCRIPTS|not covered by allowScripts|Ignored build scripts|approve-builds' "$INSTALL_LOG" || true)
+  if [[ -n "$hits" ]]; then
+    printf '%s\n' "$hits" >&2
+    fail "INSTALL_MODE=$INSTALL_MODE: a dependency install script was blocked or awaits approval (#6481)" 10
+  fi
+}
+
+step "Phase 1: install nexus-agents@${VERSION}"
+# Detect tarball path vs version spec. Tarballs install by file path directly;
+# versions install via the registry as `nexus-agents@<version>`.
+if [[ -f "$VERSION" ]]; then
+  INSTALL_SPEC="$VERSION"
+  printf 'Installing from local tarball: %s\n' "$INSTALL_SPEC"
+else
+  INSTALL_SPEC="nexus-agents@${VERSION}"
+fi
+case "$INSTALL_MODE" in
+  ignore-scripts)
+    # Defense in depth: --ignore-scripts blocks postinstall hooks from arbitrary
+    # packages in the dep tree. We can't hash-pin `npm install -g <name>@<version>`
+    # the way Scorecard suggests (hash-pinning via --require-hashes needs a lock
+    # file; global installs are by-name), but --ignore-scripts mitigates the class
+    # of threats the pin-check defends against.
+    if ! npm install -g "$INSTALL_SPEC" --omit=optional --ignore-scripts 2>&1; then
+      fail "npm install failed" 1
+    fi
+    ;;
+  default)
+    if ! npm install -g "$INSTALL_SPEC" 2>&1; then
+      fail "npm install failed" 1
+    fi
+    ;;
+  npm12 | npm12-strict)
+    if ! npm install -g npm@12 2>&1; then
+      fail "npm 12 install failed" 1
+    fi
+    hash -r
+    NPM_VERSION=$(npm -v)
+    if [[ "$NPM_VERSION" != 12.* ]]; then
+      fail "npm 12 activation failed: npm -v reported $NPM_VERSION" 1
+    fi
+    if [[ "$INSTALL_MODE" == "npm12-strict" ]]; then
+      npm config set strict-allow-scripts=true --location=user
+    fi
+    INSTALL_STATUS=0
+    npm install -g "$INSTALL_SPEC" >"$INSTALL_LOG" 2>&1 || INSTALL_STATUS=$?
+    cat "$INSTALL_LOG"
+    assert_no_blocked_scripts
+    if [[ "$INSTALL_STATUS" -ne 0 ]]; then
+      fail "npm install failed under npm 12 ($INSTALL_MODE)" 1
+    fi
+    ;;
+  update)
+    resolve_requested_version
+    if ! npm install -g nexus-agents@8.6.0 2>&1; then
+      fail "older nexus-agents install failed" 1
+    fi
+    read_installed_version
+    if [[ "$INSTALLED_VERSION" != "8.6.0" ]]; then
+      fail "older-version mismatch: expected 8.6.0, got $INSTALLED_VERSION" 3
+    fi
+    PREVIOUS_VERSION="$INSTALLED_VERSION"
+    if ! npm install -g "$INSTALL_SPEC" 2>&1; then
+      fail "npm update-in-place failed" 1
+    fi
+    read_installed_version
+    if [[ "$INSTALLED_VERSION" == "$PREVIOUS_VERSION" ]]; then
+      fail "update did not change version from $PREVIOUS_VERSION" 3
+    fi
+    if [[ "$INSTALLED_VERSION" != "$REQUESTED_VERSION" ]]; then
+      fail "updated-version mismatch: expected $REQUESTED_VERSION, got $INSTALLED_VERSION" 3
+    fi
+    ;;
+  pnpm)
+    export PNPM_HOME="$HOME/.pnpm"
+    export PATH="$PNPM_HOME:$PNPM_HOME/bin:$PATH"
+    if ! corepack enable 2>&1; then
+      fail "corepack enable failed" 1
+    fi
+    if ! corepack prepare pnpm@latest --activate 2>&1; then
+      fail "pnpm activation failed" 1
+    fi
+    resolve_requested_version
+    # KEBAB, not camelCase. pnpm 12 defaults `minimumReleaseAge` to 24h, so
+    # `latest` resolves to the newest release OLDER than that — 8.19.1 while
+    # latest was 8.31.0. `--config.minimumReleaseAge=0` is accepted and
+    # silently ignored; `--config.minimum-release-age=0` is the form that
+    # takes. Verified in a clean node:22-bookworm-slim container against
+    # pnpm 12.3.4: camelCase installed 8.19.1, kebab installed 8.31.0.
+    INSTALL_STATUS=0
+    pnpm add -g "$INSTALL_SPEC" --config.minimum-release-age=0 >"$INSTALL_LOG" 2>&1 || INSTALL_STATUS=$?
+    cat "$INSTALL_LOG"
+    if [[ "$INSTALL_STATUS" -ne 0 ]]; then
+      fail "pnpm global install failed" 1
+    fi
+    # Non-interactive here, so pnpm prints "Ignored build scripts" where a
+    # terminal install would stop at its approve-builds prompt — same list.
+    assert_no_blocked_scripts
+    read_installed_version
+    if [[ "$INSTALLED_VERSION" != "$REQUESTED_VERSION" ]]; then
+      fail "pnpm-version mismatch: expected $REQUESTED_VERSION, got $INSTALLED_VERSION" 3
+    fi
+    if ! PNPM_PACKAGE_LIST=$(pnpm list -g --parseable nexus-agents 2>&1); then
+      printf '%s\n' "$PNPM_PACKAGE_LIST" >&2
+      fail "could not locate pnpm global package" 1
+    fi
+    PACKAGE_ROOT=$(printf '%s\n' "$PNPM_PACKAGE_LIST" | tail -1)
+    if [[ "$PACKAGE_ROOT" != */node_modules/nexus-agents || ! -d "$PACKAGE_ROOT" ]]; then
+      fail "pnpm global package path is invalid: $PACKAGE_ROOT" 1
+    fi
+    ;;
+esac
+
+if [[ "$INSTALL_MODE" != "pnpm" ]]; then
+  PACKAGE_ROOT="$(npm root -g)/nexus-agents"
+fi
+ok "installed"
+
+step "Phase 2: binary on PATH"
+if ! command -v nexus-agents >/dev/null 2>&1; then
+  fail "nexus-agents binary not found on PATH (npm prefix: $(npm config get prefix))" 2
+fi
+ok "binary at $(command -v nexus-agents)"
+
+step "Phase 3: --version reports a semver"
+RAW_VERSION=$(nexus-agents --version 2>&1 | tr -d '\r' | tail -1)
+ACTUAL_VERSION=$(printf '%s' "$RAW_VERSION" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if [[ -z "$ACTUAL_VERSION" ]]; then
+  fail "--version did not contain a semver: '$RAW_VERSION'" 3
+fi
+ok "version: $ACTUAL_VERSION (raw output: $RAW_VERSION)"
+if [[ -n "$EXPECTED_VERSION" && "$ACTUAL_VERSION" != "$EXPECTED_VERSION"* ]]; then
+  fail "version mismatch: expected $EXPECTED_VERSION, got $ACTUAL_VERSION" 3
+fi
+ok "INSTALL_MODE=$INSTALL_MODE: install ok ($ACTUAL_VERSION)"
+
+step "Public TypeScript declarations: installed package consumer (#7576)"
+# The consumer is a sibling of the package in node_modules, including pnpm's
+# virtual store layout. Bare resolution reaches the ACTUAL installed package;
+# only compiler tools go into this private consumer. No second product install.
+(
+  TYPE_CONSUMER=$(mktemp -d "$(dirname "$PACKAGE_ROOT")/.nexus-types.XXXXXX") || fail "could not create owned TypeScript consumer" 11
+  trap 'rm -rf "$TYPE_CONSUMER"' EXIT
+  cd "$TYPE_CONSUMER"
+  printf '%s\n' '{"name":"nexus-public-type-consumer","private":true,"type":"module"}' > package.json
+  if ! PACKAGE_ROOT="$PACKAGE_ROOT" INSTALLED_VERSION="$ACTUAL_VERSION" node --input-type=module <<'TYPE_IDENTITY'
+import { readFileSync, realpathSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const root = realpathSync(process.env.PACKAGE_ROOT);
+const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+const resolved = realpathSync(fileURLToPath(import.meta.resolve('nexus-agents')));
+if (manifest.name !== 'nexus-agents' || manifest.version !== process.env.INSTALLED_VERSION ||
+    resolved !== realpathSync(join(root, 'dist/index.js'))) {
+  throw new Error('Bare nexus-agents specifier does not identify the installed package');
+}
+console.log(`Installed TypeScript consumer resolves nexus-agents to ${resolved}`);
+TYPE_IDENTITY
+  then
+    fail "installed package identity check failed" 11
+  fi
+  if ! npm install --prefix "$TYPE_CONSUMER" --ignore-scripts --save-dev --save-exact \
+      typescript@6.0.3 @types/node@24.19.2 undici@6.29.1; then
+    fail "pinned TypeScript consumer toolchain installation failed" 11
+  fi
+  if [[ ! -f "$TYPE_CONSUMER/node_modules/typescript/bin/tsc" ]]; then
+    fail "pinned TypeScript consumer toolchain is unavailable" 11
+  fi
+  if ! node --input-type=module <<'TYPE_VERSIONS'
+import { readFileSync } from 'node:fs';
+for (const [name, expected] of [['typescript', '6.0.3'], ['@types/node', '24.19.2'], ['undici', '6.29.1']]) {
+  const version = JSON.parse(readFileSync(`node_modules/${name}/package.json`, 'utf8')).version;
+  if (version !== expected) throw new Error(`TypeScript consumer toolchain mismatch: ${name}`);
+  console.log(`TypeScript consumer toolchain: ${name}@${version}`);
+}
+TYPE_VERSIONS
+  then
+    fail "pinned TypeScript consumer toolchain version check failed" 11
+  fi
+  cat > bare-consumer.ts <<'BARE_CONSUMER'
+import { EventBus } from 'nexus-agents';
+void new EventBus();
+BARE_CONSUMER
+  cat > dispatcher-consumer.ts <<'DISPATCHER_CONSUMER'
+import { type OpenAIAdapterConfig } from 'nexus-agents';
+import { ProxyAgent } from 'undici';
+const dispatcher = new ProxyAgent('http://127.0.0.1:8080');
+const valid: OpenAIAdapterConfig['fetchOptions'] = { dispatcher };
+// @ts-expect-error dispatcher strings are invalid
+const invalidString: OpenAIAdapterConfig['fetchOptions'] = { dispatcher: 'FAKE_INVALID_DISPATCHER' };
+// @ts-expect-error arbitrary objects are not dispatchers
+const invalidObject: OpenAIAdapterConfig['fetchOptions'] = { dispatcher: { notADispatcher: true } };
+// @ts-expect-error this public projection accepts dispatcher only
+const unrelatedOption: OpenAIAdapterConfig['fetchOptions'] = { dispatcher, headers: { 'x-test': 'FAKE' } };
+void [valid, invalidString, invalidObject, unrelatedOption];
+DISPATCHER_CONSUMER
+  # Default TypeScript libraries intentionally include DOM. The explicit type
+  # root selects pinned Node declarations, without workspace tsconfig aliases.
+  TYPE_FLAGS=(--ignoreConfig --noEmit --strict --module NodeNext --moduleResolution NodeNext --target ES2022 --types node --typeRoots "$TYPE_CONSUMER/node_modules/@types")
+  printf 'Compiler command:'
+  printf ' %q' node "$TYPE_CONSUMER/node_modules/typescript/bin/tsc" "${TYPE_FLAGS[@]}" bare-consumer.ts
+  printf '\n'
+  if ! node "$TYPE_CONSUMER/node_modules/typescript/bin/tsc" "${TYPE_FLAGS[@]}" bare-consumer.ts; then
+    fail "installed public TypeScript declarations failed (bare EventBus consumer)" 11
+  fi
+  printf 'Compiler command:'
+  printf ' %q' node "$TYPE_CONSUMER/node_modules/typescript/bin/tsc" "${TYPE_FLAGS[@]}" dispatcher-consumer.ts
+  printf '\n'
+  if ! node "$TYPE_CONSUMER/node_modules/typescript/bin/tsc" "${TYPE_FLAGS[@]}" dispatcher-consumer.ts; then
+    fail "installed dispatcher TypeScript controls failed" 11
+  fi
+)
+ok "installed package public declarations and dispatcher controls compile"
+
+step "Phase 4: --help lists core commands"
+HELP_OUT=$(nexus-agents --help 2>&1 || true)
+for cmd in orchestrate vote workflow expert doctor; do
+  if ! printf '%s' "$HELP_OUT" | grep -qiE "(^|[[:space:]])$cmd"; then
+    fail "--help missing expected command: $cmd" 4
+  fi
+done
+ok "all 5 core commands present in --help"
+
+step "Phase 5: doctor command runs"
+# `doctor` exits non-zero when CLIs aren't installed (expected in a bare
+# container). Treat as success as long as it produced its summary line.
+DOCTOR_OUT=$(nexus-agents doctor 2>&1 || true)
+if ! printf '%s' "$DOCTOR_OUT" | grep -qE 'Summary:|MCP Server mode|Models available'; then
+  printf '%s\n' "$DOCTOR_OUT" >&2
+  fail "doctor did not produce expected output sections" 5
+fi
+ok "doctor ran (output length: ${#DOCTOR_OUT} chars)"
+
+step "Phase 6: MCP stdio server starts + responds to tools/list"
+# Keep the server's stdin open until its complete response arrives. Closing it
+# immediately can cut a large tools/list JSON line at a pipe-buffer boundary;
+# grepping that partial line previously certified the install as healthy (#6824).
+if ! node <<'NODE'
+const { spawn } = require('node:child_process');
+const server = spawn('nexus-agents', ['--mode=server'], { stdio: ['pipe', 'pipe', 'ignore'] });
+let buffer = '';
+let initialized = false;
+let finished = false;
+const deadline = setTimeout(() => fail('MCP tools/list timed out'), 10_000);
+
+function finish(message, success = false) {
+  if (finished) return;
+  finished = true;
+  clearTimeout(deadline);
+  server.kill('SIGKILL');
+  const stream = success ? process.stdout : process.stderr;
+  stream.write(`${message}\n`, () => process.exit(success ? 0 : 1));
+}
+function fail(message) { finish(message); }
+
+server.on('error', (error) => fail(`MCP server could not start: ${error.message}`));
+server.on('close', () => fail('MCP server exited with an incomplete tools/list response'));
+server.stdout.setEncoding('utf8');
+server.stdout.on('data', (chunk) => {
+  buffer += chunk;
+  if (buffer.length > 4_000_000) return fail('MCP response exceeded 4 MB');
+  let newline;
+  while (!finished && (newline = buffer.indexOf('\n')) !== -1) {
+    const line = buffer.slice(0, newline).trim();
+    buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    let response;
+    try { response = JSON.parse(line); }
+    catch { return fail('MCP server returned malformed or incomplete JSON'); }
+    if (response?.jsonrpc !== '2.0') return fail('MCP server returned invalid JSON-RPC');
+    if (response.id === 1) {
+      const result = response.result;
+      if (Object.hasOwn(response, 'error') ||
+          typeof result?.protocolVersion !== 'string' || !result.protocolVersion ||
+          typeof result.capabilities !== 'object' || result.capabilities === null || Array.isArray(result.capabilities) ||
+          typeof result.serverInfo?.name !== 'string' || !result.serverInfo.name ||
+          typeof result.serverInfo.version !== 'string' || !result.serverInfo.version) {
+        return fail('MCP initialize failed');
+      }
+      initialized = true;
+      continue;
+    }
+    if (response.id !== 2) continue;
+    if (!initialized) return fail('MCP tools/list arrived without initialization');
+    if (Object.hasOwn(response, 'error')) return fail('MCP tools/list failed');
+    const tools = response.result?.tools;
+    if (!Array.isArray(tools) || tools.some((tool) => typeof tool?.name !== 'string' || !tool.name)) {
+      return fail('MCP tools/list response is invalid');
+    }
+    if (Object.hasOwn(response.result, 'nextCursor')) return fail('MCP tools/list is paginated; partial listing cannot be certified');
+    const names = new Set(tools.map((tool) => tool.name));
+    if (names.size !== tools.length) return fail('MCP tools/list contains duplicate names');
+    if (!names.has('orchestrate')) return fail('MCP tools/list omitted orchestrate');
+    if (names.size < 25) return fail(`MCP tool count below sanity floor of 25 (got ${names.size})`);
+    return finish(`MCP server responded; advertised ${names.size} distinct tools (expected ≥ 25)`, true);
+  }
+});
+
+for (const message of [
+  { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'verify-npm-install', version: '1.0' } } },
+  { jsonrpc: '2.0', method: 'notifications/initialized' },
+  { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+]) server.stdin.write(`${JSON.stringify(message)}\n`);
+NODE
+then
+  fail "MCP stdio handshake failed" 6
+fi
+
+step "Phase 7: SQLite is actually usable (#5388)"
+# THE phase this file was missing. Install above already passes
+# `--ignore-scripts`, which is exactly the condition that broke end users: with
+# better-sqlite3 the native binding was never built, `npm install` still exited
+# 0, and the CLI died at runtime with "Could not locate the bindings file".
+#
+# Phases 1-6 all passed in that state, because not one of them touches a
+# SQLite-backed path — and Phase 5 explicitly tolerates a failing `doctor`. A
+# gate that cannot observe the breakage it is meant to catch is not a gate.
+#
+# `doctor` reports SQLite availability explicitly, so assert the POSITIVE
+# verdict rather than merely that doctor ran.
+SQLITE_OUT=$(nexus-agents doctor 2>&1 || true)
+if printf '%s' "$SQLITE_OUT" | grep -qiE 'SQLite[^\n]*Not available'; then
+  printf '%s\n' "$SQLITE_OUT" | grep -iE 'SQLite' >&2
+  fail "SQLite reported unavailable after an --ignore-scripts install (#5388)" 7
+fi
+if ! printf '%s' "$SQLITE_OUT" | grep -qiE 'SQLite'; then
+  fail "doctor no longer reports SQLite availability — Phase 7 cannot fail, so it is not a check" 7
+fi
+ok "SQLite available without any install script"
+
+step "Phase 8: no experimental-SQLite warning leaks to users (#5392)"
+# `node:sqlite` is experimental on Node 22 and Node emits its warning at IMPORT
+# time, not first use. The CLI filters that one warning — but #5388 shipped a
+# filter that could never fire, because the bundler hoists a static
+# `import ... from 'node:sqlite'` above the filter's installation.
+#
+# Every unit test of the filter passed while it was useless, since each one
+# installed the filter and then raised a warning by hand. Only the built
+# artifact shows the truth, so assert on the artifact.
+WARN_OUT=$(nexus-agents doctor 2>&1 >/dev/null || true)
+if printf '%s' "$WARN_OUT" | grep -q 'SQLite is an experimental feature'; then
+  printf '%s\n' "$WARN_OUT" | head -5 >&2
+  fail "node:sqlite ExperimentalWarning leaked to stderr — the CLI filter is not firing (#5392)" 8
+fi
+ok "no experimental-SQLite warning on stderr"
+
+step "Phase 9: ast-grep native grammars still parse (#5427)"
+# The OTHER native surface, and since #5388 removed better-sqlite3, the last
+# one. @ast-grep/lang-{python,go} ship prebuilt tree-sitter `.so` grammars and
+# declare a `postinstall`, so under the --ignore-scripts install above they are
+# in exactly the position better-sqlite3 was in: nothing rebuilt them.
+#
+# Importing them is not evidence — their `libraryPath` is a lazy getter, so the
+# import succeeds whether or not the `.so` exists. Parsing alone is not evidence
+# either: tree-sitter is error-tolerant, so the Go grammar parses Python source
+# without complaint and simply finds nothing. Both halves are why this asserts
+# on named RULE IDS from a fixture rather than on an exit code.
+GRAMMAR_FIXTURE=$(mktemp -d)
+trap 'rm -rf "$GRAMMAR_FIXTURE"' EXIT
+cat > "$GRAMMAR_FIXTURE/bad.py" <<'PYFIXTURE'
+import os
+
+
+def run(cmd):
+    os.system("ls " + cmd)
+    eval(cmd)
+PYFIXTURE
+
+# `nexus-agents verify` reports the grammars as a named check, so assert its
+# POSITIVE verdict — the same shape as Phase 7, and the diagnostic a user gets.
+GRAMMAR_VERIFY=$(nexus-agents verify 2>&1 || true)
+if ! printf '%s' "$GRAMMAR_VERIFY" | grep -qi 'Native Grammars'; then
+  printf '%s\n' "$GRAMMAR_VERIFY" >&2
+  fail "verify no longer reports a Native Grammars check — Phase 9 cannot fail, so it is not a check" 9
+fi
+if printf '%s' "$GRAMMAR_VERIFY" | grep -i 'Native Grammars' | grep -qiE 'unavailable|unusable|failed'; then
+  printf '%s\n' "$GRAMMAR_VERIFY" | grep -i 'Native Grammars' >&2
+  fail "verify reports the ast-grep grammars unusable after an --ignore-scripts install (#5427)" 9
+fi
+ok "verify reports Native Grammars healthy"
+
+# Then the real scanner end to end: dist/security/ast-rules YAML + dynamic
+# grammar registration + the walk. Run from inside the fixture directory
+# because collectAstQaFindings refuses a scope outside the cwd.
+cat > "$GRAMMAR_FIXTURE/probe.mjs" <<PROBE
+import { runAstQaRules } from '${PACKAGE_ROOT}/dist/index.js';
+const findings = await runAstQaRules({ targetDir: process.cwd() });
+console.log(findings.map((f) => f.ruleId).sort().join(','));
+PROBE
+SCAN_OUT=$(cd "$GRAMMAR_FIXTURE" && node probe.mjs 2>&1 || true)
+for expected in dangerous-eval-python shell-injection-python; do
+  if ! printf '%s' "$SCAN_OUT" | grep -q "$expected"; then
+    printf 'scanner output: %s\n' "$SCAN_OUT" >&2
+    fail "polyglot scanner did not report $expected — the Python grammar is not usable (#5427)" 9
+  fi
+done
+ok "polyglot scanner returned both expected findings without any install script"
+
+step "All smoke tests passed"
+printf '✅ nexus-agents@%s installs and runs cleanly\n' "$ACTUAL_VERSION"

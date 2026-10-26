@@ -1,0 +1,1352 @@
+/**
+ * run_dev_pipeline MCP Tool Tests (#1684)
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Pass-through the secure-handler / timeout chain so the registered callback
+// is the bare handler — lets the tests invoke it directly (#2824).
+vi.mock('../middleware/tool-wrapper.js', () => ({
+  wrapToolWithTimeout: (_name: string, fn: unknown) => fn,
+  toSdkCallback: (fn: unknown) => fn,
+  getToolTimeout: () => 900_000,
+}));
+vi.mock('../middleware/secure-handler.js', () => ({
+  createSecureHandler: (fn: unknown) => fn,
+}));
+
+// #3712: capture the options (esp. trustTier) handed to runDevPipeline so we can
+// assert the consensus→execute snapshot is fed the caller's real trust tier.
+const PIPELINE_RESULT = {
+  completed: true,
+  plan: 'plan',
+  tasks: [],
+  voteIterations: 1,
+  qaIterations: 1,
+  securityPassed: true,
+};
+const runDevPipelineMock = vi.fn(
+  (_task: string, _stages: unknown, _options?: { trustTier?: string; dryRun?: boolean }) =>
+    Promise.resolve(PIPELINE_RESULT)
+);
+vi.mock('../../pipeline/dev-pipeline.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../pipeline/dev-pipeline.js')>();
+  return {
+    ...actual,
+    runDevPipeline: (
+      task: string,
+      stages: unknown,
+      options?: { trustTier?: string; dryRun?: boolean }
+    ) => runDevPipelineMock(task, stages, options),
+  };
+});
+
+import {
+  DevPipelineInputSchema,
+  registerDevPipelineTool,
+  runDevPipelineForGoal,
+} from './dev-pipeline-tool.js';
+import { buildStructuredOutput } from './dev-pipeline-output.js';
+import type { DevPipelineResult } from '../../pipeline/dev-pipeline.js';
+import { ERROR_ENVELOPE_META_KEY } from '../error-envelope.js';
+import { readJobResult } from '../jobs/job-result-store.js';
+import { _resetForTests as resetJobConcurrency } from '../jobs/job-concurrency.js';
+import {
+  _resetActiveWorkspaceRootForTests,
+  resetNexusDataDirCache,
+  setActiveWorkspaceRoot,
+} from '../../config/nexus-data-dir.js';
+import type { CallerInfo } from '../middleware/request-context.js';
+import { createRequestContext } from '../middleware/request-context.js';
+import type { HandlerContext } from '../middleware/secure-handler.js';
+import { createLogger } from '../../core/index.js';
+import * as agentExecutor from '../../pipeline/agent-executor.js';
+import {
+  createSymlinkEscapeFixture,
+  type SymlinkEscapeFixture,
+} from '../../testing/symlink-escape-fixture.js';
+
+interface HandlerCtx {
+  // `caller` is part of the real RequestContext and is what makes the tier a
+  // measurement rather than the `deriveTrustTier({})` fallback (#4733), so the
+  // fixture type has to carry it.
+  requestContext: { trustTier: string; caller?: CallerInfo };
+  sanitization?: HandlerContext['sanitization'];
+}
+type CtxHandler = (args: unknown, ctx?: HandlerCtx) => Promise<CapturedToolResult>;
+
+interface CapturedToolResult {
+  isError?: boolean;
+  content: Array<{ type: string; text: string }>;
+  /** #5888: a hoisted failure carries its payload here, not in `content`. */
+  _meta?: Record<string, unknown>;
+}
+
+/**
+ * A stdio-tier (trusted) context, the production default for a local CLI caller.
+ * The `caller` is what a real stdio request carries; without it the tier is the
+ * constant fallback and is deliberately not threaded (#4733).
+ */
+const STDIO_CTX: HandlerCtx = {
+  requestContext: { trustTier: '1', caller: { transport: 'stdio' } },
+};
+
+/**
+ * Registers the tool against a mock server and returns the captured callback.
+ * The secure-handler is mocked to identity (top of file), so the captured value
+ * is the bare 2-arg `(args, ctx)` handler — tests must pass a HandlerCtx (#3712).
+ */
+function captureHandler(): CtxHandler {
+  let captured: CtxHandler | undefined;
+  let registeredName: string | undefined;
+  const mockServer = {
+    registerTool: (name: string, _schema: unknown, handler: unknown) => {
+      registeredName = name;
+      captured = handler as CtxHandler;
+    },
+  };
+  registerDevPipelineTool(mockServer as never, {
+    rateLimiter: { tryConsume: () => ({ allowed: true, remaining: 99 }) } as never,
+  });
+  expect(registeredName).toBe('run_dev_pipeline');
+  if (captured === undefined) throw new Error('handler not registered');
+  return captured;
+}
+
+describe('DevPipelineInputSchema', () => {
+  it('documents the quick panel and intentional full-panel escalation (#7297)', () => {
+    const description = DevPipelineInputSchema.shape.quickMode.description;
+    expect(description).toContain('3');
+    expect(description).toContain('architect, security, scope_steward');
+    expect(description).toMatch(/7.*escalat/i);
+    expect(description).toMatch(/posterior/i);
+    expect(description).toMatch(/contrarian/i);
+  });
+
+  it('rejects proof_of_learning with retirement and migration guidance (#5234)', () => {
+    const input = {
+      task: 'Build a login form',
+      votingStrategy: 'proof_of_learning',
+    };
+    expect(() => DevPipelineInputSchema.parse(input)).toThrow(
+      /proof_of_learning.*retired.*9\.0.*#5234/
+    );
+    expect(() => DevPipelineInputSchema.parse(input)).toThrow(/simple_majority.*higher_order/);
+  });
+
+  it('accepts direct task instructions', () => {
+    const parsed = DevPipelineInputSchema.parse({ task: 'Build a login form' });
+    expect(parsed.task).toBe('Build a login form');
+    expect(parsed.dryRun).toBe(false);
+    expect(parsed.maxVoteIterations).toBe(3);
+    expect(parsed.maxQaIterations).toBe(3);
+  });
+
+  it('accepts planFile path', () => {
+    const parsed = DevPipelineInputSchema.parse({ planFile: '/tmp/plan.md' });
+    expect(parsed.planFile).toBe('/tmp/plan.md');
+  });
+
+  it('accepts dryRun mode', () => {
+    const parsed = DevPipelineInputSchema.parse({ task: 'test', dryRun: true });
+    expect(parsed.dryRun).toBe(true);
+  });
+
+  it('accepts custom iteration limits', () => {
+    const parsed = DevPipelineInputSchema.parse({
+      task: 'test',
+      maxVoteIterations: 5,
+      maxQaIterations: 2,
+    });
+    expect(parsed.maxVoteIterations).toBe(5);
+    expect(parsed.maxQaIterations).toBe(2);
+  });
+
+  it('rejects when both task and planFile are missing', () => {
+    // Schema allows both empty, but resolveTaskInput will throw at runtime
+    const parsed = DevPipelineInputSchema.parse({});
+    expect(parsed.task).toBeUndefined();
+    expect(parsed.planFile).toBeUndefined();
+  });
+
+  it('rejects iteration limits out of range', () => {
+    expect(() => DevPipelineInputSchema.parse({ task: 'test', maxVoteIterations: 10 })).toThrow();
+    expect(() => DevPipelineInputSchema.parse({ task: 'test', maxQaIterations: 0 })).toThrow();
+  });
+
+  it('accepts workingDir', () => {
+    const parsed = DevPipelineInputSchema.parse({
+      task: 'test',
+      workingDir: '/home/user/project',
+    });
+    expect(parsed.workingDir).toBe('/home/user/project');
+  });
+
+  it('accepts an opt-in maxBudgetTokens ceiling (#3395)', () => {
+    const parsed = DevPipelineInputSchema.parse({ task: 'test', maxBudgetTokens: 50_000 });
+    expect(parsed.maxBudgetTokens).toBe(50_000);
+  });
+
+  it('leaves maxBudgetTokens undefined by default (enforcement off)', () => {
+    const parsed = DevPipelineInputSchema.parse({ task: 'test' });
+    expect(parsed.maxBudgetTokens).toBeUndefined();
+  });
+
+  it('rejects a non-positive maxBudgetTokens', () => {
+    expect(() => DevPipelineInputSchema.parse({ task: 'test', maxBudgetTokens: 0 })).toThrow();
+    expect(() => DevPipelineInputSchema.parse({ task: 'test', maxBudgetTokens: -100 })).toThrow();
+  });
+
+  it('defaults dispatch to sync and accepts async (#3726)', () => {
+    expect(DevPipelineInputSchema.parse({ task: 'test' }).dispatch).toBe('sync');
+    expect(DevPipelineInputSchema.parse({ task: 'test', dispatch: 'async' }).dispatch).toBe(
+      'async'
+    );
+    expect(() => DevPipelineInputSchema.parse({ task: 'test', dispatch: 'bogus' })).toThrow();
+  });
+});
+
+// #4933: the async hint is remediation text, and remediation that does not
+// apply to the request it answers is worse than none — a caller following it
+// verbatim gets another synchronous run.
+describe('the async hint matches whether async is actually available (#4933)', () => {
+  /** Drives the handler's catch block: no task and no planFile. */
+  async function errorEnvelope(extra: Record<string, unknown>): Promise<string> {
+    const handler = captureHandler();
+    const result = await handler(extra, STDIO_CTX);
+    return result.content[0]!.text;
+  }
+
+  it('omits the async hint for a dry run, which ignores dispatch entirely', async () => {
+    // `input.dispatch === 'async' && !input.dryRun` is false for a dry run, so
+    // `dispatch: 'async'` is silently discarded. Telling the caller to retry
+    // with it sends them back through the same synchronous path.
+    const text = await errorEnvelope({ dryRun: true });
+
+    expect(text).not.toContain("dispatch: 'async'");
+  });
+
+  it('says instead that dry runs are synchronous', async () => {
+    // The pair: deleting the hint entirely would satisfy the assertion above
+    // while leaving the caller with no explanation at all.
+    const text = await errorEnvelope({ dryRun: true });
+
+    expect(text).toMatch(/dry run/i);
+  });
+
+  it('still carries the hint for a real run, where async does apply', async () => {
+    // The other pair, and the regression this must not cause: a non-dryRun
+    // run genuinely can exceed the 900s ceiling, and async is its escape.
+    const text = await errorEnvelope({ dryRun: false });
+
+    expect(text).toContain("dispatch: 'async'");
+  });
+
+  it('reports the underlying error in both cases', async () => {
+    // Whatever the hint says, the actual failure has to survive it.
+    expect(await errorEnvelope({ dryRun: true })).toContain('planFile');
+    expect(await errorEnvelope({ dryRun: false })).toContain('planFile');
+  });
+});
+
+// #3726: async dispatch mode. A real run can exceed the 900s MCP request
+// timeout, so `dispatch: 'async'` returns a jobId immediately and runs the
+// pipeline in the background (poll get_job_result).
+describe('run_dev_pipeline async dispatch (#3726)', () => {
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+
+  /** Parse the JSON envelope out of a captured tool result. */
+  function envelope(result: CapturedToolResult): Record<string, unknown> {
+    return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+  }
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-dp-async-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    resetJobConcurrency();
+    runDevPipelineMock.mockClear();
+  });
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    resetJobConcurrency();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns { status: 'pending', jobId } and mints a dp-<uuid> id without a sessionId", async () => {
+    const handler = captureHandler();
+    const result = await handler({ task: 'Build feature X', dispatch: 'async' }, STDIO_CTX);
+    const env = envelope(result);
+    expect(env['status']).toBe('pending');
+    expect(typeof env['jobId']).toBe('string');
+    expect(env['jobId'] as string).toMatch(/^dp-/);
+    expect(env['pollTool']).toBe('get_job_result');
+  });
+
+  it('uses the sessionId verbatim as the jobId when one is provided', async () => {
+    const handler = captureHandler();
+    const result = await handler(
+      { task: 'Build feature X', dispatch: 'async', sessionId: 'my-session-1' },
+      STDIO_CTX
+    );
+    expect(envelope(result)['jobId']).toBe('my-session-1');
+  });
+
+  it('dryRun ALWAYS stays sync even when dispatch is async', async () => {
+    const handler = captureHandler();
+    const result = await handler(
+      { task: 'Build feature X', dispatch: 'async', dryRun: true },
+      STDIO_CTX
+    );
+    // Sync path runs the (mocked) pipeline inline and returns a structured
+    // result, NOT a pending envelope.
+    expect(envelope(result)['status']).toBeUndefined();
+    expect(runDevPipelineMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('records the pipeline result to the sidecar when the background run completes', async () => {
+    const handler = captureHandler();
+    const result = await handler(
+      { task: 'Build feature X', dispatch: 'async', sessionId: 'sess-complete' },
+      STDIO_CTX
+    );
+    expect(envelope(result)['jobId']).toBe('sess-complete');
+    // The background run is fire-and-forget; let the microtask queue drain.
+    await new Promise((r) => setImmediate(r));
+    const record = readJobResult('sess-complete');
+    expect(record?.status).toBe('complete');
+  });
+
+  // #5888: `runAsJob`'s fail-closed check reads the ToolResult's ROOT keys, and
+  // `toolSuccessStructured` nests everything under `structuredContent` — so a
+  // rejected pipeline recorded `complete`, the branch `get_job_result` documents
+  // as "read `result`, not `error`".
+  it('records a rejected pipeline as a FAILED job, not a complete one', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: false,
+      plan: 'p',
+      tasks: [],
+      voteIterations: 1,
+      qaIterations: 0,
+      securityPassed: false,
+      securityRan: true,
+    } as never);
+    const handler = captureHandler();
+
+    await handler(
+      { task: 'Build feature X', dispatch: 'async', sessionId: 'sess-rejected' },
+      STDIO_CTX
+    );
+    await new Promise((r) => setImmediate(r));
+
+    const record = readJobResult('sess-rejected');
+    expect(record?.status).toBe('failed');
+    // The record names WHICH root key tripped, so the failure is debuggable.
+    // The pipeline's own reason does NOT reach `record.error`: `runAsJob`'s
+    // DETAIL_KEYS look for a root `error`/`message`, and `toolStructuredError`
+    // carries the message in `_meta`. That gap is shared with the two sibling
+    // callers that already hoist, and is tracked separately — asserting the
+    // reason here would pin a behaviour this PR does not deliver.
+    expect(record?.error).toContain('isError');
+  });
+
+  it('retains planning artifacts through the registered async tool (#7424)', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: false,
+      plan: 'Complete rejected plan',
+      planVoteProposal: 'Exact proposal and context',
+      planStatus: 'unapproved',
+      planVoteRecordId: 'vote-wrapper-test',
+      tasks: [],
+      voteIterations: 1,
+      qaIterations: 0,
+      securityPassed: false,
+      securityRan: false,
+    } as never);
+    const handler = captureHandler();
+    await handler(
+      { task: 'Build feature X', dispatch: 'async', sessionId: 'sess-plan-evidence' },
+      STDIO_CTX
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const record = readJobResult('sess-plan-evidence');
+    expect(record?.status).toBe('failed');
+    expect(record?.result).toBeUndefined();
+    expect(record).toMatchObject({
+      failureEvidence: {
+        plan: { text: 'Complete rejected plan', coverage: 'complete' },
+        proposal: { text: 'Exact proposal and context', coverage: 'complete' },
+        voteRecordId: 'vote-wrapper-test',
+      },
+    });
+  });
+
+  it('records a harness run as a COMPLETE job — it stopped by request', async () => {
+    // Pair test. Harness mode hands the tasks back for external implementation
+    // and legitimately reports `completed: false`; erroring on it would trade a
+    // false success for a false failure. It is why `harnessMode` exists.
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: false,
+      harnessMode: true,
+      plan: 'p',
+      tasks: [],
+      voteIterations: 1,
+      qaIterations: 0,
+      securityPassed: false,
+      securityRan: false,
+    } as never);
+    const handler = captureHandler();
+
+    await handler(
+      { task: 'Build feature X', dispatch: 'async', sessionId: 'sess-harness', mode: 'harness' },
+      STDIO_CTX
+    );
+    await new Promise((r) => setImmediate(r));
+
+    expect(readJobResult('sess-harness')?.status).toBe('complete');
+  });
+
+  it('surfaces an idempotency collision when a sessionId is reused with different inputs', async () => {
+    const handler = captureHandler();
+    const first = await handler(
+      { task: 'First task', dispatch: 'async', sessionId: 'collide-1' },
+      STDIO_CTX
+    );
+    expect(envelope(first)['status']).toBe('pending');
+    // Reusing the sessionId with a DIFFERENT task must NOT silently return the
+    // first run's data — it surfaces the existing idempotency collision envelope.
+    const second = await handler(
+      { task: 'DIFFERENT task', dispatch: 'async', sessionId: 'collide-1' },
+      STDIO_CTX
+    );
+    expect(second.isError).toBe(true);
+    expect(second.content[0]?.text).toContain('Idempotency key already used');
+  });
+
+  it('sync errors carry the async-mode discoverability hint (#3726)', async () => {
+    runDevPipelineMock.mockRejectedValueOnce(new Error('stage exploded'));
+    const handler = captureHandler();
+    const result = await handler({ task: 'Build feature X' }, STDIO_CTX);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("dispatch: 'async'");
+    expect(result.content[0]?.text).toContain('get_job_result');
+  });
+});
+
+// #4170: simulateVotes must FAIL CLOSED outside test runners. The old guard
+// only logged a warning and proceeded — a random panel could resolve
+// outcome:'approved' with zero live voters. Outside a test runner the handler
+// now rejects with a `permission` envelope unless NEXUS_ALLOW_SIMULATE=1.
+describe('run_dev_pipeline simulateVotes fail-closed gate (#4170)', () => {
+  const originalVitest = process.env['VITEST'];
+  const originalNodeEnv = process.env['NODE_ENV'];
+  const originalAllowSimulate = process.env['NEXUS_ALLOW_SIMULATE'];
+
+  /** Simulate a non-test-runner process (no VITEST, production NODE_ENV). */
+  function leaveTestRunnerEnv(): void {
+    delete process.env['VITEST'];
+    process.env['NODE_ENV'] = 'production';
+    delete process.env['NEXUS_ALLOW_SIMULATE'];
+  }
+
+  afterEach(() => {
+    if (originalVitest === undefined) delete process.env['VITEST'];
+    else process.env['VITEST'] = originalVitest;
+    if (originalNodeEnv === undefined) delete process.env['NODE_ENV'];
+    else process.env['NODE_ENV'] = originalNodeEnv;
+    if (originalAllowSimulate === undefined) delete process.env['NEXUS_ALLOW_SIMULATE'];
+    else process.env['NEXUS_ALLOW_SIMULATE'] = originalAllowSimulate;
+  });
+
+  it('rejects simulateVotes outside a test runner with a permission envelope', async () => {
+    const handler = captureHandler();
+    leaveTestRunnerEnv();
+    const result = await handler({ task: 'Build feature X', simulateVotes: true }, STDIO_CTX);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('NEXUS_ALLOW_SIMULATE');
+    const meta = (result as { _meta?: Record<string, unknown> })._meta;
+    const envelope = meta?.[ERROR_ENVELOPE_META_KEY] as { errorCategory: string };
+    expect(envelope.errorCategory).toBe('permission');
+  });
+
+  it('rejects identically in async dispatch mode — no pending envelope leaks out', async () => {
+    const handler = captureHandler();
+    leaveTestRunnerEnv();
+    const result = await handler(
+      { task: 'Build feature X', simulateVotes: true, dispatch: 'async' },
+      STDIO_CTX
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('NEXUS_ALLOW_SIMULATE');
+  });
+
+  it('proceeds with simulated: true in the output when NEXUS_ALLOW_SIMULATE=1', async () => {
+    const handler = captureHandler();
+    leaveTestRunnerEnv();
+    process.env['NEXUS_ALLOW_SIMULATE'] = '1';
+    const result = await handler({ task: 'Build feature X', simulateVotes: true }, STDIO_CTX);
+    expect(result.isError).not.toBe(true);
+    const output = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+    expect(output['simulated']).toBe(true);
+  });
+
+  /** Read the structured payload out of an error envelope's `detail` (#5888). */
+  function errorDetail(result: CapturedToolResult): Record<string, unknown> {
+    const envelope = result._meta?.[ERROR_ENVELOPE_META_KEY] as { detail?: unknown } | undefined;
+    return (envelope?.detail ?? {}) as Record<string, unknown>;
+  }
+
+  // #4772: the fields exist on DevPipelineResult and must reach the MCP
+  // envelope. A live dry run on 4.1.1 showed they did not — the response is
+  // built from an explicit field list, so adding them to the result type was
+  // not enough. "The field exists" and "a caller sees it" are different claims.
+  it('surfaces securityRan and planStatus in the response envelope', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: false,
+      plan: '',
+      tasks: [],
+      voteIterations: 1,
+      qaIterations: 0,
+      securityPassed: false,
+      securityRan: false,
+      planStatus: 'empty',
+    } as never);
+    const handler = captureHandler();
+
+    const result = await handler({ task: 'Build feature X' }, STDIO_CTX);
+    const output = errorDetail(result);
+
+    // securityPassed:false alone reads as "security rejected this".
+    expect(output['securityPassed']).toBe(false);
+    expect(output['securityRan']).toBe(false);
+    expect(output['planStatus']).toBe('empty');
+    // #5888: a plan-gate stop is a FAILED run, so the verdict is hoisted to
+    // the ToolResult root where `runAsJob`'s fail-closed check can see it. The
+    // envelope carries the same fields it used to nest under structuredContent.
+    expect(result.isError).toBe(true);
+  });
+
+  it('surfaces terminal plan-vote evidence in the response envelope', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: false,
+      plan: 'last plan',
+      tasks: [],
+      voteIterations: 3,
+      qaIterations: 0,
+      securityPassed: false,
+      securityRan: false,
+      planStatus: 'unapproved',
+      planVoteApprovalPercentage: 40,
+      planVoteFeedback: 'Still not right',
+    } as never);
+    const result = await captureHandler()({ task: 'Build feature X' }, STDIO_CTX);
+
+    const output = errorDetail(result);
+    expect(output['planStatus']).toBe('unapproved');
+    expect(output['planVoteApprovalPercentage']).toBe(40);
+    expect(output['planVoteFeedback']).toBe('Still not right');
+    expect(result.isError).toBe(true);
+  });
+
+  it('reports actionable baseline security evidence in the MCP response (#7238)', async () => {
+    const securityComparison = {
+      baseSha: 'a'.repeat(40),
+      baseCount: 7,
+      worktreeCount: 8,
+      introducedBlockingCount: 1,
+      complete: true,
+      errors: [],
+      blockingFindings: [
+        { rule: 'detect-eval', file: 'src/app.ts', startLine: 12, severity: 'high' },
+      ],
+    };
+    runDevPipelineMock.mockResolvedValueOnce({
+      ...PIPELINE_RESULT,
+      completed: false,
+      securityPassed: false,
+      securityRan: true,
+      securityComparison,
+    } as never);
+    const result = await captureHandler()({ task: 'Build feature X' }, STDIO_CTX);
+    const output = errorDetail(result);
+    expect(output['security']).toEqual({ status: 'failed', ...securityComparison });
+  });
+
+  it.each([false, true])(
+    'reports an incomplete comparison as unmeasured despite securityPassed %s',
+    async (securityPassed) => {
+      const securityComparison = {
+        baseSha: 'a'.repeat(40),
+        baseCount: 7,
+        worktreeCount: null,
+        introducedBlockingCount: null,
+        complete: false,
+        errors: ['Worktree scan failed'],
+        blockingFindings: [],
+      };
+      runDevPipelineMock.mockResolvedValueOnce({
+        ...PIPELINE_RESULT,
+        completed: false,
+        securityPassed,
+        securityRan: true,
+        securityComparison,
+      } as never);
+      const result = await captureHandler()({ task: 'Build feature X' }, STDIO_CTX);
+      expect(errorDetail(result)['security']).toEqual({
+        status: 'unmeasured',
+        ...securityComparison,
+      });
+      expect(result.isError).toBe(true);
+    }
+  );
+
+  it('surfaces the dryRun marker too', async () => {
+    // #4993 added `dryRun` to DevPipelineResult for the same reason as the two
+    // fields above — `completed: false` was the request, not a fault — and then
+    // did not list it in `buildStructuredOutput` either. A live
+    // `run_dev_pipeline({ dryRun: true })` came back with no way to tell a
+    // successful dry run from a failed pipeline. Same omission, same function,
+    // under the comment describing it.
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: false,
+      dryRun: true,
+      plan: 'a real plan',
+      tasks: [],
+      voteIterations: 2,
+      qaIterations: 0,
+      securityPassed: false,
+      securityRan: false,
+    } as never);
+    const handler = captureHandler();
+
+    const result = await handler({ task: 'Build feature X', dryRun: true }, STDIO_CTX);
+    const output = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+
+    expect(output['dryRun']).toBe(true);
+    expect(output['completed']).toBe(false);
+  });
+
+  // #7181: a dry run's response carried no verdict, and `securityPassed: false`
+  // beside `securityRan: false` read as a failed check.
+  it('surfaces the plan vote outcome and an unmeasured security status on a dry run', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: false,
+      dryRun: true,
+      plan: 'a real plan',
+      tasks: [],
+      voteIterations: 1,
+      qaIterations: 0,
+      securityPassed: false,
+      securityRan: false,
+      planVoteDecision: 'approved',
+      planVoteApprovalPercentage: 100,
+      planVoteRecordId: 'vr-7181',
+    } as never);
+    const result = await captureHandler()({ task: 'Build feature X', dryRun: true }, STDIO_CTX);
+    const output = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+
+    expect(output['planVoteDecision']).toBe('approved');
+    expect(output['planVoteApprovalPercentage']).toBe(100);
+    expect(output['planVoteRecordId']).toBe('vr-7181');
+    expect(output['security']).toEqual({ status: 'unmeasured' });
+  });
+
+  it('reports a security verdict only when the scan ran', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: true,
+      plan: 'a real plan',
+      tasks: [],
+      voteIterations: 1,
+      qaIterations: 1,
+      securityPassed: true,
+      securityRan: true,
+    } as never);
+    const passed = JSON.parse(
+      (await captureHandler()({ task: 'Build feature X' }, STDIO_CTX)).content[0]!.text
+    ) as Record<string, unknown>;
+    expect(passed['security']).toEqual({ status: 'passed' });
+    expect(passed['securityPassed']).toBe(true);
+    expect(passed).not.toHaveProperty('planVoteDecision');
+  });
+
+  it('reports a ran-and-failed scan as failed', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: false,
+      plan: 'a real plan',
+      tasks: [],
+      voteIterations: 1,
+      qaIterations: 1,
+      securityPassed: false,
+      securityRan: true,
+    } as never);
+    const result = await captureHandler()({ task: 'Build feature X' }, STDIO_CTX);
+    expect(errorDetail(result)['security']).toEqual({ status: 'failed' });
+  });
+
+  it('reports an absent securityRan as unmeasured, not as failed', async () => {
+    // Absent means the producer predates #4772; securityPassed alone is no verdict.
+    const output = JSON.parse(
+      (await captureHandler()({ task: 'Build feature X' }, STDIO_CTX)).content[0]!.text
+    ) as Record<string, unknown>;
+    expect(output['security']).toEqual({ status: 'unmeasured' });
+  });
+
+  it('surfaces taskStatus in the response envelope (#5645)', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: true,
+      plan: 'a real plan',
+      tasks: [],
+      voteIterations: 1,
+      qaIterations: 1,
+      securityPassed: true,
+      securityRan: true,
+      taskStatus: 'all_done',
+    } as never);
+    const handler = captureHandler();
+
+    const result = await handler({ task: 'Build feature X' }, STDIO_CTX);
+    const output = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+
+    expect(output['taskStatus']).toBe('all_done');
+  });
+
+  it('surfaces the pipeline warnings in the response envelope (#6792)', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      completed: true,
+      plan: 'a real plan',
+      tasks: [],
+      voteIterations: 1,
+      qaIterations: 1,
+      securityPassed: true,
+      warnings: ['the gate ran edited scripts'],
+    } as never);
+    const handler = captureHandler();
+
+    const result = await handler({ task: 'Build feature X' }, STDIO_CTX);
+    const output = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+
+    expect(output['warnings']).toEqual(['the gate ran edited scripts']);
+  });
+
+  it('surfaces the scratch artifact and names an empty implementation (#6794)', async () => {
+    const changes = {
+      diff: '',
+      baseSha: 'a'.repeat(40),
+      worktreePath: '/tmp/removed-scratch',
+      worktreeRemoved: true,
+      dependencies: { status: 'none' as const },
+      empty: true,
+      status: 'no_changes',
+    };
+    runDevPipelineMock.mockResolvedValueOnce({
+      ...PIPELINE_RESULT,
+      completed: false,
+      changes,
+    } as never);
+    const result = await captureHandler()({ task: 'Build feature X' }, STDIO_CTX);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('no_changes');
+    const envelope = result._meta?.[ERROR_ENVELOPE_META_KEY] as {
+      detail?: Record<string, unknown>;
+    };
+    expect(envelope.detail?.['changes']).toEqual(changes);
+  });
+
+  it('omits both fields when the pipeline did not report them', async () => {
+    // Absent means the producer predates the distinction — not false, not 'empty'.
+    const handler = captureHandler();
+
+    const result = await handler({ task: 'Build feature X' }, STDIO_CTX);
+    const output = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+
+    expect(output).not.toHaveProperty('securityRan');
+    expect(output).not.toHaveProperty('planStatus');
+    // The pair for dryRun: an ordinary run must not claim to have been one.
+    expect(output).not.toHaveProperty('dryRun');
+    expect(output).not.toHaveProperty('taskStatus');
+  });
+
+  it('stays allowed inside a test runner with no simulated flag (existing suites unaffected)', async () => {
+    // Default vitest env: VITEST=true.
+    const handler = captureHandler();
+    const result = await handler({ task: 'Build feature X', simulateVotes: true }, STDIO_CTX);
+    expect(result.isError).not.toBe(true);
+    const output = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+    expect(output['simulated']).toBeUndefined();
+  });
+});
+
+// #2824: run_dev_pipeline used to register a bare callback that called
+// `schema.parse(args)` outside any try/catch — a ZodError on bad input
+// escaped as a raw JSON-RPC -32603 instead of a structured `validation`
+// envelope. It now routes through the standard secure-handler chain.
+describe('registerDevPipelineTool', () => {
+  it('registers under the run_dev_pipeline name', () => {
+    // captureHandler asserts the registered name internally.
+    expect(captureHandler()).toBeTypeOf('function');
+  });
+
+  it('returns a structured validation error for invalid input, not a thrown ZodError', async () => {
+    const handler = captureHandler();
+    // task must be a string; maxVoteIterations max is 5 — both invalid here.
+    const result = await handler({ task: 12345, maxVoteIterations: 99 }, STDIO_CTX);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('Invalid input');
+  });
+});
+
+describe('registerDevPipelineTool — trustTier threading (#3712)', () => {
+  beforeEach(() => runDevPipelineMock.mockClear());
+
+  // #4733: these fixtures now carry `caller`, because a tier without one is
+  // not a measurement — `createRequestContext` derives from `caller = {}` and
+  // no production site supplies `options.trustTier` explicitly, so a
+  // caller-less tier is the constant fallback rather than a threaded value.
+  it('threads the real RequestContext.trustTier into runDevPipeline options', async () => {
+    const handler = captureHandler();
+    await handler(
+      { task: 'Build feature X' },
+      { requestContext: { trustTier: '1', caller: { transport: 'stdio' } } }
+    );
+    expect(runDevPipelineMock).toHaveBeenCalledTimes(1);
+    expect(runDevPipelineMock.mock.calls[0]?.[2]?.trustTier).toBe('1');
+  });
+
+  it("forwards an untrusted tier '3' unchanged (not silently downgraded to trusted)", async () => {
+    const handler = captureHandler();
+    await handler(
+      { task: 'Build feature X' },
+      { requestContext: { trustTier: '3', caller: { authenticated: false } } }
+    );
+    expect(runDevPipelineMock.mock.calls[0]?.[2]?.trustTier).toBe('3');
+  });
+
+  it('does NOT thread a caller-less tier — that is the constant, not a measurement', async () => {
+    // The shipped reality until a callerInfo producer exists (#4733).
+    const handler = captureHandler();
+    await handler({ task: 'Build feature X' }, { requestContext: { trustTier: '3' } });
+    expect(runDevPipelineMock.mock.calls[0]?.[2]?.trustTier).toBeUndefined();
+  });
+
+  it('threads a declared sourceTrustTier with the measured caller tier (#6795)', async () => {
+    const handler = captureHandler();
+    await handler(
+      { task: 'Build feature X', sourceTrustTier: '1' },
+      { requestContext: { trustTier: '1', caller: { transport: 'stdio' } } }
+    );
+    expect(runDevPipelineMock.mock.calls[0]?.[2]).toMatchObject({
+      trustTier: '1',
+      sourceTrustTier: '1',
+    });
+  });
+
+  it('leaves an omitted sourceTrustTier omitted, for the pipeline to apply 3 (#6795)', async () => {
+    const handler = captureHandler();
+    await handler(
+      { task: 'Build feature X' },
+      { requestContext: { trustTier: '1', caller: { transport: 'stdio' } } }
+    );
+    expect(runDevPipelineMock).toHaveBeenCalledTimes(1);
+    expect(runDevPipelineMock.mock.calls[0]?.[2]).not.toHaveProperty('sourceTrustTier');
+  });
+
+  it('rejects a sourceTrustTier outside the tier enum (#6795)', () => {
+    expect(DevPipelineInputSchema.safeParse({ task: 'x', sourceTrustTier: '5' }).success).toBe(
+      false
+    );
+  });
+});
+
+describe('dev pipeline input sanitization forwarding (#4733)', () => {
+  beforeEach(() => vi.spyOn(agentExecutor, 'createAgentStages'));
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([false, true])('threads dryRun=%s to the stage executor (#6958)', async (dryRun) => {
+    await captureHandler()({ task: 'Build feature X', dryRun }, STDIO_CTX);
+
+    expect(agentExecutor.createAgentStages).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ dryRun })
+    );
+  });
+
+  it('threads the plain-goal dry run to the stage executor (#6958)', async () => {
+    await runDevPipelineForGoal('Build feature X', undefined, true);
+
+    expect(agentExecutor.createAgentStages).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ dryRun: true })
+    );
+  });
+
+  it.each([false, true])(
+    'records middleware modification result %s with its counts',
+    async (modified) => {
+      const ctx: HandlerContext = {
+        requestContext: createRequestContext({
+          toolName: 'run_dev_pipeline',
+          caller: { authenticated: false },
+        }),
+        logger: createLogger({ tool: 'run_dev_pipeline_test' }),
+        sanitization: {
+          wasModified: modified,
+          commentsRemoved: modified ? 2 : 0,
+          fieldsModified: modified ? 1 : 0,
+          tagsRemoved: modified ? 3 : 0,
+          rawFieldHashes: {},
+          rawFieldBytes: {},
+        },
+      };
+      await captureHandler()({ task: 'Build feature X' }, ctx);
+
+      expect(agentExecutor.createAgentStages).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          callerTrustTier: '3',
+          trustTier: '3',
+          inputSanitization: modified ? 'modified' : 'unmodified',
+          ...(modified && {
+            inputSanitizationCounts: { tagsRemoved: 3, commentsRemoved: 2, fieldsModified: 1 },
+          }),
+        })
+      );
+      if (!modified) {
+        expect(vi.mocked(agentExecutor.createAgentStages).mock.calls[0]?.[0]).not.toHaveProperty(
+          'inputSanitizationCounts'
+        );
+      }
+    }
+  );
+
+  it('threads the caller session to the stage executor and trace options (#6858)', async () => {
+    const sessionId = 'session-6858-tool-unusual';
+    await captureHandler()({ task: 'Build feature X', sessionId });
+    expect(agentExecutor.createAgentStages).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ sessionId })
+    );
+    expect(runDevPipelineMock.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ sessionId }));
+  });
+
+  it('names absent HandlerContext as unmeasured', async () => {
+    await captureHandler()({ task: 'Build feature X' });
+
+    expect(agentExecutor.createAgentStages).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ inputSanitization: 'unmeasured' })
+    );
+  });
+
+  it('records unmeasured for the plain-goal entry point without HandlerContext', async () => {
+    await runDevPipelineForGoal('Build feature X');
+
+    expect(agentExecutor.createAgentStages).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ inputSanitization: 'unmeasured' })
+    );
+  });
+});
+
+// ============================================================================
+// The iteration caps reach the pipeline (#4939)
+// ============================================================================
+
+describe('run_dev_pipeline iteration caps are wired (#4939)', () => {
+  // Both were bounds-checked, defaulted and described in the generated tool
+  // reference, and neither was read off `parsed.data` — a documented parameter
+  // a caller could set to no effect. The schema tests above prove parsing; this
+  // proves the value leaves the handler.
+  beforeEach(() => {
+    runDevPipelineMock.mockClear();
+  });
+
+  it('passes both caps through to the pipeline', async () => {
+    const handler = captureHandler();
+    await handler({ task: 'Build feature X', maxVoteIterations: 1, maxQaIterations: 2 }, STDIO_CTX);
+
+    const options = runDevPipelineMock.mock.calls[0]?.[2] as
+      { maxVoteIterations?: number; maxQaIterations?: number } | undefined;
+    expect(options?.maxVoteIterations).toBe(1);
+    expect(options?.maxQaIterations).toBe(2);
+  });
+
+  it('passes the schema defaults when the caller sets neither', async () => {
+    // The pair: forwarding `undefined` would satisfy nothing above and let the
+    // pipeline fall back on its own constants, which happen to agree today and
+    // would diverge the moment either changed.
+    const handler = captureHandler();
+    await handler({ task: 'Build feature X' }, STDIO_CTX);
+
+    const options = runDevPipelineMock.mock.calls[0]?.[2] as
+      { maxVoteIterations?: number; maxQaIterations?: number } | undefined;
+    expect(options?.maxVoteIterations).toBe(3);
+    expect(options?.maxQaIterations).toBe(3);
+  });
+});
+
+describe('run_dev_pipeline timeoutMs is wired (#6736)', () => {
+  // Advertised as "Max time per stage" since the tool shipped; nothing read it.
+  beforeEach(() => {
+    runDevPipelineMock.mockClear();
+  });
+
+  it('passes timeoutMs through as the per-stage deadline', async () => {
+    const handler = captureHandler();
+    await handler({ task: 'Build feature X', timeoutMs: 45_000 }, STDIO_CTX);
+
+    const options = runDevPipelineMock.mock.calls[0]?.[2] as
+      { stageTimeoutMs?: number } | undefined;
+    expect(options?.stageTimeoutMs).toBe(45_000);
+  });
+
+  it('leaves the deadline to the stage defaults when the caller sets none', async () => {
+    const handler = captureHandler();
+    await handler({ task: 'Build feature X' }, STDIO_CTX);
+
+    expect(runDevPipelineMock.mock.calls[0]?.[2]).not.toHaveProperty('stageTimeoutMs');
+  });
+});
+
+describe('runDevPipelineForGoal — dryRun reaches the pipeline (#4806)', () => {
+  beforeEach(() => runDevPipelineMock.mockClear());
+
+  // The seam. `run-tool.test.ts` asserts that `run` calls
+  // `runDevPipelineForGoal` with `dryRun: true`, and stops there — one link
+  // short of the only place the flag does anything. This function parsed the
+  // flag into `input`, which only `createStages` reads, and then built the
+  // options from `trustTier` alone, so `dev-pipeline.ts`'s dry-run
+  // short-circuit never fired and the "plan and vote only" run implemented,
+  // QA'd and security-scanned for real.
+  it('passes dryRun through to runDevPipeline options', async () => {
+    await runDevPipelineForGoal('add retry logic', undefined, true);
+
+    expect(runDevPipelineMock).toHaveBeenCalledTimes(1);
+    expect(runDevPipelineMock.mock.calls[0]?.[2]?.dryRun).toBe(true);
+  });
+
+  it('leaves dryRun unset on an ordinary run', async () => {
+    // The pair: a fix that hardcoded `dryRun: true` would pass the test above
+    // while turning every `run` into a no-op.
+    await runDevPipelineForGoal('add retry logic', undefined, undefined);
+
+    expect(runDevPipelineMock.mock.calls[0]?.[2]?.dryRun).toBeUndefined();
+  });
+
+  it("threads run's declared sourceTrustTier into the options (#6795)", async () => {
+    await runDevPipelineForGoal('add retry logic', '1', undefined, undefined, '1');
+
+    expect(runDevPipelineMock.mock.calls[0]?.[2]).toMatchObject({
+      trustTier: '1',
+      sourceTrustTier: '1',
+    });
+  });
+
+  it('still threads trustTier alongside it', async () => {
+    await runDevPipelineForGoal('add retry logic', '3', true);
+
+    expect(runDevPipelineMock.mock.calls[0]?.[2]).toMatchObject({
+      trustTier: '3',
+      dryRun: true,
+    });
+  });
+});
+
+// ============================================================================
+// workingDir and planFile are contained to the cwd subtree
+// ============================================================================
+
+describe('run_dev_pipeline path containment', () => {
+  let fx: SymlinkEscapeFixture;
+
+  beforeEach(() => {
+    fx = createSymlinkEscapeFixture();
+    runDevPipelineMock.mockClear();
+    vi.spyOn(agentExecutor, 'createAgentStages');
+  });
+
+  afterEach(() => {
+    fx.cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it('rejects a workingDir outside cwd before any stage is created', async () => {
+    const result = await captureHandler()(
+      { task: 'Build X', workingDir: fx.outsideDir },
+      STDIO_CTX
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/workingDir must be within/);
+    expect(agentExecutor.createAgentStages).not.toHaveBeenCalled();
+    expect(runDevPipelineMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a ../ workingDir', async () => {
+    const result = await captureHandler()({ task: 'Build X', workingDir: '../../..' }, STDIO_CTX);
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/workingDir must be within/);
+    expect(agentExecutor.createAgentStages).not.toHaveBeenCalled();
+  });
+
+  it('rejects a workingDir that reaches outside cwd through a symlink', async () => {
+    const result = await captureHandler()({ task: 'Build X', workingDir: fx.linkOut }, STDIO_CTX);
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/workingDir must be within/);
+    expect(agentExecutor.createAgentStages).not.toHaveBeenCalled();
+  });
+
+  it('accepts a workingDir inside cwd and scans its resolved path', async () => {
+    await captureHandler()({ task: 'Build X', workingDir: fx.linkIn }, STDIO_CTX);
+
+    expect(agentExecutor.createAgentStages).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ scanTarget: join(fx.insideDir, 'real') })
+    );
+  });
+
+  describe('with a client-declared workspace root outside cwd', () => {
+    afterEach(() => {
+      _resetActiveWorkspaceRootForTests();
+    });
+
+    it('accepts a workingDir inside the workspace root', async () => {
+      expect(setActiveWorkspaceRoot(fx.outsideDir)).toBe(true);
+
+      const result = await captureHandler()(
+        { task: 'Build X', workingDir: fx.outsideDir },
+        STDIO_CTX
+      );
+
+      expect(result.content[0]?.text ?? '').not.toMatch(/workingDir must be within/);
+      expect(agentExecutor.createAgentStages).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ scanTarget: fx.outsideDir })
+      );
+    });
+
+    it('still rejects a workingDir outside both cwd and the workspace root', async () => {
+      expect(setActiveWorkspaceRoot(join(fx.insideDir, 'real'))).toBe(true);
+
+      const result = await captureHandler()(
+        { task: 'Build X', workingDir: fx.outsideDir },
+        STDIO_CTX
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0]!.text).toMatch(/workingDir must be within/);
+      expect(agentExecutor.createAgentStages).not.toHaveBeenCalled();
+    });
+  });
+
+  it('leaves scanTarget unset when workingDir is omitted', async () => {
+    await captureHandler()({ task: 'Build X' }, STDIO_CTX);
+
+    expect(vi.mocked(agentExecutor.createAgentStages)).toHaveBeenCalledTimes(1);
+    expect(
+      vi.mocked(agentExecutor.createAgentStages).mock.calls[0]?.[0]?.scanTarget
+    ).toBeUndefined();
+  });
+
+  it('rejects a planFile that reaches outside cwd through a symlink', async () => {
+    const result = await captureHandler()({ planFile: join(fx.linkOut, 'plan.md') }, STDIO_CTX);
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/planFile must be within/);
+    expect(runDevPipelineMock).not.toHaveBeenCalled();
+  });
+
+  it('reads a planFile through an inside symlink', async () => {
+    await captureHandler()({ planFile: join(fx.linkIn, 'plan.md') }, STDIO_CTX);
+
+    expect(runDevPipelineMock.mock.calls[0]?.[0]).toBe('# plan');
+  });
+});
+
+// #7297: text-only MCP callers need the reason; metadata retains full evidence.
+describe('run_dev_pipeline failure text (#7297)', () => {
+  it.each([
+    {
+      fields: { securityRan: true, securityNote: 'Critical SQL injection' },
+      stage: 'security',
+      reason: 'Critical SQL injection',
+      message: 'Pipeline did not complete: the security gate rejected the change',
+    },
+    {
+      fields: {
+        securityRan: false,
+        taskStatus: 'partial',
+        securityNote: 'Manifest coverage missing',
+      },
+      stage: 'security',
+      reason: 'Manifest coverage missing',
+      message: 'Pipeline did not complete: tasks partial',
+    },
+    {
+      fields: { planStatus: 'no_quorum', planVoteReason: 'Missing security voter' },
+      stage: 'planning',
+      reason: 'Missing security voter',
+      message: 'Pipeline stopped at the planning gate (planStatus: no_quorum)',
+    },
+    {
+      fields: { planStatus: 'unapproved', planVoteFeedback: 'Add retry logic' },
+      stage: 'planning',
+      reason: 'Add retry logic',
+      message: 'Pipeline stopped at the planning gate (planStatus: unapproved)',
+    },
+    {
+      fields: {
+        taskStatus: 'partial',
+        tasks: [
+          {
+            id: 't1',
+            title: 'Feature',
+            description: '',
+            assignedTo: 'coder',
+            status: 'rejected',
+            feedback: 'Quality gate: lint failed',
+          },
+        ],
+      },
+      stage: 'tasks',
+      reason: 'Quality gate: lint failed',
+      message: 'Pipeline did not complete: tasks partial',
+    },
+  ])(
+    'includes $stage and $reason while preserving metadata',
+    async ({ fields, stage, reason, message }) => {
+      const pipelineResult = {
+        ...PIPELINE_RESULT,
+        completed: false,
+        securityPassed: false,
+        ...fields,
+      } as DevPipelineResult;
+      runDevPipelineMock.mockResolvedValueOnce(pipelineResult as never);
+      const result = await captureHandler()({ task: 'Build X' }, STDIO_CTX);
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain(stage);
+      expect(result.content[0]?.text).toContain(reason);
+      expect(result._meta).toEqual({
+        [ERROR_ENVELOPE_META_KEY]: {
+          errorCategory: 'business',
+          isRetryable: false,
+          message,
+          detail: buildStructuredOutput(pipelineResult, false),
+        },
+      });
+    }
+  );
+
+  it('includes a warning-only quality gate refusal with no security verdict', async () => {
+    const reason = 'Quality gate refused: unmeasured content tier has no isolated workspace';
+    const pipelineResult = {
+      ...PIPELINE_RESULT,
+      completed: false,
+      securityPassed: false,
+      securityRan: false,
+      taskStatus: 'all_done' as const,
+      warnings: [reason],
+    };
+    runDevPipelineMock.mockResolvedValueOnce(pipelineResult);
+    const result = await captureHandler()({ task: 'Build X' }, STDIO_CTX);
+    expect(result.content[0]?.text).toContain(reason);
+    expect(result._meta).toEqual({
+      [ERROR_ENVELOPE_META_KEY]: {
+        errorCategory: 'business',
+        isRetryable: false,
+        message: 'Pipeline did not complete',
+        detail: buildStructuredOutput(pipelineResult, false),
+      },
+    });
+  });
+
+  it('truncates long text visibly while retaining the full reason in metadata', async () => {
+    const securityNote = 'Security scan unavailable: ' + 'x'.repeat(3000) + 'END';
+    const pipelineResult = {
+      ...PIPELINE_RESULT,
+      completed: false,
+      securityPassed: false,
+      securityRan: false,
+      securityNote,
+    };
+    runDevPipelineMock.mockResolvedValueOnce(pipelineResult);
+    const result = await captureHandler()({ task: 'Build X' }, STDIO_CTX);
+    const text = result.content[0]!.text;
+    expect(text).toContain('Security scan unavailable:');
+    expect(text.length).toBeLessThanOrEqual(2000);
+    expect(text).toMatch(/…$/);
+    expect(result._meta?.[ERROR_ENVELOPE_META_KEY]).toMatchObject({ detail: { securityNote } });
+  });
+
+  it('keeps the measured quality cause visible before long task feedback without changing metadata (#7407)', async () => {
+    const reason = 'Quality gate failed: Typecheck failed with TS2322';
+    const pipelineResult: DevPipelineResult = {
+      ...PIPELINE_RESULT,
+      completed: false,
+      securityPassed: false,
+      securityRan: false,
+      taskStatus: 'partial',
+      warnings: [reason, 'Existing workspace warning'],
+      tasks: [
+        {
+          id: 'long',
+          title: 'Long feedback',
+          description: '',
+          assignedTo: 'coder',
+          status: 'rejected',
+          feedback: 'x'.repeat(3000),
+        },
+      ],
+    };
+    runDevPipelineMock.mockResolvedValueOnce(pipelineResult as never);
+    const result = await captureHandler()({ task: 'Build X' }, STDIO_CTX);
+    const text = result.content[0]!.text;
+    expect(result.isError).toBe(true);
+    expect(text).toContain(reason);
+    expect(text.length).toBeLessThanOrEqual(2000);
+    expect(text).toMatch(/…$/);
+    expect(result._meta).toEqual({
+      [ERROR_ENVELOPE_META_KEY]: {
+        errorCategory: 'business',
+        isRetryable: false,
+        message: 'Pipeline did not complete: tasks partial',
+        detail: buildStructuredOutput(pipelineResult, false),
+      },
+    });
+  });
+
+  it('keeps task feedback ahead of unrelated long warnings (#7407 control)', async () => {
+    const pipelineResult: DevPipelineResult = {
+      ...PIPELINE_RESULT,
+      completed: false,
+      securityPassed: false,
+      securityRan: false,
+      taskStatus: 'partial',
+      warnings: ['Advisory workspace warning: ' + 'x'.repeat(3000)],
+      tasks: [
+        {
+          id: 'review',
+          title: 'Review',
+          description: '',
+          assignedTo: 'coder',
+          status: 'rejected',
+          feedback: 'Missing task error handling',
+        },
+      ],
+    };
+    runDevPipelineMock.mockResolvedValueOnce(pipelineResult as never);
+    const result = await captureHandler()({ task: 'Build X' }, STDIO_CTX);
+    expect(result.content[0]?.text).toContain('Missing task error handling');
+    expect(result.content[0]?.text.length).toBeLessThanOrEqual(2000);
+  });
+
+  it('retains the fallback when no failure evidence was produced', async () => {
+    runDevPipelineMock.mockResolvedValueOnce({
+      ...PIPELINE_RESULT,
+      completed: false,
+      securityPassed: false,
+    });
+    const result = await captureHandler()({ task: 'Build X' }, STDIO_CTX);
+    expect(result.content[0]?.text).toBe('Pipeline did not complete');
+  });
+});

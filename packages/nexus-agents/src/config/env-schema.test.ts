@@ -1,0 +1,1414 @@
+/**
+ * env-schema - Unit Tests (Issue #1016)
+ *
+ * Tests for centralized NEXUS_* environment variable validation.
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { validateNexusEnv, getKnownNexusVarNames } from './env-schema.js';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+
+import { VOTER_ROLES } from '../cli/vote-types.js';
+import { ApiArmIdSchema } from '../cli-adapters/types-core.js';
+import { isGatewayArmId } from '../adapters/sdk/gateway-cost.js';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** Repo root, from `<root>/packages/nexus-agents/src/config/`. */
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
+
+describe('env-schema', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  describe('validateNexusEnv', () => {
+    it('returns no warnings for valid env vars', () => {
+      vi.stubEnv('NEXUS_V2_MODE', 'full');
+      vi.stubEnv('NEXUS_LOG_LEVEL', 'debug');
+      vi.stubEnv('NEXUS_VOTE_TIMEOUT_MS', '30000');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('reports NEXUS_TIMEOUT_{CLI,API,WORKFLOW,MCP} as unknown — nothing read them (#4939)', () => {
+      // Their only reader was getTimeout(), which had zero production callers;
+      // config-manager echoed them back as `Source: (env)` for a value nothing
+      // consumed. Removed on the #2977 / #4180 / #5903 precedent.
+      vi.stubEnv('NEXUS_TIMEOUT_CLI', '30000');
+      vi.stubEnv('NEXUS_TIMEOUT_API', '30000');
+      vi.stubEnv('NEXUS_TIMEOUT_WORKFLOW', '30000');
+      vi.stubEnv('NEXUS_TIMEOUT_MCP', '30000');
+      const result = validateNexusEnv();
+      const unknown = result.unknownVars.map((v) => v.name);
+      expect(unknown).toContain('NEXUS_TIMEOUT_CLI');
+      expect(unknown).toContain('NEXUS_TIMEOUT_API');
+      expect(unknown).toContain('NEXUS_TIMEOUT_WORKFLOW');
+      expect(unknown).toContain('NEXUS_TIMEOUT_MCP');
+    });
+
+    it('reports NEXUS_AUTH_METHOD as unknown — it never reached enforcement (#5665)', () => {
+      // The variable was registered and documented, but the only reader was
+      // the startup log line; AuthHandler never consulted it. Removed by panel
+      // decision rather than wired, as with #2977 / #4180.
+      vi.stubEnv('NEXUS_AUTH_METHOD', 'token');
+      const result = validateNexusEnv();
+      expect(result.unknownVars.map((v) => v.name)).toContain('NEXUS_AUTH_METHOD');
+    });
+
+    it('accepts the documented NEXUS_SANDBOX flavor string (#5695)', () => {
+      // The schema said boolean while the guide, `init --opencode` and doctor
+      // all use flavor strings such as docker-opencode, so a correctly
+      // configured sandbox warned "invalid value" on every start.
+      vi.stubEnv('NEXUS_SANDBOX', 'docker-opencode');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name)).not.toContain('NEXUS_SANDBOX');
+      expect(result.unknownVars).toHaveLength(0);
+    });
+
+    it('accepts an empty NEXUS_SANDBOX as the off switch (#5695)', () => {
+      // `export NEXUS_SANDBOX=""` is how an operator overrides the image's
+      // export for one run; sandbox-detection reads empty as unset, so the
+      // validator must not call the documented off state invalid.
+      vi.stubEnv('NEXUS_SANDBOX', '');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name)).not.toContain('NEXUS_SANDBOX');
+    });
+
+    it.each(['off', 'audit', 'enforce'])('recognizes consensus enforcement %s', (mode) => {
+      vi.stubEnv('NEXUS_CONSENSUS_ENFORCE', mode);
+      const result = validateNexusEnv();
+      expect(result.unknownVars.map((v) => v.name)).not.toContain('NEXUS_CONSENSUS_ENFORCE');
+      expect(result.invalidVars.map((v) => v.name)).not.toContain('NEXUS_CONSENSUS_ENFORCE');
+    });
+
+    it.each(['ENFORCE', '1'])('reports invalid consensus enforcement %s', (mode) => {
+      vi.stubEnv('NEXUS_CONSENSUS_ENFORCE', mode);
+      expect(validateNexusEnv().invalidVars.map((v) => v.name)).toContain(
+        'NEXUS_CONSENSUS_ENFORCE'
+      );
+    });
+
+    it('recognizes the autonomous-remediation + policy + overlay vars (#3713)', () => {
+      vi.stubEnv('NEXUS_AUTO_REMEDIATE', 'audit');
+      vi.stubEnv('NEXUS_POLICY_GATE_MODE', 'warn');
+      vi.stubEnv('NEXUS_MODELS_OVERLAY_PATH', '/tmp/overlay.yaml');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('recognizes NEXUS_CONTEXT_RANKED (#3236)', () => {
+      vi.stubEnv('NEXUS_CONTEXT_RANKED', '1');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('rejects an invalid NEXUS_CONTEXT_RANKED value (#3236)', () => {
+      vi.stubEnv('NEXUS_CONTEXT_RANKED', 'yes');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name)).toContain('NEXUS_CONTEXT_RANKED');
+    });
+
+    it('recognizes NEXUS_REPO_MAP (#4254)', () => {
+      vi.stubEnv('NEXUS_REPO_MAP', '1');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('rejects an invalid NEXUS_REPO_MAP value (#4254)', () => {
+      vi.stubEnv('NEXUS_REPO_MAP', 'on');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name)).toContain('NEXUS_REPO_MAP');
+    });
+
+    it('recognizes NEXUS_ALLOW_SIMULATE (#4170)', () => {
+      vi.stubEnv('NEXUS_ALLOW_SIMULATE', '1');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('flags the never-wired timeout vars removed in #4180 as unknown', () => {
+      vi.stubEnv('NEXUS_TEST_TIMEOUT_MS', '60000');
+      const result = validateNexusEnv();
+      expect(result.unknownVars.map((u) => u.name)).toContain('NEXUS_TEST_TIMEOUT_MS');
+    });
+
+    it('rejects an invalid NEXUS_ALLOW_SIMULATE value (#4170)', () => {
+      vi.stubEnv('NEXUS_ALLOW_SIMULATE', 'yes');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name)).toContain('NEXUS_ALLOW_SIMULATE');
+    });
+
+    it('recognizes NEXUS_META_SHADOW_TRAIN (#3593)', () => {
+      vi.stubEnv('NEXUS_META_SHADOW_TRAIN', '1');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('rejects an invalid NEXUS_META_SHADOW_TRAIN value (#3593)', () => {
+      vi.stubEnv('NEXUS_META_SHADOW_TRAIN', 'on');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name)).toContain('NEXUS_META_SHADOW_TRAIN');
+    });
+
+    it('recognizes NEXUS_ROUTE_MODEL_SELECTION and NEXUS_ROUTE_MODEL_SHADOW (#4197)', () => {
+      vi.stubEnv('NEXUS_ROUTE_MODEL_SELECTION', 'true');
+      vi.stubEnv('NEXUS_ROUTE_MODEL_SHADOW', '1');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    // `1` and `true` until #5464. Those two values were the split itself —
+    // `NEXUS_ROUTE_MODEL_SELECTION` took `true` while its neighbour took `1`,
+    // and this test asserted each one's rejection of the other's spelling as
+    // intended behaviour. Both are now valid; `on` and `yes` are outside the
+    // accept-set every NEXUS_* boolean shares, which is what this case tests.
+    it('rejects invalid NEXUS_ROUTE_MODEL_SELECTION / NEXUS_ROUTE_MODEL_SHADOW values (#4197)', () => {
+      vi.stubEnv('NEXUS_ROUTE_MODEL_SELECTION', 'on');
+      vi.stubEnv('NEXUS_ROUTE_MODEL_SHADOW', 'yes');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name).sort()).toEqual([
+        'NEXUS_ROUTE_MODEL_SELECTION',
+        'NEXUS_ROUTE_MODEL_SHADOW',
+      ]);
+    });
+
+    // The migration's own acceptance: each of the six now takes all four
+    // spellings, which is the whole point of one accept-set (#5464).
+    it.each([
+      'NEXUS_ROUTE_MODEL_SELECTION',
+      'NEXUS_ROUTE_MODEL_SHADOW',
+      'NEXUS_META_SHADOW_TRAIN',
+      'NEXUS_LLM_CLASSIFICATION',
+      'NEXUS_REPO_PREFERRED',
+      'NEXUS_PERSIST_LEARNING',
+    ])('accepts the full boolean set for %s (#5464)', (name) => {
+      for (const value of ['true', 'false', '1', '0', 'TRUE', 'False']) {
+        vi.stubEnv(name, value);
+        const result = validateNexusEnv();
+        expect(result.invalidVars.map((v) => v.name)).not.toContain(name);
+      }
+    });
+
+    it('rejects invalid NEXUS_AUTO_REMEDIATE / NEXUS_POLICY_GATE_MODE values (#3713)', () => {
+      vi.stubEnv('NEXUS_AUTO_REMEDIATE', 'bogus');
+      vi.stubEnv('NEXUS_POLICY_GATE_MODE', 'nope');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name).sort()).toEqual([
+        'NEXUS_AUTO_REMEDIATE',
+        'NEXUS_POLICY_GATE_MODE',
+      ]);
+    });
+
+    it('returns no warnings when no NEXUS_* vars are set', () => {
+      // Clear all NEXUS_* vars via stubEnv
+      for (const key of Object.keys(process.env)) {
+        if (key.startsWith('NEXUS_')) {
+          vi.stubEnv(key, undefined);
+        }
+      }
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('detects unknown var with typo suggestion', () => {
+      vi.stubEnv('NEXUS_PERIST_LEARNING', 'true');
+      const result = validateNexusEnv();
+      expect(result.unknownVars.length).toBeGreaterThanOrEqual(1);
+      const typo = result.unknownVars.find((u) => u.name === 'NEXUS_PERIST_LEARNING');
+      expect(typo).toBeDefined();
+      expect(typo?.suggestion).toBe('NEXUS_PERSIST_LEARNING');
+    });
+
+    it('detects unknown var with no suggestion when too distant', () => {
+      vi.stubEnv('NEXUS_FOOBAR_XYZZY_RANDOM', 'true');
+      const result = validateNexusEnv();
+      const entry = result.unknownVars.find((u) => u.name === 'NEXUS_FOOBAR_XYZZY_RANDOM');
+      expect(entry).toBeDefined();
+      expect(entry?.suggestion).toBeNull();
+    });
+
+    it('detects invalid enum value for NEXUS_V2_MODE', () => {
+      vi.stubEnv('NEXUS_V2_MODE', 'invalid');
+      const result = validateNexusEnv();
+      const inv = result.invalidVars.find((v) => v.name === 'NEXUS_V2_MODE');
+      expect(inv).toBeDefined();
+      expect(inv?.value).toBe('invalid');
+    });
+
+    it('detects invalid integer value for NEXUS_VOTE_TIMEOUT_MS', () => {
+      vi.stubEnv('NEXUS_VOTE_TIMEOUT_MS', 'abc');
+      const result = validateNexusEnv();
+      const inv = result.invalidVars.find((v) => v.name === 'NEXUS_VOTE_TIMEOUT_MS');
+      expect(inv).toBeDefined();
+      expect(inv?.value).toBe('abc');
+    });
+
+    it('detects invalid boolean value for NEXUS_AUTH_ENABLED', () => {
+      vi.stubEnv('NEXUS_AUTH_ENABLED', 'maybe');
+      const result = validateNexusEnv();
+      const inv = result.invalidVars.find((v) => v.name === 'NEXUS_AUTH_ENABLED');
+      expect(inv).toBeDefined();
+      expect(inv?.value).toBe('maybe');
+    });
+
+    it('detects invalid log level', () => {
+      vi.stubEnv('NEXUS_LOG_LEVEL', 'verbose');
+      const result = validateNexusEnv();
+      const inv = result.invalidVars.find((v) => v.name === 'NEXUS_LOG_LEVEL');
+      expect(inv).toBeDefined();
+      expect(inv?.value).toBe('verbose');
+    });
+
+    it('reports multiple issues simultaneously', () => {
+      vi.stubEnv('NEXUS_PERIST_LEARNING', 'true');
+      vi.stubEnv('NEXUS_V2_MODE', 'invalid');
+      vi.stubEnv('NEXUS_VOTE_TIMEOUT_MS', 'not-a-number');
+      const result = validateNexusEnv();
+      expect(result.unknownVars.length).toBeGreaterThanOrEqual(1);
+      expect(result.invalidVars.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('accepts all valid boolean values', () => {
+      vi.stubEnv('NEXUS_AUTH_ENABLED', 'true');
+      const result = validateNexusEnv();
+      const boolInvalids = result.invalidVars.filter((v) => v.name === 'NEXUS_AUTH_ENABLED');
+      expect(boolInvalids).toHaveLength(0);
+    });
+
+    it('accepts valid NEXUS_REFLECTIVE_MEMORY shadow mode', () => {
+      vi.stubEnv('NEXUS_REFLECTIVE_MEMORY', 'shadow');
+      const result = validateNexusEnv();
+      const inv = result.invalidVars.find((v) => v.name === 'NEXUS_REFLECTIVE_MEMORY');
+      expect(inv).toBeUndefined();
+    });
+
+    it('logs warnings when logger is provided', () => {
+      vi.stubEnv('NEXUS_PERIST_LEARNING', 'true');
+      vi.stubEnv('NEXUS_V2_MODE', 'invalid');
+      const warnings: string[] = [];
+      const mockLogger = {
+        warn: (msg: string) => warnings.push(msg),
+        info: vi.fn(),
+        debug: vi.fn(),
+        error: vi.fn(),
+      } as unknown as import('../core/index.js').ILogger;
+
+      validateNexusEnv(mockLogger);
+
+      expect(warnings.length).toBeGreaterThanOrEqual(2);
+      expect(warnings.some((w) => w.includes('NEXUS_PERIST_LEARNING'))).toBe(true);
+      expect(warnings.some((w) => w.includes('did you mean NEXUS_PERSIST_LEARNING'))).toBe(true);
+      expect(warnings.some((w) => w.includes('NEXUS_V2_MODE'))).toBe(true);
+    });
+
+    it('suggests NEXUS_V2_DELEGATE for NEXUS_V2_DELEATE', () => {
+      vi.stubEnv('NEXUS_V2_DELEATE', 'true');
+      const result = validateNexusEnv();
+      const entry = result.unknownVars.find((u) => u.name === 'NEXUS_V2_DELEATE');
+      expect(entry).toBeDefined();
+      expect(entry?.suggestion).toBe('NEXUS_V2_DELEGATE');
+    });
+  });
+
+  describe('code-read variables are registered (#5142)', () => {
+    // Verified live before the fix: each of these produced an unknownVars entry
+    // while production code read the value, so the typo detector accused the
+    // user of a typo they had not made.
+
+    it('recognizes NEXUS_MCP_DEPTH, read by the codex MCP nesting guard', () => {
+      vi.stubEnv('NEXUS_MCP_DEPTH', '1');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('reports a non-integer NEXUS_MCP_DEPTH as invalid rather than ignoring it', () => {
+      vi.stubEnv('NEXUS_MCP_DEPTH', 'abc');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name)).toContain('NEXUS_MCP_DEPTH');
+    });
+
+    it('accepts 0 for NEXUS_JOB_MAX_CONCURRENT_TOTAL, which disables async dispatch', () => {
+      vi.stubEnv('NEXUS_JOB_MAX_CONCURRENT_TOTAL', '0');
+      const result = validateNexusEnv();
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('recognizes the path and token variables', () => {
+      vi.stubEnv('NEXUS_VOTE_RECORDS_PATH', '/tmp/votes.jsonl');
+      vi.stubEnv('NEXUS_OPENAI_COMPAT_URL', 'https://example.test/v1');
+      vi.stubEnv('NEXUS_SENSITIVE_REFS', 'alpha,beta');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+      expect(result.invalidVars).toHaveLength(0);
+    });
+
+    it('accepts the full parseBoolEnv set for NEXUS_VERSION_CHECK', () => {
+      for (const value of ['true', 'false', '1', '0', 'TRUE']) {
+        vi.stubEnv('NEXUS_VERSION_CHECK', value);
+        expect(validateNexusEnv().invalidVars).toHaveLength(0);
+      }
+    });
+
+    it('rejects "yes" for a parseBoolEnv variable, which the helper silently discards', () => {
+      // parseBoolEnv accepts only true|1|false|0; `yes` falls through to the
+      // default, so reporting it is what stops a silent no-op (#5155).
+      vi.stubEnv('NEXUS_VERSION_CHECK', 'yes');
+      const result = validateNexusEnv();
+      expect(result.invalidVars.map((v) => v.name)).toContain('NEXUS_VERSION_CHECK');
+    });
+
+    it('accepts 1/0 for the hook flags, which are read via parseBoolEnv (#5155)', () => {
+      // handler-utils.ts reads all three through parseBoolEnv, so `1`/`0` work
+      // at runtime (the hook tests set `=1`); the strict boolStr registration
+      // reported those spellings invalid — the inverse of the silent no-op.
+      for (const name of [
+        'NEXUS_HOOK_VERBOSE',
+        'NEXUS_DISABLE_SESSIONS',
+        'NEXUS_DISABLE_METRICS',
+      ]) {
+        for (const value of ['1', '0', 'TRUE']) {
+          vi.stubEnv(name, value);
+          expect(validateNexusEnv().invalidVars.map((v) => v.name)).not.toContain(name);
+        }
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it('accepts NEXUS_REPUTATION_GATING in mixed case, as the consumer lowercases it', () => {
+      vi.stubEnv('NEXUS_REPUTATION_GATING', 'Enforce');
+      expect(validateNexusEnv().invalidVars).toHaveLength(0);
+    });
+  });
+
+  describe('dynamic variable families (#5142)', () => {
+    it('recognizes every NEXUS_VOTER_MODEL_<ROLE> built from VOTER_ROLES', () => {
+      for (const role of Object.keys(VOTER_ROLES)) {
+        vi.stubEnv(`NEXUS_VOTER_MODEL_${role.toUpperCase()}`, 'claude-opus');
+      }
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+    });
+
+    it('still flags a NEXUS_VOTER_MODEL_ suffix that is not a real role', () => {
+      // Without this the family check would accept anything and could not fail.
+      vi.stubEnv('NEXUS_VOTER_MODEL_NOTAROLE', 'claude-opus');
+      const result = validateNexusEnv();
+      expect(result.unknownVars.map((u) => u.name)).toContain('NEXUS_VOTER_MODEL_NOTAROLE');
+    });
+
+    it('recognizes a per-tool NEXUS_JOB_MAX_CONCURRENT_<TOOL> override', () => {
+      vi.stubEnv('NEXUS_JOB_MAX_CONCURRENT_ORCHESTRATE', '2');
+      const result = validateNexusEnv();
+      expect(result.unknownVars).toHaveLength(0);
+    });
+
+    it('does not treat a bare family prefix with no suffix as known', () => {
+      vi.stubEnv('NEXUS_VOTER_MODEL_', 'x');
+      const result = validateNexusEnv();
+      expect(result.unknownVars.map((u) => u.name)).toContain('NEXUS_VOTER_MODEL_');
+    });
+  });
+
+  describe('getKnownNexusVarNames', () => {
+    it('returns a non-empty array of known variable names', () => {
+      const names = getKnownNexusVarNames();
+      expect(names.length).toBeGreaterThan(40);
+    });
+
+    it('includes core known variables', () => {
+      const names = getKnownNexusVarNames();
+      expect(names).toContain('NEXUS_VOTE_TIMEOUT_MS');
+      expect(names).toContain('NEXUS_V2_MODE');
+      expect(names).toContain('NEXUS_LOG_LEVEL');
+      expect(names).toContain('NEXUS_PERSIST_LEARNING');
+      expect(names).toContain('NEXUS_AUTH_ENABLED');
+      expect(names).toContain('NEXUS_BILLING_MODE');
+    });
+
+    it('does not register the never-wired timeout vars removed in #4180', () => {
+      const names = getKnownNexusVarNames();
+      expect(names).not.toContain('NEXUS_TEST_TIMEOUT_MS');
+      expect(names).not.toContain('NEXUS_TIMEOUT_CLISIMPLE');
+      expect(names).not.toContain('NEXUS_TIMEOUT_CLICOMPLEX');
+    });
+
+    it('all names start with NEXUS_', () => {
+      const names = getKnownNexusVarNames();
+      for (const name of names) {
+        expect(name).toMatch(/^NEXUS_/);
+      }
+    });
+  });
+});
+
+// =============================================================================
+// The schema must know every variable the docs tell people to set (#4722)
+// =============================================================================
+
+describe('documented NEXUS_* vars are all in the schema (#4722)', () => {
+  // `NEXUS_DATA_DIR` sat in CLAUDE.md's most-used table and not in this schema,
+  // so setting the documented variable made `validateNexusEnv` report it as an
+  // UNKNOWN var — with a typo suggestion for a name spelled correctly. Three
+  // siblings were missing the same way. Nothing connected the two lists.
+  // Reads AGENTS.md, not CLAUDE.md (#5151). The env table moved there so every
+  // harness sees it; checking CLAUDE.md would gate the table in the one file
+  // only Claude reads, which is what this guarantee was quietly doing before.
+  // CLAUDE.md still renders the same table — it is injected from this source —
+  // so nothing is lost by checking the origin instead of the copy.
+  const AGENTS_MD = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8');
+
+  /** Every `NEXUS_*` name appearing in backticks in AGENTS.md. */
+  function documentedVars(): string[] {
+    const found = new Set<string>();
+    for (const m of AGENTS_MD.matchAll(/`(NEXUS_[A-Z0-9_]+)`/g)) {
+      const name = m[1];
+      if (name !== undefined) found.add(name);
+    }
+    return [...found].sort();
+  }
+
+  it('finds the documented list it is checking against', () => {
+    // Guard the guard: a regex that matched nothing would make the assertion
+    // below pass over an empty set, which is the failure this file is about.
+    expect(documentedVars().length).toBeGreaterThan(10);
+  });
+
+  it('recognizes every documented variable', () => {
+    // AGENTS.md also names variables that were REMOVED (#2977, #4180) and
+    // documents them as removed; those must stay out of the schema.
+    const removed = new Set(
+      documentedVars().filter((v) =>
+        new RegExp(`\`${v}\`[^\\n]*(?:removed|were removed)`, 'i').test(AGENTS_MD)
+      )
+    );
+    const schemaKeys = new Set(getKnownNexusVarNames());
+
+    const missing = documentedVars().filter((v) => !schemaKeys.has(v) && !removed.has(v));
+
+    expect(missing).toEqual([]);
+  });
+});
+
+// =============================================================================
+// CONFIGURATION.md is the authoritative list, and it was unguarded (#5159)
+// =============================================================================
+
+describe('documented NEXUS_* vars in CONFIGURATION.md are all in the schema (#5159)', () => {
+  // The #4722 guarantee reads AGENTS.md, which carries only the MOST-USED
+  // table and explicitly defers to CONFIGURATION.md for the full list. So the
+  // authoritative document was the one nothing checked: measured on
+  // 2026-08-29, 16 of the 22 variables registered by #5142 were already
+  // documented here while unregistered, and the test built to catch exactly
+  // that could not see any of them.
+  const CONFIG_MD = readFileSync(join(REPO_ROOT, 'docs/getting-started/CONFIGURATION.md'), 'utf8');
+
+  const BASELINE = JSON.parse(
+    readFileSync(join(REPO_ROOT, 'docs/ops/env-schema-coverage-baseline.json'), 'utf8')
+  ) as { intentional: Record<string, unknown>; debt: string[] };
+
+  /** Every `NEXUS_*` name appearing in backticks in CONFIGURATION.md. */
+  function documentedVars(): string[] {
+    const found = new Set<string>();
+    for (const m of CONFIG_MD.matchAll(/`(NEXUS_[A-Z0-9_]+)`/g)) {
+      const name = m[1];
+      if (name !== undefined) found.add(name);
+    }
+    return [...found].sort();
+  }
+
+  it('finds the documented list it is checking against', () => {
+    // Guard the guard, same as the AGENTS.md check: a regex that matched
+    // nothing would make the assertion below pass over an empty set, which is
+    // the exact failure this file exists to prevent.
+    expect(documentedVars().length).toBeGreaterThan(50);
+  });
+
+  it('recognizes every documented variable', () => {
+    // Three documented populations are legitimately absent from the schema:
+    //
+    //  1. REMOVED vars (#2977, #4180). CONFIGURATION.md documents them AS
+    //     removed so a user who still has one set can find out why it stopped
+    //     working. Registering them would resurrect names with no reader.
+    //  2. Accepted debt already tracked in the coverage baseline (#5142) —
+    //     registering those needs a per-variable judgment on the accepted
+    //     value set, which is #5156, not this test.
+    //  3. Script-scoped vars, marked as such in their doc row: they are read
+    //     under scripts/, never by the server, so the runtime schema that
+    //     validates the server's own process env is the wrong home for them.
+    //
+    // Anything else documented-but-unregistered is the #4722 defect: the user
+    // sets a documented name and gets an unknown-variable warning, often
+    // suggesting a DIFFERENT spelling that does work.
+    // Removed vars are listed as prose under `### Removed …` headings, not as
+    // table rows, so this collects every name inside such a section rather
+    // than pattern-matching a row. Each section runs to the next heading.
+    const removed = new Set<string>();
+    for (const m of CONFIG_MD.matchAll(/^#{2,3} Removed[^\n]*$/gim)) {
+      const start = m.index ?? 0;
+      const rest = CONFIG_MD.slice(start + m[0].length);
+      const nextHeading = rest.search(/^#{2,3} /m);
+      const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading);
+      for (const n of section.matchAll(/`(NEXUS_[A-Z0-9_]+)`/g)) {
+        const name = n[1];
+        if (name !== undefined) removed.add(name);
+      }
+    }
+    const scriptScoped = new Set(
+      documentedVars().filter((v) =>
+        new RegExp(`\`${v}\`[^\\n]*script-scoped`, 'i').test(CONFIG_MD)
+      )
+    );
+    const baselined = new Set([...BASELINE.debt, ...Object.keys(BASELINE.intentional)]);
+    const schemaKeys = new Set(getKnownNexusVarNames());
+
+    const missing = documentedVars().filter(
+      (v) => !schemaKeys.has(v) && !removed.has(v) && !baselined.has(v) && !scriptScoped.has(v)
+    );
+
+    expect(missing).toEqual([]);
+  });
+
+  it('does not document a name that no code reads under a real one it shadows', () => {
+    // #5159's original pair was NEXUS_RATE_LIMIT (documented, read by nothing)
+    // shadowing NEXUS_RATE_LIMIT_RPM (real, documented nowhere). BOTH are gone
+    // as of #5903 — the whole rate-limit/retry/circuit-breaker family was
+    // removed because none of the twelve was read by anything that runs.
+    //
+    // What this test guards NOW, stated plainly so the comment does not
+    // describe a pair that no longer exists: CONFIGURATION.md must not name
+    // either removed spelling, and must still name at least one variable that
+    // is genuinely read. NEXUS_DATA_DIR is that example.
+    //
+    // The SHADOW class itself — a documented name with no reader — is covered
+    // structurally now, which it was not when #5159 landed:
+    //   - scripts/check-env-schema-coverage.ts proves registered == read
+    //   - the 'documented NEXUS_* vars ... are all in the schema' describe
+    //     above proves documented ⊆ registered
+    // Those two compose to "documented ⊆ read", for any name, which is what a
+    // fixture-specific pair could never do. This test is the tombstone for the
+    // original pair, not the enforcement.
+    expect(CONFIG_MD).not.toMatch(/`NEXUS_RATE_LIMIT`/);
+    expect(CONFIG_MD).not.toMatch(/`NEXUS_RATE_LIMIT_RPM`/);
+    expect(CONFIG_MD).toMatch(/`NEXUS_DATA_DIR`/);
+  });
+});
+
+// =============================================================================
+// Every parseBoolEnv / parseBoolValue consumer is registered with the
+// boolLooseStr shape (#5155)
+// =============================================================================
+
+describe('parseBoolEnv consumers are registered as boolLooseStr (#5155)', () => {
+  // The #5142 coverage gate (scripts/check-env-schema-coverage.ts) proves a
+  // flag the code reads is REGISTERED; it says nothing about the accept-set.
+  // A boolean flag registered as strict `boolStr` (`true|false`) would report
+  // `NEXUS_X=1` invalid while the helper accepts it — and one registered as a
+  // free string would tell the user `yes` works when the helper discards it.
+  // So this reads the actual call sites and probes each name against the
+  // schema for the exact helper accept-set: `TRUE` in, `yes` out.
+  const SRC = join(REPO_ROOT, 'packages/nexus-agents/src');
+
+  function sourceFiles(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) {
+        out.push(...sourceFiles(full));
+        continue;
+      }
+      if (!entry.endsWith('.ts') || entry.includes('.test.') || entry.includes('.spec.')) continue;
+      out.push(full);
+    }
+    return out;
+  }
+
+  /** One `parseBoolEnv` / `parseBoolValue` argument the scanner could not name. */
+  interface UnresolvedBoolRead {
+    readonly file: string;
+    readonly line: number;
+    readonly argument: string;
+  }
+
+  interface BoolFlagScan {
+    /** NEXUS_* names resolved from the call sites. */
+    readonly names: readonly string[];
+    /** Call sites whose argument is not a NEXUS_* literal by any known shape. */
+    readonly unresolved: readonly UnresolvedBoolRead[];
+    /**
+     * The FALLBACK each resolved call site passes — the value the flag takes
+     * when unset, i.e. the thing the docs call its default (#5955). Only
+     * `true`/`false` literals are recorded; a computed fallback is absent, and
+     * the consumer must treat absence as "cannot check", never as a match.
+     */
+    readonly fallbacks: readonly (readonly [string, boolean])[];
+  }
+
+  /**
+   * Call sites whose argument is a runtime value the scanner cannot resolve,
+   * keyed by file (relative to `src/`) → the env names that reach it. Each
+   * name is probed exactly like a resolved one. A site that is neither
+   * resolvable nor listed here FAILS the test, so a new indirect reader has
+   * to be tabled with its names before it can pass — the table is the
+   * visible, countable set of readers the regex cannot see.
+   */
+  const INDIRECT_BOOL_READERS: Readonly<Record<string, readonly string[]>> = {
+    // `isFeatureDisabled(envVar)` — called from stop.ts, post-tool.ts and
+    // session-end.ts with these two members of HookEnvVars.
+    'cli/hooks/handlers/handler-utils.ts': ['NEXUS_DISABLE_SESSIONS', 'NEXUS_DISABLE_METRICS'],
+  };
+
+  /**
+   * Resolve one call argument to a NEXUS_* name. Four shapes are known:
+   * a literal (`'NEXUS_X'`), a same-file constant (`const FLAG = 'NEXUS_X'`),
+   * a member expression (`HookEnvVars.NEXUS_X` — the member IS the name), and
+   * the injected-env form (`source['NEXUS_X']`). Anything else — a parameter,
+   * an imported constant, a computed key — is `undefined`, which the caller
+   * must treat as a failure, never as "nothing to check".
+   */
+  function resolveBoolFlagArgument(
+    argument: string,
+    constants: ReadonlyMap<string, string>
+  ): string | undefined {
+    const literal = /^['"](NEXUS_[A-Z0-9_]+)['"]$/.exec(argument);
+    if (literal?.[1] !== undefined) return literal[1];
+    const member = /^\w+\.(NEXUS_[A-Z0-9_]+)$/.exec(argument);
+    if (member?.[1] !== undefined) return member[1];
+    const bracket = /^\w+\[['"](NEXUS_[A-Z0-9_]+)['"]\]$/.exec(argument);
+    if (bracket?.[1] !== undefined) return bracket[1];
+    if (/^\w+$/.test(argument)) return constants.get(argument);
+    return undefined;
+  }
+
+  /**
+   * Scan one source text for `parseBoolEnv(...)` / `parseBoolValue(...)` reads.
+   * Pure — takes text, not a path — so the unresolved branch can be proven on
+   * an inline fixture. The helpers' own definitions in defaults-env.ts are
+   * blanked first (newlines kept, so line numbers stay true): the body of
+   * `parseBoolEnv` delegates with `parseBoolValue(process.env[envKey], …)`,
+   * which is the definition, not a consumer.
+   */
+  function scanBoolFlagReads(source: string, file: string): BoolFlagScan {
+    const code = source.replace(
+      /export function parseBool(?:Env|Value)\([^)]*\)[^{]*\{[\s\S]*?\n\}/g,
+      (m) => m.replace(/[^\n]/g, '')
+    );
+    const constants = new Map<string, string>();
+    for (const m of code.matchAll(/^(?:export )?const (\w+)\s*=\s*'(NEXUS_[A-Z0-9_]+)'/gm)) {
+      if (m[1] !== undefined && m[2] !== undefined) constants.set(m[1], m[2]);
+    }
+    const names: string[] = [];
+    const unresolved: UnresolvedBoolRead[] = [];
+    for (const m of code.matchAll(/parseBool(?:Env|Value)\(\s*([^,)]+?)\s*,/g)) {
+      const argument = m[1] ?? '';
+      const name = resolveBoolFlagArgument(argument, constants);
+      if (name !== undefined) names.push(name);
+      else unresolved.push({ file, line: code.slice(0, m.index).split('\n').length, argument });
+    }
+
+    // Second, INDEPENDENT pass for the fallback (#5955). Deliberately not
+    // folded into the loop above: requiring a closing paren narrows what
+    // matches, and a call this stricter pattern misses would have vanished
+    // from `names` too — silently shrinking the #5155 name ratchet instead of
+    // failing it. A fallback the pattern cannot see is simply absent here,
+    // which the consumer must treat as "cannot check", never as a match.
+    const fallbacks: (readonly [string, boolean])[] = [];
+    for (const m of code.matchAll(
+      /parseBool(?:Env|Value)\(\s*([^,)]+?)\s*,\s*(true|false)\s*\)/g
+    )) {
+      const name = resolveBoolFlagArgument(m[1] ?? '', constants);
+      if (name !== undefined) fallbacks.push([name, m[2] === 'true']);
+    }
+    return { names, unresolved, fallbacks };
+  }
+
+  interface TreeScan {
+    readonly sites: Map<string, string[]>;
+    /**
+     * name -> the fallback every call site passes, when they AGREE. A name
+     * whose readers disagree is absent, and `conflictingFallbacks` names it:
+     * two readers of one flag with different defaults means no single
+     * documented default can be right, which is itself the finding (#5955).
+     */
+    readonly fallbacks: Map<string, boolean>;
+    readonly conflictingFallbacks: readonly string[];
+    /** Unresolved sites in files NOT tabled — each one fails the gate. */
+    readonly untabled: readonly UnresolvedBoolRead[];
+    /** Tabled files that no longer have an unresolved site — stale table. */
+    readonly staleTable: readonly string[];
+  }
+
+  /**
+   * Collapse each flag's observed fallbacks to the single value its readers
+   * agree on. Disagreement is not resolved to a winner — it is reported, since
+   * two readers of one flag with different defaults means no documented
+   * default can be right for it (#5955).
+   */
+  function reconcileFallbacks(seen: ReadonlyMap<string, ReadonlySet<boolean>>): {
+    readonly fallbacks: Map<string, boolean>;
+    readonly conflictingFallbacks: readonly string[];
+  } {
+    const fallbacks = new Map<string, boolean>();
+    const conflictingFallbacks: string[] = [];
+    for (const [name, values] of seen) {
+      const only = [...values];
+      if (only.length === 1 && only[0] !== undefined) fallbacks.set(name, only[0]);
+      else conflictingFallbacks.push(name);
+    }
+    return { fallbacks, conflictingFallbacks };
+  }
+
+  function scanTree(): TreeScan {
+    const sites = new Map<string, string[]>();
+    const add = (name: string, file: string): void => {
+      sites.set(name, [...(sites.get(name) ?? []), file]);
+    };
+    const untabled: UnresolvedBoolRead[] = [];
+    const filesWithUnresolved = new Set<string>();
+    const seen = new Map<string, Set<boolean>>();
+    for (const full of sourceFiles(SRC)) {
+      const file = full.replace(`${SRC}/`, '');
+      const scan = scanBoolFlagReads(readFileSync(full, 'utf8'), file);
+      for (const name of scan.names) add(name, file);
+      for (const [name, value] of scan.fallbacks) {
+        seen.set(name, (seen.get(name) ?? new Set<boolean>()).add(value));
+      }
+      if (scan.unresolved.length === 0) continue;
+      filesWithUnresolved.add(file);
+      const tabled = INDIRECT_BOOL_READERS[file];
+      if (tabled === undefined) untabled.push(...scan.unresolved);
+      else for (const name of tabled) add(name, file);
+    }
+    const staleTable = Object.keys(INDIRECT_BOOL_READERS).filter(
+      (f) => !filesWithUnresolved.has(f)
+    );
+    const { fallbacks, conflictingFallbacks } = reconcileFallbacks(seen);
+    return { sites, untabled, staleTable, fallbacks, conflictingFallbacks };
+  }
+
+  const TREE = scanTree();
+  const KNOWN_SITES = TREE.sites;
+
+  it('reports an argument it cannot resolve instead of skipping it', () => {
+    // The scanner must fail closed: a parameter, an imported constant or a
+    // computed key is an env read the gate cannot see, and silently skipping
+    // it is how three strict-boolStr hook flags went unprobed (#5155 review).
+    const fixture = [
+      "const FLAG = 'NEXUS_FIXTURE_CONST';",
+      'export function isVerbose(): boolean {',
+      '  return parseBoolEnv(Vars.NEXUS_FIXTURE_MEMBER, false);',
+      '}',
+      'export function isDisabled(envVar: string): boolean {',
+      '  return parseBoolEnv(envVar, false);',
+      '}',
+      "const a = parseBoolEnv('NEXUS_FIXTURE_LITERAL', true);",
+      'const b = parseBoolEnv(FLAG, true);',
+      "const c = parseBoolValue(source['NEXUS_FIXTURE_BRACKET'], true);",
+      'const d = parseBoolValue(source[key], true);',
+    ].join('\n');
+    const scan = scanBoolFlagReads(fixture, 'fixture.ts');
+    expect(scan.names).toEqual([
+      'NEXUS_FIXTURE_MEMBER',
+      'NEXUS_FIXTURE_LITERAL',
+      'NEXUS_FIXTURE_CONST',
+      'NEXUS_FIXTURE_BRACKET',
+    ]);
+    expect(scan.unresolved).toEqual([
+      { file: 'fixture.ts', line: 6, argument: 'envVar' },
+      { file: 'fixture.ts', line: 11, argument: 'source[key]' },
+    ]);
+  });
+
+  it('does not count the helper definitions themselves as consumers', () => {
+    const helper = [
+      'export function parseBoolValue(value: string | undefined, fallback: boolean): boolean {',
+      '  return fallback;',
+      '}',
+      'export function parseBoolEnv(envKey: string, fallback: boolean): boolean {',
+      '  return parseBoolValue(process.env[envKey], fallback);',
+      '}',
+      "const x = parseBoolEnv('NEXUS_FIXTURE_AFTER', false);",
+    ].join('\n');
+    const scan = scanBoolFlagReads(helper, 'defaults-env.ts');
+    expect(scan.unresolved).toEqual([]);
+    expect(scan.names).toEqual(['NEXUS_FIXTURE_AFTER']);
+  });
+
+  it('finds the call sites it is checking against', () => {
+    // Guard the guard: a regex that matched nothing would pass the assertions
+    // below over an empty set. The five #5155 flags, the four registered
+    // earlier, and the three hook flags are the floor.
+    expect(KNOWN_SITES.size).toBeGreaterThanOrEqual(12);
+    expect([...KNOWN_SITES.keys()]).toEqual(
+      expect.arrayContaining([
+        'NEXUS_BUDGET_ENFORCE',
+        'NEXUS_DYNAMIC_MODELS',
+        'NEXUS_CONTEXT_RETRIEVER_INJECT',
+        'NEXUS_GITIGNORE_AUTO',
+        'NEXUS_SUBPROCESS_ENV_ALLOWLIST',
+        'NEXUS_HOOK_VERBOSE',
+        'NEXUS_DISABLE_SESSIONS',
+        'NEXUS_DISABLE_METRICS',
+      ])
+    );
+  });
+
+  it('fails on a call site it cannot resolve unless the file is tabled with its names', () => {
+    // Name the empty case: an INDIRECT_BOOL_READERS entry with no names would
+    // exempt a file from the gate while probing nothing.
+    for (const [file, names] of Object.entries(INDIRECT_BOOL_READERS)) {
+      expect(names.length, `${file} is tabled with no env names`).toBeGreaterThan(0);
+    }
+    expect(
+      TREE.untabled.map((u) => `${u.file}:${String(u.line)} parseBool*(${u.argument}, …)`)
+    ).toEqual([]);
+    expect(TREE.staleTable).toEqual([]);
+  });
+
+  it('registers every consumer name with the exact helper accept-set', () => {
+    const schemaKeys = new Set(getKnownNexusVarNames());
+    const unregistered: string[] = [];
+    const wrongShape: string[] = [];
+
+    for (const [name, files] of KNOWN_SITES) {
+      if (!schemaKeys.has(name)) {
+        unregistered.push(`${name} (${files.map((f) => f.replace(`${SRC}/`, '')).join(', ')})`);
+        continue;
+      }
+      // Probe the registered shape rather than reading the source: `TRUE` must
+      // be accepted (the helper lowercases) and `yes` must be rejected (the
+      // helper discards it).
+      vi.stubEnv(name, 'TRUE');
+      const acceptsUpper = !validateNexusEnv().invalidVars.some((v) => v.name === name);
+      vi.stubEnv(name, 'yes');
+      const rejectsYes = validateNexusEnv().invalidVars.some((v) => v.name === name);
+      vi.unstubAllEnvs();
+      if (!acceptsUpper || !rejectsYes) wrongShape.push(name);
+    }
+
+    expect(unregistered).toEqual([]);
+    expect(wrongShape).toEqual([]);
+  });
+
+  // --------------------------------------------------------------------
+  // Nested here because it reuses this block's TREE scan: the same call
+  // sites that must be REGISTERED must also be documented with the
+  // default they actually apply (#5955).
+  // --------------------------------------------------------------------
+  describe('documented defaults match the parseBoolEnv fallback (#5955)', () => {
+    // The two gates above this one (#4722, #5159) check that every NEXUS_* name
+    // in the docs is REGISTERED. Neither reads what the row says about the
+    // variable. Measured on 2026-09-08: changing NEXUS_LLM_CLASSIFICATION's
+    // AGENTS.md row from "default off" to "default ON" — for a flag whose
+    // fallback is false, and which costs one model call per task when on —
+    // passed all 61 tests here and `check-env-schema-coverage.ts` with exit 0.
+    // The env table is the only basis an operator has for what a flag does.
+
+    const AGENTS_MD = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf8');
+    const CONFIG_MD = readFileSync(
+      join(REPO_ROOT, 'docs/getting-started/CONFIGURATION.md'),
+      'utf8'
+    );
+
+    /**
+     * Default cells that are deliberately NOT a boolean spelling, with the
+     * reason. Tabled rather than skipped: an unrecognised cell fails, so a new
+     * one has to be justified here before it can pass.
+     */
+    const NON_BOOLEAN_DEFAULT_CELLS: Readonly<Record<string, string>> = {
+      // "unset" describes the variable's presence, not a value. Consistent with
+      // a false fallback, but it is not a claim about the boolean, so there is
+      // nothing to compare.
+      NEXUS_NO_SCAFFOLD: 'unset',
+    };
+
+    /**
+     * `true`/`1` -> true, `false`/`0` -> false. Failing that, an explicit
+     * `(… on)` / `(… off)` parenthetical — the vocabulary AGENTS.md already
+     * uses, and what lets a cell keep saying something useful in prose
+     * ("unset (allowlist on)") instead of being tabled away as uncheckable.
+     * Anything else -> undefined, which the caller treats as a failure.
+     */
+    function parseDocumentedBool(cell: string): boolean | undefined {
+      const v = cell.trim().replace(/^`|`$/g, '').toLowerCase();
+      if (v === 'true' || v === '1') return true;
+      if (v === 'false' || v === '0') return false;
+      const phrase = /\((?:[^()]*\s)?(on|off)\)$/.exec(v);
+      if (phrase?.[1] !== undefined) return phrase[1] === 'on';
+      return undefined;
+    }
+
+    /** The Default column of the CONFIGURATION.md row for `name`, if it has one. */
+    function configuredDefaultCell(name: string): string | undefined {
+      const row = new RegExp(`^\\|\\s*\`${name}\`\\s*\\|([^|]*)\\|([^|]*)\\|\\s*$`, 'm').exec(
+        CONFIG_MD
+      );
+      return row?.[2]?.trim();
+    }
+
+    /** The "(default off|ON)" phrase in the AGENTS.md row for `name`, if present. */
+    function agentsDefaultPhrase(name: string): boolean | undefined {
+      const row = new RegExp(`^\\|\\s*\`${name}\`\\s*\\|(.*)\\|\\s*$`, 'm').exec(AGENTS_MD);
+      if (row?.[1] === undefined) return undefined;
+      const phrase = /\(default\s+(on|off)\)/i.exec(row[1]);
+      if (phrase?.[1] === undefined) return undefined;
+      return phrase[1].toLowerCase() === 'on';
+    }
+
+    const FALLBACKS = [...TREE.fallbacks].sort(([a], [b]) => a.localeCompare(b));
+
+    it('finds the parseBoolEnv fallbacks at all', () => {
+      // Guards the whole describe against passing vacuously: if the scanner
+      // stopped resolving fallbacks, every case below would iterate nothing.
+      expect(FALLBACKS.length).toBeGreaterThanOrEqual(10);
+      expect(Object.fromEntries(FALLBACKS)).toMatchObject({
+        NEXUS_PERSIST_LEARNING: true,
+        NEXUS_REPO_PREFERRED: true,
+        NEXUS_LLM_CLASSIFICATION: false,
+      });
+    });
+
+    it('has no flag whose readers disagree about the default', () => {
+      // Two readers of one flag with different fallbacks means no single
+      // documented default can be correct for it.
+      expect(TREE.conflictingFallbacks).toEqual([]);
+    });
+
+    // The case above passes because the tree has no conflict today, so on its
+    // own it is a check that cannot fail — mutating the detector to accept
+    // any value leaves all 95 cases green. This proves the detector on a
+    // synthetic map instead, which is the only input that can exercise it.
+    it('reports a flag whose readers disagree, and keeps the ones that agree', () => {
+      const result = reconcileFallbacks(
+        new Map([
+          ['NEXUS_FIXTURE_AGREED', new Set([true])],
+          ['NEXUS_FIXTURE_SPLIT', new Set([true, false])],
+        ])
+      );
+      expect(result.conflictingFallbacks).toEqual(['NEXUS_FIXTURE_SPLIT']);
+      expect([...result.fallbacks]).toEqual([['NEXUS_FIXTURE_AGREED', true]]);
+    });
+
+    it('treats a flag with no observed fallback as absent, not as false', () => {
+      // An empty set is "the scanner saw nothing", which must not collapse to
+      // a default the docs could then be checked against.
+      const result = reconcileFallbacks(new Map([['NEXUS_FIXTURE_NONE', new Set<boolean>()]]));
+      expect(result.fallbacks.has('NEXUS_FIXTURE_NONE')).toBe(false);
+      expect(result.conflictingFallbacks).toEqual(['NEXUS_FIXTURE_NONE']);
+    });
+
+    it.each(FALLBACKS)('CONFIGURATION.md documents %s as %s', (name, fallback) => {
+      const cell = configuredDefaultCell(name);
+      if (cell === undefined) return; // row has no Default column — #5159 covers presence
+      const documented = parseDocumentedBool(cell);
+      if (documented === undefined) {
+        expect(
+          NON_BOOLEAN_DEFAULT_CELLS[name],
+          `${name}: Default cell ${JSON.stringify(cell)} is not a boolean spelling and is not tabled in NON_BOOLEAN_DEFAULT_CELLS`
+        ).toBe(cell.replace(/^`|`$/g, ''));
+        return;
+      }
+      expect(
+        documented,
+        `${name}: CONFIGURATION.md says ${cell}, code falls back to ${String(fallback)}`
+      ).toBe(fallback);
+    });
+
+    it.each(FALLBACKS)('AGENTS.md documents %s as %s', (name, fallback) => {
+      const documented = agentsDefaultPhrase(name);
+      if (documented === undefined) return; // not in the most-used table, or no phrase
+      expect(
+        documented,
+        `${name}: AGENTS.md says "(default ${documented ? 'on' : 'off'})", code falls back to ${String(fallback)}`
+      ).toBe(fallback);
+    });
+  });
+});
+
+// =============================================================================
+// NEXUS_MCP_POLICY_ENFORCE (#6431)
+// =============================================================================
+
+describe('NEXUS_MCP_POLICY_ENFORCE is registered as a parseBoolEnv flag (#6431)', () => {
+  // #4987/#4988 described this as the per-operator enforce opt-in; it had no
+  // reader, no schema entry and no docs. The #5155 ratchet above now finds the
+  // reader; this pins the registration on its own so the name is greppable.
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('is a known variable', () => {
+    expect(getKnownNexusVarNames()).toContain('NEXUS_MCP_POLICY_ENFORCE');
+  });
+
+  it.each(['1', 'true', '0', 'false'])('accepts %j', (value) => {
+    vi.stubEnv('NEXUS_MCP_POLICY_ENFORCE', value);
+    const result = validateNexusEnv();
+    expect(result.unknownVars.map((v) => v.name)).not.toContain('NEXUS_MCP_POLICY_ENFORCE');
+    expect(result.invalidVars.map((v) => v.name)).not.toContain('NEXUS_MCP_POLICY_ENFORCE');
+  });
+
+  it.each(['yes', 'on', 'enforce'])(
+    'reports %j as invalid, so the warn fallback is not silent',
+    (value) => {
+      vi.stubEnv('NEXUS_MCP_POLICY_ENFORCE', value);
+      expect(validateNexusEnv().invalidVars.map((v) => v.name)).toContain(
+        'NEXUS_MCP_POLICY_ENFORCE'
+      );
+    }
+  );
+});
+
+// =============================================================================
+// NEXUS_GATEWAY_COST (#4392 increment 2, step 1)
+// =============================================================================
+
+describe('NEXUS_GATEWAY_COST is registered with its grammar (#4392 inc 2)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('is a known variable', () => {
+    expect(getKnownNexusVarNames()).toContain('NEXUS_GATEWAY_COST');
+  });
+
+  it.each(['free', 'local', 'priced', 'priced:2,10', 'corp-proxy=free;priced:2,10'])(
+    'accepts %j',
+    (value) => {
+      vi.stubEnv('NEXUS_GATEWAY_COST', value);
+      const result = validateNexusEnv();
+      expect(result.unknownVars.map((v) => v.name)).not.toContain('NEXUS_GATEWAY_COST');
+      expect(result.invalidVars.map((v) => v.name)).not.toContain('NEXUS_GATEWAY_COST');
+    }
+  );
+
+  it.each([
+    ['priced:1', /both values/],
+    ['cheap', /not one of free \| local \| priced/],
+    ['free;local', /more than one bare declaration/],
+    ['corp=free;corp=local', /duplicate endpoint key/],
+    ['priced:-1,2', /non-negative/],
+  ])("reports %j as invalid, not unknown, with the parser's own reason", (value, reason) => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', value);
+    const result = validateNexusEnv();
+    expect(result.unknownVars.map((v) => v.name)).not.toContain('NEXUS_GATEWAY_COST');
+    const invalid = result.invalidVars.find((v) => v.name === 'NEXUS_GATEWAY_COST');
+    expect(invalid).toBeDefined();
+    // The reason reaches the operator, not a fixed grammar reminder.
+    expect(invalid?.error).toMatch(reason);
+  });
+
+  it.each(['ghp_SECRET=free', 'https://user:pw@host=free'])(
+    'never echoes the raw value %j into the record or the warn line — it can carry a key',
+    (value) => {
+      vi.stubEnv('NEXUS_GATEWAY_COST', value);
+      const warnings: string[] = [];
+      const logger = {
+        warn: (msg: string) => warnings.push(msg),
+        info: vi.fn(),
+        debug: vi.fn(),
+        error: vi.fn(),
+      } as unknown as import('../core/index.js').ILogger;
+
+      const result = validateNexusEnv(logger);
+
+      const invalid = result.invalidVars.find((v) => v.name === 'NEXUS_GATEWAY_COST');
+      expect(invalid).toBeDefined();
+      expect(invalid?.value).not.toContain('ghp_SECRET');
+      expect(invalid?.value).not.toContain('pw@');
+      const line = warnings.find((w) => w.includes('NEXUS_GATEWAY_COST'));
+      expect(line).toBeDefined();
+      expect(line).not.toContain('ghp_SECRET');
+      expect(line).not.toContain('pw@');
+      expect(line).toContain('<redacted>');
+    }
+  );
+});
+
+// =============================================================================
+// NEXUS_OPENAI_COMPAT_ENDPOINT (#4392 increment 2, step 2)
+// =============================================================================
+
+describe('NEXUS_OPENAI_COMPAT_ENDPOINT is registered as an endpoint id (#4392 inc 2 step 2)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('is a known variable', () => {
+    expect(getKnownNexusVarNames()).toContain('NEXUS_OPENAI_COMPAT_ENDPOINT');
+  });
+
+  it.each(['openai-compat', 'corp-proxy', 'gw_1.2'])('accepts %j', (value) => {
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_ENDPOINT', value);
+    const result = validateNexusEnv();
+    expect(result.unknownVars.map((v) => v.name)).not.toContain('NEXUS_OPENAI_COMPAT_ENDPOINT');
+    expect(result.invalidVars.map((v) => v.name)).not.toContain('NEXUS_OPENAI_COMPAT_ENDPOINT');
+  });
+
+  it.each(['Corp-Proxy', 'a b', 'https://user:pw@host/v1', ''])(
+    'reports %j as invalid, not unknown, without echoing the value',
+    (value) => {
+      vi.stubEnv('NEXUS_OPENAI_COMPAT_ENDPOINT', value);
+      const result = validateNexusEnv();
+      expect(result.unknownVars.map((v) => v.name)).not.toContain('NEXUS_OPENAI_COMPAT_ENDPOINT');
+      const invalid = result.invalidVars.find((v) => v.name === 'NEXUS_OPENAI_COMPAT_ENDPOINT');
+      expect(invalid).toBeDefined();
+      // A URL pasted here can carry a credential; the value never reaches the log.
+      expect(JSON.stringify(invalid)).not.toContain('user:pw');
+      expect(invalid?.value).toBe('<redacted>');
+    }
+  );
+
+  // #6409: a vendor segment passes the endpoint-id shape but makes the
+  // gateway register as a VENDOR arm (`api:openai`), where its
+  // NEXUS_GATEWAY_COST declaration is unreachable and the ceiling prices it
+  // as the vendor. The list is read from the vendor arm ids, not retyped.
+  const vendorSegments = ApiArmIdSchema.options
+    .filter((arm): boolean => !isGatewayArmId(arm))
+    .map((arm) => arm.slice('api:'.length));
+
+  it('reads the vendor segments from the vendor arm ids', () => {
+    expect(vendorSegments.sort()).toEqual(['anthropic', 'google', 'openai']);
+  });
+
+  it.each(['anthropic', 'google', 'openai'])(
+    'reports vendor segment %j as invalid, naming the collision (#6409)',
+    (value) => {
+      vi.stubEnv('NEXUS_OPENAI_COMPAT_ENDPOINT', value);
+      const result = validateNexusEnv();
+      const invalid = result.invalidVars.find((v) => v.name === 'NEXUS_OPENAI_COMPAT_ENDPOINT');
+      expect(invalid).toBeDefined();
+      expect(invalid?.error).toMatch(/vendor/);
+      expect(invalid?.error).toContain(value);
+      expect(invalid?.value).toBe('<redacted>');
+    }
+  );
+
+  it('still accepts a vendor-prefixed name that is not the vendor segment', () => {
+    for (const value of ['openai-compat', 'openai2', 'my-anthropic']) {
+      vi.stubEnv('NEXUS_OPENAI_COMPAT_ENDPOINT', value);
+      const result = validateNexusEnv();
+      expect(
+        result.invalidVars.map((v) => v.name),
+        value
+      ).not.toContain('NEXUS_OPENAI_COMPAT_ENDPOINT');
+    }
+  });
+
+  it('reports custom-openai as invalid, naming the single-model reservation (#6437)', () => {
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_ENDPOINT', 'custom-openai');
+    const result = validateNexusEnv();
+    const invalid = result.invalidVars.find((v) => v.name === 'NEXUS_OPENAI_COMPAT_ENDPOINT');
+    expect(invalid).toBeDefined();
+    expect(invalid?.error).toContain('reserved for the custom-openai compatibility arm');
+    expect(invalid?.value).toBe('<redacted>');
+  });
+});
+
+// =============================================================================
+// Removed gateway env aliases (#6291 B1)
+// =============================================================================
+
+describe('removed gateway env aliases (#6291 B1)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    for (const name of [
+      'NEXUS_CUSTOM_API_BASE_URL',
+      'NEXUS_CUSTOM_API_KEY',
+      'NEXUS_OPENAI_COMPAT_URL',
+      'NEXUS_OPENAI_COMPAT_KEY',
+      'NEXUS_ACCESS_POLICY_MODE',
+    ])
+      vi.stubEnv(name, undefined);
+  });
+
+  it.each([false, true])(
+    'reports removed aliases as unknown with canonical names set: %s',
+    (canonicalSet) => {
+      const oldUrl = 'https://gateway.example/v1';
+      const oldKey = 'sk-TESTFAKE-NOT-REAL-0000';
+      vi.stubEnv('NEXUS_CUSTOM_API_BASE_URL', oldUrl);
+      vi.stubEnv('NEXUS_CUSTOM_API_KEY', oldKey);
+      if (canonicalSet) {
+        vi.stubEnv('NEXUS_OPENAI_COMPAT_URL', 'https://canonical.example/v1');
+        vi.stubEnv('NEXUS_OPENAI_COMPAT_KEY', 'sk-TESTFAKE-canonical-NOT-REAL-0000');
+      }
+      const warnings: string[] = [];
+      const logger = {
+        warn: (msg: string) => warnings.push(msg),
+        info: vi.fn(),
+        debug: vi.fn(),
+        error: vi.fn(),
+      } as unknown as import('../core/index.js').ILogger;
+
+      const result = validateNexusEnv(logger);
+      expect(result.unknownVars.map((entry) => entry.name)).toEqual([
+        'NEXUS_CUSTOM_API_BASE_URL',
+        'NEXUS_CUSTOM_API_KEY',
+      ]);
+      expect(result.invalidVars).toEqual([]);
+      expect(result).not.toHaveProperty('deprecatedVars');
+      for (const name of ['NEXUS_CUSTOM_API_BASE_URL', 'NEXUS_CUSTOM_API_KEY']) {
+        expect(getKnownNexusVarNames().includes(name)).toBe(false);
+        expect(
+          warnings.some((warning) => warning.includes(`Unknown environment variable: ${name}`))
+        ).toBe(true);
+      }
+      expect(warnings.join('\n')).not.toContain(oldUrl);
+      expect(warnings.join('\n')).not.toContain(oldKey);
+    }
+  );
+
+  it('accepts canonical names without reporting deprecated variables', () => {
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_URL', 'https://gateway.example/v1');
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_KEY', 'sk-TESTFAKE-NOT-REAL-0000');
+    const result = validateNexusEnv();
+    expect(result.unknownVars).toEqual([]);
+    expect(result.invalidVars).toEqual([]);
+    expect(result).not.toHaveProperty('deprecatedVars');
+  });
+});
+
+describe('removed access-policy mode (#6319)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    vi.stubEnv('NEXUS_ACCESS_POLICY_MODE', undefined);
+  });
+
+  it.each(['off', 'audit', 'confirm_risky', 'enforce', '', 'invalid'])(
+    'reports the removed variable as unknown for value %j',
+    (value) => {
+      vi.stubEnv('NEXUS_ACCESS_POLICY_MODE', value);
+      const warnings: string[] = [];
+      const logger = {
+        warn: (msg: string) => warnings.push(msg),
+        info: vi.fn(),
+        debug: vi.fn(),
+        error: vi.fn(),
+      } as unknown as import('../core/index.js').ILogger;
+
+      const result = validateNexusEnv(logger);
+      expect(result.unknownVars.map((entry) => entry.name)).toContain('NEXUS_ACCESS_POLICY_MODE');
+      expect(result.invalidVars.map((entry) => entry.name)).not.toContain(
+        'NEXUS_ACCESS_POLICY_MODE'
+      );
+      expect(getKnownNexusVarNames()).not.toContain('NEXUS_ACCESS_POLICY_MODE');
+      expect(warnings).toContain('Unknown environment variable: NEXUS_ACCESS_POLICY_MODE');
+      expect(warnings.join('\n')).not.toContain('is deprecated');
+      // Its only producer is removed; retain no empty mechanism for hypothetical future use.
+      expect(result).not.toHaveProperty('deprecatedVars');
+    }
+  );
+
+  it('reports nothing for the removed variable when unset', () => {
+    const result = validateNexusEnv();
+    expect(result.unknownVars.map((entry) => entry.name)).not.toContain('NEXUS_ACCESS_POLICY_MODE');
+    expect(result.invalidVars.map((entry) => entry.name)).not.toContain('NEXUS_ACCESS_POLICY_MODE');
+    expect(result).not.toHaveProperty('deprecatedVars');
+  });
+});
+
+describe('debt variables registered (#6457)', () => {
+  it('recognizes all 6 former debt variables as known', () => {
+    const known = new Set(getKnownNexusVarNames());
+    expect(known.has('NEXUS_BUDGET_TOLERANCE')).toBe(true);
+    expect(known.has('NEXUS_CONSOLE')).toBe(true);
+    expect(known.has('NEXUS_CONTEXT_WARN_THRESHOLD')).toBe(true);
+    expect(known.has('NEXUS_CUSTOM_API_ALLOW_PRIVATE')).toBe(true);
+    expect(known.has('NEXUS_PORTABLE_MODE')).toBe(true);
+    expect(known.has('NEXUS_TASK_STATE_ENABLED')).toBe(true);
+  });
+
+  it('validates NEXUS_BUDGET_TOLERANCE', () => {
+    vi.stubEnv('NEXUS_BUDGET_TOLERANCE', '1.5');
+    expect(validateNexusEnv().invalidVars.map((v) => v.name)).not.toContain(
+      'NEXUS_BUDGET_TOLERANCE'
+    );
+    vi.stubEnv('NEXUS_BUDGET_TOLERANCE', 'not-a-number');
+    expect(validateNexusEnv().invalidVars.map((v) => v.name)).toContain('NEXUS_BUDGET_TOLERANCE');
+  });
+
+  it('validates NEXUS_CONSOLE', () => {
+    for (const val of ['0', '1', 'true', 'false', 'on', 'off', 'TRUE', 'OFF']) {
+      vi.stubEnv('NEXUS_CONSOLE', val);
+      expect(validateNexusEnv().invalidVars.map((v) => v.name)).not.toContain('NEXUS_CONSOLE');
+    }
+    vi.stubEnv('NEXUS_CONSOLE', 'invalid');
+    expect(validateNexusEnv().invalidVars.map((v) => v.name)).toContain('NEXUS_CONSOLE');
+  });
+
+  it('validates NEXUS_CONTEXT_WARN_THRESHOLD', () => {
+    vi.stubEnv('NEXUS_CONTEXT_WARN_THRESHOLD', '0.85');
+    expect(validateNexusEnv().invalidVars.map((v) => v.name)).not.toContain(
+      'NEXUS_CONTEXT_WARN_THRESHOLD'
+    );
+    vi.stubEnv('NEXUS_CONTEXT_WARN_THRESHOLD', 'bad');
+    expect(validateNexusEnv().invalidVars.map((v) => v.name)).toContain(
+      'NEXUS_CONTEXT_WARN_THRESHOLD'
+    );
+  });
+
+  it('validates NEXUS_CUSTOM_API_ALLOW_PRIVATE', () => {
+    for (const val of ['1', '0', 'true', 'false', 'TRUE']) {
+      vi.stubEnv('NEXUS_CUSTOM_API_ALLOW_PRIVATE', val);
+      expect(validateNexusEnv().invalidVars.map((v) => v.name)).not.toContain(
+        'NEXUS_CUSTOM_API_ALLOW_PRIVATE'
+      );
+    }
+    vi.stubEnv('NEXUS_CUSTOM_API_ALLOW_PRIVATE', 'yes');
+    expect(validateNexusEnv().invalidVars.map((v) => v.name)).toContain(
+      'NEXUS_CUSTOM_API_ALLOW_PRIVATE'
+    );
+  });
+
+  it('validates NEXUS_PORTABLE_MODE', () => {
+    for (const val of ['1', '0', 'true', 'false']) {
+      vi.stubEnv('NEXUS_PORTABLE_MODE', val);
+      expect(validateNexusEnv().invalidVars.map((v) => v.name)).not.toContain(
+        'NEXUS_PORTABLE_MODE'
+      );
+    }
+    vi.stubEnv('NEXUS_PORTABLE_MODE', 'invalid');
+    expect(validateNexusEnv().invalidVars.map((v) => v.name)).toContain('NEXUS_PORTABLE_MODE');
+  });
+
+  it('validates NEXUS_TASK_STATE_ENABLED', () => {
+    for (const val of ['1', '0', 'true', 'false']) {
+      vi.stubEnv('NEXUS_TASK_STATE_ENABLED', val);
+      expect(validateNexusEnv().invalidVars.map((v) => v.name)).not.toContain(
+        'NEXUS_TASK_STATE_ENABLED'
+      );
+    }
+    vi.stubEnv('NEXUS_TASK_STATE_ENABLED', 'invalid');
+    expect(validateNexusEnv().invalidVars.map((v) => v.name)).toContain('NEXUS_TASK_STATE_ENABLED');
+  });
+});
+
+describe('inferred capability-gap opt-in (#6930)', () => {
+  it.each(['0', '1'])('recognizes the exact switch value %s', (value) => {
+    vi.stubEnv('NEXUS_CAPABILITY_GAP_INFERRED', value);
+    const result = validateNexusEnv();
+    expect(result.unknownVars.map((entry) => entry.name)).not.toContain(
+      'NEXUS_CAPABILITY_GAP_INFERRED'
+    );
+    expect(result.invalidVars.map((entry) => entry.name)).not.toContain(
+      'NEXUS_CAPABILITY_GAP_INFERRED'
+    );
+  });
+  it('rejects true because only 1 enables the recording switch', () => {
+    vi.stubEnv('NEXUS_CAPABILITY_GAP_INFERRED', 'true');
+    const result = validateNexusEnv();
+    expect(result.invalidVars.map((entry) => entry.name)).toContain(
+      'NEXUS_CAPABILITY_GAP_INFERRED'
+    );
+  });
+});

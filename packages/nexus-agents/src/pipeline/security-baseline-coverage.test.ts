@@ -1,0 +1,192 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempOutsideRepo } from '../testing/non-repo-temp-dir.js';
+import { hermeticGitEnv } from '../utils/hermetic-git-env.js';
+import { compareSecurityBaseline } from './security-baseline.js';
+import type { SecurityScanInput } from '../mcp/tools/security-scan-types.js';
+import type { ScannerParseDiagnostic, SarifParseResult } from '../security/sarif-types.js';
+
+const mocks = vi.hoisted(() => ({ scan: vi.fn(), changedPath: '' }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readFile: async (...args: Parameters<typeof actual.readFile>) =>
+      args[0] === mocks.changedPath ? Buffer.from('changed source') : actual.readFile(...args),
+  };
+});
+vi.mock('../mcp/tools/security-scan.js', () => ({
+  executeSecurityScan: mocks.scan,
+  prepareSecurityScan: vi.fn().mockResolvedValue({ version: '1.128.1' }),
+}));
+
+describe('baseline parse coverage (#7238)', () => {
+  let repository = '';
+  let sha: string;
+  let target: string;
+
+  beforeAll(() => {
+    repository = mkdtempOutsideRepo('baseline-coverage-');
+    target = join(repository, 'packages/nexus-agents');
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, 'package.json'), '{"name":"test-fake-baseline","private":true}\n');
+    const env = {
+      ...hermeticGitEnv(),
+      GIT_AUTHOR_NAME: 'TEST_FAKE baseline fixture',
+      GIT_AUTHOR_EMAIL: 'test-fake@example.invalid',
+      GIT_COMMITTER_NAME: 'TEST_FAKE baseline fixture',
+      GIT_COMMITTER_EMAIL: 'test-fake@example.invalid',
+    };
+    const git = (args: string[]): string =>
+      execFileSync(
+        'git',
+        ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args],
+        {
+          cwd: repository,
+          env,
+          encoding: 'utf8',
+        }
+      ).trim();
+    git(['init', '--quiet']);
+    git(['add', 'packages/nexus-agents/package.json']);
+    git(['commit', '--quiet', '-m', 'TEST_FAKE pinned baseline']);
+    sha = git(['rev-parse', 'HEAD']);
+  });
+  afterAll(() => {
+    if (repository !== '') rmSync(repository, { recursive: true, force: true });
+  });
+
+  const compare = (): ReturnType<typeof compareSecurityBaseline> =>
+    compareSecurityBaseline(target, ['p/default'], {
+      root: target,
+      baseline: { sha, directory: repository },
+    });
+  const diagnostics = (
+    input: SecurityScanInput,
+    file = 'package.json',
+    message = 'syntax'
+  ): ScannerParseDiagnostic[] => [
+    { file: join(input.target, file), kind: 'partial-parse', message },
+  ];
+  const scan = (parseDiagnostics: ReturnType<typeof diagnostics> = []): SarifParseResult => ({
+    scanner: 'semgrep',
+    scannerVersion: '1.128.1',
+    coverageComplete: true,
+    totalFindings: 0,
+    findings: [],
+    errors: [],
+    parseDiagnostics,
+  });
+
+  beforeEach(() => {
+    // Shallow-checkout TMPDIR is in the scanned repo; use the real OS fallback.
+    vi.stubEnv('TMPDIR', process.env['VITEST_SYSTEM_TMPDIR']);
+    vi.clearAllMocks();
+    mocks.scan.mockReset();
+    mocks.changedPath = '';
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('reports identical untouched partial parses and the measured scanner version', async () => {
+    mocks.scan.mockImplementation((input: SecurityScanInput) =>
+      scan(
+        diagnostics(
+          input,
+          'package.json',
+          `Syntax error at line ${join(input.target, 'package.json')}:1:\n syntax`
+        )
+      )
+    );
+    expect(await compare()).toMatchObject({
+      complete: true,
+      introducedBlockingCount: 0,
+      blockingFindings: [],
+      unscannedCoverage: ['package.json'],
+      scannerVersion: '1.128.1',
+      errors: [],
+    });
+  });
+
+  it('retains known unscanned coverage when a separate scanner error blocks measurement', async () => {
+    mocks.scan.mockImplementation((input: SecurityScanInput) => ({
+      ...scan(diagnostics(input)),
+      coverageComplete: false,
+      errors: ['scanner timeout: other.ts'],
+    }));
+    const result = await compare();
+    expect(result.complete).toBe(false);
+    expect(result.errors.join(';')).toContain('scanner timeout: other.ts');
+    expect(result.unscannedCoverage).toEqual(['package.json']);
+    expect(result.blockingFindings).toEqual([]);
+  });
+
+  it('blocks a newly unparsable file and names it in errors', async () => {
+    mocks.scan.mockImplementation((input: SecurityScanInput) =>
+      scan(input.target === target ? diagnostics(input) : [])
+    );
+    const result = await compare();
+    expect(result.complete).toBe(false);
+    expect(result.errors.join(';')).toContain('package.json');
+    expect(result.blockingFindings).toEqual([]);
+  });
+
+  it('blocks changed diagnostic identities even for identical file bytes', async () => {
+    mocks.scan.mockImplementation((input: SecurityScanInput) =>
+      scan(diagnostics(input, 'package.json', input.target === target ? 'new syntax' : 'syntax'))
+    );
+    const result = await compare();
+    expect(result.complete).toBe(false);
+    expect(result.errors.join(';')).toContain('package.json');
+  });
+
+  it('blocks a change touching a file with stable partial parsing', async () => {
+    mocks.changedPath = join(target, 'package.json');
+    mocks.scan.mockImplementation((input: SecurityScanInput) => scan(diagnostics(input)));
+    const result = await compare();
+    expect(result.complete).toBe(false);
+    expect(result.errors.join(';')).toContain('package.json');
+  });
+
+  it.each(['package.json\n', 'package.json\r', 'package\u001b.json', 'package\u0085.json'])(
+    'keeps a diagnostic path with control characters outside the scanned tree: %j',
+    async (file) => {
+      mocks.scan.mockImplementation(() =>
+        scan([{ file, kind: 'partial-parse', message: 'syntax' }])
+      );
+      const result = await compare();
+      expect(result.complete).toBe(false);
+      expect(result.errors).toEqual([
+        `Coverage diagnostic path outside scanned tree: ${JSON.stringify(file)}`,
+      ]);
+      expect(result.unscannedCoverage).toEqual([]);
+    }
+  );
+
+  it('does not label worktree findings as introductions if the base scan failed', async () => {
+    mocks.scan.mockResolvedValueOnce({ error: 'scanner unavailable' }).mockResolvedValueOnce({
+      ...scan(),
+      totalFindings: 1,
+      findings: [
+        {
+          id: 'eval',
+          scanner: 'semgrep',
+          rule: 'eval',
+          severity: 'high',
+          file: 'package.json',
+          startLine: 1,
+          snippet: '{',
+          message: 'unsafe',
+          cweIds: [],
+          confidence: 1,
+        },
+      ],
+    });
+    expect(await compare()).toMatchObject({
+      complete: false,
+      introducedBlockingCount: null,
+      blockingFindings: [],
+    });
+  });
+});

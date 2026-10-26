@@ -1,0 +1,951 @@
+/* eslint-disable max-lines -- Cohesive subprocess adapter base class; governance 400-600 OK if cohesive */
+/**
+ * nexus-agents/cli-adapters - Subprocess Adapter
+ *
+ * Base class for subprocess-based CLI adapters.
+ * Used by ClaudeCliAdapter and GeminiCliAdapter.
+ *
+ * Extracted from base-adapter.ts per Issue #272 (file size limits).
+ */
+
+import { spawn } from 'node:child_process';
+import type {
+  ChildProcess,
+  ChildProcessWithoutNullStreams,
+  SpawnOptionsWithoutStdio,
+} from 'node:child_process';
+
+import type { Result } from '../core/index.js';
+import { ok, err, getTimeProvider, createLogger, getErrorMessage } from '../core/index.js';
+
+import type {
+  CliName,
+  CliTransport,
+  CliTask,
+  CliResponse,
+  CliError,
+  CliErrorCode,
+  ResolvedExecutionOptions,
+  ICliResponseParser,
+} from './types.js';
+import { BaseCliAdapter } from './base-adapter.js';
+import { buildChildEnv } from './subprocess-env.js';
+import { SIGKILL_GRACE_MS, terminateProcessTree, trackProcessTree } from './process-tree-kill.js';
+import { sanitizeOutput } from '../security/output-sanitizer.js';
+import { isRateLimitText, isDurableCapacityText } from '../adapters/rate-limit-detector.js';
+import {
+  parseCliErrorEnvelope,
+  classifyExtractedError,
+  isAuthFailureText,
+} from './cli-error-envelope.js';
+import { createCallerAbortCliError, isTimeoutText } from './cli-error-helpers.js';
+import { generateHyphenId } from '../utils/id-utils.js';
+import { recordAbortObservation } from '../adapters/abort-observation.js';
+import {
+  NATIVE_EXECUTION_POLICY,
+  hasIssuedNativeExecutionPolicy,
+  resolveNativeSpawnOptions,
+} from './native-execution-policy.js';
+
+/** Error patterns in stderr that indicate a real failure, not debug output (#1402). */
+const STDERR_ERROR_PATTERNS = [
+  'error:',
+  'fatal:',
+  'panic:',
+  'unhandled',
+  'not found',
+  'invalid model',
+  'authentication',
+  'unauthorized',
+  'permission denied',
+  'connection refused',
+  'econnrefused',
+  'enotfound',
+  'timeout',
+  'failed to connect',
+  'invalid api key',
+  'rate limit',
+  'quota exceeded',
+  'service unavailable',
+];
+
+/** Checks if stderr looks like a real error (not just debug/progress output). */
+function looksLikeErrorStderr(stderr: string): boolean {
+  const lower = stderr.toLowerCase();
+  return STDERR_ERROR_PATTERNS.some((pattern) => lower.includes(pattern));
+}
+
+/** Stderr patterns indicating transient connection failures (retryable). */
+const STDERR_CONNECTION_PATTERNS = [
+  'connection refused',
+  'econnrefused',
+  'enotfound',
+  'econnreset',
+  'failed to connect',
+  'service unavailable',
+  'eaddrinuse',
+  'address already in use',
+];
+
+/**
+ * Classifies a stderr error message into the most specific CliErrorCode.
+ * Checks for transient patterns (connection, rate-limit, timeout) before
+ * falling back to EXECUTION_ERROR. This ensures transient failures in
+ * stderr are retried instead of treated as terminal. (#1401)
+ *
+ * Rate-limit detection uses shared patterns from rate-limit-detector. (#1596)
+ */
+function classifyStderrError(stderr: string): CliErrorCode {
+  const lower = stderr.toLowerCase();
+  if (STDERR_CONNECTION_PATTERNS.some((p) => lower.includes(p))) return 'CONNECTION_ERROR';
+  if (isRateLimitText(stderr)) return 'RATE_LIMITED';
+  if (isTimeoutText(stderr)) return 'TIMEOUT';
+  // #6269: a credential failure is terminal for this CLI (not in
+  // RETRYABLE_ERROR_CODES) and counts as `authentication` on the breaker.
+  if (isAuthFailureText(stderr)) return 'NOT_AUTHENTICATED';
+  return 'EXECUTION_ERROR';
+}
+
+/**
+ * The first non-blank stderr line, for an error message that names the cause
+ * without the stack frames and tier tables that follow it (#6269). `stderr`
+ * is already sanitized by the caller.
+ */
+function firstStderrLine(stderr: string): string {
+  return (
+    stderr
+      .split('\n')
+      .find((line) => line.trim() !== '')
+      ?.trim() ?? ''
+  );
+}
+
+const subprocessLogger = createLogger({ component: 'subprocess-adapter' });
+
+/**
+ * Longest stderr carried on a SUCCESSFUL response (#6094). The buffer above
+ * caps capture at 10 MB; the response field exists so a classifier can read a
+ * failure line, not to ship a log. Kept from the head: the sandbox failure is
+ * written when the CLI's tool loop first tries the shell.
+ */
+export const MAX_RESPONSE_STDERR_CHARS = 8_000;
+
+/**
+ * The `stderr` field of a SUCCESSFUL response (#6094). A run's stderr was
+ * captured and dropped here: a sandboxed shell failure inside the CLI's tool
+ * loop is written to it while stdout still carries a parsed answer, and that
+ * is the voter classifier's structured signal. Present only when non-empty.
+ */
+function successStderrField(stderr: string): { stderr?: string } {
+  return stderr === '' ? {} : { stderr: stderr.slice(0, MAX_RESPONSE_STDERR_CHARS) };
+}
+
+/** Maximum buffer size for stdout/stderr (10 MB). */
+const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+
+/** CliErrorCodes that represent transient failures safe to retry. */
+const TRANSIENT_ERROR_CODES: ReadonlySet<CliErrorCode> = new Set([
+  'TIMEOUT',
+  'RATE_LIMITED',
+  'CONNECTION_ERROR',
+  'PARSE_ERROR',
+]);
+
+/** Delay schedule for transient-error retries (ms per attempt index). */
+const TRANSIENT_RETRY_DELAYS_MS = [500, 1000] as const;
+
+/** Maximum number of transient-error retries. */
+const MAX_TRANSIENT_RETRIES = TRANSIENT_RETRY_DELAYS_MS.length;
+
+/**
+ * Maximum retries for PARSE_ERROR specifically (#1533).
+ * Parse errors are less likely to self-heal than timeouts/connection errors,
+ * so we cap at 1 retry instead of 2.
+ */
+export const MAX_PARSE_RETRIES = 1;
+
+/** Timeout extension multiplier when retrying a TIMEOUT error. (#1401) */
+export const TIMEOUT_RETRY_MULTIPLIER = 1.5;
+
+/**
+ * Grace period before escalating SIGTERM to SIGKILL on timeout (#3026
+ * finding 1). Defined beside the tree kill, which every subprocess runner
+ * shares (#6747); re-exported so tests can assert against the threshold.
+ */
+export { SIGKILL_GRACE_MS };
+
+/**
+ * Checks whether a CliErrorCode represents a transient failure.
+ * Timeout, rate_limit, connection, and parse errors are transient.
+ * Parse errors get fewer retries (MAX_PARSE_RETRIES) than others (#1533).
+ */
+export function isTransientError(code: CliErrorCode): boolean {
+  return TRANSIENT_ERROR_CODES.has(code);
+}
+
+/**
+ * Spawn the CLI and track it so server shutdown ends it (#6680). It stays in
+ * the server's process group, so a signal to that group reaches it too.
+ */
+function spawnCliChild(
+  cliName: CliName,
+  cmdConfig: CommandConfig,
+  task: CliTask,
+  execution: ResolvedExecutionOptions
+): Result<{ child: ChildProcessWithoutNullStreams; options: ResolvedExecutionOptions }, CliError> {
+  const { timeoutMs } = execution;
+  // Curated child env: base infrastructure vars + only this CLI's
+  // own vendor credentials, so cross-vendor API keys don't leak
+  // into the spawned CLI (#2865). Also drops CLAUDECODE — a nested
+  // CLI must not believe it's already inside Claude Code.
+  // #6754: a command's own variables (e.g. a read-only permission config) are
+  // applied last, so an inherited value of the same name cannot override them.
+  const childEnv = { ...buildChildEnv(cliName), ...cmdConfig.env };
+  const cwd = spawnCwd(task.options?.['workDir']);
+  const wrapped = task.wrapper?.(cmdConfig.command, cmdConfig.args, {
+    cwd,
+    env: childEnv,
+    timeoutMs,
+  });
+  const { command, args, options } = wrapped ?? {
+    command: cmdConfig.command,
+    args: cmdConfig.args,
+    options: { cwd, env: childEnv },
+  };
+  // Fully evaluate host iterators/getters before the final cancellation/deadline fence.
+  const spawnArgs = [...args];
+  const env = options.env;
+  const spawnEnv = env === undefined ? undefined : (Object.create(null) as NodeJS.ProcessEnv);
+  if (env !== undefined && spawnEnv !== undefined) {
+    // Node intentionally includes inherited enumerable env values. Flatten them too,
+    // so its own normalization cannot invoke host getters after the final guard.
+    for (const key in env) spawnEnv[key] = env[key];
+  }
+  const finalCwd = options.cwd;
+  const spawnOptions: SpawnOptionsWithoutStdio = {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: spawnEnv,
+    ...(finalCwd !== undefined ? { cwd: finalCwd } : {}),
+  };
+  // No await, wrapper, iterator or host getter remains between consume and spawn.
+  const checked = resolveNativeSpawnOptions(execution, cliName, true);
+  if (!checked.ok) return checked;
+  const child = trackProcessTree(spawn(command, spawnArgs, spawnOptions));
+  return ok({ child, options: checked.value });
+}
+
+/**
+ * The working directory a CLI child is spawned in for a task's `workDir`
+ * option, or `undefined` when it inherits this process's cwd. Exported so a
+ * command builder that reads the child's config files resolves the same
+ * directory the spawn uses (#6970).
+ */
+export function spawnCwd(workDir: unknown): string | undefined {
+  return typeof workDir === 'string' && workDir.trim().length > 0 ? workDir : undefined;
+}
+
+/**
+ * Whether a failed spawn is worth spawning again (#6120).
+ *
+ * A transient CODE is not the whole answer: a durable capacity cap arrives as
+ * RATE_LIMITED too, and re-running the same model against a spend ceiling is
+ * the futile work #5359 named. The claude out-of-credits envelope cost two
+ * extra spawns and 1.5 s per call this way, then still failed.
+ */
+function shouldRetryInPlace(error: CliError, signal: AbortSignal | undefined): boolean {
+  // #6680: an aborted call is not transient — retrying it only sleeps through
+  // the backoff to fast-fail again.
+  if (signal?.aborted === true) return false;
+  return isTransientError(error.code) && !isDurableCapacityText(error.message);
+}
+
+/**
+ * Exit codes that indicate transient process termination (retryable).
+ * - 137 = 128 + SIGKILL (9): OOM killer, system resource limits
+ * - 143 = 128 + SIGTERM (15): external termination (our timeout SIGTERM
+ *   is already caught by the timeout handler before close fires)
+ */
+const TRANSIENT_EXIT_CODES = new Set([137, 143]);
+
+/** Human-readable signal names for exit codes (128 + signal number). */
+const EXIT_CODE_SIGNAL_NAMES: Record<number, string> = {
+  137: 'SIGKILL (OOM or killed)',
+  143: 'SIGTERM (terminated)',
+};
+
+/** Builds an error message for signal exit codes that includes identifiable keywords. */
+function buildSignalExitMessage(code: number): string {
+  const signalName = EXIT_CODE_SIGNAL_NAMES[code];
+  if (signalName !== undefined) return `Process killed by ${signalName}, exit code ${String(code)}`;
+  return `Process exited with code ${String(code)}`;
+}
+
+/**
+ * Checks whether a process exit code indicates a transient failure
+ * that is safe to retry (e.g., OOM kill, external SIGTERM).
+ */
+export function isTransientExitCode(code: number | null): boolean {
+  return code !== null && TRANSIENT_EXIT_CODES.has(code);
+}
+
+/** Internal state for buffered stream collection. */
+interface BufferState {
+  stdout: string;
+  stderr: string;
+  stdoutBytes: number;
+  /** All stdout received, including chunks excluded by the capture cap (#6851). */
+  receivedStdoutBytes: number;
+  stderrBytes: number;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  resolved: boolean;
+  /**
+   * Wall-clock at first stdout byte (or null if none yet). Used by #2472 to
+   * split total subprocess time into spawn-latency (spawn→first byte) and
+   * streaming (first byte→close), which is the cheapest way to identify
+   * which stage causes stochastic timeouts.
+   */
+  firstByteTime: number | null;
+}
+
+/** Append data to a buffered stream, respecting the 10 MB cap. */
+function appendBuffered(state: BufferState, stream: 'stdout' | 'stderr', data: Buffer): void {
+  const bytesKey = stream === 'stdout' ? 'stdoutBytes' : 'stderrBytes';
+  const truncKey = stream === 'stdout' ? 'stdoutTruncated' : 'stderrTruncated';
+  if (state[bytesKey] < MAX_BUFFER_BYTES) {
+    state[stream] += data.toString();
+    state[bytesKey] += data.length;
+  } else if (!state[truncKey]) {
+    state[truncKey] = true;
+    subprocessLogger.warn(`${stream} buffer exceeded 10 MB, truncating`);
+  }
+}
+
+/**
+ * Command configuration returned by getCommand.
+ */
+export interface CommandConfig {
+  command: string;
+  args: string[];
+  /** Optional stdin content (prompt passed via stdin instead of args) */
+  stdin?: string;
+  /**
+   * Variables set on the child's environment on top of the curated base
+   * (#6754). They win over any inherited value of the same name.
+   */
+  env?: Readonly<Record<string, string>>;
+  /**
+   * Optional cleanup callback invoked after the subprocess resolves
+   * (success, error, or timeout). Used by adapters that materialize
+   * temp files for the subprocess (e.g. codex `model_instructions_file`).
+   * Errors thrown by cleanup are logged but do not affect the request result.
+   */
+  cleanup?: () => void | Promise<void>;
+}
+
+/**
+ * Configuration for transient-error retry behaviour.
+ */
+export interface TransientRetryConfig {
+  /** Whether transient-error retry is enabled (default: false). */
+  enabled: boolean;
+}
+
+/**
+ * Base class for subprocess-based CLI adapters.
+ * Used by ClaudeCliAdapter and GeminiCliAdapter.
+ */
+export abstract class SubprocessCliAdapter extends BaseCliAdapter {
+  readonly transport: CliTransport = 'subprocess';
+
+  protected abstract readonly parser: ICliResponseParser;
+
+  /** Transient-error retry config. Override in subclass to enable. */
+  protected readonly transientRetry: TransientRetryConfig = { enabled: true };
+
+  /**
+   * The inner {@link retryTransient} layer is the single retry authority
+   * for subprocess CLIs. When it is enabled (the default), the shared
+   * outer retry loop must not also retry: nesting both meant up to 6
+   * subprocess spawns and ~10-minute hangs on a persistent TIMEOUT, since
+   * the inner layer's timeout extension compounds on every outer attempt
+   * (#2824). The outer loop still runs once, so circuit-breaker failure
+   * recording is unaffected.
+   */
+  protected override shouldOuterRetry(opts: ResolvedExecutionOptions): boolean {
+    return super.shouldOuterRetry(opts) && !this.transientRetry.enabled;
+  }
+
+  /**
+   * Gets CLI command and arguments for execution.
+   * If stdin is provided, it will be written to the process stdin.
+   */
+  protected abstract getCommand(task: CliTask): CommandConfig;
+
+  /**
+   * Invokes the optional cleanup hook supplied by getCommand(). Sync
+   * throws are swallowed (warn-only) and async rejections are caught
+   * so cleanup failures never bubble up and mask the real subprocess
+   * result.
+   */
+  private runSubprocessCleanup(cleanup: CommandConfig['cleanup']): void {
+    if (cleanup === undefined) return;
+    try {
+      const r = cleanup();
+      if (r instanceof Promise) {
+        r.catch((e: unknown) => {
+          this.logger.warn('Subprocess cleanup failed', { error: String(e) });
+        });
+      }
+    } catch (e: unknown) {
+      this.logger.warn('Subprocess cleanup threw', { error: String(e) });
+    }
+  }
+
+  /**
+   * #3026 finding 2: SIGTERM the child when the caller's AbortSignal
+   * aborts mid-execution. Listener auto-detaches on `'close'` so we
+   * don't leak across child lifetimes.
+   */
+  private attachAbortSignal(
+    child: ChildProcess,
+    signal: AbortSignal,
+    resolve: (r: Result<CliResponse, CliError>) => void,
+    state: BufferState
+  ): void {
+    const onAbort = (): void => {
+      recordAbortObservation(signal.reason, {
+        stdoutBytes: state.receivedStdoutBytes,
+        sawFirstByte: state.firstByteTime !== null,
+      });
+      if (child.exitCode === null && child.signalCode === null) {
+        // #6680: the child and its descendants, so a relaunched CLI worker is
+        // not orphaned; a tree that ignores SIGTERM is force-reaped rather than
+        // left running after the cancel.
+        void terminateProcessTree(child, SIGKILL_GRACE_MS, () => {
+          this.logger.warn('Child ignored SIGTERM after abort, escalating to SIGKILL', {
+            cli: this.name,
+            sigkillGraceMs: SIGKILL_GRACE_MS,
+          });
+        });
+      }
+      // #6691: the adapter's own watchdog is the timer in `spawnSubprocess`,
+      // not this listener, so a caller abort is a cancel unless its reason
+      // names a deadline.
+      resolve(err(createCallerAbortCliError(signal.reason, 'Aborted by caller signal', this.name)));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    child.once('close', () => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  }
+
+  /**
+   * Executes a task via subprocess, with optional transient-error retry.
+   * When `transientRetry.enabled` is true, transient errors (timeout,
+   * rate_limit, connection, parse) are retried with exponential backoff
+   * (500ms, 1000ms). Parse errors get max 1 retry (#1533); others get 2.
+   */
+  async executeTask(
+    task: CliTask,
+    options: ResolvedExecutionOptions
+  ): Promise<Result<CliResponse, CliError>> {
+    // #2963 site 3: per-execute request ID for log correlation. CliTask
+    // doesn't carry a task-id field; generate one here so every
+    // log-line for this invocation (including the per-retry timing
+    // breakdown emitted by `logTimingBreakdown`) can be grouped by a
+    // single ID. Doesn't propagate up to MCP — it's purely an
+    // adapter-internal correlation key.
+    const requestId = generateHyphenId('cli-req', 8);
+    const result = await this.spawnSubprocess(task, options, requestId);
+    if (
+      result.ok ||
+      !this.transientRetry.enabled ||
+      !options.allowRetry ||
+      hasIssuedNativeExecutionPolicy(options)
+    )
+      return result;
+    if (!shouldRetryInPlace(result.error, options.signal)) return result;
+
+    return this.retryTransient(task, options, result, 0, requestId);
+  }
+
+  /**
+   * Retries a transient error with bounded exponential backoff.
+   */
+  private async retryTransient(
+    task: CliTask,
+    options: ResolvedExecutionOptions,
+    lastResult: Result<CliResponse, CliError>,
+    attempt: number,
+    requestId: string
+  ): Promise<Result<CliResponse, CliError>> {
+    const isParseError = !lastResult.ok && lastResult.error.code === 'PARSE_ERROR';
+    const maxRetries = isParseError ? MAX_PARSE_RETRIES : MAX_TRANSIENT_RETRIES;
+    if (attempt >= maxRetries) return lastResult;
+
+    // Guard above ensures attempt < maxRetries ≤ TRANSIENT_RETRY_DELAYS_MS.length
+    const delayMs = TRANSIENT_RETRY_DELAYS_MS[attempt] as number;
+    const isTimeout = !lastResult.ok && lastResult.error.code === 'TIMEOUT';
+    subprocessLogger.debug('Retrying transient error', {
+      cli: this.name,
+      requestId,
+      attempt: attempt + 1,
+      delayMs,
+      errorCode: !lastResult.ok ? lastResult.error.code : undefined,
+    });
+
+    await this.delay(delayMs);
+
+    // Extend timeout on TIMEOUT retries so near-miss tasks can complete (#1401)
+    const retryOptions = isTimeout
+      ? { ...options, timeoutMs: Math.round(options.timeoutMs * TIMEOUT_RETRY_MULTIPLIER) }
+      : options;
+    const result = await this.spawnSubprocess(task, retryOptions, requestId);
+    if (result.ok) return result;
+    if (!shouldRetryInPlace(result.error, options.signal)) return result;
+
+    return this.retryTransient(task, retryOptions, result, attempt + 1, requestId);
+  }
+
+  /**
+   * Spawns a single subprocess execution (no retry).
+   *
+   * `requestId` (#2963 site 3) correlates the timing-breakdown log emitted
+   * on subprocess close back to the parent `executeTask` invocation —
+   * essential when multiple subprocesses for the same CLI run concurrently
+   * (pipelines, votes) and the JSDoc's stated goal ("group by cli + provider
+   * + model and surface tail-latency outliers") requires a way to
+   * disambiguate which timing row belongs to which call.
+   */
+  /**
+   * Wraps a command's cleanup in a once-guard (#4488).
+   *
+   * `CommandConfig.cleanup` removes a tempdir the command builder created (e.g.
+   * codex's `nexus-codex-sysprompt-*` holding the system prompt). It must run on
+   * EVERY exit path — a path that skips it leaks a directory per invocation, the
+   * leak codex-adapter's own comment records as having exhausted inodes on
+   * long-running MCP daemons — and exactly ONCE, since a second rm could hit a
+   * path the OS has already handed to someone else.
+   */
+  /**
+   * Result for a synchronous spawn failure (#4488).
+   *
+   * `spawn()` throws synchronously on some failures (EACCES, and ENOENT on
+   * certain platforms), and handler setup can throw too. Those paths never
+   * reach `resolve`, so without catching them the tempdir leaks AND the promise
+   * rejects instead of returning a Result — breaking the never-throws contract
+   * this adapter is supposed to honour.
+   */
+  private spawnFailure(command: string, error: unknown): Result<CliResponse, CliError> {
+    return err(
+      this.createError('EXECUTION_ERROR', `Failed to spawn ${command}: ${getErrorMessage(error)}`)
+    );
+  }
+
+  private onceCleanup(cleanup: CommandConfig['cleanup']): () => void {
+    let done = false;
+    return (): void => {
+      if (done) return;
+      done = true;
+      this.runSubprocessCleanup(cleanup);
+    };
+  }
+
+  private spawnSubprocess(
+    task: CliTask,
+    options: ResolvedExecutionOptions,
+    requestId: string
+  ): Promise<Result<CliResponse, CliError>> {
+    // Validate before creating command resources, then consume only after the wrapper.
+    const prepared = resolveNativeSpawnOptions(options, this.name, false);
+    if (!prepared.ok) return Promise.resolve(prepared);
+    const execution = prepared.value;
+    // #6277: the resolved guard reaches getCommand on the task, so an adapter
+    // whose CLI has its own wait (agy --print-timeout) can size it to the
+    // budget instead of a default that races the guard.
+    const needsTimeout =
+      task.timeoutMs === undefined || execution[NATIVE_EXECUTION_POLICY] !== undefined;
+    const timeoutMs = Math.min(task.timeoutMs ?? execution.timeoutMs, execution.timeoutMs);
+    const cmdConfig = this.getCommand(needsTimeout ? { ...task, timeoutMs } : task);
+    const startTime = getTimeProvider().now();
+
+    return new Promise((resolveOuter) => {
+      const runCleanupOnce = this.onceCleanup(cmdConfig.cleanup);
+      const resolve = (r: Result<CliResponse, CliError>): void => {
+        runCleanupOnce();
+        resolveOuter(r);
+      };
+      try {
+        const spawned = spawnCliChild(this.name, cmdConfig, task, execution);
+        if (!spawned.ok) {
+          resolve(spawned);
+          return;
+        }
+        const { child, options: finalOptions } = spawned.value;
+
+        const onProgress = finalOptions.onProgress;
+        // Keep stdout evidence available to the caller-deadline abort path (#6851).
+        const state = this.setupChildProcessHandlers({
+          child,
+          startTime,
+          timeoutMs: finalOptions.timeoutMs,
+          resolve,
+          requestId,
+          ...(onProgress !== undefined ? { onProgress } : {}),
+        });
+
+        if (finalOptions.signal !== undefined) {
+          this.attachAbortSignal(child, finalOptions.signal, resolve, state);
+        }
+
+        // Write stdin content if provided and close stdin
+        if (cmdConfig.stdin !== undefined) {
+          child.stdin.write(cmdConfig.stdin);
+        }
+        child.stdin.end();
+      } catch (error: unknown) {
+        runCleanupOnce();
+        resolveOuter(this.spawnFailure(cmdConfig.command, error));
+      }
+    });
+  }
+
+  /**
+   * Sets up child process event handlers for output collection and error handling.
+   */
+  private setupChildProcessHandlers(args: {
+    child: ReturnType<typeof spawn>;
+    startTime: number;
+    timeoutMs: number;
+    resolve: (result: Result<CliResponse, CliError>) => void;
+    requestId: string;
+    onProgress?: () => void;
+  }): BufferState {
+    const { child, startTime, timeoutMs, resolve, requestId, onProgress } = args;
+    const state: BufferState = {
+      stdout: '',
+      stderr: '',
+      resolved: false,
+      stdoutBytes: 0,
+      receivedStdoutBytes: 0,
+      stderrBytes: 0,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      firstByteTime: null,
+    };
+
+    const resolveOnce = (result: Result<CliResponse, CliError>): void => {
+      if (!state.resolved) {
+        state.resolved = true;
+        resolve(result);
+      }
+    };
+
+    this.attachStdoutHandlers(child, state, onProgress);
+
+    child.on('error', (error: Error) => {
+      resolveOnce(this.handleSubprocessError(error));
+    });
+
+    const timeoutId = this.scheduleTimeoutWithSigkillEscalation({
+      child,
+      timeoutMs,
+      requestId,
+      resolveOnce,
+    });
+
+    child.on('close', (code: number | null) => {
+      // #6680: the SIGKILL escalation is terminateProcessTree's; a descendant
+      // can outlive the child's close, so only an empty tree cancels it there.
+      clearTimeout(timeoutId);
+      this.logTimingBreakdown(state, startTime, code, requestId);
+      resolveOnce(this.classifyCloseResult(code, state, startTime));
+    });
+
+    return state;
+  }
+
+  /**
+   * Schedules the SIGTERM-on-timeout + SIGKILL-on-grace escalation
+   * (#3026 finding 1).
+   *
+   * The timer SIGTERMs the tree and resolves the caller's promise
+   * immediately so it doesn't wait on a hung child. The escalation
+   * (`SIGKILL_GRACE_MS` later, in {@link terminateProcessTree}) checks
+   * whether the tree actually exited and force-reaps it with SIGKILL if
+   * not — preventing zombie accumulation when a child ignores SIGTERM
+   * (Node CLIs that install graceful-shutdown handlers can hang on a broken
+   * stream). Off Linux the descendants are collected by an async `ps`
+   * first (#6718). Returns the timeout timer, for the `'close'` handler.
+   */
+  private scheduleTimeoutWithSigkillEscalation(opts: {
+    child: ReturnType<typeof spawn>;
+    timeoutMs: number;
+    requestId: string;
+    resolveOnce: (result: Result<CliResponse, CliError>) => void;
+  }): NodeJS.Timeout {
+    const { child, timeoutMs, requestId, resolveOnce } = opts;
+    return setTimeout(() => {
+      void terminateProcessTree(child, SIGKILL_GRACE_MS, () => {
+        this.logger.warn('Child ignored SIGTERM, escalating to SIGKILL', {
+          cli: this.name,
+          requestId,
+          sigkillGraceMs: SIGKILL_GRACE_MS,
+        });
+      });
+      resolveOnce(err(this.createError('TIMEOUT', 'Execution timed out')));
+    }, timeoutMs);
+  }
+
+  /** Attach stdout/stderr data handlers + capture first-byte time (#2472). */
+  private attachStdoutHandlers(
+    child: ReturnType<typeof spawn>,
+    state: BufferState,
+    onProgress?: () => void
+  ): void {
+    // stdio: ['pipe', 'pipe', 'pipe'] guarantees non-null streams
+    if (child.stdout !== null) {
+      child.stdout.on('data', (data: Buffer) => {
+        state.receivedStdoutBytes += data.length;
+        if (state.firstByteTime === null && data.length > 0) {
+          state.firstByteTime = getTimeProvider().now();
+        }
+        appendBuffered(state, 'stdout', data);
+        onProgress?.();
+      });
+    }
+    if (child.stderr !== null) {
+      child.stderr.on('data', (data: Buffer) => {
+        appendBuffered(state, 'stderr', data);
+      });
+    }
+  }
+
+  /**
+   * Log spawn-latency vs streaming breakdown at info level (#2472). Emits
+   * one structured event per subprocess invocation, queryable via the
+   * existing trace JSONL infrastructure. The breakdown lets operators
+   * identify whether a slow run was caused by:
+   *   - High spawn-latency: model gateway took its time before producing
+   *     the first token (cold-start, queueing, network jitter).
+   *   - High streaming-time: response body was large or generation slow.
+   *   - Total approaches the timeout cap with no first-byte: hung process.
+   *
+   * Structured fields chosen so existing query_trace tooling can group by
+   * cli + provider + model and surface tail-latency outliers.
+   */
+  private logTimingBreakdown(
+    state: BufferState,
+    startTime: number,
+    code: number | null,
+    requestId: string
+  ): void {
+    const now = getTimeProvider().now();
+    const totalMs = now - startTime;
+    const spawnLatencyMs = state.firstByteTime === null ? null : state.firstByteTime - startTime;
+    const streamingMs = state.firstByteTime === null ? null : now - state.firstByteTime;
+    this.logger.info('Subprocess timing', {
+      cli: this.name,
+      requestId,
+      totalMs,
+      spawnLatencyMs,
+      streamingMs,
+      sawFirstByte: state.firstByteTime !== null,
+      exitCode: code,
+      stdoutBytes: state.stdoutBytes,
+      stderrBytes: state.stderrBytes,
+    });
+  }
+
+  /** Classify a subprocess close event into a Result. */
+  private classifyCloseResult(
+    code: number | null,
+    state: BufferState,
+    startTime: number
+  ): Result<CliResponse, CliError> {
+    // Redact API keys from output before any processing, logging, or tracing (#1597)
+    state.stdout = sanitizeOutput(state.stdout);
+    state.stderr = sanitizeOutput(state.stderr);
+
+    if (code !== 0 && state.stdout === '') {
+      // Stderr classification takes priority over exit code (#1401)
+      if (state.stderr !== '') {
+        const msg = state.stderr;
+        return err(this.createError(classifyStderrError(state.stderr), msg));
+      }
+      // Signal-killed processes (137=SIGKILL/OOM, 143=SIGTERM) are transient.
+      // Message includes signal name for downstream outcome classification.
+      const msg = code !== null ? buildSignalExitMessage(code) : 'Process exited with unknown code';
+      if (isTransientExitCode(code)) {
+        return err(this.createError('CONNECTION_ERROR', msg));
+      }
+      return err(this.createError('EXECUTION_ERROR', msg));
+    }
+    // Non-zero exit with stderr errors: classify specifically to enable
+    // transient retry for connection/rate-limit/timeout errors (#1401, #1402)
+    if (code !== 0 && state.stderr !== '' && looksLikeErrorStderr(state.stderr)) {
+      const msg = `Exit code ${String(code)}: ${state.stderr.slice(0, 500).trim()}`;
+      return err(this.createError(classifyStderrError(state.stderr), msg));
+    }
+    return this.handleSubprocessOutput(state.stdout, state.stderr, startTime);
+  }
+
+  /**
+   * Handles successful subprocess output.
+   */
+  protected handleSubprocessOutput(
+    stdout: string,
+    stderr: string,
+    startTime: number
+  ): Result<CliResponse, CliError> {
+    if (stderr !== '' && stdout === '') {
+      return err(this.createError(classifyStderrError(stderr), stderr));
+    }
+
+    const text = this.parser.extractResponse(stdout);
+    if (text === null) return this.handleNoAnswer(stdout, stderr);
+    const authFailure = this.classifyEmptyAnswer(text, stderr);
+    if (authFailure !== null) return authFailure;
+
+    const usage = this.parser.extractUsage(stdout);
+    const sessionId = this.parser.extractSessionId(stdout);
+    // #5241: a vendor-reported cost is a MEASUREMENT and was being dropped, so
+    // `CliResponse.costUsd` had no producer at all — leaving budget-router's
+    // `result.value.costUsd ?? estimatedCostUsd` unable to take its left branch
+    // and debiting an estimate under a field named `actual`. Parsers whose CLI
+    // reports no cost do not implement the method, so absence here means "this
+    // vendor does not report cost", not "cost unknown this call".
+    const costUsd = this.parser.extractCostUsd?.(stdout) ?? null;
+
+    return ok(
+      this.normalizeResponse(text, usage ?? undefined, {
+        durationMs: getTimeProvider().now() - startTime,
+        raw: stdout,
+        ...(sessionId !== null && { sessionId }),
+        ...(costUsd !== null && { costUsd }),
+        ...successStderrField(stderr),
+      })
+    );
+  }
+
+  /**
+   * The parser found no usable content. An error-only stream (e.g. OpenCode
+   * NDJSON `{"type":"error"}`) surfaced an `errorMessage`: classify it before
+   * the generic PARSE_ERROR path, which would mask the real cause.
+   */
+  private handleNoAnswer(stdout: string, stderr: string): Result<CliResponse, CliError> {
+    const errorOnly = this.classifyErrorOnlyStream(stdout);
+    if (errorOnly !== null) return errorOnly;
+    return this.handleUnparseableOutput(stdout, stderr);
+  }
+
+  /**
+   * #6269: a well-formed envelope carrying NO answer while stderr names a
+   * credential failure is that failure, not a completion. `agy` exits 0 with
+   * `{"status":"SUCCESS","response":""}` and "Error authenticating: …" on
+   * stderr; handing "" downstream had the vote path parse it (and retry the
+   * parse) for the whole panel budget. Returns `null` — no reclassification —
+   * for a non-empty answer, and for an empty answer with stderr that names no
+   * auth failure: empty stderr is NOT evidence, so that case still flows
+   * through as the empty answer it is.
+   */
+  private classifyEmptyAnswer(text: string, stderr: string): Result<CliResponse, CliError> | null {
+    if (text.trim() !== '' || !isAuthFailureText(stderr)) return null;
+    const msg = `${this.name}: ${firstStderrLine(stderr)}`;
+    return err(this.createError('NOT_AUTHENTICATED', msg));
+  }
+
+  /**
+   * Classify an error-only stream — one where the parser surfaced an
+   * `errorMessage` but no usable content (so `extractResponse` returned null).
+   * Returns a typed error (NOT_AUTHENTICATED / RATE_LIMITED with a remediation
+   * hint, or EXECUTION_ERROR) so an upstream 401 / 429 isn't masked as
+   * PARSE_ERROR. Returns `null` when the parser exposes no error message (no
+   * `extractErrorMessage`, or empty) — the caller then falls back to the
+   * generic unparseable-output recovery.
+   */
+  private classifyErrorOnlyStream(stdout: string): Result<CliResponse, CliError> | null {
+    const errorMessage = this.parser.extractErrorMessage?.(stdout) ?? null;
+    if (errorMessage === null || errorMessage === '') return null;
+    const classified = classifyExtractedError(errorMessage, this.name);
+    const msg =
+      classified.hint !== undefined
+        ? `${classified.message}\n  → ${classified.hint}`
+        : classified.message;
+    return err(this.createError(classified.code, msg));
+  }
+
+  /**
+   * Handles the parse-failure branch: when the CLI's structured response
+   * parser returned null. Order of recovery attempts (most-specific first):
+   *   1. Rate-limit text in raw stdout (#1320)
+   *   2. Structured CLI error envelope (#2440)
+   *   3. Generic PARSE_ERROR with truncated snippet
+   * Only the adapter parser can authorize a successful response (#7073).
+   */
+  private handleUnparseableOutput(stdout: string, stderr: string): Result<CliResponse, CliError> {
+    if (isRateLimitText(stdout)) {
+      const snippet = stdout.slice(0, 500).trim();
+      return err(this.createError('RATE_LIMITED', snippet));
+    }
+    const envelope = parseCliErrorEnvelope(stdout, this.name);
+    if (envelope !== null) {
+      const msg =
+        envelope.hint !== undefined
+          ? `${envelope.message}\n  → ${envelope.hint}`
+          : envelope.message;
+      // #2455 ask 3: at debug level, dump the full sanitized envelope so
+      // operators can recover context without re-running. Sanitized via
+      // output-sanitizer.ts so leaked tokens (some upstreams echo back the
+      // bad token in error responses) don't reach logs.
+      subprocessLogger.debug('CLI error envelope unwrapped', {
+        cli: this.name,
+        code: envelope.code,
+        rawSanitized: sanitizeOutput(stdout),
+      });
+      return err(this.createError(envelope.code, msg));
+    }
+    const snippet = stdout.slice(0, 500).trim();
+    const stderrHint = stderr !== '' ? ` [stderr: ${stderr.slice(0, 300).trim()}]` : '';
+    return err(
+      this.createError('PARSE_ERROR', `Failed to parse response: ${snippet}${stderrHint}`)
+    );
+  }
+
+  /**
+   * Handles subprocess execution errors.
+   */
+  private handleSubprocessError(error: unknown): Result<CliResponse, CliError> {
+    if (!(error instanceof Error)) {
+      return err(this.createError('EXECUTION_ERROR', 'Unknown error'));
+    }
+
+    if (error.message.includes('ETIMEDOUT') || error.message.includes('timeout')) {
+      return err(this.createError('TIMEOUT', 'Execution timed out', error));
+    }
+
+    if (error.message.includes('ENOENT')) {
+      return err(this.createError('NOT_FOUND', `${this.binaryName} CLI not found`, error));
+    }
+
+    return err(this.createError('EXECUTION_ERROR', sanitizeOutput(error.message), error));
+  }
+
+  /**
+   * Initializes the adapter and capacity tracker.
+   */
+  initialize(): Promise<void> {
+    this.initCapacityTracker();
+    this.initialized = true;
+    return Promise.resolve();
+  }
+
+  /**
+   * Disposes the adapter (no-op for subprocess).
+   */
+  dispose(): Promise<void> {
+    this.initialized = false;
+    return Promise.resolve();
+  }
+}

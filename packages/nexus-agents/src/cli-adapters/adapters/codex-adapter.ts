@@ -1,0 +1,207 @@
+/**
+ * nexus-agents/cli-adapters - Codex CLI Adapter
+ *
+ * Subprocess-based adapter for Codex CLI.
+ * Extends SubprocessCliAdapter to reuse retry logic, health checks,
+ * version detection, and capacity tracking.
+ *
+ * (Source: cli-project_plan.md v2.1.0)
+ * (Source: Issue #1140 — Migrated to SubprocessCliAdapter base class)
+ *
+ * SECURITY: All spawn() calls use array-based args without shell: true.
+ * User task content is passed through stdin (no shell interpolation).
+ */
+
+import { writeFileSync, rmSync } from 'node:fs';
+import { nexusMkdtempSync } from '../../config/nexus-tmp-dir.js';
+import { join } from 'node:path';
+import type { ICliResponseParser, CliTask, ModelInfo, CliName, CliError } from '../types.js';
+import { codexSandboxPreflight, createCodexSandboxGuard } from '../codex-sandbox-preflight.js';
+import { SubprocessCliAdapter, type CommandConfig } from '../subprocess-adapter.js';
+import { CodexResponseParser } from '../parsers/codex-parser.js';
+import type { CliModelInfo } from '../types-capability.js';
+import { listModelsForCli } from '../../config/models-dev-by-vendor.js';
+import { isReadOnlyAnalysis } from '../access-mode.js';
+import {
+  CODEX_SYSTEM_CONFIG_FILES,
+  codexMcpDisableArgs,
+  scanCodexMcpServers,
+} from '../codex-mcp-isolation.js';
+import { mcpScanRefusal, scanOrThrow, subprocessScanContext } from '../mcp-config-scan.js';
+import {
+  CODEX_LEGACY_DEFAULTS,
+  type CodexAdapterOptions,
+  toCodexModelSlug,
+} from './codex-adapter-helpers.js';
+import {
+  getDefaultModelForCli,
+  getCliModelName,
+  buildModelInfo,
+} from '../../config/model-config-helpers.js';
+
+// Re-export CLI-specific helpers for backward compatibility
+export { createCodexError, normalizeCodexResponse, delay } from './codex-adapter-helpers.js';
+
+/**
+ * Codex CLI adapter using subprocess transport.
+ *
+ * Extends SubprocessCliAdapter which provides:
+ * - Retry logic with exponential backoff
+ * - Health checks with version compatibility
+ * - Capacity tracking
+ * - Subprocess spawn with timeout handling
+ */
+/**
+ * The codex sandbox every `codex exec` runs under (#6754). Read-only analysis
+ * mode needs nothing beyond it: `-s read-only` already refuses writes and
+ * network, so this adapter enforces the mode on every task, not only on the
+ * ones that ask. Named so a change to the default is a visible change to the
+ * mode's guarantee.
+ */
+const CODEX_EXEC_SANDBOX = 'read-only';
+
+export class CodexCliAdapter extends SubprocessCliAdapter {
+  readonly name: CliName = 'codex';
+  override readonly enforcesReadOnlyAnalysis = true;
+  protected readonly parser: ICliResponseParser = new CodexResponseParser();
+
+  private readonly model: string;
+  private sandboxArgs: readonly string[] = [];
+  private readonly sandboxRefusal: () => Promise<CliError | undefined>;
+
+  constructor(options?: CodexAdapterOptions) {
+    super(options?.logger);
+    this.model = options?.model ?? getCliModelName(getDefaultModelForCli('codex'));
+    this.sandboxRefusal = createCodexSandboxGuard(
+      options?.sandboxProbe ?? codexSandboxPreflight,
+      this.logger,
+      (args) => {
+        this.sandboxArgs = args;
+      },
+      options?.platform
+    );
+  }
+
+  /**
+   * The adapter always executes under read-only, including default-mode tasks.
+   * A read-only analysis task is also refused when codex's MCP config cannot
+   * be listed (#6970): its servers run outside the sandbox.
+   */
+  protected override async accessModeRefusal(task: CliTask): Promise<CliError | undefined> {
+    const base = await super.accessModeRefusal(task);
+    if (base !== undefined) return base;
+    if (isReadOnlyAnalysis(task)) {
+      const scan = scanCodexMcpServers(
+        subprocessScanContext(this.name, task),
+        this.codexSystemConfigFiles()
+      );
+      if (!scan.ok) return mcpScanRefusal(this.name, scan.error);
+    }
+    return this.sandboxRefusal();
+  }
+
+  /**
+   * The system config files the MCP scan reads (#6970). A seam so tests can
+   * keep the host's real `/etc/codex` out of the scan.
+   */
+  protected codexSystemConfigFiles(): readonly string[] {
+    return CODEX_SYSTEM_CONFIG_FILES;
+  }
+
+  /**
+   * `-c mcp_servers.<name>.enabled=false` for every MCP server codex would
+   * load (#6970). Measured live on codex-cli 0.160.0: `-s read-only` does not
+   * cover MCP servers, which start outside the sandbox, and the nexus-agents
+   * server wrote `.gitignore` and `.nexus-agents/` into the tree. Throws when
+   * the config cannot be listed, so the task never spawns with a server it
+   * could not see.
+   */
+  private readOnlyMcpArgs(task: CliTask): readonly string[] {
+    if (!isReadOnlyAnalysis(task)) return [];
+    const servers = scanOrThrow(
+      this.name,
+      scanCodexMcpServers(subprocessScanContext(this.name, task), this.codexSystemConfigFiles())
+    );
+    return codexMcpDisableArgs(servers);
+  }
+
+  /** Key-free model enumeration via the models.dev snapshot (#3405). */
+  listModels(): Promise<readonly CliModelInfo[]> {
+    return Promise.resolve(listModelsForCli(this.name));
+  }
+
+  /**
+   * Gets Codex model information.
+   * Resolves from canonical registry when possible, falls back to legacy lookup.
+   */
+  getModelInfo(): ModelInfo {
+    const fromRegistry = buildModelInfo('codex', this.model);
+    if (fromRegistry !== undefined) return fromRegistry;
+    return {
+      id: this.model,
+      name: CODEX_LEGACY_DEFAULTS.displayNames[this.model] ?? this.model,
+      contextWindow: CODEX_LEGACY_DEFAULTS.contextWindow,
+      maxOutput: CODEX_LEGACY_DEFAULTS.maxOutput,
+      costPerMillionInput:
+        CODEX_LEGACY_DEFAULTS.inputCosts[this.model] ?? CODEX_LEGACY_DEFAULTS.inputCost,
+      costPerMillionOutput:
+        CODEX_LEGACY_DEFAULTS.outputCosts[this.model] ?? CODEX_LEGACY_DEFAULTS.outputCost,
+    };
+  }
+
+  /**
+   * Gets CLI command and arguments for execution.
+   * Task content is read from stdin via `codex exec -` to avoid argv size limits.
+   */
+  protected getCommand(task: CliTask): CommandConfig {
+    const args: string[] = ['exec'];
+
+    // Add JSON output
+    args.push('--json');
+
+    // Add model only if specified (use CLI default otherwise). task.model is
+    // the canonical registry id, which codex rejects — translate it (#5091).
+    const model = task.model ?? this.model;
+    if (model !== '') {
+      args.push('-m', toCodexModelSlug(model, this.logger));
+    }
+
+    // The awaited preflight selects the backend; every task stays read-only.
+    args.push('-s', CODEX_EXEC_SANDBOX, ...this.sandboxArgs, ...this.readOnlyMcpArgs(task));
+
+    // Skip git repo check for standalone prompts
+    args.push('--skip-git-repo-check');
+
+    // Honor systemPrompt via codex's `model_instructions_file` config key
+    // (per openai/codex#11588 — closed with this workaround). We materialize
+    // the prompt into a tempfile, pass it via `-c`, and clean up on exit.
+    let cleanup: (() => void) | undefined;
+    if (task.systemPrompt !== undefined && task.systemPrompt !== '') {
+      const dir = nexusMkdtempSync('nexus-codex-sysprompt-');
+      const file = join(dir, 'instructions.md');
+      writeFileSync(file, task.systemPrompt, { encoding: 'utf8', mode: 0o600 });
+      args.push('-c', `model_instructions_file=${file}`);
+      cleanup = (): void => {
+        // Recursive rm so we drop the parent tempdir, not just the file
+        // inside it. Pre-fix every codex call with a systemPrompt leaked
+        // one empty `/tmp/nexus-codex-sysprompt-XXXXXX` dir until the OS
+        // reaper ran — exhausting inodes on long-running MCP daemons.
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // best-effort; tempdir auto-cleanup will eventually reap it
+        }
+      };
+    }
+
+    // `codex exec -` reads stdin, avoiding Linux's per-argument size limit (#7106).
+    args.push('-');
+
+    return {
+      command: 'codex',
+      args,
+      stdin: task.content,
+      ...(cleanup === undefined ? {} : { cleanup }),
+    };
+  }
+}

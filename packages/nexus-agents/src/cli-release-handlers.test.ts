@@ -1,0 +1,393 @@
+/**
+ * CLI Release Handlers Tests
+ *
+ * Tests for the release automation command handlers in cli-release-handlers.ts.
+ * (Source: Issue #637 - Release automation suite)
+ */
+
+import { describe, it, expect, vi } from 'vitest';
+import type { ParsedCliArgs } from './cli-types.js';
+import { EXIT_CODES } from './cli-types.js';
+import type { ServerMode } from './cli/index.js';
+
+// Mock release commands
+vi.mock('./cli/index.js', () => ({
+  releaseNotesCommand: vi.fn(() => Promise.resolve(0)),
+  releaseValidateCommand: vi.fn(() => Promise.resolve(0)),
+  releaseAnnounceCommand: vi.fn(() => Promise.resolve(0)),
+}));
+
+import {
+  handleReleaseNotesCommand,
+  handleReleaseValidateCommand,
+  handleReleaseAnnounceCommand,
+} from './cli-release-handlers.js';
+import {
+  releaseNotesCommand,
+  releaseValidateCommand,
+  releaseAnnounceCommand,
+} from './cli/index.js';
+
+/**
+ * Creates a ParsedCliArgs object with sensible defaults for release handler tests.
+ * Uses omission pattern for optional properties to comply with exactOptionalPropertyTypes.
+ */
+function createArgs(overrides?: Partial<ParsedCliArgs>): ParsedCliArgs {
+  const baseOptions = {
+    help: false,
+    version: false,
+    verbose: false,
+    interactive: false,
+    mode: 'server' as ServerMode,
+    force: false,
+    format: 'changelog',
+    dryRun: false,
+    banditStats: false,
+    setup: false,
+    skipChecks: false,
+    createIssue: false,
+    fix: false,
+    quick: false,
+    resume: false,
+    nonInteractive: false,
+    skipMcp: false,
+    skipRules: false,
+    skipHooks: false,
+    mock: false,
+  };
+
+  const result = {
+    command: 'release-notes' as const,
+    options: baseOptions,
+    positionals: ['release-notes'],
+    ...overrides,
+  } as unknown as ParsedCliArgs;
+  return result;
+}
+
+describe('handleReleaseNotesCommand', () => {
+  it('passes correct options to releaseNotesCommand', async () => {
+    const args = createArgs({
+      positionals: ['release-notes'],
+      options: {
+        ...createArgs().options,
+        format: 'json',
+        dryRun: true,
+        verbose: true,
+      },
+    });
+
+    const result = await handleReleaseNotesCommand(args);
+
+    expect(releaseNotesCommand).toHaveBeenCalledWith({
+      positionals: ['release-notes'],
+      options: {
+        format: 'json',
+        dryRun: true,
+        verbose: true,
+      },
+    });
+    expect(result).toEqual({ success: true, exitCode: EXIT_CODES.SUCCESS });
+  });
+
+  it('returns SUCCESS exit code', async () => {
+    const args = createArgs();
+
+    const result = await handleReleaseNotesCommand(args);
+
+    expect(result).toEqual({ success: true, exitCode: EXIT_CODES.SUCCESS });
+  });
+
+  it('returns SERVER_START_FAILED exit code', async () => {
+    vi.mocked(releaseNotesCommand).mockResolvedValueOnce(1);
+    const args = createArgs();
+
+    const result = await handleReleaseNotesCommand(args);
+
+    expect(result).toEqual({ success: false, exitCode: EXIT_CODES.SERVER_START_FAILED });
+  });
+
+  it('defaults format to changelog for unrecognized formats', async () => {
+    const args = createArgs({
+      positionals: ['release-notes'],
+      options: {
+        ...createArgs().options,
+        format: 'unknown-format',
+      },
+    });
+
+    await handleReleaseNotesCommand(args);
+
+    expect(releaseNotesCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          format: 'changelog',
+        }),
+      })
+    );
+  });
+
+  it('accepts markdown as a valid format', async () => {
+    const args = createArgs({
+      positionals: ['release-notes'],
+      options: {
+        ...createArgs().options,
+        format: 'markdown',
+      },
+    });
+
+    await handleReleaseNotesCommand(args);
+
+    expect(releaseNotesCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          format: 'markdown',
+        }),
+      })
+    );
+  });
+
+  it('passes from/to from positionals[1] and positionals[2]', async () => {
+    const args = createArgs({
+      positionals: ['release-notes', 'v1.0.0', 'v2.0.0'],
+    });
+
+    await handleReleaseNotesCommand(args);
+
+    expect(releaseNotesCommand).toHaveBeenCalledWith({
+      positionals: ['release-notes', 'v1.0.0', 'v2.0.0'],
+      options: {
+        from: 'v1.0.0',
+        to: 'v2.0.0',
+        format: 'changelog',
+        dryRun: false,
+        verbose: false,
+      },
+    });
+  });
+
+  it('omits from/to when positionals are missing', async () => {
+    const args = createArgs({
+      positionals: ['release-notes'],
+    });
+
+    await handleReleaseNotesCommand(args);
+
+    expect(releaseNotesCommand).toHaveBeenCalledWith({
+      positionals: ['release-notes'],
+      options: {
+        format: 'changelog',
+        dryRun: false,
+        verbose: false,
+      },
+    });
+  });
+});
+
+describe('handleReleaseValidateCommand', () => {
+  it('passes correct options to releaseValidateCommand', async () => {
+    const args = createArgs({
+      command: 'release-validate',
+      positionals: ['release-validate', '2.0.0'],
+      options: {
+        ...createArgs().options,
+        verbose: true,
+        force: true,
+      },
+    });
+
+    await handleReleaseValidateCommand(args);
+
+    expect(releaseValidateCommand).toHaveBeenCalledWith({
+      positionals: ['release-validate', '2.0.0'],
+      options: {
+        version: '2.0.0',
+        verbose: true,
+        strict: true,
+      },
+    });
+  });
+
+  it('returns SUCCESS exit code', async () => {
+    const args = createArgs({
+      command: 'release-validate',
+      positionals: ['release-validate'],
+    });
+
+    const result = await handleReleaseValidateCommand(args);
+
+    expect(result).toEqual({ success: true, exitCode: EXIT_CODES.SUCCESS });
+  });
+
+  it('returns SERVER_START_FAILED exit code', async () => {
+    vi.mocked(releaseValidateCommand).mockResolvedValueOnce(1);
+    const args = createArgs({
+      command: 'release-validate',
+      positionals: ['release-validate'],
+    });
+
+    const result = await handleReleaseValidateCommand(args);
+
+    expect(result).toEqual({ success: false, exitCode: EXIT_CODES.SERVER_START_FAILED });
+  });
+
+  it('reuses force flag as strict', async () => {
+    const argsWithForce = createArgs({
+      command: 'release-validate',
+      positionals: ['release-validate', '1.0.0'],
+      options: {
+        ...createArgs().options,
+        force: true,
+      },
+    });
+
+    await handleReleaseValidateCommand(argsWithForce);
+
+    expect(releaseValidateCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          strict: true,
+        }),
+      })
+    );
+  });
+
+  it('passes strict as false when force is false', async () => {
+    const args = createArgs({
+      command: 'release-validate',
+      positionals: ['release-validate', '1.0.0'],
+      options: {
+        ...createArgs().options,
+        force: false,
+      },
+    });
+
+    await handleReleaseValidateCommand(args);
+
+    expect(releaseValidateCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          strict: false,
+        }),
+      })
+    );
+  });
+
+  it('omits version when positional[1] is missing', async () => {
+    const args = createArgs({
+      command: 'release-validate',
+      positionals: ['release-validate'],
+    });
+
+    await handleReleaseValidateCommand(args);
+
+    expect(releaseValidateCommand).toHaveBeenCalledWith({
+      positionals: ['release-validate'],
+      options: {
+        verbose: false,
+        strict: false,
+      },
+    });
+  });
+});
+
+describe('handleReleaseAnnounceCommand', () => {
+  it('passes correct options to releaseAnnounceCommand', async () => {
+    const args = createArgs({
+      command: 'release-announce',
+      positionals: ['release-announce', '2.0.0', 'slack,discord'],
+      options: {
+        ...createArgs().options,
+        dryRun: true,
+        verbose: true,
+      },
+    });
+
+    await handleReleaseAnnounceCommand(args);
+
+    expect(releaseAnnounceCommand).toHaveBeenCalledWith({
+      positionals: ['release-announce', '2.0.0', 'slack,discord'],
+      options: {
+        version: '2.0.0',
+        channels: 'slack,discord',
+        dryRun: true,
+        verbose: true,
+      },
+    });
+  });
+
+  it('returns SUCCESS exit code', async () => {
+    const args = createArgs({
+      command: 'release-announce',
+      positionals: ['release-announce', '1.0.0'],
+    });
+
+    const result = await handleReleaseAnnounceCommand(args);
+
+    expect(result).toEqual({ success: true, exitCode: EXIT_CODES.SUCCESS });
+  });
+
+  it('returns SERVER_START_FAILED exit code', async () => {
+    vi.mocked(releaseAnnounceCommand).mockResolvedValueOnce(1);
+    const args = createArgs({
+      command: 'release-announce',
+      positionals: ['release-announce', '1.0.0'],
+    });
+
+    const result = await handleReleaseAnnounceCommand(args);
+
+    expect(result).toEqual({ success: false, exitCode: EXIT_CODES.SERVER_START_FAILED });
+  });
+
+  it('passes channels from positionals[2]', async () => {
+    const args = createArgs({
+      command: 'release-announce',
+      positionals: ['release-announce', '1.0.0', 'email'],
+    });
+
+    await handleReleaseAnnounceCommand(args);
+
+    expect(releaseAnnounceCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          channels: 'email',
+        }),
+      })
+    );
+  });
+
+  it('omits version and channels when positionals are missing', async () => {
+    const args = createArgs({
+      command: 'release-announce',
+      positionals: ['release-announce'],
+    });
+
+    await handleReleaseAnnounceCommand(args);
+
+    expect(releaseAnnounceCommand).toHaveBeenCalledWith({
+      positionals: ['release-announce'],
+      options: {
+        dryRun: false,
+        verbose: false,
+      },
+    });
+  });
+
+  it('omits channels but includes version when only positional[1] is present', async () => {
+    const args = createArgs({
+      command: 'release-announce',
+      positionals: ['release-announce', '3.0.0'],
+    });
+
+    await handleReleaseAnnounceCommand(args);
+
+    expect(releaseAnnounceCommand).toHaveBeenCalledWith({
+      positionals: ['release-announce', '3.0.0'],
+      options: {
+        version: '3.0.0',
+        dryRun: false,
+        verbose: false,
+      },
+    });
+  });
+});

@@ -1,0 +1,347 @@
+/**
+ * nexus-agents/mcp - Research Query Tool
+ *
+ * MCP tool for querying the research registry.
+ * Wraps existing CLI helpers: getResearchStatus(), findOverlaps(), generateStatsJson().
+ *
+ * @module mcp/tools/research-query
+ * (Source: Research System Enhancement - Phase 1A)
+ */
+
+import { z } from 'zod';
+import { join } from 'node:path';
+import type { McpServer } from '../sdk-types.js';
+import { createLogger, formatZodError } from '../../core/index.js';
+import { withToolError } from '../middleware/tool-error-handler.js';
+import {
+  registerStructuredTool,
+  toolStructuredError,
+  structuredToolSuccess,
+  type ToolResult,
+  type BaseMcpToolDeps,
+} from './tool-result.js';
+
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { getResearchStatus, findOverlaps, getProjectRoot } from '../../cli/research-helpers.js';
+import { checkRejected, formatRejectionWarning } from '../../research/negative-results.js';
+import { parseRegistry } from '../../indexer/research-index/index.js';
+import { generateStatsJson } from '../../indexer/research-index/index.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+import { REGISTRY_PATH } from '../../cli/research-helpers-io.js';
+
+// =============================================================================
+// SCHEMAS
+// =============================================================================
+
+/**
+ * Input schema for research_query tool.
+ */
+export const ResearchQueryInputSchema = z.object({
+  action: z
+    .enum(['status', 'overlap', 'stats', 'search'])
+    .describe(
+      'Query action: status (technique status), overlap (find related techniques), stats (registry statistics), search (text search)'
+    ),
+  techniqueId: z.string().optional().describe('Technique ID for status/overlap queries'),
+  query: z.string().optional().describe('Search query string for search action'),
+  status: z
+    .enum(['implemented', 'planned', 'not-started', 'rejected', 'all'])
+    .optional()
+    .default('all')
+    .describe('Filter by technique status (for status action)'),
+  threshold: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .default(0.3)
+    .describe('Overlap threshold (0-1) for overlap action'),
+});
+
+/**
+ * Type for validated research query input.
+ */
+export type ResearchQueryInput = z.infer<typeof ResearchQueryInputSchema>;
+
+// Envelope schema (#2340). Inner `data` is intentionally `z.unknown()` because
+// the four action variants return different shapes.
+const ResearchQueryOutputSchema = {
+  action: z.string(),
+  success: z.boolean(),
+  data: z.unknown(),
+  rejectionNotice: z.string().optional(),
+  negativeResults: z
+    .object({
+      status: z.literal('unavailable'),
+      reason: z.string(),
+    })
+    .optional(),
+};
+
+// =============================================================================
+// DEPS
+// =============================================================================
+
+/**
+ * Dependencies for research_query tool.
+ */
+export type ResearchQueryDeps = BaseMcpToolDeps;
+
+// =============================================================================
+// RESPONSE
+// =============================================================================
+
+/**
+ * Response from research_query tool.
+ */
+export interface ResearchQueryResponse {
+  /** Action that was performed */
+  action: string;
+  /** Whether the query succeeded */
+  success: boolean;
+  /** Query results */
+  data: unknown;
+  /**
+   * A recorded rejection for the queried technique, when one exists (#4555).
+   *
+   * Advisory. The registry says a prior attempt failed and why; it does not
+   * suppress the result, because a prior rejection is evidence to weigh, not
+   * a veto.
+   */
+  rejectionNotice?: string;
+  /** Present when the negative-results registry could not be measured. */
+  negativeResults?: { status: 'unavailable'; reason: string };
+}
+
+// =============================================================================
+// HANDLERS
+// =============================================================================
+
+/**
+ * Surface a recorded rejection for `techniqueId`, if the registry holds one.
+ *
+ * `docs/research/registry/negative-results.yaml` exists to "prevent
+ * re-researching failed implementations", and until now nothing read it —
+ * maintained data with no consumer, so a technique explicitly recorded as
+ * rejected was re-suggested with no warning (#4555). This is the read.
+ *
+ * Advisory: the rejection is attached to the response, never used to suppress
+ * a result. A prior rejection is evidence to weigh, not a veto — the failure
+ * mode may not apply, or the record may be stale.
+ */
+type RejectionMetadata = Pick<ResearchQueryResponse, 'negativeResults' | 'rejectionNotice'>;
+
+function rejectionMetadataFor(techniqueId: string | undefined): RejectionMetadata {
+  if (techniqueId === undefined || techniqueId === '') return {};
+  const result = checkRejected(techniqueId);
+  if (result.kind === 'rejected') {
+    return { rejectionNotice: formatRejectionWarning(techniqueId, result.entry) };
+  }
+  if (result.kind === 'unavailable') {
+    return { negativeResults: { status: 'unavailable', reason: result.reason } };
+  }
+  return {};
+}
+
+/** Handles status action. */
+async function handleStatus(input: ResearchQueryInput): Promise<ResearchQueryResponse> {
+  const result = await getResearchStatus({
+    techniqueId: input.techniqueId,
+    status: input.status,
+    format: 'json',
+  });
+  const rejection = rejectionMetadataFor(input.techniqueId);
+  return {
+    action: 'status',
+    success: result.success,
+    data: result,
+    ...rejection,
+  };
+}
+
+/** Handles overlap action. */
+async function handleOverlap(input: ResearchQueryInput): Promise<ResearchQueryResponse> {
+  if (input.techniqueId === undefined || input.techniqueId === '') {
+    return {
+      action: 'overlap',
+      success: false,
+      data: { error: 'techniqueId is required for overlap action' },
+    };
+  }
+  const result = await findOverlaps({
+    techniqueId: input.techniqueId,
+    threshold: input.threshold,
+    format: 'json',
+  });
+  const rejection = rejectionMetadataFor(input.techniqueId);
+  return {
+    action: 'overlap',
+    success: result.success,
+    data: result,
+    ...rejection,
+  };
+}
+
+/** Handles stats action. */
+function handleStats(): ResearchQueryResponse {
+  // #5053: resolve from the workspace/repo root, not the server's cwd.
+  const registryPath = join(getProjectRoot(), REGISTRY_PATH);
+  const result = parseRegistry({ registryPath });
+  if (!result.ok) {
+    return {
+      action: 'stats',
+      success: false,
+      data: { error: `Failed to parse registry: ${result.error.message}` },
+    };
+  }
+  const statsJson = generateStatsJson(result.value);
+  let data: unknown;
+  try {
+    data = JSON.parse(statsJson) as unknown;
+  } catch {
+    return {
+      action: 'stats',
+      success: false,
+      data: { error: 'Failed to generate stats JSON' },
+    };
+  }
+  return {
+    action: 'stats',
+    success: true,
+    data,
+  };
+}
+
+/** Handles search action. */
+async function handleSearch(input: ResearchQueryInput): Promise<ResearchQueryResponse> {
+  if (input.query === undefined || input.query === '') {
+    return {
+      action: 'search',
+      success: false,
+      data: { error: 'query is required for search action' },
+    };
+  }
+  const queryLower = input.query.toLowerCase();
+  const result = await getResearchStatus({
+    status: 'all',
+    format: 'json',
+  });
+  if (!result.success) {
+    return { action: 'search', success: false, data: result };
+  }
+  const matches = result.techniques.filter(
+    (t) =>
+      t.name.toLowerCase().includes(queryLower) ||
+      t.id.toLowerCase().includes(queryLower) ||
+      t.topic.toLowerCase().includes(queryLower)
+  );
+  return {
+    action: 'search',
+    success: true,
+    data: { query: input.query, matches, matchCount: matches.length },
+  };
+}
+
+/** Routes to the correct action handler. */
+async function executeQuery(input: ResearchQueryInput): Promise<ResearchQueryResponse> {
+  switch (input.action) {
+    case 'status':
+      return handleStatus(input);
+    case 'overlap':
+      return handleOverlap(input);
+    case 'stats':
+      return handleStats();
+    case 'search':
+      return handleSearch(input);
+  }
+}
+
+// =============================================================================
+// MCP TOOL
+// =============================================================================
+
+/**
+ * Creates the core handler logic for research_query tool.
+ */
+function createResearchQueryHandler(deps: ResearchQueryDeps) {
+  return async (args: unknown, ctx: HandlerContext): Promise<ToolResult> => {
+    const validationResult = ResearchQueryInputSchema.safeParse(args);
+    if (!validationResult.success) {
+      return toolStructuredError({
+        errorCategory: 'validation',
+        message: `Validation error: ${formatZodError(validationResult.error)}`,
+      });
+    }
+
+    ctx.logger.debug('Executing research query', { action: validationResult.data.action });
+
+    const logger = deps.logger ?? createLogger({ tool: 'research_query' });
+    return withToolError('Research query failed', logger, async () => {
+      const result = await executeQuery(validationResult.data);
+      if (result.negativeResults?.status === 'unavailable') {
+        logger.warn('Negative-results registry unavailable', {
+          reason: result.negativeResults.reason,
+        });
+      }
+      return structuredToolSuccess(z.object(ResearchQueryOutputSchema), result);
+    });
+  };
+}
+
+/**
+ * Registers the research_query tool with the MCP server.
+ *
+ * @category MCP
+ * @param server - MCP server instance
+ * @param deps - Tool dependencies
+ */
+export function registerResearchQueryTool(server: McpServer, deps: ResearchQueryDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'research_query' });
+  const toolSchema = {
+    action: z
+      .enum(['status', 'overlap', 'stats', 'search'])
+      .describe('Query action: status, overlap, stats, or search'),
+    techniqueId: z.string().optional().describe('Technique ID for status/overlap queries'),
+    query: z.string().optional().describe('Search query string for search action'),
+    status: z
+      .enum(['implemented', 'planned', 'not-started', 'rejected', 'all'])
+      .optional()
+      .describe('Filter by technique status'),
+    threshold: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe('Overlap threshold (0-1) for overlap action'),
+  };
+
+  const description =
+    'Query the research registry for technique status, overlaps, statistics, or text search. ' +
+    'Provides read-only access to the research tracking system.';
+
+  const secureHandler = createSecureHandler(createResearchQueryHandler(deps), {
+    toolName: 'research_query',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const timeoutMs = getToolTimeout('research_query', deps.security);
+  const wrappedHandler = wrapToolWithTimeout('research_query', secureHandler, {
+    timeoutMs,
+    logger,
+  });
+
+  registerStructuredTool(
+    server,
+    'research_query',
+    {
+      description,
+      inputSchema: toolSchema,
+      outputSchema: ResearchQueryOutputSchema,
+      annotations: getToolAnnotations('research_query'),
+    },
+    toSdkCallback(wrappedHandler)
+  );
+  logger.info('Registered research_query tool with secure handler and timeout protection');
+}

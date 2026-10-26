@@ -1,0 +1,833 @@
+/**
+ * Tests for Model Config Helpers
+ *
+ * @module config/model-config-helpers.test
+ * (Source: Issue #807 - Centralized Model Registry)
+ */
+
+import { describe, it, expect, vi } from 'vitest';
+import { getDefaultRegistry, peekDefaultRegistry, setDefaultRegistry } from './model-registry.js';
+import { CLI_NAMES } from './model-capabilities-types.js';
+import {
+  getModelPricing,
+  getModelDisplayName,
+  getModelContextWindow,
+  getModelMaxOutput,
+  getModelQualityScores,
+  getDefaultModelForCli,
+  getCliModelName,
+  resolveCliAlias,
+  findCanonicalModel,
+  resolveCliModelName,
+  buildModelInfo,
+  buildCapabilityProfiles,
+  buildCliCapabilityProfiles,
+  buildTopsisProfiles,
+  buildMockModelInfo,
+  findInTreeByCli,
+  resolveModelCostPer1M,
+  resolveCliCostPer1M,
+} from './model-config-helpers.js';
+import type { ModelId } from './model-capabilities-types.js';
+import {
+  DEFAULT_MODEL_CAPABILITIES,
+  STATIC_CLI_COST_PER_1M,
+  unpricedCliCostPer1M,
+} from './in-tree-data.js';
+import type { ModelCapability } from './model-capabilities-types.js';
+
+// ============================================================================
+// Single-Model Lookups
+// ============================================================================
+
+describe('getModelPricing', () => {
+  it('returns pricing for known model', () => {
+    const pricing = getModelPricing('claude-sonnet');
+    expect(pricing).toBeDefined();
+    expect(pricing?.inputPer1M).toBeGreaterThan(0);
+    expect(pricing?.outputPer1M).toBeGreaterThan(0);
+  });
+
+  it('returns undefined for unknown model', () => {
+    // Cast to bypass type restriction for testing edge case
+    const pricing = getModelPricing('nonexistent-model' as 'claude-sonnet');
+    expect(pricing).toBeUndefined();
+  });
+});
+
+describe('getModelDisplayName', () => {
+  it('returns display name for known model', () => {
+    const name = getModelDisplayName('claude-sonnet');
+    expect(name).toBeTruthy();
+    expect(name).not.toBe('claude-sonnet'); // Should be a friendly name
+  });
+
+  it('falls back to modelId for unknown model', () => {
+    const name = getModelDisplayName('nonexistent' as 'claude-sonnet');
+    expect(name).toBe('nonexistent');
+  });
+});
+
+describe('getModelContextWindow', () => {
+  it('returns context window for known model', () => {
+    const ctx = getModelContextWindow('claude-sonnet');
+    expect(ctx).toBeGreaterThan(0);
+  });
+
+  it('returns fail-closed 8k default for unknown model (#2177)', () => {
+    // Previously returned a silent 200_000 — masked routing-critical
+    // metadata for unknown models. CapabilityDiscovery now resolves
+    // unknown ids at T4 with a conservative 8 K default + structured warn.
+    const ctx = getModelContextWindow('nonexistent' as 'claude-sonnet');
+    expect(ctx).toBe(8_192);
+  });
+});
+
+describe('getModelMaxOutput', () => {
+  it('returns max output for known model', () => {
+    const max = getModelMaxOutput('claude-sonnet');
+    expect(max).toBeDefined();
+    expect(max).toBeGreaterThan(0);
+  });
+
+  it('returns undefined for unknown model', () => {
+    const max = getModelMaxOutput('nonexistent' as 'claude-sonnet');
+    expect(max).toBeUndefined();
+  });
+});
+
+describe('getModelQualityScores', () => {
+  it('returns quality scores for known model', () => {
+    const scores = getModelQualityScores('claude-sonnet');
+    expect(scores).toBeDefined();
+    expect(scores?.reasoning).toBeGreaterThan(0);
+    expect(scores?.codeGeneration).toBeGreaterThan(0);
+    expect(scores?.speed).toBeGreaterThan(0);
+    expect(scores?.cost).toBeGreaterThan(0);
+  });
+});
+
+describe('getDefaultModelForCli', () => {
+  it('returns default model for claude', () => {
+    const model = getDefaultModelForCli('claude');
+    expect(model).toBeTruthy();
+    expect(model).toContain('claude');
+  });
+
+  it('returns default model for gemini', () => {
+    const model = getDefaultModelForCli('gemini');
+    expect(model).toBeTruthy();
+  });
+
+  it('returns default model for codex', () => {
+    const model = getDefaultModelForCli('codex');
+    expect(model).toBeTruthy();
+  });
+});
+
+describe('getCliModelName', () => {
+  it('returns CLI model name for known model', () => {
+    const name = getCliModelName('claude-sonnet');
+    expect(name).toBeTruthy();
+  });
+
+  it('falls back to modelId for unknown model', () => {
+    const name = getCliModelName('unknown' as 'claude-sonnet');
+    expect(name).toBe('unknown');
+  });
+});
+
+describe('resolveCliAlias', () => {
+  it('resolves model ID to itself', () => {
+    const resolved = resolveCliAlias('claude-sonnet');
+    expect(resolved).toBe('claude-sonnet');
+  });
+
+  it('returns undefined for unknown alias', () => {
+    const resolved = resolveCliAlias('totally-fake');
+    expect(resolved).toBeUndefined();
+  });
+
+  // #2199 Child 5: aliases field migration. Legacy version-suffix names
+  // resolve via the registry's `aliases` array, so adapter files don't need
+  // to maintain their own LEGACY_CLAUDE_ALIASES lookups.
+  it('resolves claude-opus-4 legacy alias to claude-opus via registry aliases', () => {
+    expect(resolveCliAlias('claude-opus-4')).toBe('claude-opus');
+  });
+
+  it('resolves claude-sonnet-4 legacy alias to claude-sonnet via registry aliases', () => {
+    expect(resolveCliAlias('claude-sonnet-4')).toBe('claude-sonnet');
+  });
+
+  it('resolves claude-haiku-4 legacy alias to claude-haiku via registry aliases', () => {
+    expect(resolveCliAlias('claude-haiku-4')).toBe('claude-haiku');
+  });
+
+  it('resolves claude-haiku-3 legacy alias to claude-haiku (pre-4.x compat)', () => {
+    expect(resolveCliAlias('claude-haiku-3')).toBe('claude-haiku');
+  });
+});
+
+// ============================================================================
+// CLI-Model Lookups (Issue #886)
+// ============================================================================
+
+describe('findCanonicalModel', () => {
+  it('finds codex model by cliModelName', () => {
+    const model = findCanonicalModel('codex', 'gpt-5.6-terra');
+    expect(model).toBeDefined();
+    expect(model?.id).toBe('codex-5.3');
+  });
+
+  it('finds gemini model by cliModelName', () => {
+    const model = findCanonicalModel('gemini', 'gemini-2.5-flash');
+    expect(model).toBeDefined();
+    expect(model?.id).toBe('gemini-flash');
+  });
+
+  it('finds claude model by cliAlias', () => {
+    const model = findCanonicalModel('claude', 'opus');
+    expect(model).toBeDefined();
+    expect(model?.id).toBe('claude-opus');
+  });
+
+  it('returns undefined for unknown model', () => {
+    expect(findCanonicalModel('codex', 'nonexistent')).toBeUndefined();
+  });
+
+  it('returns undefined when cli does not match', () => {
+    // 'o3' is a codex model, not gemini
+    expect(findCanonicalModel('gemini', 'o3')).toBeUndefined();
+  });
+
+  // #2200 Child 1: legacy version-suffix names resolve via aliases[]
+  it('finds claude model by legacy alias from aliases[] (claude-opus-4)', () => {
+    const model = findCanonicalModel('claude', 'claude-opus-4');
+    expect(model).toBeDefined();
+    expect(model?.id).toBe('claude-opus');
+  });
+
+  it('finds claude model by legacy alias from aliases[] (claude-haiku-3)', () => {
+    const model = findCanonicalModel('claude', 'claude-haiku-3');
+    expect(model).toBeDefined();
+    expect(model?.id).toBe('claude-haiku');
+  });
+
+  it('does not match alias if cli does not match', () => {
+    // claude-opus-4 is a claude alias, not gemini
+    expect(findCanonicalModel('gemini', 'claude-opus-4')).toBeUndefined();
+  });
+});
+
+describe('buildModelInfo', () => {
+  it('builds model info for codex model', () => {
+    const info = buildModelInfo('codex', 'gpt-5.6-terra');
+    expect(info).toBeDefined();
+    expect(info?.id).toBe('gpt-5.6-terra');
+    expect(info?.name).toBe('GPT-5.6 Terra');
+    expect(info?.contextWindow).toBe(1_050_000);
+    expect(info?.maxOutput).toBe(128_000);
+    // models.dev 2026-09-06 for gpt-5.6-terra (#5694)
+    expect(info?.costPerMillionInput).toBe(2.0);
+    expect(info?.costPerMillionOutput).toBe(12.0);
+  });
+
+  it('builds model info for gemini model', () => {
+    const info = buildModelInfo('gemini', 'gemini-2.5-flash');
+    expect(info).toBeDefined();
+    expect(info?.id).toBe('gemini-2.5-flash');
+    expect(info?.name).toBe('Gemini 2.5 Flash');
+    expect(info?.contextWindow).toBe(1_048_576);
+  });
+
+  it('builds model info for claude model via cliAlias', () => {
+    const info = buildModelInfo('claude', 'opus');
+    expect(info).toBeDefined();
+    expect(info?.id).toBe('opus');
+    expect(info?.name).toBe('Claude Opus 4.6');
+    expect(info?.contextWindow).toBe(1_000_000);
+    expect(info?.maxOutput).toBe(128_000);
+  });
+
+  it('returns undefined for unknown model', () => {
+    expect(buildModelInfo('codex', 'nonexistent')).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Bulk Builders
+// ============================================================================
+
+describe('buildCapabilityProfiles', () => {
+  it('returns profiles keyed by ModelId', () => {
+    const profiles = buildCapabilityProfiles();
+    expect(Object.keys(profiles).length).toBeGreaterThan(0);
+
+    const first = Object.values(profiles)[0];
+    expect(first).toBeDefined();
+    expect(first).toHaveProperty('reasoning');
+    expect(first).toHaveProperty('contextWindow');
+    expect(first).toHaveProperty('codeGeneration');
+    expect(first).toHaveProperty('speed');
+    expect(first).toHaveProperty('cost');
+  });
+
+  it('includes claude-sonnet profile', () => {
+    const profiles = buildCapabilityProfiles();
+    expect(profiles['claude-sonnet']).toBeDefined();
+  });
+});
+
+describe('buildCliCapabilityProfiles', () => {
+  it('returns profiles for all CLIs', () => {
+    const profiles = buildCliCapabilityProfiles();
+    for (const cli of CLI_NAMES) {
+      expect(profiles[cli]).toBeDefined();
+    }
+  });
+
+  it('has valid capability values', () => {
+    const profiles = buildCliCapabilityProfiles();
+    for (const profile of Object.values(profiles)) {
+      expect(profile.reasoning).toBeGreaterThan(0);
+      expect(profile.contextWindow).toBeGreaterThan(0);
+      expect(profile.speed).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('buildTopsisProfiles', () => {
+  it('builds static fallback profiles without constructing the registry', () => {
+    const previous = peekDefaultRegistry();
+    setDefaultRegistry(undefined);
+    try {
+      expect(buildTopsisProfiles()).toHaveLength(CLI_NAMES.length);
+      expect(peekDefaultRegistry()).toBeUndefined();
+    } finally {
+      setDefaultRegistry(previous);
+    }
+  });
+
+  it('returns profiles for all CLIs', () => {
+    const profiles = buildTopsisProfiles();
+    expect(profiles.length).toBe(CLI_NAMES.length);
+  });
+
+  it('has valid TOPSIS profile structure', () => {
+    const profiles = buildTopsisProfiles();
+    for (const profile of profiles) {
+      expect(profile.cliName).toBeTruthy();
+      expect(profile.capabilities.reasoning).toBeGreaterThan(0);
+      expect(profile.costPerMillionInput).toBeGreaterThanOrEqual(0);
+      expect(profile.costPerMillionOutput).toBeGreaterThanOrEqual(0);
+      expect(profile.averageLatencyMs).toBeGreaterThan(0);
+      expect(profile.qualityScore).toBeGreaterThan(0);
+    }
+  });
+
+  it('quality score is average of reasoning and code generation', () => {
+    const profiles = buildTopsisProfiles();
+    for (const profile of profiles) {
+      const expected = (profile.capabilities.reasoning + profile.capabilities.codeGeneration) / 2;
+      expect(profile.qualityScore).toBeCloseTo(expected);
+    }
+  });
+});
+
+describe('buildMockModelInfo', () => {
+  it('returns info for all CLIs', () => {
+    const info = buildMockModelInfo();
+    for (const cli of CLI_NAMES) {
+      expect(info[cli]).toBeDefined();
+    }
+  });
+
+  it('has valid model info structure', () => {
+    const info = buildMockModelInfo();
+    for (const model of Object.values(info)) {
+      expect(model.id).toBeTruthy();
+      expect(model.name).toBeTruthy();
+      expect(model.contextWindow).toBeGreaterThan(0);
+    }
+  });
+});
+
+// ============================================================================
+// Cost resolution (#4168) — the single authoritative per-CLI/per-model $ source
+// ============================================================================
+
+describe('resolveModelCostPer1M', () => {
+  it('upgrades a priced model to real registry pricing', () => {
+    // claude-sonnet is priced $3/$15 per 1M in-tree; must NOT use the fallback.
+    const fallback = { input: 999, output: 999 };
+    expect(resolveModelCostPer1M('claude-sonnet', fallback)).toEqual({ input: 3.0, output: 15.0 });
+  });
+
+  it('FAIL DIRECTION: unpriced model falls back conservatively, never $0', () => {
+    // A model the registry cannot price MUST NOT resolve to $0 — a $0 candidate
+    // fails OPEN (always passes a budget filter, looks cheapest to TOPSIS) and
+    // gets over-selected, spending real money (#4168 binding condition 2).
+    const fallback = { input: 3.0, output: 15.0 };
+    const resolved = resolveModelCostPer1M('nonexistent-unpriced-model-xyz' as ModelId, fallback);
+    expect(resolved).toEqual(fallback);
+    expect(resolved.input).toBeGreaterThan(0);
+    expect(resolved.output).toBeGreaterThan(0);
+  });
+
+  it('preserves an EXPLICIT $0 registry price (only a missing price falls back)', () => {
+    // openrouter-nemotron-super is deliberately priced $0 in-tree — that is a
+    // real (priced) $0, not an unknown, so it is returned as-is, not the fallback.
+    const fallback = { input: 3.0, output: 15.0 };
+    expect(resolveModelCostPer1M('openrouter-nemotron-super', fallback)).toEqual({
+      input: 0,
+      output: 0,
+    });
+  });
+});
+
+describe('resolveCliCostPer1M', () => {
+  it('bounds an unpriced default by overlay pricing the registry reports (#6866)', () => {
+    // A manifest overlay outranks in-tree data and may raise a sibling's price;
+    // the runtime estimate must follow the registry, not the in-tree matrix.
+    const registry = getDefaultRegistry();
+    const entries = registry.allEntries();
+    const raised = entries.map((e) =>
+      e.id === 'gpt-5.6-sol' ? { ...e, pricing: { inputPer1M: 50, outputPer1M: 100 } } : e
+    );
+    const spy = vi.spyOn(registry, 'allEntries').mockReturnValue(raised);
+    const getEntry = registry.getEntry.bind(registry);
+    const priceSpy = vi.spyOn(registry, 'getEntry').mockImplementation((id) => {
+      const entry = { ...getEntry(id) };
+      if (id === 'gpt-6.1-sol') delete entry.pricing;
+      return entry;
+    });
+    try {
+      expect(resolveCliCostPer1M('codex')).toEqual({ input: 50, output: 100 });
+    } finally {
+      spy.mockRestore();
+      priceSpy.mockRestore();
+    }
+  });
+
+  it('maps each CLI to default registry pricing or the unpriced fallback (per-1M)', () => {
+    // Snapshot refreshes may price a previously unpriced default. Follow the
+    // canonical registry rather than pinning codex to an obsolete fallback.
+    for (const cli of ['claude', 'gemini', 'codex'] as const) {
+      const pricing = getModelPricing(getDefaultModelForCli(cli));
+      const expected =
+        pricing === undefined
+          ? unpricedCliCostPer1M(cli)
+          : { input: pricing.inputPer1M, output: pricing.outputPer1M };
+      expect(resolveCliCostPer1M(cli), cli).toEqual(expected);
+    }
+  });
+
+  // #6866 panel (catfish): the unpriced codex default fell back to the static
+  // $2.5/$10, which undercut priced gpt-5.6-sol ($4/$20) and made the unknown
+  // model look CHEAPER to budget filters and cost-weighted TOPSIS.
+  it('never estimates an unpriced default below any priced model of the same CLI', () => {
+    for (const cli of CLI_NAMES) {
+      if (getModelPricing(getDefaultModelForCli(cli)) !== undefined) continue;
+      const est = resolveCliCostPer1M(cli);
+      for (const m of DEFAULT_MODEL_CAPABILITIES.models) {
+        if (m.cliName !== cli || m.pricing === undefined) continue;
+        expect(est.input, `${cli} input vs ${m.id}`).toBeGreaterThanOrEqual(m.pricing.inputPer1M);
+        expect(est.output, `${cli} output vs ${m.id}`).toBeGreaterThanOrEqual(
+          m.pricing.outputPer1M
+        );
+      }
+    }
+  });
+
+  it('estimates an explicitly unpriced codex default at no less than a priced sibling', () => {
+    const registry = getDefaultRegistry();
+    const getEntry = registry.getEntry.bind(registry);
+    const spy = vi.spyOn(registry, 'getEntry').mockImplementation((id) => {
+      const entry = { ...getEntry(id) };
+      if (id === 'gpt-6.1-sol') delete entry.pricing;
+      return entry;
+    });
+    try {
+      expect(getModelPricing('gpt-6.1-sol')).toBeUndefined();
+      const sibling = getModelPricing('gpt-5.6-sol');
+      expect(sibling).toBeDefined();
+      const est = resolveCliCostPer1M('codex');
+      expect(est.input + est.output).toBeGreaterThanOrEqual(
+        (sibling?.inputPer1M ?? Infinity) + (sibling?.outputPer1M ?? Infinity)
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('keeps the static codex row at or above every priced codex model', () => {
+    for (const m of DEFAULT_MODEL_CAPABILITIES.models) {
+      if (m.cliName !== 'codex' || m.pricing === undefined) continue;
+      expect(STATIC_CLI_COST_PER_1M.codex.input).toBeGreaterThanOrEqual(m.pricing.inputPer1M);
+      expect(STATIC_CLI_COST_PER_1M.codex.output).toBeGreaterThanOrEqual(m.pricing.outputPer1M);
+    }
+  });
+
+  describe('unpricedCliCostPer1M empty case (#6866)', () => {
+    const codexModel = (id: string, pricing?: ModelCapability['pricing']): ModelCapability => {
+      const base = DEFAULT_MODEL_CAPABILITIES.models.find((m) => m.id === 'gpt-5.6-sol');
+      if (base === undefined) throw new Error('fixture base gpt-5.6-sol missing');
+      const { pricing: _drop, ...rest } = base;
+      return { ...rest, id: id as ModelId, ...(pricing !== undefined ? { pricing } : {}) };
+    };
+
+    it('uses the static row when the CLI has no priced model', () => {
+      expect(unpricedCliCostPer1M('codex', [])).toEqual(STATIC_CLI_COST_PER_1M.codex);
+      expect(unpricedCliCostPer1M('codex', [codexModel('a')])).toEqual(
+        STATIC_CLI_COST_PER_1M.codex
+      );
+    });
+
+    it('uses the static row, not $0, when the only priced sibling is free', () => {
+      const free = codexModel('a', { inputPer1M: 0, outputPer1M: 0 });
+      expect(unpricedCliCostPer1M('codex', [free])).toEqual(STATIC_CLI_COST_PER_1M.codex);
+    });
+
+    it('never undercuts a known rate when a sibling prices one side at $0', () => {
+      // PricingSchema allows free input with paid output. Falling back the whole
+      // pair to the static row would drop the known $40 output rate (#6866).
+      const freeInput = codexModel('a', { inputPer1M: 0, outputPer1M: 40 });
+      const estimate = unpricedCliCostPer1M('codex', [freeInput]);
+      expect(estimate.output).toBe(40);
+      expect(estimate.input).toBe(STATIC_CLI_COST_PER_1M.codex.input);
+    });
+
+    it('takes the highest input and output rate independently', () => {
+      const models = [
+        codexModel('a', { inputPer1M: 9, outputPer1M: 1 }),
+        codexModel('b', { inputPer1M: 1, outputPer1M: 40 }),
+      ];
+      expect(unpricedCliCostPer1M('codex', models)).toEqual({ input: 9, output: 40 });
+      expect(unpricedCliCostPer1M('claude', models)).toEqual(STATIC_CLI_COST_PER_1M.claude);
+    });
+  });
+
+  it('runtime TOPSIS prices every default exactly as the budget policy does', async () => {
+    const { getDefaultTopsisProfiles } = await import('../cli-adapters/topsis-types.js');
+    const profiles = getDefaultTopsisProfiles();
+    expect(profiles).toHaveLength(CLI_NAMES.length);
+    for (const profile of profiles) {
+      const est = resolveCliCostPer1M(profile.cliName);
+      expect(profile.costPerMillionInput, profile.cliName).toBe(est.input);
+      expect(profile.costPerMillionOutput, profile.cliName).toBe(est.output);
+    }
+  });
+
+  it('every CLI resolves to a non-$0 cost (no fail-open in budget gates)', () => {
+    for (const cli of CLI_NAMES) {
+      const c = resolveCliCostPer1M(cli);
+      expect(c.input).toBeGreaterThan(0);
+      expect(c.output).toBeGreaterThan(0);
+    }
+  });
+});
+
+// ============================================================================
+// resolveCliModelName (#5091)
+// ============================================================================
+
+describe('resolveCliModelName', () => {
+  it('translates a canonical registry id to the cliModelName the binary expects', () => {
+    // codex-5.3 is the registry id; gpt-5.6-terra is what `codex -m` accepts.
+    expect(resolveCliModelName('codex', 'codex-5.3')).toBe('gpt-5.6-terra');
+  });
+
+  it('passes a value that is already a cliModelName through unchanged', () => {
+    expect(resolveCliModelName('codex', 'gpt-5.6-terra')).toBe('gpt-5.6-terra');
+  });
+
+  it('translates a cliAlias to the cliModelName', () => {
+    expect(resolveCliModelName('claude', 'opus')).toBe('claude-opus-4-6');
+  });
+
+  it('translates a legacy aliases[] name to the cliModelName', () => {
+    expect(resolveCliModelName('claude', 'claude-opus-4')).toBe('claude-opus-4-6');
+  });
+
+  it('returns undefined for a model the registry does not know under that CLI', () => {
+    expect(resolveCliModelName('codex', 'nonexistent-model')).toBeUndefined();
+  });
+
+  it('returns undefined when the id belongs to a different CLI', () => {
+    // codex-5.3 is a codex entry; asking the gemini arm must not translate it.
+    expect(resolveCliModelName('gemini', 'codex-5.3')).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Codex registry entries (#5091)
+// ============================================================================
+
+describe('codex registry entries (#5091)', () => {
+  // Verified against ~/.codex/models_cache.json (codex-cli 0.155.1,
+  // 2026-09-23, visibility=list): gpt-6-astra, gpt-6-sol, gpt-6-luna,
+  // gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5. `gpt-5.3-codex-spark`
+  // and `gpt-5.4-mini` (the #5091 targets) are no longer served.
+  it.each([
+    ['codex-5.3', 'gpt-5.6-terra'],
+    ['codex-5.2', 'gpt-5.6-luna'],
+    ['codex-5.1-mini', 'gpt-6-luna'],
+  ] as const)('%s → cliModelName %s (a slug codex serves)', (id, slug) => {
+    expect(getCliModelName(id)).toBe(slug);
+  });
+
+  /** The codex entry for `slug`, failing the test (not the type) when absent. */
+  function codexEntry(slug: string): NonNullable<ReturnType<typeof findCanonicalModel>> {
+    const entry = findCanonicalModel('codex', slug);
+    if (entry === undefined) throw new Error(`no codex entry for ${slug}`);
+    return entry;
+  }
+
+  it('describes the slug it points at, not the one it replaced', () => {
+    // codex-5.2 → gpt-5.6-luna: models.dev snapshot 2026-09-21.
+    const luna56 = codexEntry('gpt-5.6-luna');
+    expect(luna56.displayName).toBe('GPT-5.6 Luna');
+    expect(luna56.contextWindow).toBe(1_050_000);
+    expect(luna56.maxOutputTokens).toBe(128_000);
+    expect(luna56.pricing).toEqual({ inputPer1M: 0.2, outputPer1M: 1.2 });
+    expect(luna56.notes).toMatch(/^GPT-5\.6 Luna/);
+
+    // codex-5.1-mini → gpt-6-luna: live models.dev / LiteLLM 2026-09-23.
+    const luna6 = codexEntry('gpt-6-luna');
+    expect(luna6.displayName).toBe('GPT-6 Luna');
+    expect(luna6.contextWindow).toBe(1_050_000);
+    expect(luna6.maxOutputTokens).toBe(128_000);
+    expect(luna6.pricing).toEqual({ inputPer1M: 0.1, outputPer1M: 0.5 });
+    expect(luna6.notes).toMatch(/^GPT-6 Luna/);
+  });
+
+  /** cliModelName → ids of every in-tree entry (any CLI) that claims it. */
+  function ownersByCliModelName(): Map<string, string[]> {
+    const owners = new Map<string, string[]>();
+    for (const cli of CLI_NAMES) {
+      for (const entry of findInTreeByCli(cli)) {
+        if (entry.cliModelName === undefined) continue;
+        owners.set(entry.cliModelName, [...(owners.get(entry.cliModelName) ?? []), entry.id]);
+      }
+    }
+    return owners;
+  }
+
+  it('every codex cliModelName is unique across the whole in-tree registry', () => {
+    const codex = findInTreeByCli('codex');
+    // Name the empty case: with no codex entries there is nothing to compare,
+    // and `[].every` would report the uniqueness claim as satisfied.
+    expect(codex.length).toBeGreaterThan(0);
+
+    const owners = ownersByCliModelName();
+    for (const entry of codex) {
+      const slug = entry.cliModelName ?? '';
+      expect(slug).not.toBe('');
+      const ids = owners.get(slug) ?? [];
+      expect(ids, `${slug} owned by ${ids.join(', ')}`).toEqual([entry.id]);
+    }
+  });
+
+  describe('gpt-6.1-sol as the codex default (#6842)', () => {
+    it('is the default and has id equal to its served slug', () => {
+      expect(getDefaultModelForCli('codex')).toBe('gpt-6.1-sol');
+      const sol = codexEntry('gpt-6.1-sol');
+      expect(sol.id).toBe('gpt-6.1-sol');
+      expect(sol.cliModelName).toBe('gpt-6.1-sol');
+      expect(sol.displayName).toBe('GPT-6.1 Sol');
+    });
+
+    it('uses registry pricing while labeling its carried-over capabilities', () => {
+      const sol = codexEntry('gpt-6.1-sol');
+      const previous = codexEntry('gpt-5.6-sol');
+      expect(sol.pricing).toEqual(getModelPricing('gpt-6.1-sol'));
+      expect(sol.notes).toContain('CARRIED-OVER');
+      expect(sol.contextWindow).toBe(previous.contextWindow);
+      expect(sol.maxOutputTokens).toBe(previous.maxOutputTokens);
+      expect(sol.qualityScores).toEqual(previous.qualityScores);
+      expect(sol.inputModalities).toEqual(previous.inputModalities);
+      expect(sol.outputModalities).toEqual(previous.outputModalities);
+      expect(sol.toolCapabilities).toEqual(previous.toolCapabilities);
+      expect(sol.unsupportedParameters).toEqual(previous.unsupportedParameters);
+      expect(sol.maxTokensParam).toBe('max_completion_tokens');
+    });
+  });
+
+  describe('gpt-5.6-sol remains routable (#6516)', () => {
+    // codex-cli 0.155.1's cache announces gpt-5.5's retirement on 2026-10-14
+    // with upgrade.model gpt-5.6-sol. Panel option A originally made it the
+    // default; #6842 keeps it routable for pins. gpt-5.5 stays until the
+    // removal tracked in #6526.
+    it('has id equal to its served slug', () => {
+      expect(getCliModelName('gpt-5.6-sol')).toBe('gpt-5.6-sol');
+      expect(findCanonicalModel('codex', 'gpt-5.6-sol')?.id).toBe('gpt-5.6-sol');
+    });
+
+    it('describes gpt-5.6-sol from measured sources', () => {
+      const sol = codexEntry('gpt-5.6-sol');
+      // models.dev snapshot 2026-09-21 / generated catalogue 2026-09-23.
+      expect(sol.displayName).toBe('GPT-5.6 Sol');
+      expect(sol.contextWindow).toBe(1_050_000);
+      expect(sol.maxOutputTokens).toBe(128_000);
+      expect(sol.pricing).toEqual({ inputPer1M: 4.0, outputPer1M: 20.0 });
+    });
+
+    it('preserves gpt-5.6-sol quality scores from its established baseline', () => {
+      expect(getModelQualityScores('gpt-5.6-sol')).toEqual({
+        reasoning: 10,
+        codeGeneration: 10,
+        speed: 7,
+        cost: 4,
+      });
+    });
+
+    it('resolves legacy gpt-5.5 alias to gpt-5.6-sol after codex retirement (#6526)', () => {
+      expect(findCanonicalModel('codex', 'gpt-5.5')?.id).toBe('gpt-5.6-sol');
+      expect(findCanonicalModel('codex', 'gpt-5-5')?.id).toBe('gpt-5.6-sol');
+      expect(findInTreeByCli('codex').map((e) => e.id)).not.toContain('gpt-5.5');
+    });
+  });
+});
+
+// ============================================================================
+// Gemini registry entries (#7101 / #6625)
+// ============================================================================
+
+describe('gemini registry entries (#7101 / #6625)', () => {
+  it('resolves metadata, pricing, and context window for gemini-3.8-flash', () => {
+    expect(getModelDisplayName('gemini-3.8-flash')).toBe('Gemini 3.8 Flash');
+    expect(getModelContextWindow('gemini-3.8-flash')).toBe(1_048_576);
+    expect(getModelMaxOutput('gemini-3.8-flash')).toBe(65_536);
+    expect(getModelPricing('gemini-3.8-flash')).toEqual({ inputPer1M: 0.75, outputPer1M: 3.75 });
+    expect(getCliModelName('gemini-3.8-flash')).toBe('gemini-3.8-flash');
+    expect(resolveCliAlias('gemini-3.8-flash')).toBe('gemini-3.8-flash');
+    expect(findCanonicalModel('gemini', 'gemini-3.8-flash')?.id).toBe('gemini-3.8-flash');
+    expect(findInTreeByCli('gemini').map((e) => e.id)).toContain('gemini-3.8-flash');
+  });
+
+  it('positions quality scores in flash tier below pro', () => {
+    const flash = getModelQualityScores('gemini-3.8-flash');
+    const pro = getModelQualityScores('gemini-3-pro');
+    expect(flash).toBeDefined();
+    expect(pro).toBeDefined();
+    expect(flash?.reasoning).toBeLessThan(pro?.reasoning ?? 10);
+    expect(flash?.speed).toBe(10);
+    expect(flash?.codeGeneration).toBe(9);
+  });
+});
+
+// ============================================================================
+// Drift registry proposals (#7100, #7102, #7103, #7104 / #6625)
+// ============================================================================
+
+describe('drift model registry entries (#7100, #7102, #7103, #7104 / #6625)', () => {
+  it('resolves metadata, pricing, and context window for claude-fable-5.1 (#7104)', () => {
+    expect(getModelDisplayName('claude-fable-5.1')).toBe('Claude Fable 5.1');
+    expect(getModelContextWindow('claude-fable-5.1')).toBe(1_000_000);
+    expect(getModelMaxOutput('claude-fable-5.1')).toBe(128_000);
+    expect(getModelPricing('claude-fable-5.1')).toEqual({ inputPer1M: 10.0, outputPer1M: 50.0 });
+    expect(getCliModelName('claude-fable-5.1')).toBe('claude-fable-5.1');
+    expect(findCanonicalModel('claude', 'claude-fable-5.1')?.id).toBe('claude-fable-5.1');
+    expect(findInTreeByCli('claude').map((e) => e.id)).toContain('claude-fable-5.1');
+  });
+
+  it('resolves metadata, pricing, and context window for claude-opus-5.5 (#7100)', () => {
+    expect(getModelDisplayName('claude-opus-5.5')).toBe('Claude Opus 5.5');
+    expect(getModelContextWindow('claude-opus-5.5')).toBe(1_000_000);
+    expect(getModelMaxOutput('claude-opus-5.5')).toBe(128_000);
+    expect(getModelPricing('claude-opus-5.5')).toEqual({ inputPer1M: 4.0, outputPer1M: 20.0 });
+    expect(getCliModelName('claude-opus-5.5')).toBe('claude-opus-5.5');
+    expect(findCanonicalModel('claude', 'claude-opus-5.5')?.id).toBe('claude-opus-5.5');
+    expect(findInTreeByCli('claude').map((e) => e.id)).toContain('claude-opus-5.5');
+  });
+
+  it('resolves metadata, pricing, and context window for gpt-6.1-sol-pro (#7103)', () => {
+    expect(getModelDisplayName('gpt-6.1-sol-pro')).toBe('GPT-6.1 Sol Pro');
+    expect(getModelContextWindow('gpt-6.1-sol-pro')).toBe(1_050_000);
+    expect(getModelMaxOutput('gpt-6.1-sol-pro')).toBe(65_536);
+    expect(getModelPricing('gpt-6.1-sol-pro')).toEqual({ inputPer1M: 2.0, outputPer1M: 10.0 });
+    expect(getCliModelName('gpt-6.1-sol-pro')).toBe('gpt-6.1-sol-pro');
+    expect(findCanonicalModel('codex', 'gpt-6.1-sol-pro')?.id).toBe('gpt-6.1-sol-pro');
+    expect(findInTreeByCli('codex').map((e) => e.id)).toContain('gpt-6.1-sol-pro');
+  });
+
+  it('resolves metadata, pricing, and context window for nemotron-3.5-lightning (#7102)', () => {
+    expect(getModelDisplayName('nemotron-3.5-lightning')).toBe('NVIDIA Nemotron 3.5 Lightning');
+    expect(getModelContextWindow('nemotron-3.5-lightning')).toBe(262_144);
+    expect(getModelMaxOutput('nemotron-3.5-lightning')).toBe(32_768);
+    expect(getModelPricing('nemotron-3.5-lightning')).toEqual({
+      inputPer1M: 0.07,
+      outputPer1M: 0.2,
+    });
+    expect(getCliModelName('nemotron-3.5-lightning')).toBe('nvidia/nemotron-3.5-lightning');
+    expect(findCanonicalModel('opencode', 'nvidia/nemotron-3.5-lightning')?.id).toBe(
+      'nemotron-3.5-lightning'
+    );
+    expect(findInTreeByCli('opencode').map((e) => e.id)).toContain('nemotron-3.5-lightning');
+  });
+});
+
+// ============================================================================
+// Frontier models registry proposals (#7374, #7375, #7376, #7377, #7378 / #6625)
+// ============================================================================
+
+describe('frontier models registry entries (#7374, #7375, #7376, #7377, #7378 / #6625)', () => {
+  it('resolves metadata, pricing, and context window for claude-opus-5 (#7374)', () => {
+    expect(getModelDisplayName('claude-opus-5')).toBe('Claude Opus 5');
+    expect(getModelContextWindow('claude-opus-5')).toBe(1_000_000);
+    expect(getModelMaxOutput('claude-opus-5')).toBe(128_000);
+    expect(getModelPricing('claude-opus-5')).toEqual({ inputPer1M: 5.0, outputPer1M: 25.0 });
+    expect(getCliModelName('claude-opus-5')).toBe('claude-opus-5');
+    expect(findCanonicalModel('claude', 'claude-opus-5')?.id).toBe('claude-opus-5');
+    expect(findInTreeByCli('claude').map((e) => e.id)).toContain('claude-opus-5');
+  });
+
+  it('resolves metadata, pricing, and context window for gemini-3.7-flash (#7375)', () => {
+    expect(getModelDisplayName('gemini-3.7-flash')).toBe('Gemini 3.7 Flash');
+    expect(getModelContextWindow('gemini-3.7-flash')).toBe(1_048_576);
+    expect(getModelMaxOutput('gemini-3.7-flash')).toBe(65_536);
+    expect(getModelPricing('gemini-3.7-flash')).toEqual({ inputPer1M: 0.75, outputPer1M: 3.75 });
+    expect(getCliModelName('gemini-3.7-flash')).toBe('gemini-3.7-flash');
+    expect(findCanonicalModel('gemini', 'gemini-3.7-flash')?.id).toBe('gemini-3.7-flash');
+    expect(findInTreeByCli('gemini').map((e) => e.id)).toContain('gemini-3.7-flash');
+  });
+
+  it('resolves metadata, pricing, and context window for nemotron-3.5-content-safety (#7376)', () => {
+    expect(getModelDisplayName('nemotron-3.5-content-safety')).toBe(
+      'NVIDIA Nemotron 3.5 Content Safety'
+    );
+    expect(getModelContextWindow('nemotron-3.5-content-safety')).toBe(131_072);
+    expect(getModelMaxOutput('nemotron-3.5-content-safety')).toBe(16_384);
+    expect(getModelPricing('nemotron-3.5-content-safety')).toEqual({
+      inputPer1M: 0.2,
+      outputPer1M: 0.2,
+    });
+    expect(getCliModelName('nemotron-3.5-content-safety')).toBe(
+      'nvidia/nemotron-3.5-content-safety'
+    );
+    expect(findCanonicalModel('opencode', 'nvidia/nemotron-3.5-content-safety')?.id).toBe(
+      'nemotron-3.5-content-safety'
+    );
+    expect(findInTreeByCli('opencode').map((e) => e.id)).toContain('nemotron-3.5-content-safety');
+  });
+
+  it('resolves metadata, pricing, and context window for gpt-6-luna-pro (#7377)', () => {
+    expect(getModelDisplayName('gpt-6-luna-pro')).toBe('GPT-6 Luna Pro');
+    expect(getModelContextWindow('gpt-6-luna-pro')).toBe(1_050_000);
+    expect(getModelMaxOutput('gpt-6-luna-pro')).toBe(65_536);
+    expect(getModelPricing('gpt-6-luna-pro')).toEqual({ inputPer1M: 0.1, outputPer1M: 0.5 });
+    expect(getCliModelName('gpt-6-luna-pro')).toBe('openai/gpt-6-luna-pro');
+    expect(findCanonicalModel('opencode', 'openai/gpt-6-luna-pro')?.id).toBe('gpt-6-luna-pro');
+    expect(findInTreeByCli('opencode').map((e) => e.id)).toContain('gpt-6-luna-pro');
+  });
+
+  it('resolves metadata, pricing, and context window for claude-opus-4.8 (#7378)', () => {
+    expect(getModelDisplayName('claude-opus-4.8')).toBe('Claude Opus 4.8');
+    expect(getModelContextWindow('claude-opus-4.8')).toBe(1_000_000);
+    expect(getModelMaxOutput('claude-opus-4.8')).toBe(128_000);
+    expect(getModelPricing('claude-opus-4.8')).toEqual({ inputPer1M: 5.0, outputPer1M: 25.0 });
+    expect(getCliModelName('claude-opus-4.8')).toBe('claude-opus-4.8');
+    expect(findCanonicalModel('claude', 'claude-opus-4.8')?.id).toBe('claude-opus-4.8');
+    expect(findInTreeByCli('claude').map((e) => e.id)).toContain('claude-opus-4.8');
+  });
+});

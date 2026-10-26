@@ -1,0 +1,310 @@
+/**
+ * MCP tool for spec-driven execution.
+ *
+ * Exposes the full spec pipeline (parse → decompose → compile →
+ * execute → validate → analyze) as an MCP tool.
+ *
+ * @module mcp/tools/execute-spec-tool
+ * (Source: Issue #853 — Phase 5 of AI Software Factory Epic #843)
+ */
+
+import { z } from 'zod';
+import { asyncDispatchInput, asyncDispatchInputDefaultSync } from './async-dispatch-input.js';
+import { randomUUID } from 'node:crypto';
+import type { McpServer } from '../sdk-types.js';
+import type { ILogger } from '../../core/index.js';
+import {
+  createLogger,
+  formatZodError,
+  getTimeProvider,
+  getRandomProvider,
+} from '../../core/index.js';
+import { parseSpec } from '../../orchestration/spec-parser.js';
+import { decomposeSpec } from '../../orchestration/spec-decomposer.js';
+import { executeSpec } from '../../orchestration/spec-executor.js';
+import { analyzeFailures } from '../../orchestration/failure-analyzer.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { getToolMemory } from './tool-memory.js';
+import {
+  getOutcomeStore,
+  categorizeOutcomeErrorMessage,
+} from '../../orchestration/outcomes/index.js';
+import {
+  toolStructuredError,
+  toolSuccess,
+  type BaseMcpToolDeps,
+  type ToolResult,
+} from './tool-result.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+// #3732 / epic #2631: async-mode dispatch via the shared `runAsJob` helper.
+import { runAsJob } from '../jobs/run-as-job.js';
+import { heartbeatJob } from '../jobs/job-result-store.js';
+
+// ============================================================================
+// Types & Schema
+// ============================================================================
+
+export const ExecuteSpecInputSchema = z.object({
+  spec: z.string().min(1).max(50_000).describe('Markdown specification to execute'),
+  dryRun: z.boolean().optional().default(false).describe('Parse and decompose only'),
+  /**
+   * Dispatch mode (#3732). `sync` (default) runs the full DAG pipeline inline
+   * and returns the result — but a real parse→decompose→compile→execute→
+   * validate→analyze run can exceed the MCP request timeout. `async` returns a
+   * `{ status: 'pending', jobId }` envelope immediately and runs in the
+   * background; poll `get_job_result({ jobId })` for the result. Ignored when
+   * `dryRun` is true (parse+decompose completes fast, so dry runs stay sync).
+   */
+  ...asyncDispatchInputDefaultSync('Ignored for dryRun.'),
+});
+
+export type ExecuteSpecInput = z.infer<typeof ExecuteSpecInputSchema>;
+
+export type ExecuteSpecDeps = BaseMcpToolDeps;
+
+const DRY_RUN_MODE = 'dry_run';
+
+// ============================================================================
+// Handler
+// ============================================================================
+
+function createDryRunResponse(input: ExecuteSpecInput, logger: ILogger): ToolResult {
+  const parseResult = parseSpec(input.spec);
+  if (!parseResult.ok) {
+    return toolStructuredError({
+      errorCategory: 'validation',
+      message: `Parse error: ${parseResult.error.message}`,
+    });
+  }
+
+  const dagResult = decomposeSpec(parseResult.value);
+  if (!dagResult.ok) {
+    return toolStructuredError({
+      errorCategory: 'validation',
+      message: `Decompose error: ${dagResult.error.message}`,
+    });
+  }
+
+  logger.info('Dry run completed', {
+    title: parseResult.value.title,
+    nodes: dagResult.value.nodes.length,
+  });
+  const output = { mode: DRY_RUN_MODE, spec: parseResult.value, dag: dagResult.value };
+  return toolSuccess(JSON.stringify(output, null, 2));
+}
+
+/** The async-job hooks: heartbeat (#6162) and `cancel_job`'s signal (#6305). Absent in sync mode. */
+interface SpecJobHooks {
+  readonly onProgress: () => void;
+  readonly signal: AbortSignal;
+}
+
+async function createFullResponse(
+  input: ExecuteSpecInput,
+  logger: ILogger,
+  job?: SpecJobHooks
+): Promise<ToolResult> {
+  const startMs = Date.now();
+  const result = await executeSpec(input.spec, job);
+  const durationMs = Date.now() - startMs;
+
+  if (!result.ok) {
+    recordSpecOutcome(false, durationMs, result.error.stage);
+    return toolStructuredError({
+      errorCategory: 'internal',
+      message: `Execution error (${result.error.stage}): ${result.error.message}`,
+    });
+  }
+
+  const analysis = analyzeFailures(result.value);
+  const satisfaction = result.value.validation.satisfaction;
+
+  if (!result.value.executed) {
+    const output = {
+      mode: DRY_RUN_MODE,
+      executed: false,
+      execution: result.value,
+      analysis: analysis.ok ? analysis.value : null,
+    };
+    return toolSuccess(JSON.stringify(output, null, 2));
+  }
+
+  logger.info('Spec execution completed', {
+    satisfaction,
+    passed: analysis.ok ? analysis.value.passed : false,
+  });
+
+  if (result.value.validation.allMet) {
+    recordSpecSuccess(satisfaction, durationMs);
+    recordSpecOutcome(true, durationMs);
+  } else {
+    recordSpecOutcome(false, durationMs, 'acceptance criteria unmet');
+  }
+
+  const output = {
+    mode: 'execute',
+    execution: result.value,
+    analysis: analysis.ok ? analysis.value : null,
+  };
+  return toolSuccess(JSON.stringify(output, null, 2));
+}
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+/** Creates the execute_spec handler — parse, dryRun short-circuit, async dispatch. */
+function createExecuteSpecHandler(
+  logger: ILogger
+): (args: unknown, ctx: HandlerContext) => Promise<ToolResult> {
+  return async (args: unknown, _ctx: HandlerContext): Promise<ToolResult> => {
+    const parsed = ExecuteSpecInputSchema.safeParse(args);
+    if (!parsed.success) {
+      return toolStructuredError({
+        errorCategory: 'validation',
+        message: `Invalid input: ${formatZodError(parsed.error)}`,
+      });
+    }
+
+    const input = parsed.data;
+    if (input.dryRun) {
+      return createDryRunResponse(input, logger);
+    }
+
+    // #3732: async dispatch for real (non-dryRun) runs — a full spec DAG
+    // pipeline can exceed the MCP request timeout. execute_spec has no
+    // sessionId, so a fresh `es-<uuid>` jobId is always minted (no idempotency
+    // surface). Returns `{ status: 'pending', jobId }` immediately.
+    if (input.dispatch === 'async') {
+      return runAsJob<ExecuteSpecInput, ToolResult>({
+        toolName: 'execute_spec',
+        input,
+        freshJobId: () => `es-${randomUUID()}`,
+        // #5393 / #6305: arity 3 — `executeSpec` checks the signal at every step
+        // boundary. #6162: heartbeats by jobId on every graph event.
+        run: (jobId, _input, signal) =>
+          createFullResponse(input, logger, {
+            onProgress: () => {
+              heartbeatJob(jobId);
+            },
+            signal,
+          }),
+        logger,
+      });
+    }
+
+    return createFullResponse(input, logger);
+  };
+}
+
+/** Registers the execute_spec tool with an MCP server. @category MCP */
+export function registerExecuteSpecTool(server: McpServer, deps: ExecuteSpecDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'execute_spec' });
+
+  const handler = createExecuteSpecHandler(logger);
+
+  const secureHandler = createSecureHandler(handler, {
+    toolName: 'execute_spec',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const timeoutMs = getToolTimeout('execute_spec', deps.security);
+  const wrapped = wrapToolWithTimeout('execute_spec', secureHandler, { timeoutMs, logger });
+
+  const toolSchema = {
+    spec: z
+      .string()
+      .min(1)
+      .max(50_000)
+      .describe(
+        'Markdown specification to execute. ' +
+          'Must contain "## Requirements" and "## Acceptance Criteria" sections.'
+      ),
+    dryRun: z.boolean().optional().describe('Parse and decompose only (no execution)'),
+    // #4968: the same fragment the internal schema composes — the advertised
+    // shape is what the SDK parses, so the wrong-key trap must be here too.
+    ...asyncDispatchInput('Ignored for dryRun.'),
+  };
+
+  const description =
+    'Execute a markdown specification through the full pipeline: ' +
+    'parse, decompose into task DAG, compile to graph, execute, ' +
+    'validate against acceptance criteria, and analyze failures. ' +
+    "Without a configured handler factory, execute mode runs placeholder handlers and reports mode 'dry_run'.";
+
+  server.registerTool(
+    'execute_spec',
+    { description, inputSchema: toolSchema, annotations: getToolAnnotations('execute_spec') },
+    toSdkCallback(wrapped)
+  );
+  logger.info('Registered execute_spec tool');
+}
+
+// ============================================================================
+// Recording Helpers (Issue #1174)
+// ============================================================================
+
+const specLogger = createLogger({ tool: 'execute-spec' });
+
+/** Records a successful spec execution to session memory. Best-effort. */
+function recordSpecSuccess(satisfaction: number, durationMs: number): void {
+  try {
+    const memory = getToolMemory();
+    memory.recordTask({
+      approach: `Spec execution (satisfaction: ${String(satisfaction)})`,
+      challenges: [],
+      durationMs,
+    });
+    memory.recordLearning({
+      pattern: `spec_execution → satisfaction=${String(satisfaction)}`,
+      context: `duration=${String(durationMs)}ms`,
+      confidence: 0.8,
+      source: 'manual',
+    });
+  } catch (error: unknown) {
+    specLogger.warn('Failed to record spec success', { error: String(error) });
+  }
+}
+
+/** Records spec execution outcome for adaptive routing. Best-effort. */
+function recordSpecOutcome(success: boolean, durationMs: number, stage?: string): void {
+  try {
+    if (!success && stage !== undefined) {
+      const memory = getToolMemory();
+      memory.recordError({
+        error: `Spec execution failed at stage: ${stage}`,
+        solution: 'Check spec format and requirements',
+        filePattern: 'mcp/tools/execute-spec-tool',
+      });
+    }
+    const store = getOutcomeStore();
+    store.append({
+      id: `spec-${String(getTimeProvider().now())}-${getRandomProvider().random().toString(36).slice(2, 8)}`,
+      // #5020: NOT `DEFAULT_CLI`. This tool does not know which CLI served the
+      // work — the model field below is a synthetic label, not a model id — and
+      // hardcoding 'claude' credited or debited claude for every run, poisoning
+      // the same routing learner #5003 fixed in the feedback bridge.
+      // `'unknown'` is the schema's own unattributed value, and the bandit's
+      // warm-start already partitions it out (#4935) instead of replaying it.
+      cli: 'unknown',
+      category: 'code_generation',
+      model: 'spec-executor',
+      success,
+      durationMs,
+      timestamp: new Date().toISOString(),
+      source: 'manual',
+      ...(!success && stage !== undefined
+        ? {
+            failureCategory: categorizeOutcomeErrorMessage(`Spec failed at stage: ${stage}`),
+            errorMessage: `Spec failed at stage: ${stage}`.slice(0, 500),
+          }
+        : {}),
+    });
+  } catch (storeErr: unknown) {
+    specLogger.debug('Failed to record spec outcome to store', {
+      error: storeErr instanceof Error ? storeErr.message : String(storeErr),
+    });
+  }
+}

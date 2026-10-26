@@ -1,0 +1,961 @@
+/**
+ * Tests for Resilient Adapter
+ *
+ * @module adapters/resilient-adapter.test
+ * (Source: Issue #811 - Resilient model adapter architecture)
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { AdapterSelection } from './auto-adapter.js';
+import type { CompletionRequest } from '../core/types/model.js';
+import { CliToModelAdapter } from '../cli-adapters/cli-to-model-adapter.js';
+import { createCallerAbortCliError } from '../cli-adapters/cli-error-helpers.js';
+import type { ICliAdapter } from '../cli-adapters/types.js';
+import { ok, err } from '../core/result.js';
+import { ModelError, ErrorCode } from '../core/errors.js';
+import type { ILogger } from '../core/index.js';
+import type { CircuitStateChangeEvent } from '../cli-adapters/circuit-breaker-types.js';
+import {
+  CircuitBreakerRegistry,
+  DEFAULT_CIRCUIT_BREAKER_CONFIG,
+} from '../cli-adapters/circuit-breaker.js';
+import { breakerKeys } from '../cli-adapters/breaker-key.js';
+
+// ============================================================================
+// Mocks — vi.mock is hoisted, so use inline factories only
+// ============================================================================
+
+const mockComplete = vi.fn();
+const mockStream = vi.fn();
+const mockCountTokens = vi.fn();
+const mockValidateConfig = vi.fn();
+
+vi.mock('./auto-adapter.js', () => {
+  const createAutoAdapterMock = vi.fn();
+  return { createAutoAdapter: createAutoAdapterMock };
+});
+
+vi.mock('../core/event-bus.js', () => ({
+  getGlobalEventBus: vi.fn().mockReturnValue({ emit: vi.fn() }),
+}));
+
+vi.mock('./rate-limit-detector.js', () => ({
+  isRateLimitText: vi.fn((text: string) => text.toLowerCase().includes('rate limit')),
+  isRateLimitLikeError: vi.fn().mockReturnValue(false),
+  // #5359: a DURABLE cap is counted against the breaker, unlike a transient
+  // throttle. Default false so the existing cases keep their meaning.
+  isDurableCapacityError: vi.fn().mockReturnValue(false),
+  toRateLimitError: vi.fn().mockReturnValue({ message: 'rate limit', retryAfterMs: undefined }),
+  recordRateLimitEvent: vi.fn(),
+}));
+
+import { createAutoAdapter } from './auto-adapter.js';
+import { ResilientAdapter } from './resilient-adapter.js';
+import { GatewayRediscovery, setGatewayRediscovery } from './gateway-rediscovery.js';
+import {
+  isRateLimitLikeError,
+  isDurableCapacityError,
+  toRateLimitError,
+  recordRateLimitEvent,
+} from './rate-limit-detector.js';
+import { getGlobalEventBus } from '../core/event-bus.js';
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+// eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+function makeSelection(name = 'claude', source: 'cli' | 'api' = 'cli') {
+  return {
+    adapter: {
+      providerId: 'mock-provider',
+      modelId: 'mock-model',
+      capabilities: ['completion'],
+      complete: mockComplete,
+      stream: mockStream,
+      countTokens: mockCountTokens,
+      validateConfig: mockValidateConfig,
+    },
+    source,
+    name,
+    reason: 'test',
+  } satisfies AdapterSelection;
+}
+
+function setupDefaultMocks(): void {
+  mockComplete.mockReturnValue(
+    Promise.resolve(
+      ok({
+        content: [{ type: 'text', text: 'hello' }],
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        stopReason: 'end_turn',
+        model: 'mock-model',
+      })
+    )
+  );
+  mockCountTokens.mockReturnValue(Promise.resolve(42));
+  mockValidateConfig.mockReturnValue(ok(undefined));
+  // #5359: reset per test — `vi.clearAllMocks()` clears call records but keeps
+  // implementations, so a case that sets this true would otherwise leak into
+  // every sibling and start counting rate limits against the breaker.
+  vi.mocked(isDurableCapacityError).mockReturnValue(false);
+  vi.mocked(createAutoAdapter).mockReturnValue(Promise.resolve(makeSelection()));
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+describe('ResilientAdapter', () => {
+  let adapter: ResilientAdapter;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setupDefaultMocks();
+    adapter = new ResilientAdapter();
+  });
+
+  describe('lazy initialization', () => {
+    it('does not detect adapter at construction', () => {
+      expect(createAutoAdapter).not.toHaveBeenCalled();
+      expect(adapter.getHealth()).toBeUndefined();
+    });
+
+    it('detects adapter on first complete() call', async () => {
+      await adapter.complete({ messages: [] });
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+      expect(adapter.getHealth()).toBeDefined();
+      expect(adapter.getHealth()?.state).toBe('healthy');
+    });
+
+    it('detects adapter on first countTokens() call', async () => {
+      const count = await adapter.countTokens('hello');
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+      expect(count).toBe(42);
+    });
+  });
+
+  describe('model verification provenance (#6862)', () => {
+    it.each([false, true])('carries explicit %s into health', async (modelVerified) => {
+      vi.mocked(createAutoAdapter).mockResolvedValueOnce({ ...makeSelection(), modelVerified });
+      await adapter.complete({ messages: [] });
+      expect(adapter.getHealth()).toHaveProperty('modelVerified', modelVerified);
+    });
+
+    it('leaves an unmeasured selection absent and clears previous verification', async () => {
+      expect(adapter.getHealth()).toBeUndefined();
+      vi.mocked(createAutoAdapter).mockResolvedValueOnce({
+        ...makeSelection(),
+        modelVerified: false,
+      });
+      await adapter.complete({ messages: [] });
+      expect(adapter.getHealth()).toHaveProperty('modelVerified', false);
+      await adapter.refresh();
+      expect(adapter.getHealth()).not.toHaveProperty('modelVerified');
+    });
+  });
+
+  describe('caching', () => {
+    it('reuses cached adapter on subsequent calls', async () => {
+      await adapter.complete({ messages: [] });
+      await adapter.complete({ messages: [] });
+      await adapter.complete({ messages: [] });
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('property forwarding', () => {
+    it('returns proxy values before detection', () => {
+      expect(adapter.providerId).toBe('resilient-proxy');
+      expect(adapter.modelId).toBe('pending-detection');
+      expect(adapter.capabilities).toEqual([]);
+    });
+
+    // #6119: a seat pinned to a CLI must be identifiable by that CLI BEFORE
+    // detection, or an undetected seat keys equal to the undetected default
+    // and the voter fallover (#3587) skips it as "already on the fallback".
+    it('reports the requested CLI as provider before detection', () => {
+      const pinned = new ResilientAdapter({ preferredCli: 'codex' });
+      expect(pinned.providerId).toBe('cli-codex');
+      expect(pinned.modelId).toBe('pending-detection');
+    });
+
+    it('forwards properties after detection', async () => {
+      await adapter.complete({ messages: [] });
+      expect(adapter.providerId).toBe('mock-provider');
+      expect(adapter.modelId).toBe('mock-model');
+    });
+  });
+
+  describe('validateConfig', () => {
+    it('returns ok before detection', () => {
+      const result = adapter.validateConfig();
+      expect(result.ok).toBe(true);
+    });
+
+    it('delegates to underlying adapter after detection', async () => {
+      await adapter.complete({ messages: [] });
+      adapter.validateConfig();
+      expect(mockValidateConfig).toHaveBeenCalled();
+    });
+  });
+
+  describe('detection failure', () => {
+    it('returns ModelError when no adapter available', async () => {
+      vi.mocked(createAutoAdapter).mockRejectedValueOnce(new Error('No CLIs'));
+      const result = await adapter.complete({ messages: [] });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBeInstanceOf(ModelError);
+      }
+      expect(adapter.getHealth()?.state).toBe('unavailable');
+    });
+
+    it('retries detection after failure on next call', async () => {
+      vi.mocked(createAutoAdapter).mockRejectedValueOnce(new Error('No CLIs'));
+      await adapter.complete({ messages: [] });
+      expect(adapter.getHealth()?.state).toBe('unavailable');
+
+      vi.mocked(createAutoAdapter).mockResolvedValueOnce(makeSelection());
+      await adapter.complete({ messages: [] });
+      expect(adapter.getHealth()?.state).toBe('healthy');
+      expect(createAutoAdapter).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('refresh()', () => {
+    it('invalidates cache and re-detects', async () => {
+      await adapter.complete({ messages: [] });
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+
+      await adapter.refresh();
+      expect(createAutoAdapter).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('setPreferredCli()', () => {
+    it('clears cache and uses preferred CLI on next call', async () => {
+      await adapter.complete({ messages: [] });
+
+      adapter.setPreferredCli('gemini');
+      await adapter.complete({ messages: [] });
+
+      expect(createAutoAdapter).toHaveBeenCalledTimes(2);
+      const secondCall = vi.mocked(createAutoAdapter).mock.calls[1];
+      expect(secondCall?.[0]).toMatchObject({ preferredCli: 'gemini' });
+    });
+  });
+
+  describe('onFailover callback', () => {
+    it('fires on failover after refresh', async () => {
+      await adapter.complete({ messages: [] });
+
+      const callback = vi.fn();
+      adapter.onFailover(callback);
+
+      vi.mocked(createAutoAdapter).mockResolvedValueOnce(makeSelection('gemini'));
+      await adapter.refresh();
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith(expect.objectContaining({ failoverCount: 1 }));
+    });
+
+    it('returns unsubscribe function', async () => {
+      await adapter.complete({ messages: [] });
+
+      const callback = vi.fn();
+      const unsub = adapter.onFailover(callback);
+      unsub();
+
+      await adapter.refresh();
+      expect(callback).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('circuit breaker integration', () => {
+    // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+    function makeMockRegistry() {
+      const listeners = new Set<(event: CircuitStateChangeEvent) => void>();
+      const registry = {
+        addGlobalStateChangeListener: vi.fn((cb: (event: CircuitStateChangeEvent) => void) => {
+          listeners.add(cb);
+        }),
+        removeGlobalStateChangeListener: vi.fn((cb: (event: CircuitStateChangeEvent) => void) => {
+          listeners.delete(cb);
+        }),
+      } as unknown as CircuitBreakerRegistry;
+      return { registry, listeners };
+    }
+
+    it('clears adapter when current CLI circuit opens', async () => {
+      await adapter.complete({ messages: [] });
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+
+      const { registry, listeners } = makeMockRegistry();
+      adapter.attachCircuitBreakerRegistry(registry);
+
+      for (const listener of listeners) {
+        listener({
+          cliName: 'claude',
+
+          armId: 'claude',
+
+          previousState: 'closed',
+          newState: 'open',
+          timestamp: Date.now(),
+          failureCount: 5,
+          reason: 'Failure threshold exceeded',
+        });
+      }
+
+      expect(adapter.getHealth()?.state).toBe('degraded');
+
+      await adapter.complete({ messages: [] });
+      expect(createAutoAdapter).toHaveBeenCalledTimes(2);
+    });
+
+    it('ignores circuit events for non-current CLIs', async () => {
+      await adapter.complete({ messages: [] });
+
+      const { registry, listeners } = makeMockRegistry();
+      adapter.attachCircuitBreakerRegistry(registry);
+
+      for (const listener of listeners) {
+        listener({
+          cliName: 'gemini',
+
+          armId: 'gemini',
+
+          previousState: 'closed',
+          newState: 'open',
+          timestamp: Date.now(),
+          failureCount: 5,
+          reason: 'Failure threshold exceeded',
+        });
+      }
+
+      expect(adapter.getHealth()?.state).toBe('healthy');
+    });
+  });
+
+  describe('detection coalescing (#1423)', () => {
+    it('coalesces concurrent detection into a single probe call', async () => {
+      let resolveDetection: ((v: AdapterSelection) => void) | undefined;
+      vi.mocked(createAutoAdapter).mockImplementation(
+        () =>
+          new Promise<AdapterSelection>((resolve) => {
+            resolveDetection = resolve;
+          })
+      );
+
+      const freshAdapter = new ResilientAdapter();
+
+      // Launch 3 concurrent complete() calls — all trigger ensureAdapter()
+      const p1 = freshAdapter.complete({ messages: [] });
+      const p2 = freshAdapter.complete({ messages: [] });
+      const p3 = freshAdapter.complete({ messages: [] });
+
+      // Detection starts after the gateway re-discovery check (#6659), which
+      // is asynchronous; wait for it, then resolve the single detection.
+      await vi.waitFor(() => {
+        expect(resolveDetection).toBeDefined();
+      });
+      resolveDetection!(makeSelection());
+
+      await Promise.all([p1, p2, p3]);
+
+      // createAutoAdapter should only be called ONCE despite 3 concurrent calls
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows new detection after previous completes', async () => {
+      const freshAdapter = new ResilientAdapter();
+      await freshAdapter.complete({ messages: [] });
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+
+      // Force re-detection via refresh
+      await freshAdapter.refresh();
+      expect(createAutoAdapter).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('stream() when adapter unavailable', () => {
+    it('throws instead of silently yielding nothing — matches complete() error semantics', async () => {
+      // #3105: a bare `return` made an unavailable adapter look like a clean
+      // empty stream, so streamWithFallback could not tell failure from a
+      // legitimately-empty completion. stream() now errors like complete().
+      vi.mocked(createAutoAdapter).mockRejectedValueOnce(new Error('No CLIs'));
+      const drain = (async () => {
+        const chunks: unknown[] = [];
+        for await (const chunk of adapter.stream({ messages: [] })) {
+          chunks.push(chunk);
+        }
+        return chunks;
+      })();
+      await expect(drain).rejects.toThrow('No model adapter available');
+    });
+  });
+
+  describe('countTokens() when adapter unavailable', () => {
+    it('returns 0 when no adapter detected', async () => {
+      vi.mocked(createAutoAdapter).mockRejectedValueOnce(new Error('No CLIs'));
+      const count = await adapter.countTokens('hello');
+      expect(count).toBe(0);
+    });
+  });
+
+  describe('rate limit detection in complete()', () => {
+    it('records rate limit event when error is rate-limit-like', async () => {
+      const rateLimitError = new ModelError('Rate limit exceeded, retry after 30 seconds');
+      mockComplete.mockReturnValue(Promise.resolve(err(rateLimitError)));
+      vi.mocked(isRateLimitLikeError).mockReturnValue(true);
+      vi.mocked(toRateLimitError).mockReturnValue({
+        message: 'Rate limit exceeded',
+        retryAfterMs: 30000,
+      } as unknown as ReturnType<typeof toRateLimitError>);
+
+      const result = await adapter.complete({ messages: [] });
+
+      expect(result.ok).toBe(false);
+      expect(isRateLimitLikeError).toHaveBeenCalledWith(rateLimitError);
+      expect(toRateLimitError).toHaveBeenCalledWith(rateLimitError, 'mock-provider');
+      expect(recordRateLimitEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: 'mock-provider',
+          retryAfterMs: 30000,
+        })
+      );
+    });
+
+    it('does not record rate limit event for non-rate-limit errors', async () => {
+      const genericError = new ModelError('Something went wrong');
+      mockComplete.mockReturnValue(Promise.resolve(err(genericError)));
+      vi.mocked(isRateLimitLikeError).mockReturnValue(false);
+
+      await adapter.complete({ messages: [] });
+
+      expect(recordRateLimitEvent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('circuit breaker non-open state handling', () => {
+    // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+    function makeMockRegistry() {
+      const listeners = new Set<(event: CircuitStateChangeEvent) => void>();
+      const registry = {
+        addGlobalStateChangeListener: vi.fn((cb: (event: CircuitStateChangeEvent) => void) => {
+          listeners.add(cb);
+        }),
+        removeGlobalStateChangeListener: vi.fn((cb: (event: CircuitStateChangeEvent) => void) => {
+          listeners.delete(cb);
+        }),
+      } as unknown as CircuitBreakerRegistry;
+      return { registry, listeners };
+    }
+
+    it('ignores half-open state changes for current CLI', async () => {
+      await adapter.complete({ messages: [] });
+      const { registry, listeners } = makeMockRegistry();
+      adapter.attachCircuitBreakerRegistry(registry);
+
+      for (const listener of listeners) {
+        listener({
+          cliName: 'claude',
+
+          armId: 'claude',
+
+          previousState: 'open',
+          newState: 'half-open',
+          timestamp: Date.now(),
+          failureCount: 5,
+          reason: 'Half-open probe',
+        });
+      }
+
+      expect(adapter.getHealth()?.state).toBe('healthy');
+    });
+
+    it('ignores closed state changes for current CLI', async () => {
+      await adapter.complete({ messages: [] });
+      const { registry, listeners } = makeMockRegistry();
+      adapter.attachCircuitBreakerRegistry(registry);
+
+      for (const listener of listeners) {
+        listener({
+          cliName: 'claude',
+
+          armId: 'claude',
+
+          previousState: 'half-open',
+          newState: 'closed',
+          timestamp: Date.now(),
+          failureCount: 0,
+          reason: 'Recovered',
+        });
+      }
+
+      expect(adapter.getHealth()?.state).toBe('healthy');
+    });
+  });
+
+  describe('failover callback error handling', () => {
+    it('catches and logs errors thrown by failover callbacks', async () => {
+      await adapter.complete({ messages: [] });
+
+      const throwingCallback = vi.fn(() => {
+        throw new Error('Callback exploded');
+      });
+      adapter.onFailover(throwingCallback);
+
+      // Trigger failover via refresh with a different adapter name
+      vi.mocked(createAutoAdapter).mockResolvedValueOnce(makeSelection('gemini'));
+      await adapter.refresh();
+
+      // Callback was called and error was caught (no throw propagated)
+      expect(throwingCallback).toHaveBeenCalledTimes(1);
+      expect(adapter.getHealth()?.state).toBe('healthy');
+    });
+  });
+
+  describe('CollaborationEventBus emit failure handling', () => {
+    it('catches CollaborationEventBus errors during failover emit', async () => {
+      await adapter.complete({ messages: [] });
+
+      vi.mocked(getGlobalEventBus).mockImplementation(() => {
+        throw new Error('CollaborationEventBus unavailable');
+      });
+
+      // Trigger failover
+      vi.mocked(createAutoAdapter).mockResolvedValueOnce(makeSelection('codex'));
+      await adapter.refresh();
+
+      // Failover completed despite CollaborationEventBus error
+      expect(adapter.getHealth()?.state).toBe('healthy');
+      expect(adapter.getHealth()?.failoverCount).toBe(1);
+    });
+  });
+
+  describe('mapSelectionSource with API source', () => {
+    it('returns api when selection source is not cli', async () => {
+      vi.mocked(createAutoAdapter).mockResolvedValueOnce({
+        ...makeSelection(),
+        source: 'api' as const,
+      });
+
+      await adapter.complete({ messages: [] });
+
+      expect(adapter.getHealth()?.source).toBe('api');
+    });
+  });
+
+  describe('dispose()', () => {
+    it('removes circuit breaker listener', () => {
+      const removeListener = vi.fn();
+      const registry = {
+        addGlobalStateChangeListener: vi.fn(),
+        removeGlobalStateChangeListener: removeListener,
+      } as unknown as CircuitBreakerRegistry;
+
+      adapter.attachCircuitBreakerRegistry(registry);
+      adapter.dispose();
+
+      expect(removeListener).toHaveBeenCalledTimes(1);
+    });
+
+    it('is safe to call multiple times', () => {
+      adapter.dispose();
+      adapter.dispose();
+    });
+  });
+
+  describe('API failure → circuit breaker (#3423)', () => {
+    // #6712: this layer records only direct-API selections; a CLI selection's
+    // retry loop records its own failures (resilient-adapter-breaker-count.test).
+    beforeEach(() => {
+      vi.mocked(createAutoAdapter).mockReturnValue(Promise.resolve(makeSelection('claude', 'api')));
+    });
+
+    it.each([false, true])(
+      'records vendor API failures under the reader arm (durable=%s, #7070)',
+      async (durable) => {
+        const registry = new CircuitBreakerRegistry();
+        const failingAdapter = new ResilientAdapter({ circuitBreakerRegistry: registry });
+        vi.mocked(createAutoAdapter).mockResolvedValue(makeSelection('anthropic', 'api'));
+        vi.mocked(isDurableCapacityError).mockReturnValue(durable);
+        mockComplete.mockResolvedValue(err(new ModelError('upstream failed')));
+        const breaker = registry.getArmBreaker('api:anthropic');
+        for (let i = 0; i < breaker.getSnapshot().config.failureThreshold; i++) {
+          await failingAdapter.complete({ messages: [] });
+        }
+        expect(registry.isArmOpen('api:anthropic')).toBe(true);
+        expect([...registry.getAllArmSnapshots().keys()]).not.toContain('anthropic');
+        expect(failingAdapter.getHealth()?.state).toBe('degraded');
+        await failingAdapter.complete({ messages: [] });
+        expect(createAutoAdapter).toHaveBeenCalledTimes(2);
+        failingAdapter.dispose();
+      }
+    );
+
+    it('does not evict the default opencode selection for a custom-route event (#7070)', async () => {
+      const registry = new CircuitBreakerRegistry();
+      const proxy = new ResilientAdapter({ circuitBreakerRegistry: registry });
+      vi.mocked(createAutoAdapter).mockResolvedValue(makeSelection('opencode', 'cli'));
+      await proxy.complete({ messages: [] });
+      const custom = registry.getArmBreaker('api:opencode-custom', { failureThreshold: 1 });
+      custom.recordFailure('connection');
+      expect(proxy.getHealth()?.state).toBe('healthy');
+      await proxy.complete({ messages: [] });
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+      proxy.dispose();
+    });
+
+    it('records gateway-served API selections on their slot and evicts that selection (#7070)', async () => {
+      const registry = new CircuitBreakerRegistry();
+      const proxy = new ResilientAdapter({ circuitBreakerRegistry: registry });
+      const gatewayArm = 'api:gateway-test';
+      const selection = makeSelection('claude', 'api');
+      const gatewayAdapter = { ...selection.adapter, gatewayArm };
+      vi.mocked(createAutoAdapter).mockResolvedValue({
+        ...selection,
+        adapter: gatewayAdapter,
+      });
+      mockComplete.mockResolvedValue(err(new ModelError('upstream failed')));
+      const slotKey = breakerKeys.forArm({ name: 'claude', gatewayArm });
+      const threshold = registry.getArmBreaker(slotKey).getSnapshot().config.failureThreshold;
+      for (let i = 0; i < threshold; i++) await proxy.complete({ messages: [] });
+      expect(registry.isArmOpen(slotKey)).toBe(true);
+      expect(registry.isOpen('claude')).toBe(false);
+      expect(registry.isArmOpen(gatewayArm)).toBe(false);
+      expect(proxy.getHealth()?.state).toBe('degraded');
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+      await proxy.complete({ messages: [] });
+      expect(createAutoAdapter).toHaveBeenCalledTimes(2);
+      proxy.dispose();
+    });
+
+    function makeLogger(): ILogger {
+      const logger: ILogger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        child: vi.fn(() => logger),
+        setLevel: vi.fn(),
+      };
+      return logger;
+    }
+
+    it('opens the breaker after repeated API ModelError failures', async () => {
+      const registry = new CircuitBreakerRegistry();
+      const failingAdapter = new ResilientAdapter();
+      failingAdapter.attachCircuitBreakerRegistry(registry);
+
+      mockComplete.mockReturnValue(
+        Promise.resolve(err(new ModelError('upstream failed', { code: ErrorCode.MODEL_ERROR })))
+      );
+
+      const threshold = DEFAULT_CIRCUIT_BREAKER_CONFIG.failureThreshold;
+      for (let i = 0; i < threshold; i++) {
+        await failingAdapter.complete({ messages: [] });
+      }
+
+      expect(registry.getBreaker('claude').getState()).toBe('open');
+    });
+
+    it('clears the cached adapter and re-detects (failover) once the breaker opens', async () => {
+      const registry = new CircuitBreakerRegistry();
+      const failingAdapter = new ResilientAdapter();
+      failingAdapter.attachCircuitBreakerRegistry(registry);
+
+      const onFailover = vi.fn();
+      failingAdapter.onFailover(onFailover);
+
+      mockComplete.mockReturnValue(
+        Promise.resolve(err(new ModelError('upstream failed', { code: ErrorCode.MODEL_ERROR })))
+      );
+
+      const threshold = DEFAULT_CIRCUIT_BREAKER_CONFIG.failureThreshold;
+      // First call detects the 'claude' adapter; reaching the threshold opens
+      // the breaker, whose open event clears the cached adapter.
+      for (let i = 0; i < threshold; i++) {
+        await failingAdapter.complete({ messages: [] });
+      }
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+      expect(failingAdapter.getHealth()?.state).toBe('degraded');
+
+      // Next call re-detects (failover) — a different adapter name confirms
+      // the failover path fired.
+      vi.mocked(createAutoAdapter).mockResolvedValueOnce(makeSelection('gemini', 'api'));
+      mockComplete.mockReturnValueOnce(
+        Promise.resolve(
+          ok({
+            content: [{ type: 'text', text: 'ok' }],
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            stopReason: 'end_turn',
+            model: 'mock-model',
+          })
+        )
+      );
+      await failingAdapter.complete({ messages: [] });
+
+      expect(createAutoAdapter).toHaveBeenCalledTimes(2);
+      expect(onFailover).toHaveBeenCalledTimes(1);
+      expect(failingAdapter.getHealth()?.failoverCount).toBe(1);
+    });
+
+    it('never leaks credential-bearing error content into the logged payload', async () => {
+      const registry = new CircuitBreakerRegistry();
+      const breaker = registry.getBreaker('claude');
+      const recordFailureSpy = vi.spyOn(breaker, 'recordFailure');
+      const logger = makeLogger();
+      const failingAdapter = new ResilientAdapter({ logger });
+      failingAdapter.attachCircuitBreakerRegistry(registry);
+
+      // Use a code that maps deterministically (MODEL_UNAVAILABLE → connection)
+      // so the secret in the message cannot influence the category.
+      const secretError = new ModelError('failed for key sk-SECRET-deadbeef', {
+        code: ErrorCode.MODEL_UNAVAILABLE,
+      });
+      mockComplete.mockReturnValue(Promise.resolve(err(secretError)));
+
+      await failingAdapter.complete({ messages: [] });
+
+      // recordFailure received only a FailureCategory string, never the error.
+      expect(recordFailureSpy).toHaveBeenCalledTimes(1);
+      expect(recordFailureSpy).toHaveBeenCalledWith('connection');
+      const recordedArg = recordFailureSpy.mock.calls[0]?.[0];
+      expect(typeof recordedArg).toBe('string');
+
+      // No logged call's serialized args contain the secret.
+      const allLogCalls = [
+        ...vi.mocked(logger.warn).mock.calls,
+        ...vi.mocked(logger.info).mock.calls,
+        ...vi.mocked(logger.debug).mock.calls,
+        ...vi.mocked(logger.error).mock.calls,
+      ];
+      for (const call of allLogCalls) {
+        expect(JSON.stringify(call)).not.toContain('sk-SECRET');
+      }
+    });
+
+    // #5359: the counterpart, and the more consequential half. Excluding a
+    // TRANSIENT throttle from the breaker is right — an ordinary 7-voter panel
+    // trips a per-minute limit while plenty of quota remains, and opening on
+    // that would empty the candidate pool for a condition clearing within the
+    // minute. Excluding a DURABLE cap is wrong: it never clears, so a breaker
+    // that never opens means every subsequent call pays the same futile
+    // retries against the same dead credential.
+    it('counts a durable capacity cap against the breaker', async () => {
+      const registry = new CircuitBreakerRegistry();
+      const breaker = registry.getBreaker('claude');
+      const recordFailureSpy = vi.spyOn(breaker, 'recordFailure');
+      const failingAdapter = new ResilientAdapter();
+      failingAdapter.attachCircuitBreakerRegistry(registry);
+
+      const capError = new ModelError('Key limit exceeded (total limit)', {
+        code: ErrorCode.MODEL_RATE_LIMITED,
+      });
+      mockComplete.mockReturnValue(Promise.resolve(err(capError)));
+      // Matches BOTH predicates, which is the point: it is a rate limit, and
+      // it is durable. The durable arm must win.
+      vi.mocked(isRateLimitLikeError).mockReturnValue(true);
+      vi.mocked(isDurableCapacityError).mockReturnValue(true);
+      vi.mocked(toRateLimitError).mockReturnValue({
+        message: 'Key limit exceeded (total limit)',
+        retryAfterMs: undefined,
+      } as unknown as ReturnType<typeof toRateLimitError>);
+
+      await failingAdapter.complete({ messages: [] });
+
+      expect(recordFailureSpy).toHaveBeenCalled();
+    });
+
+    it('does not double-count rate-limit failures against the breaker', async () => {
+      const registry = new CircuitBreakerRegistry();
+      const breaker = registry.getBreaker('claude');
+      const recordFailureSpy = vi.spyOn(breaker, 'recordFailure');
+      const failingAdapter = new ResilientAdapter();
+      failingAdapter.attachCircuitBreakerRegistry(registry);
+
+      const rateLimitError = new ModelError('Rate limit exceeded', {
+        code: ErrorCode.MODEL_RATE_LIMITED,
+      });
+      mockComplete.mockReturnValue(Promise.resolve(err(rateLimitError)));
+      vi.mocked(isRateLimitLikeError).mockReturnValue(true);
+      vi.mocked(toRateLimitError).mockReturnValue({
+        message: 'Rate limit exceeded',
+        retryAfterMs: 30000,
+      } as unknown as ReturnType<typeof toRateLimitError>);
+
+      await failingAdapter.complete({ messages: [] });
+
+      // The rate-limit telemetry branch fired...
+      expect(recordRateLimitEvent).toHaveBeenCalledTimes(1);
+      // ...but the breaker path skipped recordFailure to avoid double-count.
+      expect(recordFailureSpy).not.toHaveBeenCalled();
+      expect(breaker.getSnapshot().failureCount).toBe(0);
+    });
+
+    it('does not double-count a code-less rate-limit MODEL_ERROR (pattern divergence)', async () => {
+      // A MODEL_ERROR whose message is rate-limit-like to `isRateLimitLikeError`
+      // ("quota exceeded") but NOT to `categorizeError` would map to `unknown`
+      // and slip past a category-only guard — double-counting against the
+      // telemetry branch. The guard also checks `isRateLimitLikeError` (#3423).
+      const registry = new CircuitBreakerRegistry();
+      const breaker = registry.getBreaker('claude');
+      const recordFailureSpy = vi.spyOn(breaker, 'recordFailure');
+      const failingAdapter = new ResilientAdapter();
+      failingAdapter.attachCircuitBreakerRegistry(registry);
+
+      const quotaError = new ModelError('quota exceeded for this org', {
+        code: ErrorCode.MODEL_ERROR,
+      });
+      mockComplete.mockReturnValue(Promise.resolve(err(quotaError)));
+      vi.mocked(isRateLimitLikeError).mockReturnValue(true);
+      vi.mocked(toRateLimitError).mockReturnValue({
+        message: 'quota exceeded for this org',
+        retryAfterMs: 30000,
+      } as unknown as ReturnType<typeof toRateLimitError>);
+
+      await failingAdapter.complete({ messages: [] });
+
+      expect(recordFailureSpy).not.toHaveBeenCalled();
+      expect(breaker.getSnapshot().failureCount).toBe(0);
+    });
+
+    it('never counts a caller-cancelled CLI call against the breaker (#6691)', async () => {
+      // cancel_job aborts the CLI call; the cancel's AbortError cause crosses
+      // the real bridge. Without the exemption the message matches no category
+      // and counts as `unknown`.
+      const registry = new CircuitBreakerRegistry();
+      const breaker = registry.getBreaker('claude');
+      const failingAdapter = new ResilientAdapter();
+      failingAdapter.attachCircuitBreakerRegistry(registry);
+      const cli = {
+        name: 'claude',
+        getModelInfo: () => ({ id: 'claude-sonnet', name: 'x' }),
+        execute: () =>
+          Promise.resolve(
+            err(
+              createCallerAbortCliError(
+                'cancelled via cancel_job',
+                'Aborted by caller signal',
+                'claude'
+              )
+            )
+          ),
+      } as unknown as ICliAdapter;
+      const bridge = new CliToModelAdapter(cli);
+      mockComplete.mockImplementation((req: CompletionRequest) => bridge.complete(req));
+      vi.mocked(isRateLimitLikeError).mockReturnValue(false);
+
+      const attempts = DEFAULT_CIRCUIT_BREAKER_CONFIG.failureThreshold + 2;
+      for (let i = 0; i < attempts; i++) {
+        const res = await failingAdapter.complete({ messages: [] });
+        expect(res.ok).toBe(false);
+      }
+
+      expect(breaker.getSnapshot().failureCount).toBe(0);
+      expect(breaker.getState()).toBe('closed');
+    });
+
+    it('never leaks a secret carried in error.cause into the logged payload', async () => {
+      // Hardening (#3423 security review): the secret lives in `error.cause`,
+      // not `.message`. The recording path logs only {provider, category}, so a
+      // cause-borne credential must never surface either.
+      const registry = new CircuitBreakerRegistry();
+      const logger = makeLogger();
+      const failingAdapter = new ResilientAdapter({ logger });
+      failingAdapter.attachCircuitBreakerRegistry(registry);
+
+      const causeError = new ModelError('upstream failed', {
+        code: ErrorCode.MODEL_UNAVAILABLE,
+        cause: new Error('auth header Bearer sk-SECRET-cause99'),
+      });
+      mockComplete.mockReturnValue(Promise.resolve(err(causeError)));
+
+      await failingAdapter.complete({ messages: [] });
+
+      const allLogCalls = [
+        ...vi.mocked(logger.warn).mock.calls,
+        ...vi.mocked(logger.info).mock.calls,
+        ...vi.mocked(logger.debug).mock.calls,
+        ...vi.mocked(logger.error).mock.calls,
+      ];
+      for (const call of allLogCalls) {
+        expect(JSON.stringify(call)).not.toContain('sk-SECRET');
+      }
+    });
+  });
+});
+
+describe('gateway re-discovery on an already-detected adapter (#6659, #6671 review)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setupDefaultMocks();
+  });
+
+  it('a detected adapter serves a call without waiting on a blackholed discovery', async () => {
+    const adapter = new ResilientAdapter({ preferredCli: 'claude' });
+    await adapter.complete({ messages: [] }); // detected: the CLI slot serves
+    // A blackholed gateway: the discovery attempt never settles.
+    const discover = vi.fn(() => new Promise<undefined>(() => {}));
+    setGatewayRediscovery(
+      new GatewayRediscovery({ target: [], discover, logger: silentLog(), lastAttemptAt: 0 })
+    );
+    try {
+      const outcome = await Promise.race([
+        adapter.complete({ messages: [] }).then(() => 'served'),
+        new Promise((resolve) =>
+          setTimeout(() => {
+            resolve('waited on discovery');
+          }, 200)
+        ),
+      ]);
+      expect(outcome).toBe('served');
+      expect(discover).toHaveBeenCalledTimes(1); // it was still triggered
+    } finally {
+      setGatewayRediscovery(undefined);
+      adapter.dispose();
+    }
+  });
+
+  it('an adapter with nothing detected yet waits for the discovery', async () => {
+    const adapter = new ResilientAdapter({ preferredCli: 'claude' });
+    let settle: ((v: undefined) => void) | undefined;
+    const discover = vi.fn(
+      () =>
+        new Promise<undefined>((resolve) => {
+          settle = resolve;
+        })
+    );
+    setGatewayRediscovery(
+      new GatewayRediscovery({ target: [], discover, logger: silentLog(), lastAttemptAt: 0 })
+    );
+    try {
+      const call = adapter.complete({ messages: [] });
+      await vi.waitFor(() => {
+        expect(discover).toHaveBeenCalledTimes(1);
+      });
+      expect(createAutoAdapter).not.toHaveBeenCalled();
+      settle?.(undefined);
+      await call;
+      expect(createAutoAdapter).toHaveBeenCalledTimes(1);
+    } finally {
+      setGatewayRediscovery(undefined);
+      adapter.dispose();
+    }
+  });
+});
+
+function silentLog(): ILogger {
+  const log = {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    setLevel: vi.fn(),
+    child: (): ILogger => log,
+  } as unknown as ILogger;
+  return log;
+}

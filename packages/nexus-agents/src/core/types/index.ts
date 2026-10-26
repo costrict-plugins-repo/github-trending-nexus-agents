@@ -1,0 +1,97 @@
+/**
+ * nexus-agents/core - Type Exports
+ */
+
+// Model types
+export type {
+  IModelAdapter,
+  CompletionRequest,
+  CompletionResponse,
+  Message,
+  MessageRole,
+  ContentBlock,
+  ToolDefinition,
+  ResponseFormat,
+  ExecutionAccessMode,
+  TokenUsage,
+  StopReason,
+  StreamChunk,
+  ModelMetadata,
+} from './model.js';
+export { ModelCapability } from './model.js';
+
+// Agent types
+export type {
+  IAgent,
+  Task,
+  TaskContext,
+  TaskConstraints,
+  TaskHistoryItem,
+  TaskResult,
+  ResultMetadata,
+  AgentMessage,
+  AgentMessageType,
+  AgentResponse,
+  AgentContext,
+  AgentConfig,
+  AgentState,
+  AgentRole,
+  OrchestratorRole,
+} from './agent.js';
+export { AgentCapability } from './agent.js';
+
+// Workflow types
+export type {
+  IWorkflowEngine,
+  WorkflowDefinition,
+  WorkflowStep,
+  WorkflowResult,
+  WorkflowBudgetOutcome,
+  WorkflowTemplate,
+  InputDefinition,
+  StepResult,
+  ExecutionStatus,
+  ContextBudget,
+  PartialContextBudget,
+} from './workflow.js';
+export { ParseError } from './workflow.js';
+
+// Tool types
+export type { ITool, IToolRegistry, ToolResult, ToolContentBlock, ToolInfo } from './tool.js';
+export { ToolError } from './tool.js';
+
+// Orchestrator types (IOrchestrator - canonical orchestration interface)
+export type {
+  IOrchestrator,
+  IOrchestratorFactory,
+  OrchestratorType,
+  OrchestratorDefinition,
+  OrchestratorExecuteOptions,
+  OrchestratorStep,
+  OrchestratorResult,
+  OrchestratorErrorCode,
+} from './orchestrator.js';
+export { OrchestratorError } from './orchestrator.js';
+
+// Pruning strategy types (IPruneStrategy - canonical pruning interface)
+export type {
+  IPruneStrategy,
+  IPruneStrategyFactory,
+  PruneContext,
+  PruneDecision,
+  PruneResult,
+} from './prune-strategy.js';
+export { PruneStrategyName } from './prune-strategy.js';
+
+// Registry types (IRegistry - canonical registry interface, Issue #596)
+export type {
+  IRegistry,
+  ISingletonRegistry,
+  IRegistryItem,
+  IRegisterOptions,
+  IRegistryStats,
+} from './registry.js';
+export { isRegistryItem } from './registry.js';
+
+// Database types (ISQLiteDatabase - canonical SQLite interface)
+export type { ISQLiteDatabase, ISQLiteStatement, ISQLiteRunResult } from './database-types.js';

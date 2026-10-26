@@ -1,0 +1,465 @@
+/**
+ * Per-arm cost estimation for the task-class cost ceiling (#4196, #4392) and
+ * the per-task budget filter (#6393).
+ *
+ * Extracted from `budget-router.ts` for the file cap. The ceiling estimators
+ * are fail-CLOSED: `undefined` means "cannot price", and the ceiling filter
+ * excludes such a candidate rather than guessing. The budget estimator keeps
+ * the conservative non-$0 fallback for CLI slots and vendor arms, and is
+ * fail-closed for gateway arms only. {@link gatewayCostDetail} is the same
+ * declaration read in the ledger's shape, for the telemetry writers (step 4).
+ *
+ * @module cli-adapters/budget-arm-cost
+ */
+
+import { computeTokenCost, roundToMicroUsd } from '../learning/token-cost-core.js';
+import { priceBasisCaveat, type PriceBasis } from '../core/price-basis.js';
+import { createLogger } from '../core/logger.js';
+import { computeCostDetail, priceBasisOf, type CostDetail } from '../learning/usage-log.js';
+import type { CliName, EndpointArmId, ObservedArmId, RoutingArmId } from './types.js';
+import type { ModelId } from '../config/model-capabilities-types.js';
+import { observedArmDisplaySlot, routingArmDisplaySlot } from './types.js';
+import { gatewayServedSlotOf, type GatewayServedSlot } from './gateway-slot-arm.js';
+import { ModelToCliAdapter } from './model-to-cli-adapter.js';
+import { estimateCost } from './budget-utils.js';
+import {
+  getDefaultModelForCli,
+  getDefaultModelForGoogleApi,
+  getModelPricing,
+  resolveCliCostPer1M,
+} from '../config/model-config-helpers.js';
+import { getDefaultRegistry } from '../config/model-registry.js';
+import {
+  gatewayCostGap,
+  gatewayCostRates,
+  isGatewayArmId,
+  resolveGatewayCostDeclaration,
+} from '../adapters/sdk/gateway-cost.js';
+import { getGatewayCatalog } from '../adapters/sdk/gateway-catalog.js';
+
+/**
+ * Estimate the USD cost of a task on a CLI slot using CANONICAL registry
+ * pricing (#4165 path: `ModelEntry.pricing` of the slot's default model).
+ * Returns `undefined` when the registry has no pricing for the model, so the
+ * caller can fail CLOSED on a configured ceiling (#4196 BINDING condition).
+ * This deliberately differs from `resolveCliCostPer1M` (#4168), which returns
+ * a conservative non-$0 fallback for budget FILTERING — here an unknown price
+ * must stay `undefined` to preserve the ceiling's fail-CLOSED guarantee.
+ */
+export function estimateRegistryCostUsd(
+  slot: CliName,
+  inputTokens: number,
+  outputTokens: number
+): number | undefined {
+  const pricing = getModelPricing(getDefaultModelForCli(slot));
+  // Fail-CLOSED, and deliberately different from `resolveCliCostPer1M`'s
+  // conservative fallback (#4168 vs #4196). Both policies are named at their
+  // own call site precisely so neither can be swapped for the other by
+  // accident; only the arithmetic is shared (#5122).
+  if (pricing === undefined) return undefined;
+  return computeTokenCost(
+    { input: inputTokens, output: outputTokens },
+    { inputPer1M: pricing.inputPer1M, outputPer1M: pricing.outputPer1M }
+  ).costUsd;
+}
+
+/**
+ * Mechanism A's single-model gateway arm and the env that names its model.
+ * That arm never gets a catalogue. The env is only a fallback for an arm-only
+ * call: since #6650 the arm sends the ranked gateway default in gateway mode,
+ * which differs from `NEXUS_CUSTOM_MODEL` whenever the catalogue does not list
+ * it, so the router-instance functions ({@link ceilingCostOfArm},
+ * {@link budgetCostOfArm}, {@link unpricedReasonOfArm}) pass the model the arm
+ * instance actually sends ({@link sentModelOf}, #6688).
+ */
+const CUSTOM_OPENAI_ARM: EndpointArmId = 'api:custom-openai';
+const CUSTOM_MODEL_ENV = 'NEXUS_CUSTOM_MODEL';
+
+/**
+ * The model bare `priced` prices `arm` at (#4392 increment 2, step 2): the
+ * caller's `modelId`, else the head of the arm's registration-time catalogue,
+ * else — for {@link CUSTOM_OPENAI_ARM} only — `NEXUS_CUSTOM_MODEL`. `undefined`
+ * when none of those names a model, and the caller then fails CLOSED: until
+ * #6404 the display slot stood in here, which priced a gateway at opencode's
+ * default model — a number that measured nothing about the gateway.
+ */
+function gatewayPricingModel(
+  arm: EndpointArmId,
+  modelId: string | undefined,
+  env: NodeJS.ProcessEnv
+): string | undefined {
+  const known = modelId ?? getGatewayCatalog(arm)?.[0];
+  if (known !== undefined) return known;
+  if (arm !== CUSTOM_OPENAI_ARM) return undefined;
+  const pinned = env[CUSTOM_MODEL_ENV]?.trim();
+  return pinned === undefined || pinned === '' ? undefined : pinned;
+}
+
+/**
+ * Registry price of an explicit API model or a gateway model for bare `priced`. Resolves aliases the
+ * way every other pricing read does (`getDefaultRegistry().getEntry`), and is
+ * fail-CLOSED: a model the registry cannot price is `undefined`, never $0 and
+ * never the display slot's rate.
+ */
+function estimateModelCostUsd(
+  modelId: string,
+  inputTokens: number,
+  outputTokens: number
+): number | undefined {
+  const pricing = getDefaultRegistry().getEntry(modelId).pricing;
+  if (pricing === undefined) return undefined;
+  return computeTokenCost(
+    { input: inputTokens, output: outputTokens },
+    { inputPer1M: pricing.inputPer1M, outputPer1M: pricing.outputPer1M }
+  ).costUsd;
+}
+
+/**
+ * Estimate the USD cost of a task on a routing ARM (#4392 increment 2). A
+ * CLI slot is priced by its default; Google API retains its separate Pro
+ * default, and a direct-API instance uses the model it actually sends. A GATEWAY arm is priced by its `NEXUS_GATEWAY_COST`
+ * declaration: `free`/`local` → $0, `priced:<in>,<out>` → that flat rate, bare
+ * `priced` → the registry rate of the model {@link gatewayPricingModel}
+ * resolves. No model, an unpriced model and UNDECLARED are all `undefined`,
+ * so a configured ceiling fails CLOSED on them — before this, an undeclared
+ * gateway was silently priced as opencode's default model and slipped under
+ * the ceiling, and until #6404 bare `priced` with no catalogue did the same.
+ *
+ * `arm` is any observed arm: a published {@link RoutingArmId} or a dynamic
+ * `api:<endpoint>` arm (the voter gateway registers as one since step 2).
+ * A router arm INSTANCE a gateway model serves is priced through
+ * {@link ceilingCostOfArm} instead (#6604).
+ */
+export function estimateArmCostUsd(
+  arm: ObservedArmId,
+  inputTokens: number,
+  outputTokens: number,
+  env: NodeJS.ProcessEnv = process.env,
+  modelId?: string
+): number | undefined {
+  if (arm === 'api:google') {
+    return estimateModelCostUsd(
+      modelId ?? getDefaultModelForGoogleApi(),
+      inputTokens,
+      outputTokens
+    );
+  }
+  if (!isGatewayArmId(arm)) {
+    const model = modelId;
+    return model === undefined
+      ? estimateRegistryCostUsd(observedArmDisplaySlot(arm), inputTokens, outputTokens)
+      : estimateModelCostUsd(model, inputTokens, outputTokens);
+  }
+  const declaration = resolveGatewayCostDeclaration(arm, env);
+  // Fail-CLOSED sentinel, deliberately `undefined` and never $0: a $0 always
+  // passes a ceiling, which is the misreport this declaration exists to end.
+  if (declaration === undefined) return undefined;
+  const rates = gatewayCostRates(declaration);
+  if (rates !== 'registry') {
+    return computeTokenCost({ input: inputTokens, output: outputTokens }, rates).costUsd;
+  }
+  const model = gatewayPricingModel(arm, modelId, env);
+  // Fail-CLOSED again: no model to price is not a licence to price the slot.
+  if (model === undefined) return undefined;
+  return estimateModelCostUsd(model, inputTokens, outputTokens);
+}
+
+/**
+ * The cost of a CLI-slot arm a gateway model serves (#6604): priced as that
+ * gateway, by the declaration for the model that runs, never at the slot
+ * vendor's list price. Unpriced when the model carries no gateway-arm marker.
+ */
+function estimateServedSlotCostUsd(
+  served: GatewayServedSlot,
+  inputTokens: number,
+  outputTokens: number,
+  env: NodeJS.ProcessEnv
+): number | undefined {
+  if (served.arm === undefined) return undefined;
+  return estimateArmCostUsd(served.arm, inputTokens, outputTokens, env, served.modelId);
+}
+
+/** A router arm INSTANCE: its key and the adapter registered under it. */
+interface RouterArm {
+  readonly arm: RoutingArmId;
+  readonly adapter: unknown;
+}
+
+/**
+ * The model a direct-API router arm instance sends (#6688): the id of the
+ * model adapter `wrapApiSelectionForRouter` wrapped, which the SDK adapter
+ * passes to the endpoint verbatim. Undefined for any other arm shape, and the
+ * arm-only resolution ({@link gatewayPricingModel}) then applies.
+ */
+function sentModelOf(adapter: unknown): string | undefined {
+  return adapter instanceof ModelToCliAdapter ? adapter.getModelInfo().id : undefined;
+}
+
+/**
+ * {@link estimateArmCostUsd} for a router arm INSTANCE (#6604): the serving
+ * state is read from that arm (`gatewayServedSlotOf`), so a slot arm a gateway
+ * model serves is priced as its gateway, and every other arm as before.
+ */
+export function ceilingCostOfArm(
+  target: RouterArm,
+  inputTokens: number,
+  outputTokens: number,
+  env: NodeJS.ProcessEnv = process.env
+): number | undefined {
+  const served = gatewayServedSlotOf(target.adapter);
+  if (served !== undefined)
+    return estimateServedSlotCostUsd(served, inputTokens, outputTokens, env);
+  return estimateArmCostUsd(
+    target.arm,
+    inputTokens,
+    outputTokens,
+    env,
+    sentModelOf(target.adapter)
+  );
+}
+
+/** Provenance of a resolved ceiling estimate, using the arm that actually serves it. */
+function ceilingPriceBasis(
+  target: RouterArm,
+  costUsd: number | undefined,
+  env: NodeJS.ProcessEnv
+): PriceBasis {
+  if (costUsd === undefined) return 'unknown';
+  const served = gatewayServedSlotOf(target.adapter);
+  const arm = served === undefined ? target.arm : served.arm;
+  const declaration =
+    arm !== undefined && isGatewayArmId(arm) ? resolveGatewayCostDeclaration(arm, env) : undefined;
+  const declared = declaration !== undefined && gatewayCostRates(declaration) !== 'registry';
+  if (declared) return 'declared';
+  return registryCeilingBasis(target, served, arm, env);
+}
+
+/** Basis of the same registry model that supplied the ceiling estimate. */
+function registryCeilingBasis(
+  target: RouterArm,
+  served: GatewayServedSlot | undefined,
+  arm: ObservedArmId | undefined,
+  env: NodeJS.ProcessEnv
+): PriceBasis {
+  const model =
+    arm !== undefined && isGatewayArmId(arm)
+      ? gatewayPricingModel(arm, served?.modelId ?? sentModelOf(target.adapter), env)
+      : (sentModelOf(target.adapter) ??
+        (target.arm === 'api:google'
+          ? getDefaultModelForGoogleApi()
+          : getDefaultModelForCli(observedArmDisplaySlot(target.arm))));
+  return model === undefined ? 'unknown' : priceBasisOf(computeCostDetail(model, 0, 0));
+}
+
+/**
+ * Record the canonical ceiling estimate with its price basis (#5095).
+ * Missing pricing stays `undefined` and `unknown`, never a measured $0.
+ * Explicit gateway rates (including free/local) and manifest-overlay rates
+ * use `declared`; other registry rates use `list`. Bare gateway `priced`
+ * inherits the selected registry tier's basis.
+ * Admitted list-price estimates are warnings with the canonical caveat.
+ * Wrapping the existing policy preserves its arithmetic and arm resolution.
+ */
+export function recordCeilingCostOfArm(
+  target: RouterArm,
+  inputTokens: number,
+  outputTokens: number,
+  ceiling: number,
+  env: NodeJS.ProcessEnv = process.env
+): { readonly costUsd: number | undefined; readonly priceBasis: PriceBasis } {
+  const costUsd = ceilingCostOfArm(target, inputTokens, outputTokens, env);
+  const priceBasis = ceilingPriceBasis(target, costUsd, env);
+  const withinCeiling = costUsd !== undefined && costUsd <= ceiling;
+  const caveat = priceBasis === 'list' && withinCeiling ? priceBasisCaveat('list') : undefined;
+  const level = caveat === undefined ? 'info' : 'warn';
+  ceilingLogger[level]('Cost ceiling: candidate evaluated', {
+    arm: target.arm,
+    ceiling,
+    ...(costUsd !== undefined ? { cost: costUsd } : {}),
+    priceBasis,
+    ceilingMeasurement: costUsd === undefined ? 'unmeasured' : 'estimated',
+    withinCeiling,
+    ...(caveat !== undefined ? { caveat } : {}),
+  });
+  return { costUsd, priceBasis };
+}
+
+const ceilingLogger = createLogger({ component: 'budget-router' });
+
+/**
+ * Estimate the USD cost of a task on a routing ARM for the per-task budget
+ * filter (`checkBudget`, #6393). Two policies, deliberately named here so
+ * neither can be swapped for the other by accident (#5122):
+ *
+ * - A CLI slot or vendor arm keeps `estimateCost`'s CONSERVATIVE non-$0
+ *   fallback (#4168): a number is always returned, and the numbers are the
+ *   ones the budget filter reported before this function existed.
+ * - A GATEWAY arm is priced by its `NEXUS_GATEWAY_COST` declaration exactly
+ *   as {@link estimateArmCostUsd} prices it, so UNDECLARED is `undefined`
+ *   and the caller must treat it as NOT within budget. Before this the
+ *   gateway took the first branch — a gateway adapter's display `name` is its
+ *   slot — and an undeclared `api:custom-openai` was admitted under
+ *   `maxCostUsd` at opencode's default model rate, a number that measured
+ *   nothing.
+ */
+export function estimateBudgetArmCostUsd(
+  arm: RoutingArmId,
+  inputTokens: number,
+  outputTokens: number,
+  env: NodeJS.ProcessEnv = process.env,
+  served?: GatewayServedSlot
+): number | undefined {
+  if (served !== undefined)
+    return estimateServedSlotCostUsd(served, inputTokens, outputTokens, env);
+  if (arm === 'api:google') {
+    return estimateApiBudgetCostUsd(
+      'gemini',
+      getDefaultModelForGoogleApi(),
+      inputTokens,
+      outputTokens
+    );
+  }
+  if (isGatewayArmId(arm)) return estimateArmCostUsd(arm, inputTokens, outputTokens, env);
+  return estimateCost(routingArmDisplaySlot(arm), inputTokens, outputTokens);
+}
+
+/** Actual API model pricing with the slot's conservative unpriced fallback. */
+function estimateApiBudgetCostUsd(
+  slot: CliName,
+  modelId: string,
+  input: number,
+  output: number
+): number {
+  const rates = resolveCliCostPer1M(slot, getDefaultRegistry().getEntry(modelId).id as ModelId);
+  return computeTokenCost({ input, output }, { inputPer1M: rates.input, outputPer1M: rates.output })
+    .costUsd;
+}
+
+/**
+ * {@link estimateBudgetArmCostUsd} for a router arm INSTANCE: the serving
+ * state is read from that arm (`gatewayServedSlotOf`, #6604).
+ */
+export function budgetCostOfArm(
+  target: RouterArm,
+  inputTokens: number,
+  outputTokens: number,
+  env: NodeJS.ProcessEnv = process.env
+): number | undefined {
+  const served = gatewayServedSlotOf(target.adapter);
+  if (served === undefined && isGatewayArmId(target.arm)) {
+    const sent = sentModelOf(target.adapter);
+    return estimateArmCostUsd(target.arm, inputTokens, outputTokens, env, sent);
+  }
+  const sent = sentModelOf(target.adapter);
+  if (served === undefined && sent !== undefined) {
+    return estimateApiBudgetCostUsd(
+      observedArmDisplaySlot(target.arm),
+      sent,
+      inputTokens,
+      outputTokens
+    );
+  }
+  return estimateBudgetArmCostUsd(target.arm, inputTokens, outputTokens, env, served);
+}
+
+/** {@link describeUnpricedArm} for a router arm INSTANCE (#6604). */
+export function unpricedReasonOfArm(
+  target: RouterArm,
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  const served = gatewayServedSlotOf(target.adapter);
+  return describeUnpricedArm(target.arm, env, sentModelOf(target.adapter), served);
+}
+
+/**
+ * Why {@link estimateBudgetArmCostUsd} returned `undefined` for `arm`, as the
+ * reason carried on `BudgetRoutingResult.unpricedArms` and the log line.
+ * Only a gateway arm can be unpriced there (the conservative fallback always
+ * prices the rest), and only in three ways: no usable declaration (`unset`,
+ * `invalid (…)`, `undeclared for …` — {@link gatewayCostGap}); bare `priced`
+ * with no model to price (#6404 — no `modelId`, no catalogue, and no
+ * `NEXUS_CUSTOM_MODEL` for `api:custom-openai`); or bare `priced` on a model
+ * the registry cannot price.
+ */
+export function describeUnpricedArm(
+  arm: ObservedArmId,
+  env: NodeJS.ProcessEnv = process.env,
+  modelId?: string,
+  served?: GatewayServedSlot
+): string {
+  if (served !== undefined) {
+    return served.arm === undefined
+      ? `slot served by gateway model ${served.modelId}, which carries no gateway arm to price by`
+      : describeUnpricedArm(served.arm, env, served.modelId);
+  }
+  const gap = gatewayCostGap(arm, env);
+  if (gap !== undefined) return `gateway cost ${gap}`;
+  const model = isGatewayArmId(arm) ? gatewayPricingModel(arm, modelId, env) : undefined;
+  if (model === undefined) {
+    return `gateway cost priced without a catalogue or model: declare priced:<in>,<out> or set ${CUSTOM_MODEL_ENV}`;
+  }
+  return `gateway cost priced at registry rates, but ${model} has no registry pricing`;
+}
+
+/**
+ * The cost a TELEMETRY WRITER records for one call a gateway served (#4392
+ * increment 2, step 4) — the usage log (`withUsageRecording`) and the
+ * per-decision vote rollup (`votesToCostInputs`). Both used to price the
+ * MODEL id alone via {@link computeCostDetail}, so a `claude-*` id answered by
+ * an undeclared gateway recorded Anthropic's list price as `priced: true`: a
+ * measurement of nothing, and exactly the row a billing spot-check trusts.
+ *
+ * Priced by the arm's `NEXUS_GATEWAY_COST` declaration, mirroring
+ * {@link estimateArmCostUsd} but in the ledger's `CostDetail` shape:
+ *
+ * - UNDECLARED (unset, invalid, no entry for this arm — or an endpoint that is
+ *   not a gateway arm at all) → `{ costUsd: 0, priced: false }`, the documented
+ *   UNMEASURED sentinel (`priceBasisOf` → `'unknown'`), never $0-as-measured.
+ * - `free` / `local` → a MEASURED $0; `priced:<in>,<out>` → the flat rate,
+ *   micro-USD rounded like every ledger figure. `resolvedId` is the ARM: the
+ *   declaration, not a registry entry, is what supplied the number. `declared`
+ *   marks this provenance so `priceBasisOf` reports `'declared'`.
+ * - bare `priced` → {@link computeCostDetail} on the model that answered; a
+ *   model the registry cannot price stays unpriced, as it always did. A
+ *   writer that holds no model id (the routing observer, #6399) passes
+ *   `undefined`, and bare `priced` is then UNMEASURED too — there is nothing
+ *   to look up, and the display slot is not a substitute (#6404).
+ */
+export function gatewayCostDetail(
+  arm: EndpointArmId,
+  modelId: string | undefined,
+  inputTokens: number,
+  outputTokens: number,
+  env: NodeJS.ProcessEnv = process.env
+): CostDetail {
+  const unmeasured: CostDetail = { costUsd: 0, priced: false, resolvedId: modelId ?? arm };
+  const declaration = resolveGatewayCostDeclaration(arm, env);
+  if (declaration === undefined) return unmeasured;
+  const rates = gatewayCostRates(declaration);
+  if (rates === 'registry') {
+    return modelId === undefined
+      ? unmeasured
+      : computeCostDetail(modelId, inputTokens, outputTokens);
+  }
+  const { costUsd } = computeTokenCost({ input: inputTokens, output: outputTokens }, rates);
+  return { costUsd: roundToMicroUsd(costUsd), priced: true, resolvedId: arm, declared: true };
+}
+
+/**
+ * The cost a telemetry writer records for one call `modelId` served (#6624):
+ * by the gateway arm's declaration ({@link gatewayCostDetail}) when a gateway
+ * served it, else by the registry rate ({@link computeCostDetail}). The one
+ * place that choice is made, so the per-decision vote rollup and the outcome
+ * rows price a call the way the usage log does.
+ */
+export function servedCostDetail(
+  gatewayArm: EndpointArmId | undefined,
+  modelId: string,
+  inputTokens: number,
+  outputTokens: number
+): CostDetail {
+  if (gatewayArm !== undefined) {
+    return gatewayCostDetail(gatewayArm, modelId, inputTokens, outputTokens);
+  }
+  return computeCostDetail(modelId, inputTokens, outputTokens);
+}

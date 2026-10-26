@@ -1,0 +1,284 @@
+---
+title: Harness Compatibility Guide
+description: Wire nexus-agents as an MCP peer from OpenCode, Codex CLI, Cursor, Aider, and Cline
+diataxis: how-to
+audience: user
+prerequisites:
+  - 'nexus-agents installed globally (`npm install -g nexus-agents`) and verified with `nexus-agents doctor`.'
+  - 'Without a Claude CLI: at least one model API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GOOGLE_AI_API_KEY`), or a custom gateway (`NEXUS_OPENAI_COMPAT_URL` and `NEXUS_OPENAI_COMPAT_KEY`).'
+tier: 2
+keywords: [harness, mcp, opencode, codex, cursor, aider, cline, integration]
+related_files: [AGENTS.md, CLAUDE.md, docs/guides/CUSTOM_ENDPOINT_SETUP.md, docs/ENTRYPOINTS.md]
+---
+
+# Harness Compatibility Guide
+
+nexus-agents runs as a stdio MCP server — every harness below consumes it through the same `nexus-agents --mode=server` command. What changes per harness is **where you register the server** and **how the harness discovers `.rules/` + `AGENTS.md`**. This guide gives a tested snippet for each.
+
+## Install and environment (all harnesses)
+
+```bash
+npm install -g nexus-agents
+nexus-agents doctor        # verify install
+```
+
+For environments without Claude CLI, also set at least one model API key:
+
+```bash
+export ANTHROPIC_API_KEY=...   # or
+export OPENAI_API_KEY=...      # or
+export GOOGLE_AI_API_KEY=...   # or — for custom gateway:
+export NEXUS_OPENAI_COMPAT_URL=https://your-gateway.example.com/v1
+export NEXUS_OPENAI_COMPAT_KEY=...
+```
+
+`NEXUS_CUSTOM_API_BASE_URL` and `NEXUS_CUSTOM_API_KEY` were removed in 10.0 (#6291). They are ignored and reported as unknown variables. Update any harness environment blocks to the canonical names above, which configure both the single-model path and the gateway path.
+
+See [CUSTOM_ENDPOINT_SETUP.md](./CUSTOM_ENDPOINT_SETUP.md) for the custom-gateway path in depth.
+
+The MCP server process receives its environment from the client's server configuration when it launches. After changing that configuration, restart the client (or its MCP server process) to apply the new values. Some settings are read during calls, while others are retained from startup or adapter initialization; do not rely on hot reload.
+
+### Voter transport / performance (consensus_vote and similar tools)
+
+Tools that collect multiple LLM "votes" (e.g. `consensus_vote`) need one model
+call per voter role. There are two ways nexus-agents can make those calls:
+
+- **In-process, via an OpenAI-compatible gateway** — set both
+  `NEXUS_OPENAI_COMPAT_URL` and `NEXUS_OPENAI_COMPAT_KEY` (see
+  [CONFIGURATION.md](../getting-started/CONFIGURATION.md)) and nexus-agents
+  routes every voter through that gateway's HTTP API directly, in-process. No
+  subprocess is spawned per vote, so it's lower-latency and doesn't depend on
+  any individual CLI's own auth/quota. Seats are dealt across model families
+  (Anthropic, OpenAI, Google) first, then across models within a family,
+  whatever order the gateway lists them in; `NEXUS_VOTER_MODEL_<ROLE>` pins a
+  role to one model.
+- **CLI subprocess round-robin (default when no gateway is set)** — with
+  neither env var set, voters shell out to whichever CLIs (claude/codex) are
+  installed, round-robining roles across them. Only CLIs that enforce
+  read-only analysis get seats: the gemini slot (agy, #6962) and opencode
+  (#6970) cannot, so they are never seated, and the 7-seat panel is
+  architect/devex/pm/scope_steward on claude and security/ai_ml/catfish on
+  codex. With only one of the two installed, every seat falls back to a single
+  model. This works with no extra
+  configuration, but each vote spawns a subprocess and inherits that CLI's own
+  auth/quota, so a full panel is noticeably slower.
+
+If you don't need per-CLI diversity and just want the fastest, most
+predictable voting path, configure an OpenAI-compatible gateway. nexus-agents
+logs a one-time notice at startup when it falls back to the CLI-subprocess
+path so you can tell which transport is active.
+
+---
+
+## OpenCode
+
+OpenCode reads `AGENTS.md` natively and supports MCP servers via `opencode.json`.
+
+### Register nexus-agents as MCP peer
+
+Create or edit `opencode.json` in your project root:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "nexus-agents": {
+      "type": "local",
+      "command": ["nexus-agents", "--mode=server"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Or for a development install from source:
+
+```json
+{
+  "mcp": {
+    "nexus-agents": {
+      "type": "local",
+      "command": ["node", "/path/to/nexus-agents/dist/cli.js", "--mode=server"],
+      "enabled": true
+    }
+  }
+}
+```
+
+### Rules + agents
+
+OpenCode auto-reads `AGENTS.md`. It does not currently scan `.rules/` directly — reference specific rule files from AGENTS.md (which this repo already does).
+
+### Verify
+
+```bash
+opencode mcp list           # should show nexus-agents as connected
+opencode run -m opencode/big-pickle "Use the list_experts MCP tool"
+```
+
+---
+
+## Codex CLI
+
+Codex CLI uses `AGENTS.md` as its canonical agent-instructions file. MCP peers register in `.codex/config.toml`.
+
+### Register nexus-agents
+
+```toml
+# .codex/config.toml
+[mcp_servers.nexus-agents]
+command = "nexus-agents"
+args = ["--mode=server"]
+```
+
+### Verify
+
+```bash
+codex --list-mcp
+codex "run consensus_vote on this proposal: ..."
+```
+
+---
+
+## Cursor
+
+Cursor supports MCP servers via `.cursor/mcp.json` (project-scoped) or `~/.cursor/mcp.json` (user-scoped). Rules live at `.cursor/rules/*.mdc` — not compatible with `.rules/*.md` out of the box, but you can symlink or mirror.
+
+### Register nexus-agents
+
+Create `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "nexus-agents": {
+      "command": "nexus-agents",
+      "args": ["--mode=server"]
+    }
+  }
+}
+```
+
+### Rules bridge
+
+Cursor doesn't auto-load `AGENTS.md` or `.rules/*.md`. Three options:
+
+1. **Reference-only (recommended):** create `.cursor/rules/nexus-agents.mdc` that points at the shared content:
+
+   ```markdown
+   ---
+   description: nexus-agents project rules
+   globs: ['**/*']
+   alwaysApply: true
+   ---
+
+   See [AGENTS.md](../../AGENTS.md) and [.rules/\*.md](../../.rules/) for the authoritative rule set.
+   ```
+
+2. **Symlink:** `ln -s ../../.rules .cursor/rules-nexus` — only works on systems that preserve symlinks in version control.
+
+3. **Mirror:** copy `.rules/*.md` into `.cursor/rules/*.mdc` with a generator script (extra build step; not recommended unless you specifically need the `.mdc` frontmatter format).
+
+### Verify
+
+Open the project in Cursor; the MCP tools should appear in the tool palette. Trigger one: `@nexus-agents list_experts`.
+
+---
+
+## Aider
+
+Aider uses `CONVENTIONS.md` or `.aider.conf.yml` for agent instructions. MCP support is experimental — as of Aider 0.65+, register MCP servers in the config file.
+
+### Register nexus-agents
+
+```yaml
+# .aider.conf.yml
+mcp:
+  nexus-agents:
+    command: nexus-agents
+    args: ['--mode=server']
+read: AGENTS.md
+```
+
+The `read: AGENTS.md` line makes Aider load the standalone entrypoint on every session.
+
+### Verify
+
+```bash
+aider --version       # ensure 0.65+
+aider                  # /help should show the MCP tools
+```
+
+---
+
+## Cline (VS Code extension)
+
+Cline registers MCP servers through `cline_mcp_settings.json` (accessed via the extension settings UI or at `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` on macOS, similar on other platforms).
+
+### Register nexus-agents
+
+```json
+{
+  "mcpServers": {
+    "nexus-agents": {
+      "command": "nexus-agents",
+      "args": ["--mode=server"],
+      "disabled": false
+    }
+  }
+}
+```
+
+### Rules
+
+Cline reads `.clinerules` at the project root. To bridge:
+
+```text
+# .clinerules
+Project rules live in .rules/*.md. See AGENTS.md for the index. Load
+the relevant rule file when its topic applies:
+
+- .rules/typescript.md for TypeScript changes
+- .rules/testing.md for test work
+- .rules/security.md for auth/secrets/input-validation
+- (full list in AGENTS.md)
+```
+
+### Verify
+
+Restart VS Code; Cline should list `nexus-agents` in its MCP panel with its tools available.
+
+---
+
+## Troubleshooting
+
+### MCP connect fails silently
+
+```bash
+nexus-agents --mode=server < /dev/null
+# Should print "Starting MCP server..." and then wait for stdio input.
+# If it prints nothing or crashes, check Node version (24.x required)
+# and that `nexus-agents doctor` passes.
+```
+
+### Rule-file path drift
+
+If you symlinked or copied `.rules/*.md` into a harness-specific location, the `docs-content-drift` CI job may flag drift. Prefer reference-only wiring (option 1 in the Cursor section) over mirroring.
+
+### Custom API key not picked up
+
+Set env vars **before** starting the harness (MCP servers inherit the harness's environment):
+
+```bash
+export NEXUS_OPENAI_COMPAT_URL=...
+export NEXUS_OPENAI_COMPAT_KEY=...
+# Now start OpenCode/Codex/Cursor/etc.
+```
+
+For Cline and other GUI-based harnesses, set the env var at the OS level (macOS `launchctl setenv`, Linux shell profile, Windows user env vars) so the VS Code process inherits it.
+
+## See also
+
+- [AGENTS.md](../../AGENTS.md) — canonical agent-instructions entry point
+- [CUSTOM_ENDPOINT_SETUP.md](./CUSTOM_ENDPOINT_SETUP.md) — multi-vendor gateway configuration
+- [docs/ENTRYPOINTS.md](../ENTRYPOINTS.md) — full MCP tool reference

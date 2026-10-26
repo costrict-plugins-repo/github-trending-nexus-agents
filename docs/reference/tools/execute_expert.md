@@ -1,0 +1,26 @@
+---
+title: 'MCP Tool: execute_expert'
+description: 'Run a task through a previously-created expert (by expertId)'
+diataxis: reference
+audience: user
+tier: 2
+keywords: [mcp, tool, reference, execute_expert]
+---
+
+# `execute_expert`
+
+> Auto-generated from the registered MCP tool descriptions and input
+> schemas. Do not edit by hand — run `pnpm docs:tools` to regenerate.
+
+Run a task through an expert YOU PREVIOUSLY CREATED via `create_expert`. Requires the expertId returned by create_expert; not for ad-hoc execution.
+
+## Parameters
+
+| Parameter | Type | Required | Constraints | Description |
+| --------- | ---- | -------- | ----------- | ----------- |
+| `expertId` | string | yes | minLength 1 | Expert ID from create_expert tool |
+| `task` | string | yes | minLength 1; maxLength 50000 | Task description for the expert to execute |
+| `context` | object | no | — | Additional context metadata for the task |
+| `timeoutMs` | integer | no | min 120000; max 900000 | Optional timeout in ms (120s-900s). Overrides auto-detected timeout. |
+| `previousExpertSummary` | string | no | maxLength 2000 | Summary from a previous expert in the chain. Injected into prompt for context continuity. |
+| `recoveryPolicy` | object | no | — | Optional transient failure recovery policy override |

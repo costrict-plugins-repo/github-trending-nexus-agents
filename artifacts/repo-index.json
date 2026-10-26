@@ -1,0 +1,562 @@
+{
+  "version": "1.0.0",
+  "generator": "scripts/generate-repo-index.ts",
+  "packageVersion": "14.0.1",
+  "cli": {
+    "binary": "nexus-agents",
+    "commands": [
+      {
+        "name": "auth",
+        "type": "async",
+        "handler": "handleAuthCommand",
+        "file": "src/cli-auth-handler.ts"
+      },
+      {
+        "name": "auto-remediate",
+        "type": "async",
+        "handler": "handleAutoRemediateCommand",
+        "file": "src/cli/auto-remediate-command.ts"
+      },
+      {
+        "name": "capabilities",
+        "type": "sync",
+        "handler": "handleCapabilitiesCommand",
+        "file": "src/cli/capabilities-command.ts"
+      },
+      {
+        "name": "config",
+        "type": "async",
+        "handler": "handleConfigCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "demo",
+        "type": "async",
+        "handler": "handleDemoCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "doctor",
+        "type": "async",
+        "handler": "handleDoctorCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "e2e-eval",
+        "type": "sync",
+        "handler": "handleE2EEvalCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "evaluate",
+        "type": "async",
+        "handler": "handleEvaluateCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "expert",
+        "type": "sync",
+        "handler": "handleExpertCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "fitness-audit",
+        "type": "sync",
+        "handler": "handleFitnessAuditCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "health",
+        "type": "sync",
+        "handler": "handleHealthCommand",
+        "file": "src/cli/health-command.ts"
+      },
+      {
+        "name": "hello",
+        "type": "sync",
+        "handler": "handleHelloCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "hooks",
+        "type": "async",
+        "handler": "handleHooksCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "improvement-review",
+        "type": "async",
+        "handler": "handleImprovementReviewCommand",
+        "file": "src/cli/improvement-review-command.ts"
+      },
+      {
+        "name": "index",
+        "type": "async",
+        "handler": "handleIndexCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "init",
+        "type": "async",
+        "handler": "handleInitCommand",
+        "file": "src/cli-commands-handlers-setup.ts"
+      },
+      {
+        "name": "issue",
+        "type": "sync",
+        "handler": "handleIssueCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "jobs",
+        "type": "sync",
+        "handler": "handleJobsCommand",
+        "file": "src/cli/jobs-command.ts"
+      },
+      {
+        "name": "learning-metrics",
+        "type": "sync",
+        "handler": "handleLearningMetricsCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "login",
+        "type": "async",
+        "handler": "handleLoginCommand",
+        "file": "src/cli/login-command.ts"
+      },
+      {
+        "name": "memory-benchmark",
+        "type": "async",
+        "handler": "handleMemoryBenchmarkCommand",
+        "file": "src/cli/memory-benchmark-command.ts"
+      },
+      {
+        "name": "memory-eval",
+        "type": "sync",
+        "handler": "handleMemoryEvalCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "migrate",
+        "type": "async",
+        "handler": "handleMigrateCommand",
+        "file": "src/cli/migrate-command.ts"
+      },
+      {
+        "name": "mode",
+        "type": "sync",
+        "handler": "handleModeCommand",
+        "file": "src/cli/mode-command.ts"
+      },
+      {
+        "name": "model-drift",
+        "type": "async",
+        "handler": "handleModelDriftCommand",
+        "file": "src/cli/model-drift-command.ts"
+      },
+      {
+        "name": "orchestrate",
+        "type": "async",
+        "handler": "handleOrchestrateCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "registry",
+        "type": "async",
+        "handler": "handleRegistryCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "release-announce",
+        "type": "async",
+        "handler": "handleReleaseAnnounceCommand",
+        "file": "src/cli-release-handlers.ts"
+      },
+      {
+        "name": "release-notes",
+        "type": "async",
+        "handler": "handleReleaseNotesCommand",
+        "file": "src/cli-release-handlers.ts"
+      },
+      {
+        "name": "release-validate",
+        "type": "async",
+        "handler": "handleReleaseValidateCommand",
+        "file": "src/cli-release-handlers.ts"
+      },
+      {
+        "name": "remediation-review",
+        "type": "async",
+        "handler": "handleRemediationReviewCommand",
+        "file": "src/cli/remediation-review-command.ts"
+      },
+      {
+        "name": "research",
+        "type": "async",
+        "handler": "handleResearchCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "review",
+        "type": "async",
+        "handler": "handleReviewCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "routing-ab",
+        "type": "sync",
+        "handler": "handleRoutingABCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "routing-audit",
+        "type": "sync",
+        "handler": "handleRoutingAuditCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "scaffold",
+        "type": "sync",
+        "handler": "handleScaffoldCommand",
+        "file": "src/cli-scaffold-handler.ts"
+      },
+      {
+        "name": "scenario",
+        "type": "async",
+        "handler": "handleScenarioCommand",
+        "file": "src/cli/scenario-command.ts"
+      },
+      {
+        "name": "server",
+        "type": "async",
+        "handler": "handleServerCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "session",
+        "type": "async",
+        "handler": "handleSessionCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "setup",
+        "type": "async",
+        "handler": "handleSetupCommandAsync",
+        "file": "src/cli-commands-handlers-setup.ts"
+      },
+      {
+        "name": "sprint",
+        "type": "async",
+        "handler": "handleSprintCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "status",
+        "type": "sync",
+        "handler": "handleStatusCommand",
+        "file": "src/cli/status-command.ts"
+      },
+      {
+        "name": "system-review",
+        "type": "sync",
+        "handler": "handleSystemReviewCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "tour",
+        "type": "async",
+        "handler": "handleTourCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "usage",
+        "type": "async",
+        "handler": "handleUsageCommand",
+        "file": "src/cli/usage-command.ts"
+      },
+      {
+        "name": "validate",
+        "type": "async",
+        "handler": "handleValidateCommand",
+        "file": "src/cli/validate-command.ts"
+      },
+      {
+        "name": "validation",
+        "type": "sync",
+        "handler": "handleValidationCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "verify",
+        "type": "async",
+        "handler": "handleVerifyCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "visualize",
+        "type": "async",
+        "handler": "handleVisualizeCommand",
+        "file": "src/cli/visualize-command.ts"
+      },
+      {
+        "name": "vote",
+        "type": "async",
+        "handler": "handleVoteCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "warm-up",
+        "type": "sync",
+        "handler": "handleWarmUpCommand",
+        "file": "src/cli-commands-handlers.ts"
+      },
+      {
+        "name": "workflow",
+        "type": "async",
+        "handler": "handleWorkflowCommand",
+        "file": "src/cli-commands-handlers.ts"
+      }
+    ]
+  },
+  "mcp": {
+    "tools": [
+      {
+        "name": "cancel_job",
+        "file": "src/mcp/tools/cancel-job.ts"
+      },
+      {
+        "name": "ci_health_check",
+        "file": "src/mcp/tools/ci-health-check.ts"
+      },
+      {
+        "name": "compare_data_feeds",
+        "file": "src/mcp/tools/compare-data-feeds.ts"
+      },
+      {
+        "name": "consensus_vote",
+        "file": "src/mcp/tools/consensus-vote.ts"
+      },
+      {
+        "name": "create_expert",
+        "file": "src/mcp/tools/create-expert.ts"
+      },
+      {
+        "name": "delegate_to_model",
+        "file": "src/mcp/tools/delegate-to-model.ts"
+      },
+      {
+        "name": "execute_expert",
+        "file": "src/mcp/tools/execute-expert.ts"
+      },
+      {
+        "name": "execute_spec",
+        "file": "src/mcp/tools/execute-spec.ts"
+      },
+      {
+        "name": "extract_symbols",
+        "file": "src/mcp/tools/extract-symbols.ts"
+      },
+      {
+        "name": "get_job_result",
+        "file": "src/mcp/tools/get-job-result.ts"
+      },
+      {
+        "name": "improvement_review",
+        "file": "src/mcp/tools/improvement-review.ts"
+      },
+      {
+        "name": "issue_triage",
+        "file": "src/mcp/tools/issue-triage.ts"
+      },
+      {
+        "name": "list_available_models",
+        "file": "src/mcp/tools/list-available-models.ts"
+      },
+      {
+        "name": "list_experts",
+        "file": "src/mcp/tools/list-experts.ts"
+      },
+      {
+        "name": "list_jobs",
+        "file": "src/mcp/tools/list-jobs.ts"
+      },
+      {
+        "name": "list_workflows",
+        "file": "src/mcp/tools/list-workflows.ts"
+      },
+      {
+        "name": "memory_query",
+        "file": "src/mcp/tools/memory-query.ts"
+      },
+      {
+        "name": "memory_stats",
+        "file": "src/mcp/tools/memory-stats.ts"
+      },
+      {
+        "name": "memory_write",
+        "file": "src/mcp/tools/memory-write.ts"
+      },
+      {
+        "name": "orchestrate",
+        "file": "src/mcp/tools/orchestrate.ts"
+      },
+      {
+        "name": "pr_review",
+        "file": "src/mcp/tools/pr-review.ts"
+      },
+      {
+        "name": "query_task_state",
+        "file": "src/mcp/tools/query-task-state.ts"
+      },
+      {
+        "name": "query_trace",
+        "file": "src/mcp/tools/query-trace.ts"
+      },
+      {
+        "name": "registry_import",
+        "file": "src/mcp/tools/registry-import.ts"
+      },
+      {
+        "name": "repo_analyze",
+        "file": "src/mcp/tools/repo-analyze.ts"
+      },
+      {
+        "name": "repo_security_plan",
+        "file": "src/mcp/tools/repo-security-plan.ts"
+      },
+      {
+        "name": "research_add",
+        "file": "src/mcp/tools/research-add.ts"
+      },
+      {
+        "name": "research_add_source",
+        "file": "src/mcp/tools/research-add-source.ts"
+      },
+      {
+        "name": "research_analyze",
+        "file": "src/mcp/tools/research-analyze.ts"
+      },
+      {
+        "name": "research_catalog_review",
+        "file": "src/mcp/tools/research-catalog-review.ts"
+      },
+      {
+        "name": "research_discover",
+        "file": "src/mcp/tools/research-discover.ts"
+      },
+      {
+        "name": "research_query",
+        "file": "src/mcp/tools/research-query.ts"
+      },
+      {
+        "name": "research_synthesize",
+        "file": "src/mcp/tools/research-synthesize.ts"
+      },
+      {
+        "name": "run",
+        "file": "src/mcp/tools/run.ts"
+      },
+      {
+        "name": "run_dev_pipeline",
+        "file": "src/mcp/tools/run-dev-pipeline.ts"
+      },
+      {
+        "name": "run_graph_workflow",
+        "file": "src/mcp/tools/run-graph-workflow.ts"
+      },
+      {
+        "name": "run_pipeline",
+        "file": "src/mcp/tools/run-pipeline.ts"
+      },
+      {
+        "name": "run_quality_gate",
+        "file": "src/mcp/tools/run-quality-gate.ts"
+      },
+      {
+        "name": "run_workflow",
+        "file": "src/mcp/tools/run-workflow.ts"
+      },
+      {
+        "name": "search_codebase",
+        "file": "src/mcp/tools/search-codebase.ts"
+      },
+      {
+        "name": "search_usages",
+        "file": "src/mcp/tools/search-usages.ts"
+      },
+      {
+        "name": "suggest_research_tasks",
+        "file": "src/mcp/tools/suggest-research-tasks.ts"
+      },
+      {
+        "name": "supply_chain_tradeoff_panel",
+        "file": "src/mcp/tools/supply-chain-tradeoff-panel.ts"
+      },
+      {
+        "name": "survey_oss_landscape",
+        "file": "src/mcp/tools/survey-oss-landscape.ts"
+      },
+      {
+        "name": "vendor_publishing_audit",
+        "file": "src/mcp/tools/vendor-publishing-audit.ts"
+      },
+      {
+        "name": "verify_audit_chain",
+        "file": "src/mcp/tools/verify-audit-chain.ts"
+      },
+      {
+        "name": "weather_report",
+        "file": "src/mcp/tools/weather-report.ts"
+      }
+    ]
+  },
+  "workflows": {
+    "templates": [
+      {
+        "name": "bug-fix",
+        "file": "src/workflows/templates/bug-fix.yaml"
+      },
+      {
+        "name": "code-review",
+        "file": "src/workflows/templates/code-review.yaml"
+      },
+      {
+        "name": "docs-audit",
+        "file": "src/workflows/templates/docs-audit.yaml"
+      },
+      {
+        "name": "documentation-update",
+        "file": "src/workflows/templates/documentation-update.yaml"
+      },
+      {
+        "name": "feature-implementation",
+        "file": "src/workflows/templates/feature-implementation.yaml"
+      },
+      {
+        "name": "infrastructure-audit",
+        "file": "src/workflows/templates/infrastructure-audit.yaml"
+      },
+      {
+        "name": "refactoring",
+        "file": "src/workflows/templates/refactoring.yaml"
+      },
+      {
+        "name": "research-review",
+        "file": "src/workflows/templates/research-review.yaml"
+      },
+      {
+        "name": "security-audit",
+        "file": "src/workflows/templates/security-audit.yaml"
+      },
+      {
+        "name": "standards-review",
+        "file": "src/workflows/templates/standards-review.yaml"
+      },
+      {
+        "name": "test-generation",
+        "file": "src/workflows/templates/test-generation.yaml"
+      }
+    ]
+  }
+}

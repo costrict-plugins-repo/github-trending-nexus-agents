@@ -1,0 +1,1725 @@
+/**
+ * Multi-Agent Development Pipeline Tests (#1684)
+ */
+
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { loadCheckpointState } from './pipeline-checkpoint.js';
+import { researchContextFromText } from './research-context.js';
+import { runDevPipeline, isApproved, getVoteFeedback } from './dev-pipeline.js';
+import { getPipelineEventBus } from './event-bus.js';
+import { PolicyBlockedError } from './policy-evaluator.js';
+import type { PipelineStateSnapshot } from './policy-engine.js';
+import { getGlobalLogLevel, setGlobalLogLevel } from '../core/logger.js';
+import type {
+  DevPipelineStages,
+  PipelineTask,
+  VoteResult,
+  QaReviewResult,
+} from './dev-pipeline.js';
+import type { IHindsightBeliefMemory } from '../context/belief-memory-interface.js';
+import type { HindsightRecord } from '../context/belief-hindsight-types.js';
+import { ok } from '../core/result.js';
+import type { TechniqueStatusSummary } from '../cli/research-types.js';
+import { AuditLogger, verifyChain } from '../audit/audit-logger.js';
+import { InMemoryAuditStorage } from '../audit/audit-storage.js';
+import type { AuditLogConfig } from '../audit/audit-types.js';
+import { createVoteStage } from './agent-executor-vote.js';
+import { createBudgetGuard } from './budget-guard.js';
+import { buildStructuredOutput } from '../mcp/tools/dev-pipeline-output.js';
+import { FAKE_ANTHROPIC_KEY, FAKE_PASSWORD } from '../testing/test-secrets.js';
+import * as consensusVote from '../mcp/tools/consensus-vote.js';
+
+// #3472: the dev-pipeline now recalls prior research from the registry on every
+// run. Mock it to empty by default so existing assertions (which count `- `
+// lines) stay deterministic regardless of the repo's real techniques.yaml;
+// individual tests override the resolved value.
+const researchInsightsMock = vi.fn<() => Promise<readonly TechniqueStatusSummary[]>>(() =>
+  Promise.resolve([])
+);
+vi.mock('../context/context-retriever.js', () => ({
+  getResearchInsightsForTask: (): Promise<readonly TechniqueStatusSummary[]> =>
+    researchInsightsMock(),
+}));
+
+/**
+ * Build a minimal IHindsightBeliefMemory stub. Only the read methods used by the
+ * plan-stage recall path are wired; everything else throws if touched so a test
+ * that accidentally depends on an unstubbed method fails loudly.
+ */
+function createBeliefMemoryStub(
+  overrides: Partial<IHindsightBeliefMemory>
+): IHindsightBeliefMemory {
+  const notImplemented = (name: string) => (): never => {
+    throw new Error(`belief-memory stub: ${name} not implemented`);
+  };
+  const base = {
+    retain: notImplemented('retain'),
+    retainBatch: notImplemented('retainBatch'),
+    recall: notImplemented('recall'),
+    query: notImplemented('query'),
+    recallBySubject: notImplemented('recallBySubject'),
+    recallCurrent: notImplemented('recallCurrent'),
+    recallHistory: notImplemented('recallHistory'),
+    revise: notImplemented('revise'),
+    supersede: notImplemented('supersede'),
+    applyHindsight: vi.fn().mockResolvedValue(ok([])),
+    reinforce: vi.fn().mockResolvedValue(ok(undefined)),
+    weaken: vi.fn().mockResolvedValue(ok(undefined)),
+    createCounterfactual: notImplemented('createCounterfactual'),
+    validateCounterfactual: notImplemented('validateCounterfactual'),
+    getCounterfactuals: notImplemented('getCounterfactuals'),
+    getUpdateHistory: notImplemented('getUpdateHistory'),
+    getHindsightRecords: vi.fn().mockResolvedValue(ok([])),
+    getStats: notImplemented('getStats'),
+    pruneSuperseded: notImplemented('pruneSuperseded'),
+  } as unknown as IHindsightBeliefMemory;
+  return { ...base, ...overrides };
+}
+
+function makeHindsightRecord(over: Partial<HindsightRecord>): HindsightRecord {
+  return {
+    hindsightId: 'h-1',
+    taskId: 'task',
+    priorBeliefs: [],
+    expectedOutcome: 'Pipeline completes with all gates passed',
+    actualOutcome: 'Incomplete: 3 vote iterations, 0 QA iterations',
+    outcomeMatched: false,
+    correctedBeliefs: [],
+    newBeliefs: [],
+    lessons: ['Pipeline did not complete — review plan approach'],
+    createdAt: new Date('2026-05-01T00:00:00Z'),
+    ...over,
+  };
+}
+
+function createMockStages(overrides?: Partial<DevPipelineStages>): DevPipelineStages {
+  return {
+    research: vi
+      .fn()
+      .mockResolvedValue(researchContextFromText('Research findings: relevant context gathered')),
+    plan: vi.fn().mockResolvedValue('Implementation plan: step 1, step 2, step 3'),
+    vote: vi.fn().mockResolvedValue({ kind: 'approved', approvalPercentage: 83 }),
+    decompose: vi.fn().mockResolvedValue([
+      {
+        id: 'task-1',
+        title: 'Task 1',
+        description: 'Implement step 1',
+        assignedTo: 'coder',
+        status: 'pending',
+      },
+      {
+        id: 'task-2',
+        title: 'Task 2',
+        description: 'Implement step 2',
+        assignedTo: 'coder',
+        status: 'pending',
+      },
+    ] satisfies PipelineTask[]),
+    implement: vi.fn().mockResolvedValue('Code implementation complete'),
+    qaReview: vi.fn().mockResolvedValue({
+      verdict: 'pass',
+      feedback: 'Looks good',
+      issues: [],
+    } satisfies QaReviewResult),
+    securityScan: vi
+      .fn()
+      .mockResolvedValue({ passed: true, verdict: 'pass', feedback: 'No findings' }),
+    qualityGate: vi.fn().mockResolvedValue({ passed: true, feedback: 'All checks passed.' }),
+    ...overrides,
+  };
+}
+
+describe('runDevPipeline', () => {
+  it('resumes a 9.x checkpoint containing voteConditions without conditional task fields (#5969)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pipeline-9x-resume-'));
+    vi.stubEnv('NEXUS_DATA_DIR', dir);
+    try {
+      const sessionId = 'legacy-9x';
+      const checkpointDir = join(dir, 'checkpoints');
+      mkdirSync(checkpointDir);
+      const entries = [
+        { type: 'research', text: 'Saved research' },
+        { type: 'plan', text: 'Saved 9.x plan', iterations: 2 },
+        {
+          type: 'vote',
+          approved: true,
+          conditional: true,
+          conditions: ['Add tests'],
+          caveats: ['Legacy warning'],
+          voteConditions: ['Add tests'],
+          voteCaveats: ['Legacy warning'],
+          voteConditional: true,
+          iterations: 2,
+        },
+      ].map((data) => ({ sessionId, stage: data.type, timestamp: '2026-10-01T00:00:00Z', data }));
+      writeFileSync(
+        join(checkpointDir, `pipeline-${sessionId}.jsonl`),
+        entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n'
+      );
+
+      const stages = createMockStages();
+      const result = await runDevPipeline('Resume feature', stages, { sessionId, mode: 'harness' });
+
+      expect(result.plan).toBe('Saved 9.x plan');
+      expect(result.voteIterations).toBe(2);
+      expect(stages.research).not.toHaveBeenCalled();
+      expect(stages.plan).not.toHaveBeenCalled();
+      expect(stages.vote).not.toHaveBeenCalled();
+      expect(stages.decompose).toHaveBeenCalledWith('Saved 9.x plan', expect.any(AbortSignal));
+      expect(result.tasks).toHaveLength(2);
+      for (const task of result.tasks) {
+        expect(task).not.toHaveProperty('conditions');
+        expect(task).not.toHaveProperty('caveats');
+      }
+      expect(loadCheckpointState(sessionId)).toEqual({
+        research: 'Saved research',
+        plan: 'Saved 9.x plan',
+        voteIterations: 2,
+        tasks: result.tasks,
+        lastCompletedStage: 'decompose',
+      });
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('completes full pipeline when all stages pass', async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(true);
+    expect(result.voteIterations).toBe(1);
+    expect(result.planStatus).toBeUndefined();
+    expect(result.securityPassed).toBe(true);
+    expect(result.tasks).toHaveLength(2);
+    // #6736: each stage call also receives its own abort signal.
+    expect(stages.research).toHaveBeenCalledWith('Build feature X', expect.any(AbortSignal));
+    expect(stages.implement).toHaveBeenCalledTimes(2);
+    expect(stages.qaReview).toHaveBeenCalledTimes(2);
+    // #3258: vote() must receive the research context (not decide blind).
+    expect(stages.vote).toHaveBeenCalledWith(
+      expect.any(String),
+      'Research findings: relevant context gathered',
+      expect.any(AbortSignal)
+    );
+  });
+
+  it('iterates plan when vote rejects then approves', async () => {
+    let callCount = 0;
+    const stages = createMockStages({
+      vote: vi.fn().mockImplementation((): Promise<VoteResult> => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve({
+            kind: 'rejected',
+            feedback: 'Missing error handling',
+            approvalPercentage: 33,
+          });
+        }
+        return Promise.resolve({ kind: 'approved', approvalPercentage: 83 });
+      }),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+    expect(result.voteIterations).toBe(2);
+    expect(stages.plan).toHaveBeenCalledTimes(2);
+    // Second plan call should receive vote feedback
+    const secondCall = vi.mocked(stages.plan).mock.calls[1];
+    expect(secondCall).toBeDefined();
+    expect(secondCall?.[2]).toBe('Missing error handling');
+  });
+
+  it('iterates QA when reviewer rejects then approves', async () => {
+    let qaCallCount = 0;
+    const stages = createMockStages({
+      qaReview: vi.fn().mockImplementation((): Promise<QaReviewResult> => {
+        qaCallCount++;
+        if (qaCallCount === 1) {
+          return Promise.resolve({
+            verdict: 'needs_work',
+            feedback: 'Missing tests',
+            issues: ['No edge case tests'],
+          });
+        }
+        return Promise.resolve({ verdict: 'pass', feedback: 'Fixed', issues: [] });
+      }),
+      decompose: vi.fn().mockResolvedValue([
+        {
+          id: 'task-1',
+          title: 'Task 1',
+          description: 'Do it',
+          assignedTo: 'coder',
+          status: 'pending',
+        },
+      ] satisfies PipelineTask[]),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+    expect(result.qaIterations).toBe(2);
+    expect(stages.implement).toHaveBeenCalledTimes(2);
+  });
+
+  it('carries baseline security evidence into the pipeline result (#7238)', async () => {
+    const comparison = {
+      baseSha: 'a'.repeat(40),
+      baseCount: 7,
+      worktreeCount: 8,
+      introducedBlockingCount: 1,
+      complete: true,
+      errors: [],
+      blockingFindings: [
+        { rule: 'detect-eval', file: 'src/app.ts', startLine: 12, severity: 'high' },
+      ],
+    };
+    const stages = createMockStages({
+      securityScan: vi.fn().mockResolvedValue({
+        passed: false,
+        verdict: 'fail',
+        feedback: 'Introduced eval',
+        comparison,
+      }),
+    });
+    const result = await runDevPipeline('Build feature X', stages);
+    expect(result).toMatchObject({ completed: false, securityComparison: comparison });
+  });
+
+  it('fails when security scan blocks', async () => {
+    const stages = createMockStages({
+      securityScan: vi.fn().mockResolvedValue({
+        passed: false,
+        verdict: 'fail',
+        feedback: 'Critical SQL injection',
+      }),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+    expect(result.completed).toBe(false);
+    expect(result.securityPassed).toBe(false);
+    expect(result.securityRan).toBe(true);
+  });
+
+  it('records a skipped security scan as absent while remaining fail-closed', async () => {
+    const stages = createMockStages({
+      securityScan: vi.fn().mockResolvedValue({
+        passed: false,
+        verdict: 'skip',
+        feedback: 'semgrep not installed',
+      }),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(false);
+    expect(result.securityPassed).toBe(false);
+    expect(result.securityRan).toBe(false);
+    expect(result.securityNote).toContain('semgrep not installed');
+  });
+
+  it('#5645 (a): all tasks QA-rejected + security passes reports completed false and taskStatus none', async () => {
+    const stages = createMockStages({
+      qaReview: vi.fn().mockResolvedValue({
+        verdict: 'reject',
+        feedback: 'Does not meet standards',
+        issues: ['issue 1'],
+      }),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(false);
+    expect(result.taskStatus).toBe('none');
+    expect(result.securityPassed).toBe(true);
+  });
+
+  it('#5645 (b): one of three tasks rejected + security passes reports completed false and taskStatus partial', async () => {
+    const stages = createMockStages({
+      decompose: vi.fn().mockResolvedValue([
+        {
+          id: 'task-1',
+          title: 'Task 1',
+          description: 'Step 1',
+          assignedTo: 'coder',
+          status: 'pending',
+        },
+        {
+          id: 'task-2',
+          title: 'Task 2',
+          description: 'Step 2',
+          assignedTo: 'coder',
+          status: 'pending',
+        },
+        {
+          id: 'task-3',
+          title: 'Task 3',
+          description: 'Step 3',
+          assignedTo: 'coder',
+          status: 'pending',
+        },
+      ]),
+      qaReview: vi.fn().mockImplementation((task: PipelineTask) => {
+        if (task.id === 'task-2') {
+          return Promise.resolve({
+            verdict: 'reject',
+            feedback: 'Bug found',
+            issues: ['bad logic'],
+          });
+        }
+        return Promise.resolve({
+          verdict: 'pass',
+          feedback: 'Looks good',
+          issues: [],
+        });
+      }),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(false);
+    expect(result.taskStatus).toBe('partial');
+    expect(result.securityPassed).toBe(true);
+  });
+
+  it('#5645 (c): all tasks done + security passes reports completed true and taskStatus all_done', async () => {
+    const stages = createMockStages();
+
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(true);
+    expect(result.taskStatus).toBe('all_done');
+    expect(result.securityPassed).toBe(true);
+  });
+
+  it('#5645 (d): all tasks done + security fails reports completed false, taskStatus all_done, and securityPassed false', async () => {
+    const stages = createMockStages({
+      securityScan: vi.fn().mockResolvedValue({
+        passed: false,
+        verdict: 'fail',
+        feedback: 'Critical SQL injection',
+      }),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(false);
+    expect(result.taskStatus).toBe('all_done');
+    expect(result.securityPassed).toBe(false);
+  });
+
+  it('#5645 (e): an implementation that throws for one task reports completed false and taskStatus partial', async () => {
+    const stages = createMockStages({
+      implement: vi.fn().mockImplementation((task: PipelineTask) => {
+        if (task.id === 'task-1') {
+          return Promise.reject(new Error('Syntax error in generated code'));
+        }
+        return Promise.resolve('Code implementation complete');
+      }),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(false);
+    expect(result.taskStatus).toBe('partial');
+    expect(result.securityPassed).toBe(true);
+  });
+
+  it('#5645 empty-plan: zero tasks + security passes reports completed false and taskStatus none', async () => {
+    const stages = createMockStages({
+      decompose: vi.fn().mockResolvedValue([]),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(false);
+    expect(result.taskStatus).toBe('none');
+    expect(result.securityPassed).toBe(true);
+  });
+
+  it('#5575: stops unapproved after max vote iterations without implementing', async () => {
+    const stages = createMockStages({
+      vote: vi.fn().mockResolvedValue({
+        kind: 'rejected',
+        feedback: 'Still not right',
+        approvalPercentage: 40,
+      }),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(false);
+    expect(result.planStatus).toBe('unapproved');
+    expect(result.planVoteApprovalPercentage).toBe(40);
+    expect(result.planVoteFeedback).toBe('Still not right');
+    expect(result.voteIterations).toBe(3);
+    expect(stages.plan).toHaveBeenCalledTimes(3);
+    expect(stages.decompose).not.toHaveBeenCalled();
+    expect(stages.implement).not.toHaveBeenCalled();
+    expect(stages.qaReview).not.toHaveBeenCalled();
+    expect(stages.securityScan).not.toHaveBeenCalled();
+  });
+
+  it('replans and revotes a rejected session whose diagnostics include an exact proposal (#7424)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pipeline-rejected-evidence-'));
+    vi.stubEnv('NEXUS_DATA_DIR', dir);
+    try {
+      const stages = createMockStages({
+        vote: vi.fn().mockResolvedValue({
+          kind: 'rejected',
+          feedback: 'Needs work',
+          approvalPercentage: 0,
+          proposal: 'Exact rejected proposal',
+          voteRecordId: 'vote-evidence-test',
+        }),
+      });
+      const options = { sessionId: 'rejected-evidence-resume', mode: 'harness' as const };
+      const first = await runDevPipeline('Build feature X', stages, options);
+      expect(first.planVoteProposal).toBe('Exact rejected proposal');
+      const checkpoint = loadCheckpointState(options.sessionId);
+      expect(checkpoint?.plan).toBeUndefined();
+      expect(stages.implement).not.toHaveBeenCalled();
+      vi.mocked(stages.plan).mockClear();
+      vi.mocked(stages.vote).mockClear();
+      const resumed = await runDevPipeline('Build feature X', stages, options);
+      expect(resumed.planStatus).toBe('unapproved');
+      expect(stages.plan).toHaveBeenCalled();
+      expect(stages.vote).toHaveBeenCalled();
+      expect(stages.implement).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('#5506: retries the same no_quorum plan separately, then stops without implementing', async () => {
+    const vote = vi.fn().mockResolvedValue({
+      kind: 'no_quorum',
+      reason: 'catfish voter errored',
+      approvalPercentage: 86,
+      voteRecordId: 'vr-no-quorum',
+    } satisfies VoteResult);
+    const stages = createMockStages({ vote });
+
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(false);
+    expect(result.planStatus).toBe('no_quorum');
+    expect(result.planVoteReason).toContain('catfish voter errored');
+    expect(result.planVoteApprovalPercentage).toBe(86);
+    // One plan revision iteration; the initial vote plus two quorum re-runs are separate.
+    expect(result.voteIterations).toBe(1);
+    expect(stages.plan).toHaveBeenCalledTimes(1);
+    expect(stages.plan).toHaveBeenCalledWith(
+      'Build feature X',
+      'Research findings: relevant context gathered',
+      undefined,
+      expect.any(AbortSignal)
+    );
+    expect(vote).toHaveBeenCalledTimes(3);
+    const unchangedPlan = 'Implementation plan: step 1, step 2, step 3';
+    expect(vote).toHaveBeenNthCalledWith(
+      1,
+      unchangedPlan,
+      expect.any(String),
+      expect.any(AbortSignal)
+    );
+    expect(vote).toHaveBeenNthCalledWith(
+      2,
+      unchangedPlan,
+      expect.any(String),
+      expect.any(AbortSignal)
+    );
+    expect(vote).toHaveBeenNthCalledWith(
+      3,
+      unchangedPlan,
+      expect.any(String),
+      expect.any(AbortSignal)
+    );
+    expect(stages.decompose).not.toHaveBeenCalled();
+    expect(stages.implement).not.toHaveBeenCalled();
+    expect(stages.qaReview).not.toHaveBeenCalled();
+    expect(stages.securityScan).not.toHaveBeenCalled();
+  });
+
+  it('honors a caller-supplied vote-iteration cap (#4939)', async () => {
+    // `maxVoteIterations` was advertised by the MCP tool, bounds-checked and
+    // defaulted to 3, and never read — so setting it changed nothing. The
+    // default above proves 3; this proves the knob reaches the loop.
+    const vote = vi.fn().mockResolvedValue({
+      kind: 'rejected',
+      feedback: 'Still not right',
+      approvalPercentage: 40,
+    });
+    const stages = createMockStages({ vote });
+
+    const result = await runDevPipeline('Build feature X', stages, { maxVoteIterations: 1 });
+
+    expect(result.voteIterations).toBe(1);
+    expect(vote).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors a caller-supplied QA-iteration cap (#4939)', async () => {
+    // The sibling of the vote cap, and pinned separately: forwarding the option
+    // from the tool is not the same as the QA loop reading it, and mutating the
+    // loop back to its constant passed every other test.
+    const qaReview = vi
+      .fn()
+      .mockResolvedValue({ verdict: 'rejected', feedback: 'needs work', issues: ['x'] });
+    const stages = createMockStages({ qaReview });
+
+    const result = await runDevPipeline('Build feature X', stages, { maxQaIterations: 1 });
+
+    expect(result.qaIterations).toBeGreaterThan(0);
+    // Two tasks, one QA round each.
+    expect(qaReview).toHaveBeenCalledTimes(2);
+  });
+
+  it('still uses the default cap when none is supplied (#4939)', async () => {
+    // The pair: a hardcoded 1 would satisfy the test above and silently halve
+    // every unconfigured run.
+    const stages = createMockStages({
+      vote: vi.fn().mockResolvedValue({
+        kind: 'rejected',
+        feedback: 'Still not right',
+        approvalPercentage: 40,
+      }),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages, {});
+
+    expect(result.voteIterations).toBe(3);
+  });
+
+  it('passes vote feedback back to plan stage', async () => {
+    const stages = createMockStages({
+      vote: vi
+        .fn()
+        .mockResolvedValueOnce({
+          kind: 'rejected',
+          feedback: 'Add retry logic',
+          approvalPercentage: 33,
+        })
+        .mockResolvedValueOnce({ kind: 'approved', approvalPercentage: 83 }),
+    });
+
+    await runDevPipeline('Build feature X', stages);
+    const planCalls = vi.mocked(stages.plan).mock.calls;
+    expect(planCalls[0]?.[2]).toBeUndefined(); // First call: no prior feedback
+    expect(planCalls[1]?.[2]).toBe('Add retry logic'); // Second call: has feedback
+  });
+
+  // #4772: found by running the same dry run twice — one planned well, one's
+  // planner returned nothing, and both produced identical result envelopes. The
+  // plan stage used to substitute the PROMPT when the model returned empty, so
+  // the vote (and then decompose) ran against the input text as if it were a plan.
+  it('reports planStatus empty when the planner returns nothing, and does not vote', async () => {
+    const stages = createMockStages({
+      plan: vi.fn().mockResolvedValue(''),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages, { dryRun: true });
+
+    expect(result.planStatus).toBe('empty');
+    expect(result.plan).toBe('');
+    // Both markers: stopped by request AND produced nothing. A consumer needs
+    // the pair to tell an honest dry run from one whose planner failed.
+    expect(result.dryRun).toBe(true);
+    // Voting on an empty plan wastes a panel and yields a verdict about no
+    // proposal — the loop must stop before it.
+    expect(stages.vote).not.toHaveBeenCalled();
+  });
+
+  it('stops after plan+vote in dryRun mode (#1717)', async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages, { dryRun: true });
+
+    expect(result.completed).toBe(false);
+    expect(result.plan).toBeDefined();
+    expect(result.tasks).toHaveLength(0);
+    expect(result.qaIterations).toBe(0);
+    expect(result.securityPassed).toBe(false);
+    // #4772: `securityPassed: false` here means the gate never ran, not that it
+    // rejected. Without this the two are indistinguishable to a caller.
+    expect(result.securityRan).toBe(false);
+    // #4806: and says WHY completion is false. Without this marker a consumer
+    // reading `completed` cannot tell "stopped as asked" from "failed", and
+    // `run`'s engine-failure check reported a successful dry run as a fault.
+    expect(result.dryRun).toBe(true);
+    // A real plan came back, so no failure marker.
+    expect(result.planStatus).toBeUndefined();
+    // Should NOT have called decompose, implement, qa, or security
+    expect(stages.decompose).not.toHaveBeenCalled();
+    expect(stages.implement).not.toHaveBeenCalled();
+    expect(stages.qaReview).not.toHaveBeenCalled();
+    expect(stages.securityScan).not.toHaveBeenCalled();
+  });
+
+  // #7181: a dry run's whole product is the plan and its verdict, and the
+  // verdict reached only the ledger and the logs.
+  it('carries the plan vote outcome and record id in a dry run', async () => {
+    const stages = createMockStages({
+      vote: vi
+        .fn()
+        .mockResolvedValue({ kind: 'approved', approvalPercentage: 66.7, voteRecordId: 'vr-1' }),
+    });
+    const result = await runDevPipeline('Build feature X', stages, { dryRun: true });
+
+    expect(result.planVoteDecision).toBe('approved');
+    expect(result.planVoteApprovalPercentage).toBe(66.7);
+    expect(result.planVoteRecordId).toBe('vr-1');
+  });
+
+  it('omits the record id when the vote persisted none, rather than inventing one', async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages, { dryRun: true });
+
+    expect(result.planVoteDecision).toBe('approved');
+    expect(result.planVoteApprovalPercentage).toBe(83);
+    expect(result).not.toHaveProperty('planVoteRecordId');
+  });
+
+  it('carries the final rejected verdict when a dry run exhausts its revisions', async () => {
+    const stages = createMockStages({
+      vote: vi.fn().mockResolvedValue({
+        kind: 'rejected',
+        feedback: 'No',
+        approvalPercentage: 20,
+        voteRecordId: 'vr-r',
+      }),
+    });
+    const result = await runDevPipeline('Build feature X', stages, { dryRun: true });
+
+    expect(result.planStatus).toBe('unapproved');
+    expect(result.planVoteDecision).toBe('rejected');
+    expect(result.planVoteRecordId).toBe('vr-r');
+  });
+
+  it.each([true, false])(
+    '#7250: omits unmeasured approval when the real vote stage crashes (dryRun=%s)',
+    async (dryRun) => {
+      const executeVoting = vi
+        .spyOn(consensusVote, 'executeVoting')
+        .mockRejectedValue(new Error('Adapters down'));
+      const stages = createMockStages({
+        vote: createVoteStage({ config: {}, guard: createBudgetGuard(), startStage: vi.fn() }),
+      });
+
+      const result = await runDevPipeline('Build feature X', stages, { dryRun });
+      const output = buildStructuredOutput(result, false);
+
+      expect(executeVoting).toHaveBeenCalledTimes(3);
+      expect(result).toMatchObject({
+        completed: false,
+        planStatus: 'no_quorum',
+        planVoteDecision: 'no_quorum',
+        planVoteReason: expect.stringContaining('Adapters down'),
+      });
+      expect(result).not.toHaveProperty('planVoteApprovalPercentage');
+      expect(result).not.toHaveProperty('planVoteRecordId');
+      expect(output).not.toHaveProperty('planVoteApprovalPercentage');
+      expect(output['planVoteReason']).toContain('Adapters down');
+      expect(stages.implement).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([true, false])('#7250: omits approval when no vote ran (dryRun=%s)', async (dryRun) => {
+    const stages = createMockStages();
+
+    const result = await runDevPipeline('Build feature X', stages, {
+      dryRun,
+      maxVoteIterations: 0,
+    });
+
+    expect(result).toMatchObject({
+      completed: false,
+      planStatus: 'unapproved',
+      planVoteFeedback: 'No plan vote was run',
+    });
+    expect(result).not.toHaveProperty('planVoteApprovalPercentage');
+    expect(result).not.toHaveProperty('planVoteDecision');
+    expect(buildStructuredOutput(result, false)).not.toHaveProperty('planVoteApprovalPercentage');
+    expect(stages.vote).not.toHaveBeenCalled();
+    expect(stages.implement).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 67])('#7250: keeps measured %s%% approval for a recorded no_quorum', async (pct) => {
+    const stages = createMockStages({
+      vote: vi.fn().mockResolvedValue({
+        kind: 'no_quorum',
+        reason: 'Missing voter',
+        approvalPercentage: pct,
+        voteRecordId: 'vr-measured',
+      } satisfies VoteResult),
+    });
+
+    const result = await runDevPipeline('Build feature X', stages, { dryRun: true });
+    const evidence = {
+      completed: false,
+      planStatus: 'no_quorum',
+      planVoteDecision: 'no_quorum',
+      planVoteReason: 'Missing voter',
+      planVoteApprovalPercentage: pct,
+      planVoteRecordId: 'vr-measured',
+    };
+
+    expect(result).toMatchObject(evidence);
+    expect(buildStructuredOutput(result, false)).toMatchObject(evidence);
+    expect(stages.implement).not.toHaveBeenCalled();
+  });
+
+  it('leaves a full run result without the dry-run vote fields', async () => {
+    const stages = createMockStages({
+      vote: vi
+        .fn()
+        .mockResolvedValue({ kind: 'approved', approvalPercentage: 83, voteRecordId: 'vr-2' }),
+    });
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(result.completed).toBe(true);
+    expect(result).not.toHaveProperty('planVoteDecision');
+    expect(result).not.toHaveProperty('planVoteRecordId');
+    expect(result).not.toHaveProperty('planVoteApprovalPercentage');
+  });
+
+  it('returns tasks for external implementation in harness mode (#1704)', async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages, { mode: 'harness' });
+
+    expect(result.completed).toBe(false);
+    expect(result.plan).toBeDefined();
+    // Harness mode includes decomposed tasks but no implementations
+    expect(result.tasks).toHaveLength(2);
+    expect(result.tasks[0]?.status).toBe('pending');
+    expect(result.qaIterations).toBe(0);
+    // decompose SHOULD have been called, but implement/qa/security should NOT
+    expect(stages.decompose).toHaveBeenCalled();
+    expect(stages.implement).not.toHaveBeenCalled();
+    expect(stages.qaReview).not.toHaveBeenCalled();
+    expect(stages.securityScan).not.toHaveBeenCalled();
+    // #4782: harness mode hands tasks back for someone else to build, so the
+    // scan cannot have run. Without this the envelope is byte-identical to a
+    // real security rejection.
+    expect(result.securityRan).toBe(false);
+  });
+});
+
+describe('runDevPipeline — hindsight seam into dev-pipeline-context (#3257, #1720)', () => {
+  // The recall/format cases live in dev-pipeline-context.test.ts (#6148). These
+  // cases prove the pipeline still calls both sides of the sibling module.
+  it('injects recalled prior beliefs into the plan + vote context, keyed on the task', async () => {
+    const task = 'Build feature X';
+    const records = [
+      makeHindsightRecord({
+        actualOutcome: 'Incomplete: 3 vote iterations, 0 QA iterations',
+        lessons: ['Pipeline did not complete — review plan approach for: Build feature X'],
+      }),
+    ];
+    const getHindsightRecords = vi.fn().mockResolvedValue(ok(records));
+    const beliefMemory = createBeliefMemoryStub({ getHindsightRecords });
+    const stages = createMockStages();
+
+    await runDevPipeline(task, stages, { beliefMemory });
+
+    // The recall is keyed on the task-stable id the write side uses.
+    expect(getHindsightRecords).toHaveBeenCalledWith(task.slice(0, 40));
+
+    // Plan stage receives a clearly-labeled prior-belief block in its research context.
+    const planResearch = vi.mocked(stages.plan).mock.calls[0]?.[1] ?? '';
+    expect(planResearch).toContain('Prior beliefs from past outcomes');
+    expect(planResearch).toContain('review plan approach');
+    // Original research still present.
+    expect(planResearch).toContain('Research findings: relevant context gathered');
+
+    // Vote stage also sees the same context (informed voting).
+    const voteResearch = vi.mocked(stages.vote).mock.calls[0]?.[1] ?? '';
+    expect(voteResearch).toContain('Prior beliefs from past outcomes');
+  });
+
+  it('writes a task-keyed hindsight record with the actual outcome after the run', async () => {
+    const task = 'Build feature X';
+    const applyHindsight = vi.fn().mockResolvedValue(ok([]));
+    const beliefMemory = createBeliefMemoryStub({ applyHindsight });
+    const stages = createMockStages();
+
+    const result = await runDevPipeline(task, stages, { beliefMemory });
+
+    expect(result.completed).toBe(true);
+    expect(applyHindsight).toHaveBeenCalledTimes(1);
+    const record = applyHindsight.mock.calls[0]?.[0] as HindsightRecord;
+    expect(record.taskId).toBe(task.slice(0, 40));
+    expect(record.outcomeMatched).toBe(true);
+    expect(record.actualOutcome).toBe('Completed: 2 tasks, security passed');
+  });
+
+  it('leaves the plan context unchanged when no beliefMemory is supplied', async () => {
+    const stages = createMockStages();
+    await runDevPipeline('Build feature X', stages);
+
+    const planResearch = vi.mocked(stages.plan).mock.calls[0]?.[1] ?? '';
+    expect(planResearch).toBe('Research findings: relevant context gathered');
+    expect(planResearch).not.toContain('Prior beliefs');
+  });
+});
+
+describe('runDevPipeline — quality gate (#3356)', () => {
+  // The gate executes repository scripts only for an explicitly Tier 1 plan.
+  const trustedGateOptions = {
+    trustTier: '1',
+    sourceTrustTier: '1',
+    researchOverride: 'Operator plan',
+  } as const;
+
+  it("does NOT run the quality gate when mode is 'off' (default)", async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages);
+
+    expect(stages.qualityGate).not.toHaveBeenCalled();
+    // Off must not affect ship outcome — security still gates as before.
+    expect(result.completed).toBe(true);
+    expect(result.securityPassed).toBe(true);
+  });
+
+  it("does NOT run the quality gate when explicitly 'off'", async () => {
+    const stages = createMockStages({
+      qualityGate: vi.fn().mockResolvedValue({ passed: false, feedback: 'tsc failed' }),
+    });
+    const result = await runDevPipeline('Build feature X', stages, { qualityGate: 'off' });
+
+    expect(stages.qualityGate).not.toHaveBeenCalled();
+    expect(result.completed).toBe(true);
+  });
+
+  it("runs the gate but does NOT fail the pipeline on a red gate in 'advisory' mode", async () => {
+    const stages = createMockStages({
+      qualityGate: vi.fn().mockResolvedValue({ passed: false, feedback: '2 check(s) failed' }),
+    });
+    const result = await runDevPipeline('Build feature X', stages, {
+      ...trustedGateOptions,
+      qualityGate: 'advisory',
+    });
+
+    expect(stages.qualityGate).toHaveBeenCalledTimes(1);
+    // Advisory: red gate recorded but does not block — security still runs and passes.
+    expect(stages.securityScan).toHaveBeenCalledTimes(1);
+    expect(result.completed).toBe(true);
+    expect(result.securityPassed).toBe(true);
+  });
+
+  it("runs the gate and ships when it passes in 'advisory' mode", async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages, {
+      ...trustedGateOptions,
+      qualityGate: 'advisory',
+    });
+
+    expect(stages.qualityGate).toHaveBeenCalledTimes(1);
+    expect(result.completed).toBe(true);
+  });
+
+  it("fails the phase on a red gate in 'blocking' mode and skips security", async () => {
+    const stages = createMockStages({
+      qualityGate: vi.fn().mockResolvedValue({ passed: false, feedback: 'lint failed' }),
+    });
+    const result = await runDevPipeline('Build feature X', stages, {
+      ...trustedGateOptions,
+      qualityGate: 'blocking',
+    });
+
+    expect(stages.qualityGate).toHaveBeenCalledTimes(1);
+    // Blocking red gate short-circuits before the security scan, like a security block.
+    expect(stages.securityScan).not.toHaveBeenCalled();
+    expect(result.completed).toBe(false);
+    expect(result.securityPassed).toBe(false);
+    // #4782: the gate short-circuited BEFORE the scan, so `securityPassed:
+    // false` here is absence, not a verdict.
+    expect(result.securityRan).toBe(false);
+    // Implementations still happened before the gate.
+    expect(result.tasks).toHaveLength(2);
+  });
+
+  it.each([
+    {
+      feedback: 'Typecheck failed: missing return type',
+      expected: 'Typecheck failed: missing return type',
+    },
+    { feedback: 'Lint failed: unused declaration', expected: 'Lint failed: unused declaration' },
+    { feedback: '', expected: 'no diagnostic feedback' },
+    { feedback: ' \n ', expected: 'no diagnostic feedback' },
+  ])(
+    'preserves a measured blocking diagnostic in the result and MCP detail (#7407): $expected',
+    async ({ feedback, expected }) => {
+      const stages = createMockStages({
+        qualityGate: vi.fn().mockResolvedValue({ passed: false, verdict: 'fail', feedback }),
+      });
+      const result = await runDevPipeline('Build feature X', stages, {
+        ...trustedGateOptions,
+        qualityGate: 'blocking',
+      });
+      expect(stages.qualityGate).toHaveBeenCalledTimes(1);
+      expect(stages.securityScan).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        completed: false,
+        securityRan: false,
+        taskStatus: 'all_done',
+      });
+      expect(result.warnings).toEqual([`Quality gate failed: ${expected}`]);
+      expect(buildStructuredOutput(result, false)['warnings']).toEqual(result.warnings);
+    }
+  );
+
+  it('preserves workspace warnings after the measured blocking cause (#7407)', async () => {
+    const stages = createMockStages({
+      qualityGate: vi
+        .fn()
+        .mockResolvedValue({ passed: false, verdict: 'fail', feedback: 'lint failed' }),
+      implementWorkspace: { accessMode: 'workspace-edit', directory: process.cwd() },
+    });
+    const result = await runDevPipeline('Build feature X', stages, {
+      ...trustedGateOptions,
+      qualityGate: 'blocking',
+    });
+    expect(result.warnings).toHaveLength(2);
+    expect(result.warnings?.[0]).toBe('Quality gate failed: lint failed');
+    expect(result.warnings?.[1]).toContain('executed by the gate');
+    expect(stages.securityScan).not.toHaveBeenCalled();
+  });
+
+  it('sanitizes measured gate feedback before adding it to structured warnings (#7407)', async () => {
+    const stages = createMockStages({
+      qualityGate: vi.fn().mockResolvedValue({
+        passed: false,
+        verdict: 'fail',
+        feedback: `Lint failed: ${FAKE_ANTHROPIC_KEY}; ${FAKE_PASSWORD}`,
+      }),
+    });
+    const result = await runDevPipeline('Build feature X', stages, {
+      ...trustedGateOptions,
+      qualityGate: 'blocking',
+    });
+    const detail = JSON.stringify(buildStructuredOutput(result, false));
+    expect(detail).toContain('Quality gate failed: Lint failed:');
+    expect(detail).toContain('[REDACTED');
+    expect(detail).not.toContain(FAKE_ANTHROPIC_KEY);
+    expect(detail).not.toContain(FAKE_PASSWORD.split('=')[1]);
+  });
+
+  it('retains the unmeasured skip diagnostic without relabeling it as a failed gate (#7407)', async () => {
+    const stages = createMockStages({
+      qualityGate: vi.fn().mockResolvedValue({
+        passed: false,
+        verdict: 'skip',
+        feedback: 'Gate unmeasured: dependency install unavailable',
+      }),
+    });
+    const result = await runDevPipeline('Build feature X', stages, {
+      ...trustedGateOptions,
+      qualityGate: 'blocking',
+    });
+    expect(result.warnings).toEqual(['Gate unmeasured: dependency install unavailable']);
+    expect(result.completed).toBe(false);
+    expect(stages.qualityGate).toHaveBeenCalledTimes(1);
+    expect(stages.securityScan).not.toHaveBeenCalled();
+  });
+
+  it("proceeds to ship on a green gate in 'blocking' mode", async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages, {
+      ...trustedGateOptions,
+      qualityGate: 'blocking',
+    });
+
+    expect(stages.qualityGate).toHaveBeenCalledTimes(1);
+    expect(stages.securityScan).toHaveBeenCalledTimes(1);
+    // #4782: the one path where the scan DID run must say so.
+    expect(result.securityRan).toBe(true);
+    expect(result.completed).toBe(true);
+  });
+
+  it("skips the gate gracefully when stages.qualityGate is absent even if mode is 'blocking'", async () => {
+    const stages = createMockStages();
+    delete stages.qualityGate;
+    const result = await runDevPipeline('Build feature X', stages, { qualityGate: 'blocking' });
+
+    // No gate supplied → skipped → does not block ship.
+    expect(stages.securityScan).toHaveBeenCalledTimes(1);
+    expect(result.completed).toBe(true);
+  });
+});
+
+// ============================================================================
+// #3643 — fail-closed untrusted-input boundary for the IMPLEMENT phase.
+// ============================================================================
+
+describe('runDevPipeline — untrusted-input boundary (#3643)', () => {
+  it('calls the guard before research; a throwing guard aborts and never reads untrusted input', async () => {
+    const stages = createMockStages();
+    const guard = vi.fn(() => {
+      throw new Error('untrusted-input denied in this phase');
+    });
+
+    await expect(
+      runDevPipeline('Remediate X', stages, { untrustedInputGuard: guard })
+    ).rejects.toThrow(/untrusted-input denied/);
+
+    expect(guard).toHaveBeenCalledTimes(1);
+    expect(stages.research).not.toHaveBeenCalled(); // fail-closed: no untrusted read
+  });
+
+  it('researchOverride runs plan-only — research stage is never called, guard not tripped', async () => {
+    const stages = createMockStages();
+    const guard = vi.fn();
+
+    const result = await runDevPipeline('Remediate X', stages, {
+      researchOverride: 'Plan-only research seeded from the typed RemediationPlan.',
+      untrustedInputGuard: guard,
+    });
+
+    expect(stages.research).not.toHaveBeenCalled(); // no fresh untrusted read
+    expect(guard).not.toHaveBeenCalled(); // override path skips the chokepoint
+    expect(result.completed).toBe(true);
+  });
+
+  it('does not affect normal runs (no guard, no override)', async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages);
+    expect(stages.research).toHaveBeenCalledTimes(1);
+    expect(result.completed).toBe(true);
+  });
+});
+
+describe('runDevPipeline — CapabilityLedger integration (#3643 ship-blocking)', () => {
+  it('IMPLEMENT-phase ledger fail-closes a fresh untrusted read in the dev-pipeline', async () => {
+    const { CapabilityLedger, untrustedInputGuardFor, RuleOfTwoViolation } =
+      await import('../mcp/tools/improvement-remediation-capability.js');
+    const ledger = new CapabilityLedger();
+    ledger.enterPhase('implement'); // write+secrets, NO untrusted-input
+    const stages = createMockStages();
+
+    await expect(
+      runDevPipeline('Remediate X', stages, {
+        untrustedInputGuard: untrustedInputGuardFor(ledger),
+      })
+    ).rejects.toBeInstanceOf(RuleOfTwoViolation);
+    expect(stages.research).not.toHaveBeenCalled();
+  });
+
+  it('IMPLEMENT phase runs plan-only via renderPlanAsResearch with no untrusted read', async () => {
+    const { CapabilityLedger, untrustedInputGuardFor, renderPlanAsResearch, parseRemediationPlan } =
+      await import('../mcp/tools/improvement-remediation-capability.js');
+    const ledger = new CapabilityLedger();
+    ledger.enterPhase('implement');
+    const plan = parseRemediationPlan({
+      signalKey: 'tech-debt:fitness-below-floor',
+      category: 'tech-debt',
+      summary: 'Restore the regressed dimension.',
+      steps: [{ kind: 'add-test', description: 'cover the regressed path' }],
+    });
+    const stages = createMockStages();
+
+    const result = await runDevPipeline('Remediate X', stages, {
+      researchOverride: renderPlanAsResearch(plan),
+      untrustedInputGuard: untrustedInputGuardFor(ledger),
+    });
+
+    expect(stages.research).not.toHaveBeenCalled();
+    expect(result.completed).toBe(true);
+  });
+
+  it('RESEARCH-phase ledger permits the untrusted read', async () => {
+    const { CapabilityLedger, untrustedInputGuardFor } =
+      await import('../mcp/tools/improvement-remediation-capability.js');
+    const ledger = new CapabilityLedger();
+    ledger.enterPhase('research'); // untrusted-input + secrets granted
+    const stages = createMockStages();
+
+    const result = await runDevPipeline('Diagnose X', stages, {
+      untrustedInputGuard: untrustedInputGuardFor(ledger),
+    });
+
+    expect(stages.research).toHaveBeenCalledTimes(1);
+    expect(result.completed).toBe(true);
+  });
+});
+
+// ============================================================================
+// Consensus → execute policy gate (#3704)
+// ============================================================================
+
+describe('runDevPipeline — consensus→execute policy gate (#3704)', () => {
+  /** Captures policy.evaluated gate ids emitted on the shared pipeline bus. */
+  function capturePolicyEvents(): { events: string[]; off: () => void } {
+    const events: string[] = [];
+    const off = getPipelineEventBus().subscribe({ type: 'policy.evaluated' }, (e) => {
+      if (e.type === 'policy.evaluated') events.push(e.gateId);
+    });
+    return { events, off };
+  }
+
+  afterEach(() => {
+    delete process.env['NEXUS_POLICY_GATE_MODE'];
+  });
+
+  it('(a) WARN default + missing-trustTier violation: emits policy.evaluated then PROCEEDS to decompose', async () => {
+    // No NEXUS_POLICY_GATE_MODE → defaults to WARN. The default engine's
+    // trust-tier rule denies an execute stage with no trustTier (fail-closed).
+    const cap = capturePolicyEvents();
+    const stages = createMockStages();
+    try {
+      const result = await runDevPipeline('Build feature X', stages);
+      // Execution proceeds despite the violation (WARN never halts).
+      expect(stages.decompose).toHaveBeenCalledTimes(1);
+      expect(result.completed).toBe(true);
+      // The violation was emitted for audit.
+      expect(cap.events.some((g) => g.startsWith('consensus-to-execute:'))).toBe(true);
+    } finally {
+      cap.off();
+    }
+  });
+
+  it('(b) block mode + untrusted: emits policy.evaluated, then THROWS PolicyBlockedError; decompose NOT called', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'block';
+    const cap = capturePolicyEvents();
+    const stages = createMockStages();
+    try {
+      await expect(runDevPipeline('Build feature X', stages)).rejects.toBeInstanceOf(
+        PolicyBlockedError
+      );
+      expect(stages.decompose).not.toHaveBeenCalled();
+      expect(cap.events.some((g) => g.startsWith('consensus-to-execute:'))).toBe(true);
+    } finally {
+      cap.off();
+    }
+  });
+
+  it('(e) emit-before-throw: in block mode the policy.evaluated event is captured BEFORE the throw is observed', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'block';
+    const stages = createMockStages();
+    // Record whether the audit event had already been emitted at the instant
+    // the PolicyBlockedError surfaces. If emit ran AFTER the throw, this would
+    // be false — the assertion pins the ordering, not just eventual presence.
+    let emittedBeforeThrow = false;
+    const off = getPipelineEventBus().subscribe({ type: 'policy.evaluated' }, () => {
+      emittedBeforeThrow = true;
+    });
+    try {
+      await runDevPipeline('Build feature X', stages);
+      throw new Error('expected PolicyBlockedError');
+    } catch (e: unknown) {
+      expect(e).toBeInstanceOf(PolicyBlockedError);
+      expect(emittedBeforeThrow).toBe(true);
+    } finally {
+      off();
+    }
+  });
+
+  it('(c) off mode: skips evaluation entirely — no policy.evaluated, proceeds', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'off';
+    const cap = capturePolicyEvents();
+    const stages = createMockStages();
+    try {
+      const result = await runDevPipeline('Build feature X', stages);
+      expect(stages.decompose).toHaveBeenCalledTimes(1);
+      expect(result.completed).toBe(true);
+      expect(cap.events).toHaveLength(0);
+    } finally {
+      cap.off();
+    }
+  });
+
+  it('(d) clean plan (no violations): proceeds to decompose, no policy.evaluated emitted', async () => {
+    // Stub the default engine to one with no denying rules so the verdict is a
+    // genuine allow (the built-in trust-tier rule always denies a tier-less
+    // execute stage, so an empty rule set models a clean plan).
+    const mod = await import('./policy-engine.js');
+    const spy = vi.spyOn(mod, 'createDefaultPolicyEngine').mockReturnValue(new mod.PolicyEngine());
+    const cap = capturePolicyEvents();
+    const stages = createMockStages();
+    try {
+      const result = await runDevPipeline('Build feature X', stages);
+      expect(stages.decompose).toHaveBeenCalledTimes(1);
+      expect(result.completed).toBe(true);
+      expect(cap.events).toHaveLength(0);
+    } finally {
+      cap.off();
+      spy.mockRestore();
+    }
+  });
+
+  it('(f) missing-trustTier under WARN continues (does NOT halt)', async () => {
+    // Explicit WARN — the gate evaluates, the trust-tier rule denies (no
+    // trustTier in dev-pipeline metadata), yet the run completes.
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages);
+    expect(stages.decompose).toHaveBeenCalledTimes(1);
+    expect(result.completed).toBe(true);
+  });
+
+  it('(g) dry run short-circuits BEFORE the gate (no policy.evaluated)', async () => {
+    // The gate sits after the dryRun short-circuit, so a dry run never evaluates
+    // policy and never reaches decompose.
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'block';
+    const cap = capturePolicyEvents();
+    const stages = createMockStages();
+    try {
+      const result = await runDevPipeline('Build feature X', stages, { dryRun: true });
+      expect(stages.decompose).not.toHaveBeenCalled();
+      expect(result.completed).toBe(false);
+      expect(cap.events).toHaveLength(0);
+    } finally {
+      cap.off();
+    }
+  });
+});
+
+describe('runDevPipeline — trustTier threading into the policy snapshot (#3712)', () => {
+  afterEach(() => {
+    delete process.env['NEXUS_POLICY_GATE_MODE'];
+  });
+
+  it('absent trustTier (undefined) under block mode → THROWS (fail-closed, tier 4)', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'block';
+    const stages = createMockStages();
+    // No trustTier option → seam behaves as before (#3704): untrusted default.
+    await expect(runDevPipeline('Build feature X', stages)).rejects.toBeInstanceOf(
+      PolicyBlockedError
+    );
+    expect(stages.decompose).not.toHaveBeenCalled();
+  });
+
+  // A caller-only run: `researchOverride` supplies the research text, so no
+  // external source feeds the run (#6751).
+  const CALLER_ONLY = { researchOverride: 'caller-supplied research' } as const;
+
+  it("caller '1' + declared '1', caller-only content, under block mode → COMPLETES (#6795)", async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'block';
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages, {
+      ...CALLER_ONLY,
+      trustTier: '1',
+      sourceTrustTier: '1',
+    });
+    expect(stages.research).not.toHaveBeenCalled();
+    expect(stages.decompose).toHaveBeenCalledTimes(1);
+    expect(result.completed).toBe(true);
+  });
+
+  it("caller '1' with NO declaration, caller-only content, under block mode → THROWS (#6795)", async () => {
+    // The task text's provenance is unknown, so it is Tier 3 even from a
+    // tier-1 caller: the gate escalates as it did before.
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'block';
+    const stages = createMockStages();
+    await expect(
+      runDevPipeline('Build feature X', stages, { ...CALLER_ONLY, trustTier: '1' })
+    ).rejects.toBeInstanceOf(PolicyBlockedError);
+    expect(stages.decompose).not.toHaveBeenCalled();
+  });
+
+  it("untrusted trustTier '3' under block mode → THROWS (rule blocks tier>=3 on execute)", async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'block';
+    const stages = createMockStages();
+    await expect(
+      runDevPipeline('Build feature X', stages, { ...CALLER_ONLY, trustTier: '3' })
+    ).rejects.toBeInstanceOf(PolicyBlockedError);
+    expect(stages.decompose).not.toHaveBeenCalled();
+  });
+
+  it("trusted trustTier '1' under WARN default → completes without halting", async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages, { trustTier: '1' });
+    expect(stages.decompose).toHaveBeenCalledTimes(1);
+    expect(result.completed).toBe(true);
+  });
+});
+
+describe('runDevPipeline — content tier, not caller tier, reaches the policy gate (#6751)', () => {
+  /** Replace the default engine with one rule that records the tier it sees. */
+  async function captureGateTier(): Promise<{
+    seen: unknown[];
+    snapshots: PipelineStateSnapshot[];
+    restore: () => void;
+  }> {
+    const mod = await import('./policy-engine.js');
+    const seen: unknown[] = [];
+    const snapshots: PipelineStateSnapshot[] = [];
+    const engine = new mod.PolicyEngine();
+    engine.registerRule({
+      id: 'capture-tier',
+      priority: 1,
+      evaluate(context) {
+        seen.push(context.pipelineState.trustTier);
+        snapshots.push(context.pipelineState);
+        return { allow: true };
+      },
+    });
+    const spy = vi.spyOn(mod, 'createDefaultPolicyEngine').mockReturnValue(engine);
+    return {
+      seen,
+      snapshots,
+      restore: () => {
+        spy.mockRestore();
+      },
+    };
+  }
+
+  afterEach(() => {
+    delete process.env['NEXUS_POLICY_GATE_MODE'];
+  });
+
+  it("fresh research from the external stage reaches the gate as tier '3' for a tier-1 caller", async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const cap = await captureGateTier();
+    try {
+      const stages = createMockStages();
+      await runDevPipeline('Build feature X', stages, { trustTier: '1' });
+      expect(stages.research).toHaveBeenCalledTimes(1);
+      expect(cap.seen).toEqual(['3']);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("a caller-only run (researchOverride) declared '1' by a tier-1 caller reaches the gate as '1'", async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const cap = await captureGateTier();
+    try {
+      const stages = createMockStages();
+      await runDevPipeline('Build feature X', stages, {
+        trustTier: '1',
+        sourceTrustTier: '1',
+        researchOverride: 'caller-supplied research',
+      });
+      expect(stages.research).not.toHaveBeenCalled();
+      expect(cap.seen).toEqual(['1']);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("an omitted declaration makes a tier-1 caller's own task text tier '3' (#6795)", async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const cap = await captureGateTier();
+    try {
+      await runDevPipeline('Build feature X', createMockStages(), {
+        trustTier: '1',
+        researchOverride: 'caller-supplied research',
+      });
+      expect(cap.seen).toEqual(['3']);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("declared '1' with a fresh research source still reaches the gate as '3' (#6795)", async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const cap = await captureGateTier();
+    try {
+      const stages = createMockStages();
+      await runDevPipeline('Build feature X', stages, { trustTier: '1', sourceTrustTier: '1' });
+      expect(stages.research).toHaveBeenCalledTimes(1);
+      expect(cap.seen).toEqual(['3']);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('a declaration above the caller tier is clamped, and the snapshot records it (#6795)', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const cap = await captureGateTier();
+    try {
+      await runDevPipeline('Build feature X', createMockStages(), {
+        trustTier: '2',
+        sourceTrustTier: '1',
+        researchOverride: 'caller-supplied research',
+      });
+      expect(cap.seen).toEqual(['2']);
+      expect(cap.snapshots[0]?.trustProvenance).toEqual({
+        callerTier: '2',
+        declaredSourceTier: '1',
+        taskContentTier: '2',
+        declarationClamped: true,
+        sourceTiers: [],
+        contentTier: '2',
+      });
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('an unmeasured caller keeps the gate tier absent but still records the declaration (#6795)', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const cap = await captureGateTier();
+    try {
+      await runDevPipeline('Build feature X', createMockStages(), {
+        sourceTrustTier: '1',
+        researchOverride: 'caller-supplied research',
+      });
+      expect(cap.seen).toEqual([undefined]);
+      expect(cap.snapshots[0]?.trustProvenance?.declaredSourceTier).toBe('1');
+      expect(cap.snapshots[0]?.trustProvenance?.callerTier).toBeUndefined();
+      // Nothing measured vouches for the declaration: capped at 3, recorded.
+      expect(cap.snapshots[0]?.trustProvenance?.taskContentTier).toBe('3');
+      expect(cap.snapshots[0]?.trustProvenance?.declarationClamped).toBe(true);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('the debug log records the declaration and the measured caller tier (#6795)', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const previousLevel = getGlobalLogLevel();
+    setGlobalLogLevel('debug');
+    const lines: string[] = [];
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try {
+      await runDevPipeline('Build feature X', createMockStages(), {
+        trustTier: '1',
+        sourceTrustTier: '2',
+        researchOverride: 'caller-supplied research',
+      });
+    } finally {
+      write.mockRestore();
+      setGlobalLogLevel(previousLevel);
+    }
+    const entry = lines
+      .filter((line) => line.includes('Consensus→execute content trust tier'))
+      .map((line) => JSON.parse(line) as { message?: string; context?: Record<string, unknown> })
+      .find((e) => e.message === 'Consensus→execute content trust tier');
+    expect(entry).toBeDefined();
+    expect(entry?.context).toMatchObject({
+      callerTier: '1',
+      declaredSourceTier: '2',
+      declarationClamped: false,
+      contentTier: '2',
+    });
+  });
+
+  it("a less-trusted caller is never upgraded by the research tier (caller '4' stays '4')", async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const cap = await captureGateTier();
+    try {
+      await runDevPipeline('Build feature X', createMockStages(), { trustTier: '4' });
+      expect(cap.seen).toEqual(['4']);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('fresh research under block mode blocks a tier-1 caller at consensus→execute', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'block';
+    const stages = createMockStages();
+    await expect(
+      runDevPipeline('Build feature X', stages, { trustTier: '1' })
+    ).rejects.toBeInstanceOf(PolicyBlockedError);
+    expect(stages.decompose).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// Durable policy-audit persistence (#3710)
+// ============================================================================
+
+describe('runDevPipeline — durable policy-audit persistence (#3710)', () => {
+  function hashChainConfig(): AuditLogConfig {
+    return {
+      logDir: '/tmp/nexus-audit-3710', // unused by InMemoryAuditStorage
+      filePrefix: 'test',
+      maxFileSizeBytes: 1024,
+      maxFiles: 3,
+      flushIntervalMs: 100,
+      minSeverity: 'info',
+      enableHashChain: true,
+      enableCompression: false,
+      maxQueueDepth: 10_000,
+    };
+  }
+
+  afterEach(() => {
+    delete process.env['NEXUS_POLICY_GATE_MODE'];
+  });
+
+  it('warn-mode violation → a verifiable hash-chain entry (verifyChain passes)', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const storage = new InMemoryAuditStorage();
+    const auditLogger = new AuditLogger(hashChainConfig(), storage);
+    const stages = createMockStages();
+
+    // Missing trustTier → trust-tier rule denies the execute stage (warn: continues).
+    const result = await runDevPipeline('Build feature X', stages, { auditLogger });
+    await auditLogger.flush();
+
+    expect(result.completed).toBe(true);
+    const events = storage.getAll();
+    const policyGate = events.filter((e) => e.action === 'security.policy_gate');
+    // #3727: one per-violation record (#3710) + one per-evaluation summary record.
+    const violationRec = policyGate.filter((e) => e.metadata?.['recordKind'] === 'violation');
+    const summaryRec = policyGate.filter((e) => e.metadata?.['recordKind'] === 'summary');
+    expect(violationRec).toHaveLength(1);
+    expect(summaryRec).toHaveLength(1);
+    // The per-violation record carries mode/ruleIds/stageType.
+    expect(violationRec[0]!.metadata?.['mode']).toBe('warn');
+    expect(violationRec[0]!.metadata?.['ruleIds']).toEqual(['trust-tier']);
+    expect(violationRec[0]!.metadata?.['stageType']).toBe('execute');
+    // The summary record carries the per-evaluation denominator signal.
+    expect(summaryRec[0]!.metadata?.['violationCount']).toBe(1);
+    // The persisted chain verifies.
+    expect(verifyChain(events).ok).toBe(true);
+
+    await auditLogger.close();
+  });
+
+  it('durable records and the bus event carry the trust provenance (#6795)', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const storage = new InMemoryAuditStorage();
+    const auditLogger = new AuditLogger(hashChainConfig(), storage);
+    const busEvents: unknown[] = [];
+    const off = getPipelineEventBus().subscribe({ type: 'policy.evaluated' }, (e) => {
+      if (e.type === 'policy.evaluated') busEvents.push(e.trustProvenance);
+    });
+    try {
+      // Caller measured '1', declaration omitted → task text '3' → violation.
+      await runDevPipeline('Build feature X', createMockStages(), {
+        auditLogger,
+        trustTier: '1',
+        researchOverride: 'caller-supplied research',
+      });
+      await auditLogger.flush();
+    } finally {
+      off();
+    }
+    const expected = {
+      callerTier: '1',
+      declaredSourceTier: 'undeclared',
+      taskContentTier: '3',
+      declarationClamped: false,
+      sourceTiers: [],
+      contentTier: '3',
+    };
+    const policyGate = storage.getAll().filter((e) => e.action === 'security.policy_gate');
+    expect(policyGate.length).toBeGreaterThan(0);
+    for (const rec of policyGate) expect(rec.metadata?.['trustProvenance']).toEqual(expected);
+    expect(busEvents).toEqual([expected]);
+    await auditLogger.close();
+  });
+
+  it('serialized appends: parallel runs sharing one logger keep verifyChain passing', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const storage = new InMemoryAuditStorage();
+    const auditLogger = new AuditLogger(hashChainConfig(), storage);
+
+    // Six concurrent dev-pipeline runs share the single logger. Each fires one
+    // warn-mode violation → one durable append. The hash chain must stay valid.
+    await Promise.all(
+      Array.from({ length: 6 }, (_, i) =>
+        runDevPipeline(`Build feature ${String(i)}`, createMockStages(), { auditLogger })
+      )
+    );
+    await auditLogger.flush();
+
+    const events = storage.getAll();
+    const policyGate = events.filter((e) => e.action === 'security.policy_gate');
+    // #3727: each run now appends one violation record + one summary record.
+    const violationRec = policyGate.filter((e) => e.metadata?.['recordKind'] === 'violation');
+    const summaryRec = policyGate.filter((e) => e.metadata?.['recordKind'] === 'summary');
+    expect(violationRec).toHaveLength(6); // one per run, no drops or dupes
+    expect(summaryRec).toHaveLength(6); // one summary per run
+    expect(verifyChain(events).ok).toBe(true);
+
+    await auditLogger.close();
+  });
+
+  it('no auditLogger: still emits policy.evaluated on the bus (TraceWriter back-compat)', async () => {
+    process.env['NEXUS_POLICY_GATE_MODE'] = 'warn';
+    const events: string[] = [];
+    const off = getPipelineEventBus().subscribe({ type: 'policy.evaluated' }, (e) => {
+      if (e.type === 'policy.evaluated') events.push(e.gateId);
+    });
+    try {
+      // No auditLogger threaded → pure-CLI path. Bus emit is unchanged.
+      const result = await runDevPipeline('Build feature X', createMockStages());
+      expect(result.completed).toBe(true);
+      expect(events.some((g) => g.startsWith('consensus-to-execute:'))).toBe(true);
+    } finally {
+      off();
+    }
+  });
+});
+
+describe('vote-verdict deciders (#4174) — isApproved / getVoteFeedback', () => {
+  // These helpers gate pipeline progression (isApproved consumed at the vote
+  // stage); the #4135 contract — no_quorum is NOT an approval and carries no
+  // reviewer feedback — was previously documented in a comment but unpinned.
+
+  it('isApproved: approved is an approval', () => {
+    expect(isApproved({ kind: 'approved', approvalPercentage: 100 })).toBe(true);
+  });
+
+  it('isApproved: rejected is not an approval', () => {
+    expect(isApproved({ kind: 'rejected', feedback: 'no', approvalPercentage: 20 })).toBe(false);
+  });
+
+  it('isApproved: no_quorum is NOT an approval (#4135 — voided vote must fail closed)', () => {
+    expect(
+      isApproved({ kind: 'no_quorum', reason: 'contrarian voter errored', approvalPercentage: 0 })
+    ).toBe(false);
+  });
+
+  it('getVoteFeedback: only rejected carries reviewer feedback', () => {
+    expect(
+      getVoteFeedback({ kind: 'rejected', feedback: 'fix the API', approvalPercentage: 30 })
+    ).toBe('fix the API');
+    expect(getVoteFeedback({ kind: 'approved', approvalPercentage: 100 })).toBe('');
+  });
+
+  it('getVoteFeedback: no_quorum carries NO feedback (#4135 — must not feed plan revision)', () => {
+    expect(
+      getVoteFeedback({ kind: 'no_quorum', reason: 'panel degraded', approvalPercentage: 0 })
+    ).toBe('');
+  });
+});
+
+describe('runDevPipeline — cancellation at stage boundaries (#6305)', () => {
+  it('runs no stage when the signal has already fired', async () => {
+    const stages = createMockStages();
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      runDevPipeline('Build feature X', stages, { signal: controller.signal })
+    ).rejects.toThrow('Dev pipeline cancelled before the research stage');
+    expect(stages.research).not.toHaveBeenCalled();
+  });
+
+  it('a cancel inside the implement loop surfaces as the cancel, not as failed tasks', async () => {
+    const controller = new AbortController();
+    const stages = createMockStages({
+      implement: vi.fn(() => {
+        controller.abort();
+        return Promise.resolve('impl');
+      }),
+    });
+
+    // Absorbing the cancel as a failed task would let the run reach the
+    // security boundary and name THAT stage instead. The two tasks run
+    // concurrently, so the second task's implement boundary may observe it first.
+    await expect(
+      runDevPipeline('Build feature X', stages, { signal: controller.signal })
+    ).rejects.toThrow(/^Dev pipeline cancelled before the (implement|qaReview) stage$/);
+    expect(stages.qaReview).not.toHaveBeenCalled();
+    expect(stages.securityScan).not.toHaveBeenCalled();
+  });
+
+  it('runs to completion with a signal that never fires — the empty case', async () => {
+    const stages = createMockStages();
+    const result = await runDevPipeline('Build feature X', stages, {
+      signal: new AbortController().signal,
+    });
+    expect(result.completed).toBe(true);
+    expect(stages.securityScan).toHaveBeenCalledTimes(1);
+  });
+});

@@ -1,0 +1,1312 @@
+/* eslint-disable max-lines -- Cohesive doctor command module (governance: 400-600 OK if cohesive) */
+/**
+ * nexus-agents doctor command
+ *
+ * Health check utility for CLI integration validation.
+ * Verifies CLI installations, versions, authentication, Node.js version,
+ * API keys, configuration files, and MCP server readiness.
+ *
+ * (Source: Issue #91, cli-project_plan.md DevEx amendment)
+ * (Source: Issue #422 - Doctor command validations)
+ */
+
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  accessSync,
+  constants as fsConstants,
+} from 'node:fs';
+import {
+  DATA_SUBDIRECTORIES,
+  getNexusDataDir,
+  getNexusRepoDir,
+  getPerRepoSubdirs,
+  nexusDataPath,
+} from '../config/nexus-data-dir.js';
+import { detectSandbox } from '../config/sandbox-detection.js';
+import { loadConfig } from '../config/config-loader.js';
+import {
+  checkScratchFilesystems,
+  worstSeverity,
+  type ScratchSpaceCheck,
+  scratchSeverityIsAcceptable,
+} from './doctor-scratch-space.js';
+import { getTimeProvider, getErrorMessage } from '../core/index.js';
+import {
+  isPersistenceEnabled,
+  getLearningDir,
+  getOutcomesFile,
+  getRulesFile,
+} from '../config/learning-persistence.js';
+import {
+  countEligibleOutcomesInFile,
+  countRoutedOutcomesInFile,
+  type RoutedOutcomeCounts,
+} from '../learning/distiller-eligibility.js';
+import { createAllAdapters, createCliAdapter } from '../cli-adapters/factory.js';
+import { getCliAdapterDiagnostics } from '../cli-adapters/cli-adapter-diagnostics.js';
+import { isCliAdmitted } from '../cli-adapters/cli-admission.js';
+import { resolveAuthEvidence } from '../cli-adapters/auth-evidence.js';
+import { cliBinaryAdapterOf } from '../cli-adapters/gateway-slot-arm.js';
+import { isCliDisabled } from '../cli-adapters/disabled-clis.js';
+import { codexMcpServerAvailable } from '../cli-adapters/codex-mcp-server-probe.js';
+import {
+  codexSandboxPreflight,
+  type CodexSandboxPreflightResult,
+} from '../cli-adapters/codex-sandbox-preflight.js';
+import type { CliName, HealthStatus, CapacityStatus, ICliAdapter } from '../cli-adapters/types.js';
+import { getInTreeCapabilitiesMatrix } from '../config/model-config-helpers.js';
+import { createServer } from '../mcp/server.js';
+import {
+  readOpenAICompatEndpoint,
+  readOpenAICompatEnv,
+} from '../adapters/openai-compat-adapter.js';
+import {
+  gatewayCostStatus,
+  resolveGatewayCostDeclaration,
+  type GatewayCostDeclaration,
+} from '../adapters/sdk/gateway-cost.js';
+import { printDoctorResults } from './doctor-formatting.js';
+import { disabledCliModelReason } from './doctor-disabled-clis.js';
+import { probeCli } from './cli-auth-probe.js';
+import {
+  probeClaudePinnedModel,
+  unprobedClaudeModel,
+  type ClaudeModelProbe,
+} from './doctor-claude-model.js';
+import type { AuthProbeResult } from './cli-auth-probe.js';
+import { checkHarnessAlignment } from './doctor-harness-alignment.js';
+import type { HarnessAlignmentCheck } from './doctor-harness-alignment.js';
+import {
+  assessInstallFreshness,
+  installFreshnessFailsVerdict,
+  readGlobalVersion,
+  type InstallFreshness,
+} from './doctor-install-freshness.js';
+import { execFileSync } from 'node:child_process';
+import { VERSION, NODE_ENGINE_RANGE, isNodeVersionSupported } from '../version.js';
+import { allOf } from '../utils/verdict-aggregation.js';
+import {
+  checkGatewayHealth,
+  cliFailsVerdict,
+  gatewayVerdict,
+  type GatewayHealth,
+  type GatewayVerdict,
+} from './doctor-gateway.js';
+import { gatewayCoveredClis, hasHealthyVoterCli } from './doctor-gateway-slots.js';
+
+/** API key environment variable names. */
+const API_KEY_VARS = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_AI_API_KEY'] as const;
+
+/**
+ * Check result for a single CLI.
+ */
+export interface CliCheckResult {
+  readonly name: CliName;
+  readonly installed: boolean;
+  readonly version: string;
+  readonly versionStatus: 'supported' | 'outdated' | 'unsupported' | 'breaking';
+  readonly authenticated: boolean;
+  /**
+   * The auth probe's THREE-valued result (#4661).
+   *
+   * `authenticated` above is a boolean and cannot express "we did not check".
+   * Some gateways expose no non-interactive auth check, so their probe can only
+   * ever return `unknown` — routing admits that deliberately (#4391: absence of
+   * evidence is not failure). Collapsing it to `false` printed a red
+   * "Not authenticated" for a CLI that was demonstrably working, and offered a
+   * login command that fixes nothing.
+   */
+  readonly authState: 'authenticated' | 'unverified' | 'not-authenticated';
+  /** Local evidence from the admission ladder, with the probe's readable provenance. */
+  readonly authEvidence?: ReturnType<typeof resolveAuthEvidence> & {
+    readonly description: string;
+  };
+  /**
+   * Whether the router would route to this CLI: `isCliAdmitted` over the same
+   * health check and auth probe (#6720). `doctor --gateway` reads it to say
+   * whether a gateway slot is served by the CLI or the gateway, so the report
+   * cannot claim the CLI while the router picks the gateway. Not installed is
+   * `false`.
+   */
+  readonly routerAdmits: boolean;
+  readonly authMethod?: string;
+  readonly capacity?: CapacityStatus;
+  readonly error?: string;
+  readonly fix?: string;
+}
+
+/**
+ * Node.js version check result.
+ */
+export interface NodeVersionCheck {
+  readonly version: string;
+  readonly major: number;
+  readonly supported: boolean;
+}
+
+/**
+ * API key check result.
+ */
+export interface ApiKeyCheck {
+  readonly name: string;
+  readonly configured: boolean;
+}
+
+/**
+ * Configuration file check result.
+ */
+export interface ConfigFileCheck {
+  readonly found: boolean;
+  /** Resolved file path when loading succeeds; null if missing or loading fails. */
+  readonly path: string | null;
+  /** Loader error, including YAML parsing or schema validation failures. */
+  readonly error?: string;
+}
+
+/**
+ * Model availability advisory entry (#890).
+ */
+export interface ModelAdvisory {
+  readonly modelId: string;
+  readonly displayName: string;
+  readonly cliName: string;
+  readonly available: boolean;
+  readonly reason: string;
+}
+
+/**
+ * Learning persistence health check result (#1017).
+ */
+export interface LearningPersistenceCheck {
+  readonly enabled: boolean;
+  readonly dirExists: boolean;
+  readonly dirWritable: boolean;
+  readonly outcomeCount: number;
+  /**
+   * Eligible outcomes (`isDistillerEligible`) across the WHOLE outcomes.jsonl
+   * (#6512). The distiller sees only the store's newest-10k window, so this can
+   * exceed what it trains on; `trainedOnEligible` is that number.
+   */
+  readonly fileEligibleOutcomeCount: number;
+  /**
+   * Outcomes tagged `routedBy: 'composite-router'` in outcomes.jsonl, and how
+   * many landed in the last 7 days (#6521): the routing loop's input rate.
+   */
+  readonly routedOutcomes: RoutedOutcomeCounts;
+  /** Every persisted rule, whatever its status. */
+  readonly ruleCount: number;
+  /** Persisted rules with status `active`: the ones routing applies (#6512). */
+  readonly activeRuleCount: number;
+  /**
+   * Eligible outcomes the last distill trained on, from the snapshot's
+   * `eligibleOutcomes`. Null: no snapshot, or one written before the count.
+   */
+  readonly trainedOnEligible: number | null;
+  /** `savedAt` of rules.json: the last distill time. Null means never distilled. */
+  readonly rulesLastSaved: string | null;
+  readonly error: string | null;
+}
+
+/**
+ * Registry advisory summary (#890).
+ */
+export interface RegistryAdvisory {
+  readonly totalModels: number;
+  readonly availableModels: number;
+  readonly unavailableModels: number;
+  readonly models: readonly ModelAdvisory[];
+  /** Days since the registry was last updated. */
+  readonly registryAgeDays: number;
+  /** True if the registry is >30 days old and may have stale model data. */
+  readonly registryStale: boolean;
+}
+
+/**
+ * SQLite (node:sqlite) availability check (#1249, #5388).
+ */
+export interface SqliteCheck {
+  readonly available: boolean;
+  readonly error: string | null;
+}
+
+/**
+ * Data directory health check (#1249, extended #2892).
+ * Reports the resolved location of every data subdirectory — per-repo
+ * subdirs under `<repo>/.nexus-agents/`, cross-repo subdirs under
+ * `~/.nexus-agents/` — so the operator can see where state actually
+ * lives after the epic #2872 state-split.
+ */
+export interface DataDirectoryCheck {
+  /** True if the homedir/cross-repo root exists. */
+  readonly rootExists: boolean;
+  /** The homedir/cross-repo root path. */
+  readonly rootPath: string;
+  /** `<repo>/.nexus-agents` when the repo-preferred tier is active, else null. */
+  readonly repoRoot: string | null;
+  readonly subdirectories: readonly DataSubdirStatus[];
+}
+
+/**
+ * Status of a single data subdirectory.
+ */
+export interface DataSubdirStatus {
+  readonly name: string;
+  /** Actual resolved path (per-repo or homedir, per the #2872 split). */
+  readonly path: string;
+  /** Which side of the state-split this subdir belongs to. */
+  readonly scope: 'per-repo' | 'cross-repo';
+  readonly exists: boolean;
+  readonly writable: boolean;
+}
+
+/** Compatibility export; the canonical inventory belongs to the data-dir resolver. */
+export { DATA_SUBDIRECTORIES } from '../config/nexus-data-dir.js';
+
+/**
+ * Sandbox awareness (#2501, child 1 of epic #2500).
+ *
+ * Reports whether nexus-agents is running inside a host-provided sandbox
+ * (Docker Desktop Sandbox + OpenCode, Codex sandbox, locked-down CI) and
+ * whether the explicit `NEXUS_SANDBOX` signal matches the runtime
+ * heuristic. Mismatches don't block startup but get surfaced here so the
+ * operator can fix the image / launch config.
+ */
+export interface SandboxCheck {
+  readonly active: boolean;
+  readonly flavor: string | undefined;
+  readonly root: string | undefined;
+  readonly heuristicMatch: 'docker' | 'podman' | 'unknown' | null;
+  /** True iff the explicit signal disagrees with the heuristic. */
+  readonly mismatch: boolean;
+  /** True iff `NEXUS_DATA_DIR` resolves inside a single repo subfolder. */
+  readonly dataDirInsideRepo: boolean;
+}
+
+/**
+ * Voter transport check (#4255): whether an OpenAI-compatible gateway is
+ * configured (env vars or the opencode.json bridge). Presence-only, same
+ * spirit as {@link checkApiKeys} — no network probe, and the key itself is
+ * never surfaced. When configured, consensus/voter calls route in-process
+ * through the gateway; otherwise they fall back to CLI subprocesses (see
+ * `cli-server-gateway.ts` `tryWireGatewayAdapters`).
+ */
+export interface VoterTransportCheck {
+  readonly configured: boolean;
+  /**
+   * The gateway's `NEXUS_GATEWAY_COST` declaration (#4392 increment 2),
+   * present only when a gateway is configured. Three gaps are told apart
+   * because each is a different fix: `'unset'` (variable absent),
+   * `'invalid'` (set but does not parse — the startup env warning carries the
+   * reason), and `'no-default'` (valid, but names neither a bare declaration
+   * nor this gateway's `<endpoint>=` entry — the gateway registers as
+   * `api:<endpoint>`, `NEXUS_OPENAI_COMPAT_ENDPOINT` or `openai-compat`, and a
+   * scoped entry for it counts since step 2). Every gap is a warning, not a
+   * failure: the
+   * gateway still serves voters; the task-class cost ceiling and the
+   * per-task budget exclude it (#6393).
+   */
+  readonly cost?: GatewayCostDeclaration | 'unset' | 'invalid' | 'no-default';
+}
+
+/**
+ * Complete doctor check results.
+ */
+export interface DoctorResult {
+  /** CLIs that were probed: every CLI not disabled by `NEXUS_DISABLED_CLIS`. */
+  readonly clis: CliCheckResult[];
+  /**
+   * CLIs taken out of service by `NEXUS_DISABLED_CLIS` (#6590), in slot order.
+   * Not probed and not counted toward the verdict: disabling a CLI is an
+   * operator decision, not a fault. Empty when the variable is unset.
+   */
+  readonly disabledClis: readonly CliName[];
+  readonly nodeVersion: NodeVersionCheck;
+  readonly apiKeys: ApiKeyCheck[];
+  readonly configFile: ConfigFileCheck;
+  readonly mcpServerReady: boolean;
+  /**
+   * MEASURED (#6119): codex is installed AND `codex mcp-server --help` names
+   * the subcommand. Inferring this from the install alone printed "Ready" on
+   * codex-cli 0.154, which has no `mcp-server`. `false` with codex installed
+   * means the subprocess transport (`codex exec`) is in use.
+   */
+  readonly mcpClientReady: boolean;
+  /** Model-free read-only sandbox measurement; absent when Codex is disabled or missing. */
+  readonly codexSandbox?: CodexSandboxPreflightResult;
+  /** Model registry advisory — which models are available (#890). */
+  readonly registryAdvisory: RegistryAdvisory;
+  /** Learning persistence health check (#1017). */
+  readonly learningPersistence: LearningPersistenceCheck;
+  /** SQLite (node:sqlite) availability (#1249, #5388). */
+  readonly sqliteCheck: SqliteCheck;
+  /** Data directory health (#1249). */
+  readonly dataDirectory: DataDirectoryCheck;
+  /** Sandbox detection + heuristic verification (#2501). */
+  readonly sandbox: SandboxCheck;
+  /** Per-harness config alignment with AGENTS.md federation (#2805). */
+  readonly harnessAlignment: HarnessAlignmentCheck;
+  /**
+   * Whether the globally installed package matches this build (#4767).
+   *
+   * `.mcp.json` runs the MCP server off the global install, so drift here
+   * means every MCP call executes code the operator is not looking at.
+   */
+  readonly installFreshness: InstallFreshness;
+  /** Voter transport: in-process gateway vs CLI subprocess fallback (#4255). */
+  readonly voterTransport: VoterTransportCheck;
+  /**
+   * The gateway MEASURED (#6609): guard, `/models`, family census, slots,
+   * proxy and, with `--probe`, one completion per family. `not_configured`
+   * when no gateway is set; no network call is made then.
+   */
+  readonly gateway: GatewayHealth;
+  /**
+   * Whether the pinned claude voter model answers a one-line request (#6120).
+   *
+   * Measured only with `--live`; otherwise `not-probed` states why no
+   * completion was sent (#6814).
+   */
+  readonly claudeModel: ClaudeModelProbe;
+  /**
+   * Headroom on every distinct filesystem backing a scratch root (#4488).
+   *
+   * A list rather than one reading because the nexus scratch root and the
+   * shared system temp dir are frequently on different volumes, and the
+   * incident this check exists for was on the one it did not measure.
+   */
+  readonly scratchSpace: readonly ScratchSpaceCheck[];
+  readonly allHealthy: boolean;
+  readonly timestamp: Date;
+}
+
+/**
+ * Gets the CLI install/upgrade fix command.
+ */
+function getFixCommand(
+  name: CliName,
+  issue: 'install' | 'upgrade' | 'auth',
+  adapter?: ICliAdapter
+): string {
+  const source =
+    adapter !== undefined && 'binaryName' in adapter
+      ? adapter
+      : createCliAdapter({ cli: name, transport: 'subprocess' });
+  return getCliAdapterDiagnostics(source).installationHints[issue];
+}
+
+/**
+ * Creates a result for when a CLI is not found.
+ */
+function createNotFoundResult(
+  name: CliName,
+  errorMsg: string,
+  adapter?: ICliAdapter
+): CliCheckResult {
+  return {
+    name,
+    // Not installed, so auth was never probed. `not-authenticated` would claim
+    // a determination nobody made; the auth line is not printed for an
+    // uninstalled CLI anyway (#4661).
+    authState: 'unverified',
+    routerAdmits: false,
+    installed: false,
+    version: 'N/A',
+    versionStatus: 'unsupported',
+    authenticated: false,
+    error: errorMsg,
+    fix: getFixCommand(name, 'install', adapter),
+  };
+}
+
+/**
+ * Determines the authentication method based on CLI name.
+ * CLIs use their own auth mechanisms - we report the method type
+ * rather than assuming a specific one like 'OAuth'.
+ */
+function detectAuthMethod(name: CliName): string {
+  const authMethods: Record<CliName, string> = {
+    claude: 'CLI auth',
+    gemini: 'ADC/CLI auth',
+    codex: 'CLI auth',
+    opencode: 'CLI auth',
+  };
+  return authMethods[name];
+}
+
+/**
+ * Maps the probe's three-valued state onto the reported one (#4661).
+ *
+ * `unknown` means the probe ran and could not determine auth — a gateway with
+ * no non-interactive auth check. That is distinct from a probe that determined
+ * the CLI is logged out, and collapsing the two printed a red "Not
+ * authenticated" for a CLI that was demonstrably working.
+ */
+function resolveAuthState(
+  authenticated: boolean,
+  probeState: AuthProbeResult['state']
+): CliCheckResult['authState'] {
+  if (authenticated) return 'authenticated';
+  return probeState === 'unknown' ? 'unverified' : 'not-authenticated';
+}
+
+/**
+ * Creates a result from a successful health check.
+ *
+ * Authentication state comes from the auth probe (#2439, #2447), not from
+ * `health.healthy` (which only confirms version compatibility). Without the
+ * probe, doctor falsely reports "Auth: CLI auth ✓" for installed-but-
+ * unauthed CLIs.
+ */
+function createHealthyResult(
+  name: CliName,
+  health: HealthStatus,
+  authProbe: AuthProbeResult,
+  capacity?: CapacityStatus,
+  adapter?: ICliAdapter
+): CliCheckResult {
+  const versionOk = health.healthy;
+  const authenticated = versionOk && authProbe.state === 'authenticated';
+  const authState = resolveAuthState(authenticated, authProbe.state);
+  const evidence = resolveAuthEvidence(authProbe);
+
+  const result: CliCheckResult = {
+    name,
+    installed: true,
+    version: health.version,
+    versionStatus: health.versionStatus,
+    authenticated,
+    authState,
+    authEvidence: { ...evidence, description: describeAuthEvidence(authProbe, evidence) },
+    routerAdmits: isCliAdmitted(health, authProbe),
+    ...(authenticated && { authMethod: detectAuthMethod(name) }),
+    ...(capacity !== undefined && { capacity }),
+  };
+
+  if (health.message !== undefined && health.message !== '') {
+    return { ...result, error: health.message };
+  }
+  // Surface the probe's reason when needs-login so operators see what to fix.
+  if (!authenticated && authProbe.state === 'needs-login') {
+    return {
+      ...result,
+      error: authProbe.reason,
+      fix: authProbe.fixCommand,
+    };
+  }
+  // Only offer a login command when the probe actually determined a logout.
+  // An unverified state has nothing to fix, and naming one sends operators to
+  // re-authenticate a working CLI (#4661).
+  // `not-authenticated` already implies `!authenticated` — see resolveAuthState.
+  if (authState === 'not-authenticated') {
+    return { ...result, fix: getFixCommand(name, 'auth', adapter) };
+  }
+  if (health.versionStatus === 'outdated') {
+    return { ...result, fix: getFixCommand(name, 'upgrade', adapter) };
+  }
+
+  return result;
+}
+
+/** Name the existing producer behind the ladder's source without regrading it. */
+function describeAuthEvidence(
+  probe: AuthProbeResult,
+  evidence: ReturnType<typeof resolveAuthEvidence>
+): string {
+  if (evidence.source === 'artifact') {
+    if (probe.state === 'authenticated' && probe.via === 'env-var') {
+      const envVar = probe.cli === 'claude' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
+      return `${envVar} environment variable`;
+    }
+    return 'claude credentials file';
+  }
+  if (evidence.source === 'cli') {
+    return probe.cli === 'codex' ? 'codex login status' : 'opencode auth list';
+  }
+  const binary = probe.cli === 'gemini' ? 'agy' : probe.cli;
+  return `${binary} probe ${evidence.probeState}`;
+}
+
+/**
+ * Runs health check on a single CLI adapter.
+ *
+ * Combines the version-compatibility check from `adapter.healthCheck()` with
+ * the real auth probe from `cli-auth-probe.ts` — see #2439 for why both are
+ * needed (version-OK alone misled doctor into reporting unauthed CLIs as ✓).
+ */
+async function checkCli(name: CliName): Promise<CliCheckResult> {
+  // DELIBERATE raw-adapter probe, not drift (#5191, ratified 4/6).
+  //
+  // `getGlobalRegistry()` is canonical for adapter ACQUISITION, and its adapters
+  // share a circuit-breaker registry (#4330). That is right for execution and
+  // wrong here: an open breaker would make this report a CLI unavailable
+  // WITHOUT testing it, so doctor would be reading its own cached memory rather
+  // than measuring the CLI. A probe that cannot observe a healthy CLI because
+  // something else saw it fail is not a probe.
+  //
+  // Pinned by `doctor-probe-exemption.test.ts` so a future "canonical path"
+  // cleanup cannot silently flip it.
+  const adapters = createAllAdapters();
+  const slotArm = adapters.get(name);
+
+  if (!slotArm) {
+    return createNotFoundResult(name, 'Adapter not available');
+  }
+  // #6782: in gateway mode the router arm is a gateway slot arm, and its
+  // `healthCheck` answers from whichever target the arm picks. When the CLI is
+  // unavailable that is the gateway model, and this list credited the CLI with
+  // the gateway's health. Measure the CLI binary only; the gateway's own health
+  // is the gateway section's to report.
+  const adapter = cliBinaryAdapterOf(slotArm);
+  if (adapter === undefined) {
+    return createNotFoundResult(name, 'Not found in PATH');
+  }
+
+  try {
+    const [health, authProbe] = await Promise.all([adapter.healthCheck(), probeCli(name)]);
+    let capacity: CapacityStatus | undefined;
+
+    try {
+      capacity = await adapter.getCapacity();
+    } catch {
+      // Capacity check is optional — some adapters don't support it.
+      // Optional catch binding: there is no variable to be unused.
+    }
+
+    if (health.reachable === false || authProbe.state === 'not-installed') {
+      return createNotFoundResult(name, health.message ?? 'Not found in PATH', adapter);
+    }
+
+    return createHealthyResult(name, health, authProbe, capacity, adapter);
+  } catch (error) {
+    const message = getErrorMessage(error);
+    const isNotFound = message.includes('ENOENT') || message.includes('not found');
+    return createNotFoundResult(name, isNotFound ? 'Not found in PATH' : message, adapter);
+  }
+}
+
+/**
+ * Checks the Node.js version against the required version.
+ */
+function checkNodeVersion(): NodeVersionCheck {
+  const version = process.version;
+  const major = Number(version.slice(1).split('.')[0]);
+  return {
+    version,
+    major,
+    supported: isNodeVersionSupported(version),
+  };
+}
+
+/**
+ * Checks which API keys are configured in the environment.
+ * Does NOT expose the actual key values - only reports presence.
+ *
+ * Exported so `verify` (#2136) and other health gates can reuse it without
+ * running the full doctor pipeline.
+ */
+export function checkApiKeys(): ApiKeyCheck[] {
+  return API_KEY_VARS.map((name) => ({
+    name,
+    configured: typeof process.env[name] === 'string' && process.env[name] !== '',
+  }));
+}
+
+/**
+ * Loads configuration through the server's discovery, parsing and validation path.
+ */
+function checkConfigFile(): ConfigFileCheck {
+  const result = loadConfig();
+  if (!result.ok) {
+    return { found: true, path: null, error: result.error.message };
+  }
+  return { found: !result.value.usingDefaults, path: result.value.configPath ?? null };
+}
+
+/**
+ * Validates that the MCP server can be created successfully.
+ * This is a lightweight check that verifies server instantiation works.
+ */
+function checkMcpServerReady(): boolean {
+  try {
+    const result = createServer({ name: 'nexus-agents-doctor-check' });
+    return result.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Builds model registry advisory based on detected CLI availability (#890).
+ *
+ * Staleness threshold (#2445): bumped from 30 → 90 days. The published
+ * npm tarball ships with a registry snapshot that's typically 1-4 weeks
+ * old by the time an operator installs it (normal release cadence). A
+ * 30-day threshold meant fresh installs of recently-published versions
+ * showed `⚠ Model registry is 55 days old` on day one of usage, training
+ * operators to ignore staleness warnings.
+ *
+ * Additionally, if the operator's data directory has no signs of prior
+ * usage (no audit log, no outcome store), suppress the warning entirely
+ * — staleness on first run is a publishing concern, not an operator
+ * concern.
+ */
+function buildRegistryAdvisory(
+  cliResults: CliCheckResult[],
+  disabledClis: readonly CliName[],
+  gateway: GatewayHealth
+): RegistryAdvisory {
+  const installedClis = new Set(cliResults.filter((c) => c.installed).map((c) => c.name));
+
+  const matrix = getInTreeCapabilitiesMatrix();
+  const models: ModelAdvisory[] = matrix.models
+    .filter((m) => m.cliName !== undefined)
+    .map((m) => {
+      const cliName = m.cliName ?? '';
+      const available = cliName.length > 0 && installedClis.has(cliName as CliName);
+      // A disabled CLI is switched off, not missing (#6728): never say "install it".
+      const disabled = disabledClis.find((cli) => cli === cliName);
+      const reason = available
+        ? `${cliName} CLI is installed`
+        : disabled !== undefined
+          ? disabledCliModelReason(disabled, gateway, cliResults)
+          : `${cliName} CLI is not installed`;
+      return { modelId: m.id, displayName: m.displayName, cliName, available, reason };
+    });
+
+  // Registry staleness check (#1549, threshold revised in #2445)
+  const STALE_THRESHOLD_DAYS = 90;
+  const updatedAt = new Date(matrix.updatedAt);
+  const nowMs = getTimeProvider().now();
+  const ageDays = Math.floor((nowMs - updatedAt.getTime()) / (1000 * 60 * 60 * 24));
+
+  // First-install detection: if the operator has no prior activity in
+  // their data dir, suppress the staleness warning. There's nothing they
+  // can do about it on day one anyway, and it trains them to ignore
+  // warnings.
+  const isFreshInstall = !hasPriorUsage();
+  const exceedsThreshold = ageDays > STALE_THRESHOLD_DAYS;
+
+  return {
+    totalModels: models.length,
+    availableModels: models.filter((m) => m.available).length,
+    unavailableModels: models.filter((m) => !m.available).length,
+    models,
+    registryAgeDays: ageDays,
+    registryStale: exceedsThreshold && !isFreshInstall,
+  };
+}
+
+/**
+ * Cheap heuristic for "operator has used nexus-agents before": data dir
+ * exists and contains audit / outcome / session evidence. Used to
+ * suppress staleness warnings on day-one of a fresh install (#2445).
+ */
+function hasPriorUsage(): boolean {
+  try {
+    const root = getNexusDataDir();
+    if (!existsSync(root)) return false;
+    // Check for any subdirectory with files. Lazy creation of empty
+    // subdirs by `nexus-agents setup` would falsely register as usage —
+    // hence we look for *files*, not just directories.
+    for (const sub of ['audit', 'learning', 'sessions', 'voting']) {
+      const p = `${root}/${sub}`;
+      try {
+        if (existsSync(p) && readdirSync(p).length > 0) return true;
+      } catch {
+        // ignore — best-effort heuristic
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Counts non-empty lines in a JSONL file. Returns 0 if file doesn't exist. */
+function countJsonlLines(filePath: string): number {
+  if (!existsSync(filePath)) return 0;
+  return readFileSync(filePath, 'utf-8')
+    .split('\n')
+    .filter((l) => l.trim().length > 0).length;
+}
+
+interface RulesMetadata {
+  readonly count: number;
+  readonly activeCount: number;
+  readonly eligibleOutcomes: number | null;
+  readonly savedAt: string | null;
+}
+
+const NO_RULES: RulesMetadata = { count: 0, activeCount: 0, eligibleOutcomes: null, savedAt: null };
+
+function isActiveRule(rule: unknown): boolean {
+  return (
+    typeof rule === 'object' &&
+    rule !== null &&
+    (rule as Record<string, unknown>)['status'] === 'active'
+  );
+}
+
+/** Reads rules snapshot metadata: total and active rule counts, trained-on count, savedAt. */
+function readRulesMetadata(filePath: string): RulesMetadata {
+  if (!existsSync(filePath)) return NO_RULES;
+  try {
+    const raw = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+    const rules = Array.isArray(raw['rules']) ? (raw['rules'] as unknown[]) : [];
+    const saved = raw['savedAt'];
+    const eligible = raw['eligibleOutcomes'];
+    return {
+      count: rules.length,
+      activeCount: rules.filter(isActiveRule).length,
+      eligibleOutcomes: typeof eligible === 'number' ? eligible : null,
+      savedAt: typeof saved === 'string' ? saved : null,
+    };
+  } catch {
+    return NO_RULES;
+  }
+}
+
+/** Checks if a directory exists and is writable. */
+function checkDirAccess(dir: string): { exists: boolean; writable: boolean } {
+  const exists = existsSync(dir);
+  if (!exists) return { exists: false, writable: false };
+  try {
+    accessSync(dir, fsConstants.W_OK);
+    return { exists: true, writable: true };
+  } catch {
+    return { exists: true, writable: false };
+  }
+}
+
+const DISABLED_CHECK: LearningPersistenceCheck = {
+  enabled: false,
+  dirExists: false,
+  dirWritable: false,
+  outcomeCount: 0,
+  fileEligibleOutcomeCount: 0,
+  routedOutcomes: { total: 0, last7Days: 0 },
+  ruleCount: 0,
+  activeRuleCount: 0,
+  trainedOnEligible: null,
+  rulesLastSaved: null,
+  error: null,
+};
+
+/** Checks learning persistence health (#1017). */
+function checkLearningPersistence(): LearningPersistenceCheck {
+  if (!isPersistenceEnabled()) return DISABLED_CHECK;
+  try {
+    const { exists: dirExists, writable: dirWritable } = checkDirAccess(getLearningDir());
+    const outcomeCount = countJsonlLines(getOutcomesFile());
+    const fileEligibleOutcomeCount = countEligibleOutcomesInFile(getOutcomesFile());
+    const routedOutcomes = countRoutedOutcomesInFile(getOutcomesFile(), getTimeProvider().now());
+    const rules = readRulesMetadata(getRulesFile());
+    return {
+      enabled: true,
+      dirExists,
+      dirWritable,
+      outcomeCount,
+      fileEligibleOutcomeCount,
+      routedOutcomes,
+      ruleCount: rules.count,
+      activeRuleCount: rules.activeCount,
+      trainedOnEligible: rules.eligibleOutcomes,
+      rulesLastSaved: rules.savedAt,
+      error: null,
+    };
+  } catch (error: unknown) {
+    return {
+      enabled: true,
+      dirExists: false,
+      dirWritable: false,
+      outcomeCount: 0,
+      fileEligibleOutcomeCount: 0,
+      routedOutcomes: { total: 0, last7Days: 0 },
+      ruleCount: 0,
+      activeRuleCount: 0,
+      trainedOnEligible: null,
+      rulesLastSaved: null,
+      error: getErrorMessage(error),
+    };
+  }
+}
+
+/**
+ * Checks if SQLite is available (#1249, #5388).
+ * Memory backends (agentic, adaptive, typed, mobimem, decay) require it.
+ *
+ * Since #5388 this probes `node:sqlite`, a BUILTIN, so on a supported runtime
+ * it cannot be missing. The check is kept rather than deleted because it can
+ * still fail for a real reason: `node:sqlite` did not exist before Node 22.5.0,
+ * so an older runtime reports unavailable here instead of crashing later inside
+ * a memory backend. A check that can no longer fail would be worth removing;
+ * this one still can.
+ *
+ * Exported so `verify` (#2136) can reuse it without running the full doctor
+ * pipeline.
+ */
+export async function checkSqlite(): Promise<SqliteCheck> {
+  try {
+    await import('node:sqlite');
+    return { available: true, error: null };
+  } catch (error: unknown) {
+    const msg = getErrorMessage(error);
+    const isNotFound = msg.includes('Cannot find') || msg.includes('MODULE_NOT_FOUND');
+    return {
+      available: false,
+      error: isNotFound
+        ? `node:sqlite unavailable on ${process.version} — requires Node ${NODE_ENGINE_RANGE}; 5 memory backends unavailable`
+        : `node:sqlite load error: ${msg}`,
+    };
+  }
+}
+
+/**
+ * Checks the nexus-agents data directory health (#1249, extended #2892).
+ *
+ * Resolves each subdir through `nexusDataPath()` so the reported path is
+ * the REAL location after the epic #2872 state-split — per-repo subdirs
+ * land in `<repo>/.nexus-agents/`, cross-repo subdirs in `~/.nexus-agents/`.
+ *
+ * Exported so `verify` (#2136) can reuse it without running the full doctor
+ * pipeline.
+ */
+export function checkDataDirectory(): DataDirectoryCheck {
+  const rootPath = getNexusDataDir();
+  const rootExists = existsSync(rootPath);
+  const repoRoot = getNexusRepoDir();
+  const perRepoSet = getPerRepoSubdirs();
+
+  const subdirectories: DataSubdirStatus[] = DATA_SUBDIRECTORIES.map((name) => {
+    const segments = name.split('/');
+    const fullPath = nexusDataPath(...segments);
+    const exists = existsSync(fullPath);
+    const scope: 'per-repo' | 'cross-repo' = perRepoSet.has(segments[0] ?? '')
+      ? 'per-repo'
+      : 'cross-repo';
+    return { name, path: fullPath, scope, exists, writable: exists && isWritable(fullPath) };
+  });
+
+  return { rootExists, rootPath, repoRoot, subdirectories };
+}
+
+/** Checks if a directory is writable by the current user. */
+function isWritable(dirPath: string): boolean {
+  try {
+    accessSync(dirPath, fsConstants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Sandbox awareness check (#2501).
+ *
+ * Cross-references the explicit `NEXUS_SANDBOX` signal against the runtime
+ * heuristic and the resolved data dir. Surfaces mismatches that point at
+ * a misconfigured image (claims docker but no `/.dockerenv`) or a
+ * misconfigured launch (`NEXUS_DATA_DIR` inside a single repo while the
+ * sandbox root spans multiple).
+ */
+export function checkSandbox(): SandboxCheck {
+  const info = detectSandbox();
+  const dataDir = getNexusDataDir();
+  const root = info.root;
+  const dataDirInsideRepo =
+    info.active &&
+    root !== undefined &&
+    dataDir.startsWith(`${root.replace(/\/$/, '')}/`) &&
+    // path segments BETWEEN root and `.nexus-agents/` indicate the data dir
+    // lives in a subfolder rather than at the multi-repo root.
+    dataDir.replace(`${root.replace(/\/$/, '')}/`, '').split('/').length > 1;
+
+  // Mismatch: claimed sandbox but heuristic says not-a-container, or vice versa.
+  const heuristicSaysContainer =
+    info.heuristicMatch === 'docker' || info.heuristicMatch === 'podman';
+  const mismatch =
+    (info.active && info.heuristicMatch === 'unknown') || (!info.active && heuristicSaysContainer);
+
+  return {
+    active: info.active,
+    flavor: info.flavor,
+    root: info.root,
+    heuristicMatch: info.heuristicMatch,
+    mismatch,
+    dataDirInsideRepo,
+  };
+}
+
+/**
+ * Checks whether an OpenAI-compatible gateway is configured (#4255).
+ * Presence-only — mirrors {@link checkApiKeys}, no network probe and the
+ * key value never leaves `process.env`.
+ */
+/**
+ * Compare the globally installed version with this build (#4767).
+ *
+ * Deliberately NOT exported: this is only the `npm ls -g` call. The verdict it
+ * wraps lives in `doctor-install-freshness.ts`, where it is pure and testable
+ * without npm — exporting this too would be an export whose only importer is a
+ * test, which the producer/consumer ratchet correctly rejects.
+ */
+function checkInstallFreshness(): InstallFreshness {
+  const { version, reason, prefix } = readGlobalVersion((cmd, args) => {
+    try {
+      return execFileSync(cmd, [...args], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      return null;
+    }
+  });
+  return { ...assessInstallFreshness(version, VERSION, reason), prefix };
+}
+
+/** The environment sub-checks, grouped so `runDoctor` stays under its line cap. */
+function collectEnvironmentChecks(): {
+  harnessAlignment: HarnessAlignmentCheck;
+  installFreshness: InstallFreshness;
+  voterTransport: VoterTransportCheck;
+  scratchSpace: readonly ScratchSpaceCheck[];
+} {
+  return {
+    harnessAlignment: checkHarnessAlignment(),
+    installFreshness: checkInstallFreshness(),
+    voterTransport: checkVoterTransport(),
+    scratchSpace: checkScratchFilesystems(),
+  };
+}
+
+export function checkVoterTransport(): VoterTransportCheck {
+  const gateway = readOpenAICompatEnv();
+  if (gateway === null) return { configured: false };
+  return {
+    configured: true,
+    cost: voterGatewayCostDeclaration(gateway.endpoint ?? readOpenAICompatEndpoint()),
+  };
+}
+
+/**
+ * The declaration that applies to the voter gateway's arm — a scoped
+ * `<endpoint>=` entry or the bare default, resolved exactly as the cost
+ * estimators resolve it (#4392 step 2) — or which gap (see
+ * {@link VoterTransportCheck.cost}).
+ */
+function voterGatewayCostDeclaration(endpoint: string): NonNullable<VoterTransportCheck['cost']> {
+  const status = gatewayCostStatus();
+  if (status.kind !== 'declared') return status.kind;
+  return resolveGatewayCostDeclaration(`api:${endpoint}`) ?? 'no-default';
+}
+
+/** The inputs the overall verdict is computed from. */
+export interface HealthVerdictInput {
+  readonly nodeSupported: boolean;
+  readonly hasAuthMethod: boolean;
+  readonly mcpServerReady: boolean;
+  readonly configFile: ConfigFileCheck;
+  readonly installFreshness: InstallFreshness;
+  readonly scratchSpace: readonly ScratchSpaceCheck[];
+  readonly clis: readonly CliCheckResult[];
+  /**
+   * The measured gateway (#6609). `fail` fails the verdict; `pass` makes a
+   * missing CLI acceptable, because its slot is served by the gateway.
+   */
+  readonly gateway: GatewayVerdict;
+  /**
+   * Installed-but-broken CLIs whose slot the gateway actually serves (#6782),
+   * from `gatewayCoveredClis`. They do not fail the verdict; the report names
+   * them with ⚠.
+   */
+  readonly gatewayCoveredClis: readonly CliName[];
+}
+
+/**
+ * The overall doctor verdict.
+ *
+ * Extracted so the predicate is directly testable (#4488). It needed to be:
+ * `worstSeverity` shipped in #4528 and was then called nowhere, so `doctor`
+ * exited 0 with a 100%-full tmpfs — the check reported the very condition it
+ * was built for and still could not fail on it.
+ *
+ * Scratch space counts at `critical` only. `warn` still leaves room for the
+ * current run, and failing the whole command on it would collapse the
+ * distinction between the two thresholds into one.
+ */
+
+export function isAllHealthy(input: HealthVerdictInput): boolean {
+  const voterCliHealthy = hasHealthyVoterCli(input.clis);
+  return (
+    input.gateway !== 'fail' &&
+    input.nodeSupported &&
+    input.hasAuthMethod &&
+    input.mcpServerReady &&
+    input.configFile.error === undefined &&
+    !installFreshnessFailsVerdict(input.installFreshness) &&
+    scratchSeverityIsAcceptable(worstSeverity(input.scratchSpace)) &&
+    // whenEmpty: zero detected CLIs is not a healthy install (#4581) — unless
+    // a passing gateway serves the slots (#6609), as on a gateway-only host.
+    allOf(
+      input.clis,
+      (c) =>
+        !cliFailsVerdict(
+          c,
+          input.gateway,
+          input.gatewayCoveredClis.includes(c.name),
+          voterCliHealthy
+        ),
+      input.gateway === 'pass'
+    )
+  );
+}
+
+/**
+ * Probe the pinned claude model, telling the probe whether the CLI was found
+ * (#6120). A missing claude entry among `clis` is "not installed": nothing
+ * was detected, so nothing can be probed.
+ */
+function probeClaudeModelFor(
+  clis: readonly CliCheckResult[],
+  probe: (installed: boolean) => Promise<ClaudeModelProbe> = (installed) =>
+    probeClaudePinnedModel({ installed })
+): Promise<ClaudeModelProbe> {
+  const claudeCheck = clis.find((c) => c.name === 'claude');
+  return probe(claudeCheck?.installed === true);
+}
+
+/** Keep the quota-spending pinned-model check on the explicit live path. */
+function claudeModelForDoctor(
+  clis: readonly CliCheckResult[],
+  deps: RunDoctorDeps
+): Promise<ClaudeModelProbe> | ClaudeModelProbe {
+  if (deps.skipClaudeModelProbe === true) {
+    return {
+      ...unprobedClaudeModel(clis.find((c) => c.name === 'claude')?.installed === true),
+      reason: 'adapter serving is measured in live readiness; no separate pinned-model call',
+    };
+  }
+  if (deps.live === true) return probeClaudeModelFor(clis, deps.probeClaudeModel);
+  return unprobedClaudeModel(clis.find((c) => c.name === 'claude')?.installed === true);
+}
+
+/** At least one API key configured, one CLI authenticated, or a passing gateway (#6609, #7221). */
+function hasAnyAuthMethod(
+  apiKeys: readonly ApiKeyCheck[],
+  clis: readonly CliCheckResult[],
+  gateway: GatewayVerdict
+): boolean {
+  return (
+    apiKeys.some((k) => k.configured) ||
+    clis.some((c) => c.installed && (c.authenticated || c.authState === 'unverified')) ||
+    gateway === 'pass'
+  );
+}
+
+/** The gateway measurement, through the seam when one is given. */
+function measureGateway(
+  check: GatewayCheck | undefined,
+  probe: boolean | undefined
+): Promise<GatewayHealth> {
+  return (check ?? checkGatewayHealth)({ probe: probe === true });
+}
+
+/** The gateway measurement seam (#6609); defaults to {@link checkGatewayHealth}. */
+type GatewayCheck = (options: { readonly probe: boolean }) => Promise<GatewayHealth>;
+
+/** Seams and switches for {@link runDoctor}. */
+interface RunDoctorDeps {
+  /** The shared model-free Codex sandbox probe, injectable without spawning a CLI. */
+  readonly probeCodexSandbox?: () => Promise<CodexSandboxPreflightResult>;
+  /** The pinned-model probe seam (#6120), injectable so the suite spends no quota. */
+  readonly probeClaudeModel?: (installed: boolean) => Promise<ClaudeModelProbe>;
+  /** Opt in to the pinned Claude completion probe (`--live`). */
+  readonly live?: boolean;
+  /** The CLI live ladder measures serving; suppress a duplicate pinned-model completion. */
+  readonly skipClaudeModelProbe?: boolean;
+  /** The gateway measurement seam (#6609). */
+  readonly checkGateway?: GatewayCheck;
+  /** Send one completion per gateway family (`--probe`). Spends tokens. */
+  readonly gatewayProbe?: boolean;
+}
+
+/** Probe only an installed, enabled Codex CLI; an absent measurement is not success. */
+async function codexChecksForDoctor(
+  clis: readonly CliCheckResult[],
+  deps: RunDoctorDeps
+): Promise<Pick<DoctorResult, 'mcpClientReady' | 'codexSandbox'>> {
+  const installed = clis.find((cli) => cli.name === 'codex')?.installed === true;
+  if (!installed) return { mcpClientReady: false };
+  const mcpClientReady = codexMcpServerAvailable();
+  const codexSandbox = await (deps.probeCodexSandbox ?? codexSandboxPreflight)();
+  return { mcpClientReady, codexSandbox };
+}
+
+/** Runs the complete doctor check. */
+export async function runDoctor(deps: RunDoctorDeps = {}): Promise<DoctorResult> {
+  const allClis: readonly CliName[] = ['claude', 'gemini', 'codex', 'opencode'];
+  const disabledClis = allClis.filter((cli) => isCliDisabled(cli));
+  const clis = await Promise.all(
+    allClis.filter((cli) => !isCliDisabled(cli)).map((cli) => checkCli(cli))
+  );
+  const claudeModel = await claudeModelForDoctor(clis, deps);
+  const nodeVersion = checkNodeVersion();
+  const apiKeys = checkApiKeys();
+  const configFile = checkConfigFile();
+  const mcpServerReady = checkMcpServerReady();
+  const codexChecks = await codexChecksForDoctor(clis, deps);
+  const learningPersistence = checkLearningPersistence();
+  const sqliteCheck = await checkSqlite();
+  const dataDirectory = checkDataDirectory();
+  const sandbox = checkSandbox();
+  const env = collectEnvironmentChecks();
+  const gateway = await measureGateway(deps.checkGateway, deps.gatewayProbe);
+  const registryAdvisory = buildRegistryAdvisory(clis, disabledClis, gateway);
+
+  const allHealthy = isAllHealthy({
+    nodeSupported: nodeVersion.supported,
+    hasAuthMethod: hasAnyAuthMethod(apiKeys, clis, gatewayVerdict(gateway)),
+    mcpServerReady,
+    configFile,
+    installFreshness: env.installFreshness,
+    scratchSpace: env.scratchSpace,
+    clis,
+    gateway: gatewayVerdict(gateway),
+    gatewayCoveredClis: gatewayCoveredClis(gateway, clis).map((c) => c.cli),
+  });
+
+  return {
+    clis,
+    disabledClis,
+    nodeVersion,
+    apiKeys,
+    configFile,
+    mcpServerReady,
+    ...codexChecks,
+    registryAdvisory,
+    learningPersistence,
+    sqliteCheck,
+    dataDirectory,
+    sandbox,
+    ...env,
+    gateway,
+    claudeModel,
+    allHealthy,
+    timestamp: new Date(getTimeProvider().now()),
+  };
+}
+
+/** Doctor command options. */
+export interface DoctorOptions {
+  /** The CLI handler prints the summary after its live report. */
+  readonly deferSummary?: boolean;
+  /** Auto-fix safe issues (run setup, generate config). */
+  readonly fix?: boolean;
+  /** Print the gateway section: census, slots, guard, proxy (#6609). */
+  readonly gateway?: boolean;
+  /** Also send one completion per gateway family; implies `gateway`. Spends tokens. */
+  readonly probe?: boolean;
+  /** Probe the pinned Claude model with a real completion. Spends quota. */
+  readonly live?: boolean;
+  /** The CLI live ladder measures serving; suppress a duplicate pinned-model completion. */
+  readonly skipClaudeModelProbe?: boolean;
+  /**
+   * Receives the measured result, so `doctor --live` can compare its own CLI
+   * availability check against the CLI list's (#6781).
+   */
+  readonly onResult?: (result: DoctorResult) => void;
+}
+
+/**
+ * Runs the doctor command and prints results.
+ * Returns exit code (0 = healthy, 1 = issues found).
+ */
+export async function doctorCommand(options: DoctorOptions = {}): Promise<number> {
+  const result = await runDoctor({
+    gatewayProbe: options.probe === true,
+    live: options.live === true,
+    skipClaudeModelProbe: options.skipClaudeModelProbe === true,
+  });
+  options.onResult?.(result);
+  printDoctorResults(result, undefined, options.deferSummary === true);
+  if (options.gateway === true || options.probe === true) {
+    const { formatGatewayReport } = await import('./doctor-gateway-report.js');
+    for (const line of formatGatewayReport(result.gateway, result.clis)) {
+      process.stdout.write(line + '\n');
+    }
+  }
+
+  if (options.fix === true) {
+    await runDoctorFix(result);
+  }
+
+  return result.allHealthy ? 0 : 1;
+}
+
+/**
+ * Auto-fixes safe issues found by doctor (#1254).
+ * Only runs our own code — never execs external package managers.
+ */
+async function runDoctorFix(result: DoctorResult): Promise<void> {
+  const writeLine = (text: string): void => {
+    process.stdout.write(text + '\n');
+  };
+
+  writeLine('');
+  writeLine('\x1b[1mAuto-fix\x1b[0m');
+  writeLine('─'.repeat(40));
+
+  let fixCount = 0;
+
+  // Fix: data directories (missing or not writable)
+  if (
+    !result.dataDirectory.rootExists ||
+    result.dataDirectory.subdirectories.some((d) => !d.exists || !d.writable)
+  ) {
+    // Calls the data-dir initializer directly rather than `runSetup` with
+    // every other step skipped: the result carries `created`, and that is the
+    // only thing distinguishing a real fix from a no-op.
+    //
+    // #4851: this reported on `setupResult.success` alone and so claimed
+    // "✓ Created missing data directories" for the unwritable case — which
+    // setup cannot repair. `ensureDir` returns early for a path that already
+    // exists and never checks writability, so nothing is created and success
+    // is still true, for precisely the condition that triggered the fix.
+    const { initDataDirectories, describeDataDirFix } = await import('./setup-data-dir.js');
+    const outcome = describeDataDirFix(initDataDirectories());
+    writeLine(outcome.line);
+    if (outcome.counted) fixCount++;
+  }
+
+  // Fix: config file
+  if (!result.configFile.found) {
+    const { runConfigInitSync } = await import('./setup-config.js');
+    const configResult = runConfigInitSync(process.cwd(), false, false);
+    if (configResult.success && configResult.created) {
+      writeLine(`✓ Generated config: ${configResult.path}`);
+      fixCount++;
+    }
+  }
+
+  // Display-only: SQLite availability
+  if (!result.sqliteCheck.available) {
+    writeLine('');
+    writeLine(`⚠ SQLite unavailable (node:sqlite needs Node ${NODE_ENGINE_RANGE}):`);
+    writeLine(`  Upgrade Node (currently ${process.version})`);
+  }
+
+  if (fixCount > 0) {
+    writeLine('');
+    writeLine(
+      `\x1b[32m${String(fixCount)} issue(s) fixed.\x1b[0m Re-run \x1b[1mnexus-agents doctor\x1b[0m to verify.`
+    );
+  } else {
+    writeLine('No auto-fixable issues found.');
+  }
+  writeLine('');
+}
+
+// Re-export printDoctorResults for backward compatibility
+export { printDoctorResults } from './doctor-formatting.js';

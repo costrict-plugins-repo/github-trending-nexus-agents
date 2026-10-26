@@ -1,0 +1,438 @@
+/**
+ * CLI Orchestrate Command
+ *
+ * Executes tasks using locally authenticated CLI tools (Claude, Gemini, Codex)
+ * without requiring MCP. Uses CompositeRouter for intelligent model selection.
+ *
+ * @module cli/orchestrate-command
+ * (Source: Issue #183, 5-0 consensus vote for CLI orchestrator mode)
+ * (Source: Issue #386, PuppeteerOrchestrator integration)
+ */
+
+/* eslint-disable no-console -- stdout is this command's user-facing output; the logger writes to stderr */
+
+import {
+  createLogger,
+  getTimeProvider,
+  formatPercentage,
+  type ILogger,
+  type Result,
+} from '../core/index.js';
+import {
+  createCompositeRouter,
+  createAllAdapters,
+  getAvailableClis,
+  type ICliAdapter,
+  type ICompositeRouter,
+  type CompositeRoutingDecision,
+  type CliError,
+  type CliResponse,
+  type CliName,
+  type RoutingArmId,
+  type CliTask,
+} from '../cli-adapters/index.js';
+import { getConfig, adaptRoutingConfig } from '../config/index.js';
+import { ensureGatewayDiscovered } from '../adapters/gateway-rediscovery.js';
+import { gatewayServedSlotOf } from '../cli-adapters/gateway-slot-arm.js';
+import { executeWithPuppeteer } from './orchestrate-puppeteer.js';
+import type { OrchestrateOptions, PuppeteerOrchestrationResult } from './orchestrate-types.js';
+import { buildDryRunReport, renderDryRunText, type DryRunReport } from './orchestrate-dry-run.js';
+import { recordRoutedOrchestrateOutcome } from './orchestrate-outcome.js';
+
+// Re-export types for backward compatibility
+export type { OrchestrateEngine, OrchestrateOptions } from './orchestrate-types.js';
+
+/** Orchestration result */
+interface OrchestrationResult {
+  success: boolean;
+  model: string;
+  response?: CliResponse;
+  routing?: CompositeRoutingDecision;
+  error?: string;
+  durationMs: number;
+  /** Present only when dryRun=true — enriched task analysis + cost estimate. */
+  dryRun?: DryRunReport;
+}
+
+/**
+ * Run the routed arm through the router, so it learns from the run, and record
+ * the outcome (#6533). `task` is the object that was routed; `runTask` is what
+ * the arm executes.
+ */
+async function executeRouted(
+  router: ICompositeRouter,
+  decision: CompositeRoutingDecision,
+  task: CliTask,
+  runTask: CliTask,
+  logger: ILogger
+): Promise<Result<CliResponse, CliError>> {
+  if (router.executeDecision === undefined) {
+    // Only a custom ICompositeRouter lacks it; createCompositeRouter's does not.
+    logger.warn('Router cannot execute a decision; running the arm with no outcome feedback');
+    return decision.adapter.execute(runTask);
+  }
+  const result = await router.executeDecision(decision, task, runTask);
+  recordRoutedOrchestrateOutcome(task.content, result);
+  return result;
+}
+
+/**
+ * Execute task with a routed adapter.
+ */
+async function runWithAdapter(
+  task: CliTask,
+  decision: CompositeRoutingDecision,
+  router: ICompositeRouter,
+  logger: ILogger,
+  startTime: number
+): Promise<OrchestrationResult> {
+  const time = getTimeProvider();
+  // #3394: when route-time model selection chose a concrete model, run with it —
+  // unless the task already pins one. Default-off behaviour: decision.model is
+  // undefined and effectiveTask === task.
+  const effectiveTask =
+    decision.model !== undefined && task.model === undefined
+      ? { ...task, model: decision.model }
+      : task;
+  logger.info('Executing task...', { model: decision.model ?? decision.cliName });
+  const execResult = await executeRouted(router, decision, task, effectiveTask, logger);
+
+  if (!execResult.ok) {
+    return {
+      success: false,
+      model: decision.cliName,
+      routing: decision,
+      error: execResult.error.message,
+      durationMs: time.now() - startTime,
+    };
+  }
+
+  return {
+    success: true,
+    model: decision.cliName,
+    response: execResult.value,
+    routing: decision,
+    durationMs: time.now() - startTime,
+  };
+}
+
+/**
+ * Execute task using available CLI adapters with intelligent routing.
+ */
+async function executeWithRouting(
+  task: CliTask,
+  adapters: Map<RoutingArmId, ICliAdapter>,
+  options: OrchestrateOptions,
+  logger: ILogger
+): Promise<OrchestrationResult> {
+  const time = getTimeProvider();
+  const startTime = time.now();
+
+  // Load routing config from nexus-agents.yaml (Issue #475)
+  const configResult = getConfig();
+  const routingConfig = adaptRoutingConfig(configResult.config.routing);
+
+  // Override budget constraints with CLI options if provided
+  const budgetConstraints = {
+    ...routingConfig.budgetConstraints,
+    ...(options.maxTokens !== undefined && { maxTokens: options.maxTokens }),
+    ...(options.maxCostUsd !== undefined && { maxCostUsd: options.maxCostUsd }),
+  };
+
+  const router = createCompositeRouter(adapters, {
+    ...routingConfig,
+    budgetConstraints,
+  });
+
+  logger.info('Routing task...', { task: task.content.slice(0, 50) });
+  const routingResult = await router.route(task);
+
+  if (!routingResult.ok) {
+    return {
+      success: false,
+      model: 'none',
+      error: routingResult.error.message,
+      durationMs: time.now() - startTime,
+    };
+  }
+
+  const decision = routingResult.value;
+
+  if (options.dryRun === true) {
+    return {
+      success: true,
+      model: decision.cliName,
+      routing: decision,
+      dryRun: buildDryRunReport(task, decision),
+      durationMs: time.now() - startTime,
+    };
+  }
+
+  return runWithAdapter(task, decision, router, logger, startTime);
+}
+
+/**
+ * Execute task with specific model (bypass routing).
+ */
+async function executeWithModel(
+  task: CliTask,
+  model: CliName,
+  adapters: Map<RoutingArmId, ICliAdapter>,
+  logger: ILogger
+): Promise<OrchestrationResult> {
+  const time = getTimeProvider();
+  const startTime = time.now();
+
+  const adapter = adapters.get(model);
+  if (adapter === undefined) {
+    return {
+      success: false,
+      model,
+      error: `Model '${model}' not available. Available: ${[...adapters.keys()].join(', ')}`,
+      durationMs: time.now() - startTime,
+    };
+  }
+
+  logger.info('Executing task...', { model });
+  const execResult = await adapter.execute(task);
+
+  if (!execResult.ok) {
+    return {
+      success: false,
+      model,
+      error: execResult.error.message,
+      durationMs: time.now() - startTime,
+    };
+  }
+
+  return {
+    success: true,
+    model,
+    response: execResult.value,
+    durationMs: time.now() - startTime,
+  };
+}
+
+/**
+ * Format result for JSON output.
+ */
+function formatResultJson(result: OrchestrationResult | PuppeteerOrchestrationResult): string {
+  const puppeteerResult = result as PuppeteerOrchestrationResult;
+  return JSON.stringify(
+    {
+      success: result.success,
+      model: result.model,
+      durationMs: result.durationMs,
+      ...(result.response !== undefined && {
+        text: result.response.text,
+        usage: (result.response as CliResponse).usage,
+        costUsd: (result.response as CliResponse).costUsd,
+      }),
+      ...(result.routing !== undefined && {
+        routing: {
+          cliName: result.routing.cliName,
+          confidence: result.routing.confidence,
+          reason: result.routing.reason,
+        },
+      }),
+      ...(puppeteerResult.puppeteer !== undefined && {
+        puppeteer: puppeteerResult.puppeteer,
+      }),
+      ...(result.error !== undefined && { error: result.error }),
+    },
+    null,
+    2
+  );
+}
+
+/**
+ * Format puppeteer stats for text output.
+ */
+function formatPuppeteerStats(puppeteer: PuppeteerOrchestrationResult['puppeteer']): string[] {
+  if (puppeteer === undefined) return [];
+  const lines = [
+    '\n--- Orchestration Stats ---',
+    `Steps: ${String(puppeteer.totalSteps)}`,
+    `Trajectory: ${String(puppeteer.trajectoryLength)} actions`,
+  ];
+  if (puppeteer.policyStats !== undefined) {
+    const stats = puppeteer.policyStats;
+    lines.push(`Policy updates: ${String(stats.updateCount)}`);
+    lines.push(`Learning rate: ${stats.currentLearningRate.toFixed(4)}`);
+    lines.push(`Baseline: ${stats.baseline.toFixed(4)}`);
+  }
+  return lines;
+}
+
+/**
+ * Format result for text output.
+ */
+function formatResultText(result: OrchestrationResult | PuppeteerOrchestrationResult): string {
+  const lines: string[] = [];
+  const puppeteerResult = result as PuppeteerOrchestrationResult;
+  const resultWithDryRun = result as OrchestrationResult;
+
+  // Dry run: emit enriched report instead of minimal routing summary
+  if (resultWithDryRun.dryRun !== undefined) {
+    return renderDryRunText(resultWithDryRun.dryRun);
+  }
+
+  if (result.success) {
+    lines.push(`Task completed using ${result.model} (${String(result.durationMs)}ms)`);
+
+    if (result.routing !== undefined) {
+      lines.push(`\nRouting: ${result.routing.reason}`);
+      lines.push(`Confidence: ${formatPercentage(result.routing.confidence, 1)}`);
+    }
+
+    lines.push(...formatPuppeteerStats(puppeteerResult.puppeteer));
+
+    if (result.response !== undefined) {
+      lines.push('\n--- Response ---');
+      lines.push(result.response.text);
+      const cliResponse = result.response as CliResponse;
+      if (cliResponse.usage !== undefined) {
+        lines.push('\n--- Usage ---');
+        lines.push(`Tokens: ${String(cliResponse.usage.totalTokens ?? 0)}`);
+        if (cliResponse.costUsd !== undefined) {
+          lines.push(`Cost: $${cliResponse.costUsd.toFixed(4)}`);
+        }
+      }
+    }
+  } else {
+    lines.push(`Task failed: ${result.error ?? 'Unknown error'}`);
+    lines.push(`Model: ${result.model}`);
+    lines.push(`Duration: ${String(result.durationMs)}ms`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Format result for output.
+ */
+function formatResult(
+  result: OrchestrationResult | PuppeteerOrchestrationResult,
+  format: 'text' | 'json'
+): string {
+  return format === 'json' ? formatResultJson(result) : formatResultText(result);
+}
+
+/**
+ * What to tell an operator when NO routing arm is usable (#5910).
+ *
+ * Names both routes, because the old message named only one and was wrong for
+ * the other: under `NEXUS_BILLING_MODE=api` a provider key is sufficient and no
+ * CLI need be installed, which is exactly the configuration `#3422` added.
+ */
+function noRoutingArmsMessage(): string {
+  const apiMode = process.env['NEXUS_BILLING_MODE'] === 'api';
+  const lines = [
+    'No routing arms available — nothing can run this task.',
+    '',
+    'Either install and authenticate a CLI (claude, gemini, codex, opencode),',
+    apiMode
+      ? 'or set a provider key: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_AI_API_KEY.'
+      : 'or set NEXUS_BILLING_MODE=api together with a provider key (ANTHROPIC_API_KEY,' +
+        ' OPENAI_API_KEY, GOOGLE_AI_API_KEY). API arms enter the router only in' +
+        ' explicit api billing mode, so a key alone is not enough (#3422).',
+    '',
+    'Run "nexus-agents doctor" for details.',
+  ];
+  return lines.join('\n');
+}
+
+/**
+ * Report the usable routing arms, or explain that there are none (#5910).
+ *
+ * Returns false when the caller should stop. Extracted so `orchestrateCommand`
+ * stays inside the complexity cap.
+ */
+function reportRoutingArms(
+  availableClis: readonly string[],
+  binarylessArms: readonly string[],
+  verbose: boolean
+): boolean {
+  if (availableClis.length === 0 && binarylessArms.length === 0) {
+    console.error(noRoutingArmsMessage());
+    return false;
+  }
+  if (verbose) {
+    console.log(`Available routing arms: ${[...availableClis, ...binarylessArms].join(', ')}`);
+  }
+  return true;
+}
+
+/**
+ * Main orchestrate command handler.
+ */
+export async function orchestrateCommand(options: OrchestrateOptions): Promise<number> {
+  const logger = createLogger({ component: 'orchestrate', verbose: options.verbose });
+
+  const availableClis = await getAvailableClis();
+
+  // Use subprocess for Codex in puppeteer mode (MCP 'execute' tool not
+  // available); otherwise leave the transport unset so the factory selects it
+  // by probing for `codex mcp-server` (#6119) instead of demanding `mcp`.
+  const codexTransport = options.engine === 'puppeteer' ? 'subprocess' : undefined;
+  // ROUTER CONSTRUCTION — see `pipeline/expert-bridge.ts` for the full reasoning
+  // (#5191). This site additionally needs the transport argument above, which
+  // selects a different class (`CodexCliAdapter` vs `CodexMcpAdapter`) and which
+  // `UnifiedRegistryConfig` cannot express (#5211).
+  //
+  // Built BEFORE the precondition check (#5910). The check used to be
+  // `getAvailableClis().length === 0`, which probes for the BINARIES
+  // claude/gemini/codex/opencode and never consults a credential — so it
+  // refused to start even when `createAllAdapters` would have produced usable
+  // `api:*` arms from a provider key under `NEXUS_BILLING_MODE=api` (#3422).
+  // The gate now asks the question it means to ask: is any routing arm usable?
+  // #4392: a CLI process never runs the MCP server bootstrap, and
+  // `createAllAdapters` is synchronous, so the gateway catalogue its family
+  // slots and `api:custom-openai` arm read must exist before it is called.
+  // One probe per process; a no-op with no gateway configured.
+  await ensureGatewayDiscovered();
+  const adapters = createAllAdapters(logger, codexTransport);
+  if (adapters.size === 0) {
+    // A DIFFERENT failure from "no arms usable" below, and kept separate on
+    // purpose: this one means construction itself failed, which is an engine
+    // fault rather than an operator configuration problem.
+    console.error('Failed to create CLI adapters.');
+    return 1;
+  }
+
+  // Arms that run without a CLI binary: direct-API arms, and (#4392) a vendor
+  // slot served by its family's gateway model. Not counting the latter
+  // refused a gateway-only host whose slot arms were runnable.
+  const binarylessArms = [...adapters].flatMap(([id, adapter]) => {
+    if (id.startsWith('api:')) return [id];
+    const served = gatewayServedSlotOf(adapter);
+    return served === undefined ? [] : [`${id} (gateway ${served.modelId})`];
+  });
+  if (!reportRoutingArms(availableClis, binarylessArms, options.verbose === true)) return 1;
+
+  let result: OrchestrationResult | PuppeteerOrchestrationResult;
+
+  if (options.engine === 'puppeteer') {
+    result = await executeWithPuppeteer(options.task, adapters, options, logger);
+  } else {
+    const task: CliTask = {
+      content: options.task,
+      systemPrompt: 'You are a helpful assistant.',
+    };
+
+    if (options.model !== undefined) {
+      result = await executeWithModel(task, options.model, adapters, logger);
+    } else {
+      result = await executeWithRouting(task, adapters, options, logger);
+    }
+  }
+
+  const output = formatResult(result, options.format ?? 'text');
+  console.log(output);
+
+  for (const adapter of adapters.values()) {
+    await adapter.dispose();
+  }
+
+  return result.success ? 0 : 1;
+}

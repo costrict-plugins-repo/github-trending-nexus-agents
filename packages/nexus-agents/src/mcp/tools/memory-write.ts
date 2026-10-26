@@ -1,0 +1,494 @@
+/**
+ * nexus-agents/mcp - Memory Write Tool
+ *
+ * MCP tool for manual memory injection across backends.
+ * Supports session (learnings), belief (triples), agentic (knowledge),
+ * adaptive (priority-scored), and typed (MIRIX-style) writes.
+ *
+ * @module mcp/tools/memory-write
+ * (Source: Issue #1090 - Add memory_write MCP tool)
+ */
+
+import { z } from 'zod';
+import type { McpServer } from '../sdk-types.js';
+import type { ILogger } from '../../core/index.js';
+import { createLogger, formatZodError } from '../../core/index.js';
+import { withToolError } from '../middleware/tool-error-handler.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { withPrerequisite } from '../middleware/tool-prerequisites.js';
+import {
+  registerStructuredTool,
+  toolStructuredError,
+  structuredToolSuccess,
+  type ToolResult,
+  type BaseMcpToolDeps,
+} from './tool-result.js';
+import { getToolMemory } from './tool-memory.js';
+import type { MemoryStoreOutcome } from './tool-memory.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+import { sanitizeErrorDetails } from '../../security/output-sanitizer.js';
+import { TrustTierSchema } from '../../security/trust-types.js';
+import type { TrustTier } from '../../security/trust-types.js';
+import { resolveContentTrustProvenance } from '../../security/content-trust-tier.js';
+import { measuredTrustTier } from '../middleware/request-context.js';
+import { memoryTrustTierTag } from '../../context/memory-trust-tier.js';
+
+// Concrete shape: every backend writer returns success+backend+key, with an
+// optional `deduplicated` flag (belief backend only) and an optional `error`
+// field on failure paths (#2340 batch 2).
+const OUTPUT_SCHEMA = {
+  success: z.boolean(),
+  backend: z.string(),
+  key: z.string(),
+  deduplicated: z.boolean().optional(),
+  error: z.string().optional(),
+};
+
+// ============================================================================
+// Schema & Types
+// ============================================================================
+
+const SOURCE_TRUST_TIER_DESCRIPTION =
+  "Trust tier ('1'-'4') of where the content came from: '1' only for content the caller authored " +
+  "or took from repo files, '3' for external web or issue text. Omitted means '3'. The stored tier " +
+  "is the least-trusted of this and the caller's measured tier, so it can lower trust, never raise it; " +
+  "when the caller is unmeasured, a declaration counts as at most '3'.";
+
+/**
+ * Input schema for memory_write tool.
+ */
+export const MemoryWriteInputSchema = z.object({
+  key: z.string().min(1).max(200).describe('Memory identifier or subject'),
+  content: z.string().min(1).max(5000).describe('Memory content to store'),
+  backend: z
+    .enum(['session', 'belief', 'agentic', 'adaptive', 'typed'])
+    .describe(
+      'Target memory backend: session (learnings), belief (triples), agentic (knowledge), ' +
+        'adaptive (priority-scored), typed (MIRIX-style semantic)'
+    ),
+  confidence: z
+    .enum(['high', 'medium', 'low'])
+    .optional()
+    .default('medium')
+    .describe('Confidence level (default: medium)'),
+  metadata: z
+    .record(z.string().max(100), z.string().max(500))
+    .optional()
+    .describe('Optional key-value metadata tags'),
+  sourceTrustTier: TrustTierSchema.optional().describe(SOURCE_TRUST_TIER_DESCRIPTION),
+});
+
+/**
+ * Type for validated memory write input.
+ */
+export type MemoryWriteInput = z.infer<typeof MemoryWriteInputSchema>;
+
+/**
+ * Dependencies for memory_write tool.
+ */
+export type MemoryWriteDeps = BaseMcpToolDeps;
+
+/**
+ * Response from memory_write tool.
+ */
+export interface MemoryWriteResponse {
+  /** Whether the write succeeded */
+  success: boolean;
+  /** Target backend */
+  backend: string;
+  /** Key/subject written */
+  key: string;
+  /** Whether write was skipped due to identical content already existing (#1455) */
+  deduplicated?: boolean;
+  /** Error message if write failed */
+  error?: string;
+}
+
+// ============================================================================
+// Handler
+// ============================================================================
+
+/**
+ * Writes to the session backend as a learning.
+ */
+function writeToSession(
+  key: string,
+  content: string,
+  confidence: 'high' | 'medium' | 'low',
+  trustTier: TrustTier | undefined
+): MemoryWriteResponse {
+  const toolMemory = getToolMemory();
+  const numericConfidence = confidence === 'high' ? 0.9 : confidence === 'medium' ? 0.7 : 0.4;
+  // #5889: this used to discard the outcome and return `success: true`
+  // unconditionally — the one backend the #4997 sweep missed. `executeMemoryWrite`
+  // caches a successful write, so a dropped one was remembered as landed and the
+  // identical retry short-circuited to `{ success: true, deduplicated: true }`:
+  // the tool asserting the content was already stored when nothing ever stored it.
+  const outcome: MemoryStoreOutcome = toolMemory.recordLearning({
+    pattern: content,
+    context: key,
+    confidence: numericConfidence,
+    source: 'memory_write_tool',
+    ...(trustTier !== undefined ? { trustTier } : {}),
+  });
+  if (!outcome.persisted) {
+    return { success: false, backend: 'session', key, error: outcome.reason };
+  }
+  return { success: true, backend: 'session', key };
+}
+
+/**
+ * Writes to the belief backend as a triple.
+ * Skips write if identical content already exists (content-hash dedup #1455).
+ */
+async function writeToBelief(
+  key: string,
+  content: string,
+  confidence: 'high' | 'medium' | 'low',
+  trustTier: TrustTier | undefined
+): Promise<MemoryWriteResponse> {
+  const toolMemory = getToolMemory();
+  const countBefore = toolMemory.getBeliefCount();
+  const outcome: MemoryStoreOutcome = await toolMemory.recordBelief(
+    key,
+    'has_knowledge',
+    content,
+    confidence,
+    trustTier
+  );
+  if (!outcome.persisted) {
+    return { success: false, backend: 'belief', key, error: outcome.reason };
+  }
+  // An unchanged count after a PERSISTED retain means the triple was already
+  // held. Before #4997 the count was the only signal, so a rejected write and a
+  // deduplicated one were the same observation.
+  const deduplicated = toolMemory.getBeliefCount() === countBefore;
+  return { success: true, backend: 'belief', key, ...(deduplicated ? { deduplicated: true } : {}) };
+}
+
+/**
+ * Writes to the agentic backend as knowledge.
+ */
+async function writeToAgentic(
+  key: string,
+  content: string,
+  confidence: 'high' | 'medium' | 'low',
+  metadata: Record<string, string> | undefined,
+  trustTier: TrustTier | undefined
+): Promise<MemoryWriteResponse> {
+  const toolMemory = getToolMemory();
+  if (!toolMemory.isAgenticMemoryAvailable()) {
+    return {
+      success: false,
+      backend: 'agentic',
+      key,
+      error: 'Agentic memory backend unavailable (requires SQLite)',
+    };
+  }
+  const outcome: MemoryStoreOutcome = await toolMemory.recordKnowledge(key, content, {
+    importance: confidence,
+    tags: [
+      ...(metadata !== undefined ? Object.keys(metadata) : []),
+      ...(trustTier !== undefined ? [memoryTrustTierTag(trustTier)] : []),
+    ],
+  });
+  if (!outcome.persisted) {
+    return { success: false, backend: 'agentic', key, error: outcome.reason };
+  }
+  return { success: true, backend: 'agentic', key };
+}
+
+/**
+ * Writes to the adaptive backend with priority scoring.
+ */
+async function writeToAdaptive(
+  key: string,
+  content: string,
+  confidence: 'high' | 'medium' | 'low',
+  trustTier: TrustTier | undefined
+): Promise<MemoryWriteResponse> {
+  const toolMemory = getToolMemory();
+  if (!toolMemory.isAdaptiveMemoryAvailable()) {
+    return {
+      success: false,
+      backend: 'adaptive',
+      key,
+      error: 'Adaptive memory backend unavailable (requires SQLite)',
+    };
+  }
+  const importance = confidence === 'high' ? 0.9 : confidence === 'medium' ? 0.7 : 0.5;
+  const outcome: MemoryStoreOutcome = await toolMemory.storeAdaptive(
+    key,
+    content,
+    importance,
+    trustTier
+  );
+  if (!outcome.persisted) {
+    return { success: false, backend: 'adaptive', key, error: outcome.reason };
+  }
+  return { success: true, backend: 'adaptive', key };
+}
+
+/**
+ * Writes to the typed backend as a semantic memory entry.
+ */
+async function writeToTyped(
+  key: string,
+  content: string,
+  confidence: 'high' | 'medium' | 'low',
+  trustTier: TrustTier | undefined
+): Promise<MemoryWriteResponse> {
+  const toolMemory = getToolMemory();
+  if (!toolMemory.isTypedMemoryAvailable()) {
+    return {
+      success: false,
+      backend: 'typed',
+      key,
+      error: 'Typed memory backend unavailable (requires SQLite)',
+    };
+  }
+  const importance = confidence === 'high' ? 'high' : confidence === 'medium' ? 'medium' : 'low';
+  const outcome: MemoryStoreOutcome = await toolMemory.storeTyped(
+    key,
+    content,
+    importance,
+    trustTier
+  );
+  if (!outcome.persisted) {
+    return { success: false, backend: 'typed', key, error: outcome.reason };
+  }
+  return { success: true, backend: 'typed', key };
+}
+
+/**
+ * Executes the memory write operation.
+ */
+/** Track recently written keys to prevent immediate duplicate writes within a session. */
+const recentWriteKeys = new Map<string, string>();
+
+/** Maximum entries in the dedup cache before pruning oldest. */
+const MAX_DEDUP_CACHE = 200;
+
+/**
+ * Session-level dedup: prevent writing the same key+content twice.
+ * Returns true if this is a duplicate that should be skipped.
+ */
+function dedupCacheKey(input: MemoryWriteInput): string {
+  // #4997: the backend is part of the identity. Without it, writing the same
+  // key+content to `session` and then to `belief` reported the second as
+  // `deduplicated: true` while the belief store never received it.
+  // #6751: the source tier is part of the identity too, so a write that would
+  // store a different tier is not reported as already stored.
+  return `${input.backend}::${input.sourceTrustTier ?? ''}::${input.key}::${input.content}`;
+}
+
+function isDuplicateWrite(input: MemoryWriteInput): boolean {
+  return recentWriteKeys.has(dedupCacheKey(input));
+}
+
+/**
+ * Remembers a write that actually landed (#4997).
+ *
+ * Recording it before dispatch cached intent rather than persistence: a write
+ * that failed still populated the cache, so the identical retry came back
+ * `success: true, deduplicated: true` — the tool asserting the content was
+ * already stored when nothing had ever stored it.
+ */
+function rememberWrite(input: MemoryWriteInput): void {
+  if (recentWriteKeys.size >= MAX_DEDUP_CACHE) {
+    const firstKey = recentWriteKeys.keys().next().value;
+    if (firstKey !== undefined) recentWriteKeys.delete(firstKey);
+  }
+  recentWriteKeys.set(dedupCacheKey(input), new Date().toISOString());
+}
+
+/**
+ * Redact credentials from the text before it is stored (#6751 hardening), with
+ * the shared credential redactor the job-result write path also uses.
+ */
+function redactMemoryInput(input: MemoryWriteInput): MemoryWriteInput {
+  return {
+    ...input,
+    key: sanitizeErrorDetails(input.key),
+    content: sanitizeErrorDetails(input.content),
+  };
+}
+
+/**
+ * The tier a `memory_write` entry is stored with (#6795).
+ *
+ * With a MEASURED caller: the least-trusted of the caller tier and the
+ * declared `sourceTrustTier`, where an omitted declaration means Tier 3 —
+ * content of unknown provenance is untrusted however trusted the caller, and
+ * a declaration can lower the tier but never raise it above the caller.
+ *
+ * With an UNMEASURED caller (`callerTrustTier` undefined, see
+ * `measuredTrustTier`): a declaration is capped at Tier 3, because nothing
+ * measured vouches for it; an undeclared entry is stored unlabelled, because
+ * recording a fallback would label every entry as if measured.
+ */
+function storedTrustTier(
+  callerTrustTier: TrustTier | undefined,
+  declared: TrustTier | undefined
+): TrustTier | undefined {
+  const provenance = resolveContentTrustProvenance(callerTrustTier, [], declared);
+  if (callerTrustTier !== undefined) return provenance.contentTier;
+  return declared === undefined ? undefined : provenance.taskContentTier;
+}
+
+/** Redact, resolve the content tier ({@link storedTrustTier}), then write. */
+async function executeMemoryWrite(
+  rawInput: MemoryWriteInput,
+  logger: ILogger,
+  callerTrustTier: TrustTier | undefined
+): Promise<MemoryWriteResponse> {
+  const input = redactMemoryInput(rawInput);
+  const trustTier = storedTrustTier(callerTrustTier, input.sourceTrustTier);
+  // Session-level dedup: skip if the same key+content reached this backend
+  if (isDuplicateWrite(input)) {
+    logger.debug('Skipping duplicate memory write', { key: input.key, backend: input.backend });
+    return { success: true, backend: input.backend, key: input.key, deduplicated: true };
+  }
+
+  logger.debug('Writing to memory', {
+    backend: input.backend,
+    key: input.key,
+    contentLength: input.content.length,
+  });
+
+  const response = await dispatchWrite(input, trustTier);
+  // Only a write that landed is worth deduplicating against.
+  if (response.success) rememberWrite(input);
+  return response;
+}
+
+/**
+ * #5438: wait for the non-blocking startup initialization before dispatching.
+ *
+ * Three of the five writers refuse with `"<backend> memory backend unavailable
+ * (requires SQLite)"`, and each of those guards reads an availability flag that
+ * is `false` for a short window after session start while the backend is merely
+ * still opening. Reproduced live on `memory_stats`: five backends reported
+ * absent, then all five present 55 seconds later with 519 entries already
+ * there. Here the cost is worse than a misreport — the write is DROPPED, and
+ * the caller is told SQLite is the cause when it is not.
+ *
+ * Awaited once at the dispatch seam rather than inside each writer, so a new
+ * backend cannot be added without inheriting the wait.
+ */
+async function dispatchWrite(
+  input: MemoryWriteInput,
+  trustTier: TrustTier | undefined
+): Promise<MemoryWriteResponse> {
+  try {
+    await getToolMemory().awaitBackendInitialization();
+  } catch {
+    // A backend that failed to initialise must still produce the writer's own
+    // honest "unavailable" response below, not an exception from the wait.
+  }
+  switch (input.backend) {
+    case 'session':
+      return writeToSession(input.key, input.content, input.confidence, trustTier);
+    case 'belief':
+      return writeToBelief(input.key, input.content, input.confidence, trustTier);
+    case 'agentic':
+      return writeToAgentic(input.key, input.content, input.confidence, input.metadata, trustTier);
+    case 'adaptive':
+      return writeToAdaptive(input.key, input.content, input.confidence, trustTier);
+    case 'typed':
+      return writeToTyped(input.key, input.content, input.confidence, trustTier);
+  }
+}
+
+/**
+ * Core handler logic for memory_write tool.
+ */
+async function memoryWriteHandler(args: unknown, ctx: HandlerContext): Promise<ToolResult> {
+  const validationResult = MemoryWriteInputSchema.safeParse(args);
+  if (!validationResult.success) {
+    return toolStructuredError({
+      errorCategory: 'validation',
+      message: `Validation error: ${formatZodError(validationResult.error)}`,
+    });
+  }
+
+  return withToolError('Memory write failed', ctx.logger, async () => {
+    const measured = TrustTierSchema.safeParse(measuredTrustTier(ctx.requestContext));
+    const result = await executeMemoryWrite(
+      validationResult.data,
+      ctx.logger,
+      measured.success ? measured.data : undefined
+    );
+    if (!result.success) {
+      return toolStructuredError({
+        errorCategory: 'internal',
+        message: JSON.stringify(result, null, 2),
+      });
+    }
+    return structuredToolSuccess(z.object(OUTPUT_SCHEMA), result);
+  });
+}
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+/**
+ * Registers the memory_write tool with the MCP server.
+ *
+ * @category MCP
+ * @param server - MCP server instance
+ * @param deps - Tool dependencies
+ */
+export function registerMemoryWriteTool(server: McpServer, deps: MemoryWriteDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'memory_write' });
+  const toolSchema = {
+    key: z.string().min(1).max(200).describe('Memory identifier or subject'),
+    content: z.string().min(1).max(5000).describe('Memory content to store'),
+    backend: z
+      .enum(['session', 'belief', 'agentic', 'adaptive', 'typed'])
+      .describe(
+        'Target memory backend: session (learnings), belief (triples), agentic (knowledge), ' +
+          'adaptive (priority-scored), typed (MIRIX-style semantic)'
+      ),
+    confidence: z
+      .enum(['high', 'medium', 'low'])
+      .optional()
+      .describe('Confidence level (default: medium)'),
+    metadata: z
+      .record(z.string().max(100), z.string().max(500))
+      .optional()
+      .describe('Optional key-value metadata tags'),
+    sourceTrustTier: TrustTierSchema.optional().describe(SOURCE_TRUST_TIER_DESCRIPTION),
+  };
+
+  const description =
+    'Write a memory entry to a specific backend. ' +
+    'Supports session (learnings), belief assertions (subject + object; predicate fixed as `has_knowledge`), ' +
+    'agentic (knowledge with attributes), adaptive (priority-scored), ' +
+    'and typed (MIRIX-style semantic) backends.';
+
+  const secureHandler = createSecureHandler(memoryWriteHandler, {
+    toolName: 'memory_write',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const guardedHandler = withPrerequisite('memory_write', secureHandler);
+  const timeoutMs = getToolTimeout('memory_write', deps.security);
+  const wrappedHandler = wrapToolWithTimeout('memory_write', guardedHandler, { timeoutMs, logger });
+
+  registerStructuredTool(
+    server,
+    'memory_write',
+    {
+      description,
+      inputSchema: toolSchema,
+      outputSchema: OUTPUT_SCHEMA,
+      annotations: getToolAnnotations('memory_write'),
+    },
+    toSdkCallback(wrappedHandler)
+  );
+  logger.info('Registered memory_write tool');
+}

@@ -1,0 +1,271 @@
+/**
+ * nexus-agents/cli - Health Command
+ *
+ * Swarm health dashboard showing agent utilization, routing accuracy,
+ * collaboration efficiency, and failure breakdown from weather report data.
+ *
+ * @module cli/health-command
+ * (Source: Issue #1403)
+ */
+
+import type { ConsensusDecisionTokenReport } from '../observability/consensus-decision-tokens.js';
+import type { CliExitResult, ParsedCliArgs, HealthCommandArgs } from '../cli-types.js';
+import { cliExit, EXIT_CODES } from '../cli-types.js';
+import { getTuneAdjustmentStore, type TuneDemotionStat } from '../core/index.js';
+import { colors, symbols } from './ansi-output.js';
+import { generateWeatherReport } from '../mcp/tools/weather-report.js';
+import type {
+  WeatherReportResponse,
+  SwarmHealthMetrics,
+  FailureBreakdownEntry,
+  CliWeather,
+} from '../mcp/tools/weather-report-types.js';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/** Per-CLI summary for JSON output. */
+export interface CliHealthSummary {
+  readonly cli: string;
+  readonly successRate: number;
+  readonly adapterAttemptSuccessRate: number;
+  readonly adapterUnavailableCount: number;
+  readonly totalTasks: number;
+  readonly avgDurationMs: number;
+}
+
+export interface HealthResult {
+  readonly swarmHealth: SwarmHealthMetrics | undefined;
+  readonly overallSuccessRate: number;
+  readonly adapterAttemptSuccessRate: number;
+  readonly adapterUnavailableCount: number;
+  readonly totalTasks: number;
+  readonly failureBreakdown: readonly FailureBreakdownEntry[];
+  readonly cliCount: number;
+  readonly cliHealth: readonly CliHealthSummary[];
+  /** Self-tuning loop demotion telemetry (#3323) — applied vs intended per CLI. */
+  readonly tuneAdjustments: readonly TuneDemotionStat[];
+  readonly timestamp: string;
+  /** Decision and pipeline join measurements, including unreadable trace counts. */
+  readonly consensusDecisionTokens?: ConsensusDecisionTokenReport;
+}
+
+// ============================================================================
+// Core Logic
+// ============================================================================
+
+/** Collects health data from weather report. Exported for testing. */
+export function collectHealth(): HealthResult {
+  const report: WeatherReportResponse = generateWeatherReport({ includePipelineJoins: true });
+
+  return {
+    swarmHealth: report.swarmHealth,
+    overallSuccessRate: report.overall.successRate,
+    adapterAttemptSuccessRate: report.overall.adapterAttemptSuccessRate,
+    adapterUnavailableCount: report.overall.adapterUnavailableCount,
+    totalTasks: report.overall.totalTasks,
+    failureBreakdown: report.failureBreakdown ?? [],
+    cliCount: report.cliWeather.length,
+    cliHealth: report.cliWeather.map(toCliSummary),
+    tuneAdjustments: getTuneAdjustmentStore().demotionStats(),
+    timestamp: new Date().toISOString(),
+    ...(report.costSection !== undefined
+      ? { consensusDecisionTokens: report.costSection.consensusDecisionTokens }
+      : {}),
+  };
+}
+
+function toCliSummary(cw: CliWeather): CliHealthSummary {
+  return {
+    cli: cw.cli,
+    successRate: cw.successRate,
+    adapterAttemptSuccessRate: cw.adapterAttemptSuccessRate,
+    adapterUnavailableCount: cw.adapterUnavailableCount,
+    totalTasks: cw.totalTasks,
+    avgDurationMs: cw.avgDurationMs,
+  };
+}
+
+// ============================================================================
+// Output Formatters
+// ============================================================================
+
+function renderMetricBar(value: number, max: number): string {
+  const width = 20;
+  const filled = Math.round((value / max) * width);
+  const bar = '\u2588'.repeat(filled) + '\u2591'.repeat(width - filled);
+  return bar;
+}
+
+function renderSwarmMetrics(w: (s: string) => boolean, health: SwarmHealthMetrics): void {
+  const c = colors;
+  const pct = (v: number): string => `${(v * 100).toFixed(1)}%`;
+
+  w(`  ${c.bold}Swarm Health Metrics${c.reset}\n`);
+  w(
+    `  Agent Utilization:       ${renderMetricBar(health.agentUtilization, 1)} ${pct(health.agentUtilization)}\n`
+  );
+  w(
+    `  Collaboration Efficiency:${renderMetricBar(health.collaborationEfficiency, 1)} ${pct(health.collaborationEfficiency)}\n`
+  );
+  w(
+    `  Routing Accuracy:        ${renderMetricBar(health.routingAccuracy, 1)} ${pct(health.routingAccuracy)}\n`
+  );
+  // Both of these are lower-is-better, so their unmeasured value (0) renders as
+  // the BEST possible score. Print the absence instead (#6036).
+  w(
+    `  Weekly Regret:           ${
+      health.analyzedCategories > 0 ? health.weeklyRegret.toFixed(3) : 'unmeasured'
+    }\n`
+  );
+  w(
+    `  Adaptation Speed:        ${
+      health.adaptationSpeedCategories > 0
+        ? `${String(health.adaptationSpeed)} tasks`
+        : 'unmeasured'
+    }\n`
+  );
+  w(
+    `  Observed Categories:     ${String(health.observedCategories)} (${String(health.analyzedCategories)} analysed)\n`
+  );
+  w(`  Observed Roles:          ${String(health.observedRoles)}\n`);
+  w('\n');
+}
+
+function renderCliHealth(w: (s: string) => boolean, entries: readonly CliHealthSummary[]): void {
+  const c = colors;
+  w(`  ${c.bold}Per-CLI Performance${c.reset}\n`);
+  for (const entry of entries) {
+    const rateColor =
+      entry.successRate >= 0.8 ? c.green : entry.successRate >= 0.6 ? c.yellow : c.red;
+    const pct = `${(entry.successRate * 100).toFixed(0)}%`;
+    const dur =
+      entry.avgDurationMs >= 1000
+        ? `${(entry.avgDurationMs / 1000).toFixed(1)}s`
+        : `${String(Math.round(entry.avgDurationMs))}ms`;
+    w(
+      `  ${entry.cli.padEnd(12)} ${rateColor}${pct.padStart(4)}${c.reset}  ${String(entry.totalTasks).padStart(5)} tasks  ${c.dim}avg ${dur}${c.reset}\n`
+    );
+  }
+  w('\n');
+}
+
+function renderFailureBreakdown(
+  w: (s: string) => boolean,
+  entries: readonly FailureBreakdownEntry[]
+): void {
+  const c = colors;
+  if (entries.length === 0) {
+    w(`  ${c.green}No failures recorded${c.reset}\n\n`);
+    return;
+  }
+
+  w(`  ${c.bold}Failure Breakdown${c.reset}\n`);
+  for (const entry of entries) {
+    const color = entry.category === 'unknown' ? c.yellow : c.dim;
+    w(
+      `  ${color}${entry.category.padEnd(22)}${c.reset} ${String(entry.count).padStart(4)}  (${String(entry.percentage)}%)\n`
+    );
+  }
+  w('\n');
+}
+
+function renderTable(health: HealthResult): void {
+  const c = colors;
+  const s = symbols;
+  const w = process.stdout.write.bind(process.stdout);
+
+  w(`\n${c.bold}nexus-agents${c.reset}`);
+  w(` ${c.dim}— Swarm Health Dashboard${c.reset}\n\n`);
+
+  // Overall stats
+  const rateColor =
+    health.overallSuccessRate >= 0.8
+      ? c.green
+      : health.overallSuccessRate >= 0.6
+        ? c.yellow
+        : c.red;
+  const rateSym = health.overallSuccessRate >= 0.8 ? s.check : s.warn;
+  const pctStr = `${(health.overallSuccessRate * 100).toFixed(1)}%`;
+  const attemptPctStr = `${(health.adapterAttemptSuccessRate * 100).toFixed(1)}%`;
+  w(`  Success Rate:  ${rateColor}${pctStr}${c.reset}  ${rateSym}\n`);
+  w(
+    `  Attempt Rate:  ${c.cyan}${attemptPctStr}${c.reset}  ${c.dim}(excludes adapter_unavailable: ${String(health.adapterUnavailableCount)})${c.reset}\n`
+  );
+  w(`  Total Tasks:   ${c.cyan}${String(health.totalTasks)}${c.reset}\n`);
+  w(`  Active CLIs:   ${c.cyan}${String(health.cliCount)}${c.reset}\n\n`);
+
+  const tokens = health.consensusDecisionTokens;
+  if (tokens !== undefined) {
+    const coverage = tokens.pipelineOutcomeJoinCoverage;
+    const reading =
+      coverage === null || coverage === undefined
+        ? 'unmeasured'
+        : `${(coverage * 100).toFixed(1)}%`;
+    w(
+      `  Pipeline Join Coverage: ${reading} (unreadable traces: ${String(tokens.unreadablePipelineTraces ?? 0)})\n\n`
+    );
+  }
+
+  // Per-CLI performance
+  if (health.cliHealth.length > 0) {
+    renderCliHealth(w, health.cliHealth);
+  }
+
+  // Swarm metrics
+  if (health.swarmHealth !== undefined) {
+    renderSwarmMetrics(w, health.swarmHealth);
+  } else {
+    w(`  ${c.dim}No swarm metrics available (requires task history)${c.reset}\n\n`);
+  }
+
+  // Failure breakdown
+  renderFailureBreakdown(w, health.failureBreakdown);
+
+  // Self-tuning loop demotion telemetry (#3323)
+  renderTuneAdjustments(w, health.tuneAdjustments);
+}
+
+function renderTuneAdjustments(
+  w: (s: string) => boolean,
+  stats: readonly TuneDemotionStat[]
+): void {
+  if (stats.length === 0) return;
+  const c = colors;
+  w(
+    `  ${c.bold}Self-Tuning Demotions${c.reset} ${c.dim}(applied = enforced, intended = shadow)${c.reset}\n`
+  );
+  for (const stat of stats) {
+    w(
+      `  ${stat.cli.padEnd(10)} applied: ${c.cyan}${String(stat.applied)}${c.reset}  intended: ${c.cyan}${String(stat.intended)}${c.reset}  ${c.dim}${stat.lastReason}${c.reset}\n`
+    );
+  }
+  w('\n');
+}
+
+function renderJson(health: HealthResult): void {
+  process.stdout.write(JSON.stringify(health, null, 2) + '\n');
+}
+
+// ============================================================================
+// Command Entry Point
+// ============================================================================
+
+/**
+ * Handle the `nexus-agents health` CLI command.
+ */
+export function handleHealthCommand(args: HealthCommandArgs | ParsedCliArgs): CliExitResult {
+  const health = collectHealth();
+
+  if (args.options.format === 'json') {
+    renderJson(health);
+  } else {
+    renderTable(health);
+  }
+
+  // #3942: RETURN the exit code; dispatcher owns process.exit. Pre-migration
+  // this returned void and the dispatcher no-op'd (natural exit 0) — SUCCESS (0)
+  // is byte-identical.
+  return cliExit(EXIT_CODES.SUCCESS);
+}

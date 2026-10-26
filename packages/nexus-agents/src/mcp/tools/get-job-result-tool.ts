@@ -1,0 +1,168 @@
+/**
+ * `get_job_result` MCP tool (#3042, Stage 1 of epic #2631).
+ *
+ * Read-only companion to `orchestrate({ dispatch: 'async' })`: returns the
+ * job-result record written by the background dispatch. Callers poll
+ * until `status !== 'pending'` and then read `result` (on `complete`)
+ * or `error` (on `failed` / `cancelled`).
+ *
+ * Stage 2 (#3043) will migrate the result inline to `StructuredTaskState`
+ * and `query_task_state` will return the same payload; this tool is
+ * the Stage-1 surface that lets async-mode ship before the schema
+ * migration lands.
+ *
+ * @module mcp/tools/get-job-result-tool
+ */
+
+import { z } from 'zod';
+import { jobIdSchema } from '../jobs/job-id.js';
+import type { McpServer } from '../sdk-types.js';
+
+import { createLogger, formatZodError } from '../../core/index.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler } from '../middleware/secure-handler.js';
+import {
+  toolStructuredError,
+  toolSuccess,
+  type BaseMcpToolDeps,
+  type ToolResult,
+} from './tool-result.js';
+import {
+  isAbandonedJob,
+  isMeasuredBuildVersion,
+  type JobResult,
+} from '../jobs/job-result-store.js';
+import { resolveJobResultWithSource, type JobResultSource } from '../jobs/task-state-source.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+import { getTimeProvider } from '../../core/index.js';
+
+export const GetJobResultInputSchema = z.object({
+  jobId: jobIdSchema(
+    'Job ID returned by any tool called with dispatch: "async" (e.g. orchestrate)'
+  ),
+});
+export type GetJobResultInput = z.infer<typeof GetJobResultInputSchema>;
+
+/**
+ * Response envelope. `found: false` means the jobId is unknown (or the
+ * sidecar file is unreadable / future-schema). `found: true` carries
+ * the full record — caller branches on `record.status`.
+ */
+export interface GetJobResultResponse {
+  readonly jobId: string;
+  readonly found: boolean;
+  readonly record?: JobResult;
+  /**
+   * Set when a `pending` record has outlived the runaway guard that bounds
+   * every job body (#4976), so no live process can still be working on it.
+   *
+   * The record itself is left saying `pending` — it is evidence of what was
+   * observed, and rewriting it on read would destroy that. This field is the
+   * qualifier a poller needs to stop waiting.
+   */
+  readonly abandoned?: boolean;
+  /**
+   * Whether `record.producerVersion` identifies a build (#5008). Present
+   * whenever `found` is true.
+   *
+   * This tool's own `_meta['nexus-agents/build']` stamp names the READER's
+   * build; `record.producerVersion` names the build that ran the job. `false`
+   * when the record predates the field or the producer was a `'dev'` build,
+   * in which case the two stamps must not be compared.
+   */
+  readonly producerVersionMeasured?: boolean;
+  /**
+   * Which store the record came from (#5008 follow-up). Present whenever
+   * `found` is true. A `task_state` record is synthesized from the task-state
+   * log and never carries `producerVersion`, so on that source an absent
+   * version says nothing about the producer's age or build — only a `sidecar`
+   * record's absence means it predates the field.
+   */
+  readonly producerVersionSource?: JobResultSource;
+  readonly errorMessage?: string;
+}
+
+export type GetJobResultDeps = BaseMcpToolDeps;
+
+function getJobResultHandler(args: unknown): Promise<ToolResult> {
+  const parsed = GetJobResultInputSchema.safeParse(args);
+  if (!parsed.success) {
+    return Promise.resolve(
+      toolStructuredError({
+        errorCategory: 'validation',
+        message: `Validation error: ${formatZodError(parsed.error)}`,
+      })
+    );
+  }
+  // #3090: dual-read — prefers the Stage-2 task-state log by default (#3090 / #2631),
+  // falling back to the Stage-1 sidecar unless NEXUS_JOB_RESULT_SOURCE=sidecar.
+  const resolved = resolveJobResultWithSource(parsed.data.jobId);
+  if (resolved === null) {
+    const response: GetJobResultResponse = {
+      jobId: parsed.data.jobId,
+      found: false,
+      errorMessage:
+        'Unknown jobId, or the result source is unreadable (corrupt / future schema). ' +
+        'Re-check the jobId returned by the async-mode dispatch.',
+    };
+    return Promise.resolve(toolSuccess(JSON.stringify(response, null, 2)));
+  }
+  const { record, source } = resolved;
+  const abandoned = isAbandonedJob(record, getTimeProvider().now());
+  const response: GetJobResultResponse = {
+    jobId: parsed.data.jobId,
+    found: true,
+    record,
+    producerVersionMeasured: isMeasuredBuildVersion(record.producerVersion),
+    producerVersionSource: source,
+    ...(abandoned
+      ? {
+          abandoned: true,
+          errorMessage:
+            'This job has been `pending` longer than the maximum a job body can run, ' +
+            'so the process that owned it is gone. Nothing will settle it — dispatch again.',
+        }
+      : {}),
+  };
+  return Promise.resolve(toolSuccess(JSON.stringify(response, null, 2)));
+}
+
+/** @category MCP */
+export function registerGetJobResultTool(server: McpServer, deps: GetJobResultDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'get_job_result' });
+  const toolSchema = {
+    jobId: jobIdSchema(
+      'Job ID returned by any tool called with dispatch: "async" (e.g. orchestrate)'
+    ),
+  };
+
+  const description =
+    'Read the result of an async-mode tool invocation by jobId. Returns ' +
+    'the structured record (status, result | error, timestamps, producerVersion) ' +
+    'plus producerVersionMeasured — false when the producer was a dev build or the ' +
+    'record predates the field, so its version must not be compared to this ' +
+    "server's _meta build stamp — and producerVersionSource (sidecar | task_state; " +
+    'a task_state record never carries a version). A pending record may carry ' +
+    "lastProgressAt, the job body's last heartbeat, so slow can be told from stuck " +
+    '(#6162). Poll until status !== "pending". ' +
+    'Failed development-plan jobs may carry failureEvidence (diagnostics, never approval or a resumable checkpoint). Each plan/proposal retains at most 32768 UTF-8 bytes. coverage is complete, redacted, truncated or invalid; redacted and truncated flags distinguish combined transformations. rawSha256 binds original bytes, sanitizedSha256 binds all delivery-sanitized bytes, and retainedSha256 binds returned text. Evidence is made stable under both leaf and serialized JSON redaction before hashing. For example, coverage=redacted with truncated=false means all sanitized text survived, but the raw artifact cannot be reconstructed. Absent evidence or proposal means unmeasured, not complete. Terminal task state takes precedence over the sidecar.';
+
+  const secureHandler = createSecureHandler(getJobResultHandler, {
+    toolName: 'get_job_result',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const timeoutMs = getToolTimeout('get_job_result', deps.security);
+  const wrappedHandler = wrapToolWithTimeout('get_job_result', secureHandler, {
+    timeoutMs,
+    logger,
+  });
+
+  server.registerTool(
+    'get_job_result',
+    { description, inputSchema: toolSchema, annotations: getToolAnnotations('get_job_result') },
+    toSdkCallback(wrappedHandler)
+  );
+  logger.info('Registered get_job_result tool');
+}

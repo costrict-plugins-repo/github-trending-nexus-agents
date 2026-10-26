@@ -1,0 +1,1392 @@
+/* eslint-disable max-lines -- 856 lines as eslint counts them, above the 600 ceiling (.rules/governance.md); one consensus_vote tool surface: strategy resolution, cascade, option gate and async dispatch; split tracked in #6148 */
+/**
+ * nexus-agents/mcp - Consensus Vote Tool
+ * @module mcp/tools/consensus-vote
+ */
+
+import { randomUUID } from 'node:crypto';
+import { basename } from 'node:path';
+import { z } from 'zod';
+import type { McpServer } from '../sdk-types.js';
+import type { ILogger } from '../../core/index.js';
+import {
+  createLogger,
+  getErrorMessage,
+  getTimeProvider,
+  getRandomProvider,
+  formatZodError,
+} from '../../core/index.js';
+import type { IMcpNotifier } from '../mcp-notifier.js';
+import { createMcpNotifier, NOOP_NOTIFIER, withProgressHeartbeat } from '../mcp-notifier.js';
+import {
+  wrapToolWithTimeout,
+  toSdkCallbackWithTimeoutCheck,
+  getToolTimeout,
+} from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import {
+  registerStructuredTool,
+  toolStructuredError,
+  structuredToolSuccess,
+  type ToolResult,
+  type BaseMcpToolDeps,
+} from './tool-result.js';
+import type { ConsensusAlgorithm, Vote, ConsensusResult, Proposal } from '../../consensus/types.js';
+import { SUPERMAJORITY_THRESHOLD } from '../../consensus/decision/thresholds.js';
+import type { VoterRole, AgentVoteResult } from '../../cli/vote-types.js';
+import { getVoterRoles } from '../../cli/voter-roles.js';
+import {
+  getDefaultErrorPolicy,
+  resolveStrategy,
+  strategyToAlgorithm,
+} from '../../consensus/decision/strategy.js';
+import { collectRealVotes } from '../../cli/voter-agents.js';
+import { inlineVoteArtifact, extractBoundArtifact } from '../../cli/vote-artifact.js';
+import { isAbsentSeat } from '../../cli/voter-unverifiable.js';
+import { resolveInsideRoot } from '../../security/safe-path.js';
+import { resolveAndLogVoterProject, type ResolvedVoterProject } from '../../cli/voter-project.js';
+import { resolvePanelWorkspace } from '../../cli/panel-workspace.js';
+import { evaluateOptionGate, optionThresholdFor } from './consensus-vote-option-gate.js';
+import { createConsensusEngine } from '../../consensus/engine.js';
+import type {
+  CorrelationRecordContext,
+  HigherOrderVotingResult,
+  ICorrelationTracker,
+} from '../../consensus/higher-order-types.js';
+import { HigherOrderVotingStrategy } from '../../consensus/index.js';
+import {
+  createPersistentCorrelationTracker,
+  createPersistedProposal,
+  saveCorrelationData,
+} from '../../consensus/correlation-persistence.js';
+import {
+  VotingStrategySchema,
+  VoteDecisionStatusSchema,
+  ContrarianCheckStatusSchema,
+  VoteThresholdSchema,
+  ConsensusVoteInputSchema,
+  buildResponse,
+  isHigherOrderStrategy,
+} from './consensus-vote-types.js';
+import { resolveVoteDecision } from '../../consensus/decision/verdict.js';
+import { applyErrorPolicy } from './consensus-vote-error-policy.js';
+import { maybeEscalateContrarian } from './consensus-vote-contrarian.js';
+import { recordVoteError } from './consensus-vote-recording.js';
+import { recordCompletedVote, AllVotersFailedError } from './consensus-vote-completed-recording.js';
+import { DecisionCostSummarySchema } from '../../observability/decision-cost.js';
+import type { IModelAdapter } from '../../core/index.js';
+import { emitVoteRejectedSignal } from './consensus-vote-signals.js';
+import { getPipelineEventBus } from '../../pipeline/event-bus.js';
+import { checkSimulationAllowed, simulationDeniedResult } from './simulation-guard.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+// #3045 / epic #2631 Stage 4 — async-mode dispatch + concurrency cap.
+// #3045 / epic #2631 Stage 4 — async-mode dispatch via the shared `runAsJob`
+// helper (#3729).
+import {
+  runAsJob,
+  defaultCollisionEnvelope,
+  type JobEnvelopeBuilders,
+} from '../jobs/run-as-job.js';
+import {
+  attachPartialsOnCancel,
+  throwIfVoteCancelled,
+  VoteCancelledError,
+} from './consensus-vote-cancelled.js';
+import type {
+  VotingStrategy,
+  ConsensusVoteInput,
+  ConsensusVoteResponse,
+  ErrorPolicy,
+  ExtendedVotingResult,
+} from './consensus-vote-types.js';
+
+export type {
+  VotingStrategy,
+  ConsensusVoteInput,
+  ConsensusVoteResponse,
+  ContrarianCheckStatus,
+  AgentVoteSummary,
+  VoteDecisionStatus,
+  HigherOrderMetadata,
+  ExtendedVotingResult,
+} from './consensus-vote-types.js';
+export { VotingStrategySchema, ConsensusVoteInputSchema } from './consensus-vote-types.js';
+
+// --- Correlation Tracker Singleton ---
+//
+// Lifecycle & memory model (documented per #3169):
+//   * SCOPE: one process-wide, lazily-created instance shared by every
+//     `consensus_vote` call. It accumulates cross-proposal voter agreement so
+//     the higher_order strategy can down-weight correlated (redundant) voters.
+//     One shared tracker is intentional — correlation signal is only useful
+//     pooled across proposals.
+//   * PERSISTENCE: backed by `createPersistentCorrelationTracker()`, which
+//     hydrates from / appends to the on-disk correlation store, so the signal
+//     survives restarts (the in-memory map is a hot cache over that store).
+//   * MEMORY BOUND: NOT unbounded. The underlying `CorrelationTracker` is
+//     FIFO-bounded by `maxProposals` / `maxObservationsPerAgent` (#521) —
+//     oldest proposals are evicted once the cap is hit (eviction is logged at
+//     debug in `correlation-tracker.ts`, so memory pressure is observable).
+//   * RESET: `resetCorrelationTracker()` drops the instance; the next
+//     `getOrCreateCorrelationTracker()` rebuilds it (re-hydrating from disk).
+//     Test-isolation only. There is intentionally no per-milestone "reset
+//     between cycles" coordinator API — eviction already bounds growth, and
+//     clearing history mid-run would discard the signal the strategy needs.
+let persistentCorrelationTracker: ICorrelationTracker | undefined;
+
+/**
+ * Gets or creates the process-wide persistent CorrelationTracker (#517).
+ * See the lifecycle / memory-bound / reset notes above the declaration (#3169).
+ */
+function getOrCreateCorrelationTracker(): ICorrelationTracker {
+  persistentCorrelationTracker ??= createPersistentCorrelationTracker();
+  return persistentCorrelationTracker;
+}
+
+/**
+ * Drops the singleton so the next {@link getOrCreateCorrelationTracker} rebuilds
+ * it (re-hydrating from the persistent store). Test-isolation only. @internal
+ */
+export function resetCorrelationTracker(): void {
+  persistentCorrelationTracker = undefined;
+}
+
+// --- Dependencies ---
+export interface ConsensusVoteDeps extends BaseMcpToolDeps {
+  /** MCP notifier for client-visible logging (Issue #974) */
+  notifier?: IMcpNotifier | undefined;
+  /**
+   * In-process gateway model adapters (#4040). When the server has a configured
+   * OpenAI-compatible gateway, voters route through these HTTP adapters instead
+   * of shelling out to a CLI subprocess — no per-subprocess key forwarding, and
+   * the nested-spawn deadlock (#4033) cannot occur. Omitted ⇒ CLI voter path.
+   */
+  gatewayAdapters?: readonly IModelAdapter[] | undefined;
+}
+
+// --- Strategy Resolution ---
+// `resolveStrategy`, `strategyToAlgorithm` and `getVoterRoles` moved to the
+// governed decision modules (#6000 step 1): `consensus/decision/strategy.ts`
+// and `cli/voter-roles.ts`. They were module-private here, so nothing is
+// re-exported.
+
+// --- Voting Execution ---
+/** Creates a synthetic ConsensusResult when all votes are errors (Issue #815). */
+function createEmptyConsensusResult(
+  proposal: string,
+  algorithm: ConsensusAlgorithm
+): ConsensusResult {
+  const now = new Date().toISOString();
+  return {
+    proposalId: 'no-valid-votes',
+    proposal: { title: 'MCP Consensus Vote', description: proposal, algorithm },
+    outcome: 'rejected',
+    votes: new Map<string, Vote>(),
+    voteCounts: { approve: 0, reject: 0, abstain: 0, total: 0 },
+    approvalPercentage: 0,
+    quorumReached: false,
+    startedAt: now,
+    closedAt: now,
+    durationMs: 0,
+  };
+}
+
+/**
+ * Creates a synthetic ConsensusResult for an error-policy short-circuit
+ * (#2630). Reused for both the hard floor (errors > 50%) and `fail_closed`.
+ * Stamps the reason on the proposal title and, since #3124, reports the TRUE
+ * vote breakdown of the responding (non-error) voters instead of all-zeros —
+ * the internal `outcome` stays `rejected` (the policy failed closed), but the
+ * counts and `approvalPercentage` are honest (e.g. 6 approvals + 1 error →
+ * approve:6, 100%). As of #4053 the user-facing `decision` for this short-circuit
+ * is `no_quorum` (not `rejected`) — too many voters errored to reach a valid
+ * consensus, which is distinct from the panel rejecting the proposal.
+ */
+export function createPolicyFailedResult(
+  proposal: string,
+  algorithm: ConsensusAlgorithm,
+  reason: string,
+  votes: readonly AgentVoteResult[]
+): ConsensusResult {
+  const now = new Date().toISOString();
+  const voteMap = new Map<string, Vote>();
+  let approve = 0;
+  let reject = 0;
+  let abstain = 0;
+  for (const v of votes) {
+    if (v.source === 'error') continue; // errors surface separately, not as a decision
+    voteMap.set(v.role, v.vote);
+    if (v.vote.decision === 'approve') approve++;
+    else if (v.vote.decision === 'reject') reject++;
+    else abstain++;
+  }
+  const responding = approve + reject + abstain;
+  return {
+    proposalId: 'error-policy-short-circuit',
+    proposal: { title: `MCP Consensus Vote — ${reason}`, description: proposal, algorithm },
+    outcome: 'rejected',
+    votes: voteMap,
+    voteCounts: { approve, reject, abstain, total: responding },
+    approvalPercentage: responding > 0 ? (approve / responding) * 100 : 0,
+    quorumReached: false,
+    startedAt: now,
+    closedAt: now,
+    durationMs: 0,
+  };
+}
+
+/** Thresholds per algorithm for cascade detection. */
+const CASCADE_THRESHOLDS: Record<string, number> = {
+  majority: 0.5,
+  supermajority: SUPERMAJORITY_THRESHOLD,
+  unanimous: 1.0,
+};
+
+/** Detect if vote outcome is mathematically decided (#1765). */
+function detectEarlyCascade(
+  algorithm: string,
+  approvals: number,
+  rejections: number,
+  total: number
+): { decided: boolean; reason: string } {
+  const threshold = CASCADE_THRESHOLDS[algorithm] ?? 0.5;
+  if (total === 0) return { decided: false, reason: '' };
+
+  // Unanimous: any rejection decides
+  if (algorithm === 'unanimous' && rejections > 0) {
+    return { decided: true, reason: `Unanimous rejected: ${String(rejections)} rejection(s)` };
+  }
+  // Approval locked: even if all remaining vote reject, approval holds
+  if (approvals / total > threshold) {
+    return {
+      decided: true,
+      reason: `Approval locked: ${String(approvals)}/${String(total)} > ${String(threshold)}`,
+    };
+  }
+  // Rejection locked: even if all remaining vote approve, rejection holds
+  const remaining = total - approvals - rejections;
+  if ((approvals + remaining) / total < threshold) {
+    return {
+      decided: true,
+      reason: `Rejection locked: max possible ${String(approvals + remaining)}/${String(total)} < ${String(threshold)}`,
+    };
+  }
+  return { decided: false, reason: '' };
+}
+
+/**
+ * Run the consensus engine over already-policy-applied votes.
+ *
+ * Callers MUST pass `engineVotes` produced by `applyErrorPolicy` (#2630)
+ * — under `reduce_denominator` that means errors are already filtered;
+ * under `count_as_abstain` errors have been converted to abstain
+ * decisions but kept in the array. This function does no further
+ * filtering on `source`.
+ */
+async function processVotesThroughEngine(
+  engineVotes: readonly AgentVoteResult[],
+  proposal: string,
+  algorithm: ConsensusAlgorithm,
+  totalRoles?: number
+): Promise<ConsensusResult> {
+  if (engineVotes.length === 0) return createEmptyConsensusResult(proposal, algorithm);
+
+  const boundArtifact = extractBoundArtifact(proposal);
+  const engine = createConsensusEngine();
+  const engineProposal: Proposal = {
+    title: 'MCP Consensus Vote',
+    description: proposal,
+    algorithm,
+    ...(totalRoles !== undefined ? { totalRoles } : {}),
+    ...(boundArtifact !== undefined
+      ? {
+          artifactDigest: boundArtifact.digest,
+          requireArtifact: true,
+        }
+      : {}),
+  };
+  const proposalResult = await engine.propose(engineProposal);
+  if (!proposalResult.ok)
+    throw new Error(`Failed to create proposal: ${proposalResult.error.message}`, {
+      cause: proposalResult.error,
+    });
+
+  const proposalId = proposalResult.value;
+  for (const { role, vote, source } of engineVotes) {
+    const isAbsent = isAbsentSeat({ source });
+    const boundVote: Vote =
+      boundArtifact !== undefined
+        ? {
+            ...vote,
+            artifactReadiness: isAbsent ? 'artifact_starved' : vote.artifactReadiness,
+            boundArtifactDigest: isAbsent ? undefined : vote.boundArtifactDigest,
+          }
+        : vote;
+    await engine.vote(proposalId, role, boundVote);
+  }
+
+  const resultRes = await engine.close(proposalId);
+  if (!resultRes.ok)
+    throw new Error(`Failed to close proposal: ${resultRes.error.message}`, {
+      cause: resultRes.error,
+    });
+  return resultRes.value;
+}
+
+function runHigherOrderVoting(
+  strategy: VotingStrategy,
+  voteMap: Map<string, Vote>,
+  logger: ILogger,
+  context: CorrelationRecordContext
+): HigherOrderVotingResult | undefined {
+  if (!isHigherOrderStrategy(strategy)) return undefined;
+  const hovStrategy = new HigherOrderVotingStrategy();
+  const tracker = getOrCreateCorrelationTracker();
+  tracker.setCurrentModelPins?.(context.modelPins);
+  const result = hovStrategy.aggregate(voteMap, tracker);
+  logger.info('Higher-Order Voting complete', {
+    method: result.method,
+    decision: result.decision,
+    posteriorApproval: result.posteriorApproval.toFixed(3),
+  });
+  return result;
+}
+
+function buildCorrelationContext(votes: readonly AgentVoteResult[]): CorrelationRecordContext {
+  const modelPins = new Map<string, string>();
+  const observedModels = new Map<string, string>();
+  for (const vote of votes) {
+    if (vote.pinnedModel !== undefined) modelPins.set(vote.role, vote.pinnedModel);
+    if (vote.model !== undefined) observedModels.set(vote.role, vote.model);
+  }
+  return { modelPins, observedModels };
+}
+
+function recordVotesToTracker(
+  votes: readonly AgentVoteResult[],
+  outcome: 'approved' | 'rejected',
+  logger: ILogger
+): void {
+  // #3170: record the REAL (LLM) votes even when the panel is mixed-source,
+  // rather than dropping ALL correlation data because one voter simulated/errored.
+  // Recording the accurate LLM-only subset beats leaving the matrix permanently stale.
+  const llmVotes = votes.filter((v) => v.source === 'llm');
+  if (llmVotes.length < votes.length) {
+    logger.warn('Recording only LLM votes to correlation tracker; excluding non-LLM votes', {
+      recorded: llmVotes.length,
+      excluded: votes.length - llmVotes.length,
+    });
+  }
+  if (llmVotes.length === 0) return; // nothing real to record
+  const llmVoteMap = new Map<string, Vote>();
+  for (const v of llmVotes) llmVoteMap.set(v.role, v.vote);
+  const context = buildCorrelationContext(llmVotes);
+
+  const tracker = getOrCreateCorrelationTracker();
+  const id = `consensus-${String(getTimeProvider().now())}-${getRandomProvider().random().toString(36).slice(2, 9)}`;
+  tracker.recordProposalVotes(id, llmVoteMap, outcome, context);
+  logger.debug('Recorded votes to tracker', { proposalId: id, outcome });
+
+  try {
+    const persisted = createPersistedProposal(id, llmVoteMap, outcome, context);
+    const saveResult = saveCorrelationData([persisted]);
+    if (!saveResult.ok) {
+      logger.warn('Failed to persist correlation data', { error: saveResult.error.message });
+    }
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    logger.warn('Error persisting correlation data', { error: message });
+  }
+}
+
+/** Process votes with cascade detection — extracted for max-lines-per-function (#1765). */
+/**
+ * Run the engine + cascade-detection + higher-order voting against
+ * already-policy-applied votes (#2630).
+ *
+ * Callers MUST pass `engineVotes` produced by `applyErrorPolicy` — no
+ * filtering on `source` happens inside this function. Cascade-detection
+ * counts and the higher-order voteMap are both built directly from
+ * `engineVotes`.
+ */
+async function processVotesWithCascade(
+  engineVotes: readonly AgentVoteResult[],
+  opts: {
+    totalRoles: number;
+    proposal: string;
+    algorithm: ConsensusAlgorithm;
+    strategy: VotingStrategy;
+    log: ILogger;
+  }
+): Promise<{
+  engineResult: ConsensusResult;
+  voteMap: Map<string, Vote>;
+  higherOrderResult: ReturnType<typeof runHigherOrderVoting>;
+  outcome: 'approved' | 'rejected';
+  cascaded: boolean;
+}> {
+  const approvals = engineVotes.filter((v) => v.vote.decision === 'approve').length;
+  const rejections = engineVotes.filter((v) => v.vote.decision === 'reject').length;
+  const cascadeInfo = detectEarlyCascade(opts.algorithm, approvals, rejections, opts.totalRoles);
+
+  if (cascadeInfo.decided) {
+    opts.log.info('Vote cascade: outcome decided early', {
+      approvals,
+      rejections,
+      total: opts.totalRoles,
+      reason: cascadeInfo.reason,
+    });
+  }
+
+  const engineResult = await processVotesThroughEngine(
+    engineVotes,
+    opts.proposal,
+    opts.algorithm,
+    opts.totalRoles
+  );
+  const voteMap = new Map<string, Vote>();
+  for (const { role, vote } of engineVotes) voteMap.set(role, vote);
+
+  const higherOrderResult = cascadeInfo.decided
+    ? undefined
+    : runHigherOrderVoting(opts.strategy, voteMap, opts.log, buildCorrelationContext(engineVotes));
+  const outcome: 'approved' | 'rejected' =
+    engineResult.outcome === 'approved' ? 'approved' : 'rejected';
+
+  return { engineResult, voteMap, higherOrderResult, outcome, cascaded: cascadeInfo.decided };
+}
+
+/** Execute a consensus vote with full strategy support. Exported for pipeline DRY (#1694). */
+/**
+ * Build a short-circuit result for the error-policy gate (#2630). Called
+ * when the hard floor (>50% errors) trips or `fail_closed` matches.
+ * Logs the warning and returns the synthetic `ExtendedVotingResult` that
+ * `executeVoting` propagates to the response builder.
+ */
+function buildPolicyShortCircuitResult(args: {
+  input: ConsensusVoteInput;
+  strategy: VotingStrategy;
+  algorithm: ConsensusAlgorithm;
+  roles: readonly VoterRole[];
+  votes: readonly AgentVoteResult[];
+  /** The RESOLVED policy (`executeVotingInner` applied the default before calling). */
+  errorPolicy: ErrorPolicy;
+  reason: string;
+  startTime: number;
+  logger: ILogger;
+}): ExtendedVotingResult {
+  args.logger.warn('Consensus vote short-circuited by error policy', {
+    errorPolicy: args.errorPolicy,
+    reason: args.reason,
+  });
+  const totalTimeMs = getTimeProvider().now() - args.startTime;
+  return {
+    proposal: args.input.proposal,
+    threshold: args.algorithm,
+    result: createPolicyFailedResult(args.input.proposal, args.algorithm, args.reason, args.votes),
+    votes: args.votes,
+    totalTimeMs,
+    simulateVotes: args.input.simulateVotes,
+    strategy: args.strategy,
+    // #4132: thread the requested panel shape so the absolute_quorum predicate
+    // in buildResponse has PANEL_SIZE + contrarian-presence even on a short-circuit.
+    panelSize: args.roles.length,
+    contrarianRequested: args.roles.includes('catfish'),
+    // #6111: the short-circuit returns before the escalation gate, so the
+    // quick-mode contrarian check never ran.
+    contrarianCheck: 'skipped',
+    // #3124: surface WHY a high-approval result is still 'rejected' so callers
+    // don't mistake a fail-closed policy short-circuit for a genuine rejection.
+    policyReason: args.reason,
+    // #6211: the policy that short-circuited is the policy the record states.
+    errorPolicy: args.errorPolicy,
+  };
+}
+
+/*
+ * Top-level voting flow: vote collection → error-policy gate → engine +
+ * cascade → contrarian escalation → finalize. Further extraction
+ * obscures control flow more than it helps; helpers already extracted
+ * are applyErrorPolicy, buildPolicyShortCircuitResult,
+ * maybeEscalateContrarian, finalizeVotingResult.
+ */
+export async function executeVoting(
+  input: ConsensusVoteInput,
+  logger: ILogger,
+  opts?: {
+    voteTimeoutMs?: number;
+    /** CLI ratification checkout, retained through escalation. */
+    workspace?: string | undefined;
+    workspaceSha?: string | undefined;
+    gatewayAdapters?: readonly IModelAdapter[] | undefined;
+    /** Internal callers budget these exact preassigned seats before completion. */
+    roleAdapters?: ReadonlyMap<VoterRole, IModelAdapter> | undefined;
+    /** #5393: stops LAUNCHING un-started voters when `cancel_job` fires. */
+    signal?: AbortSignal | undefined;
+    /** #6110: set only by the escalation re-vote, which reuses the outer resolution. */
+    project?: ResolvedVoterProject | undefined;
+    /**
+     * Per-seat progress callback (#6162): the async-job heartbeat, fired as
+     * each seat settles. Retained through the escalation re-vote.
+     */
+    onVoteCollected?: ((vote: AgentVoteResult) => void) | undefined;
+  }
+): Promise<ExtendedVotingResult> {
+  // #6110: resolve the target project ONCE per vote (the escalation re-vote
+  // inherits it through opts) and stamp it on the result next to `decision`.
+  const project = opts?.project ?? resolveAndLogVoterProject(input.project, logger);
+  // #6258: the directory every seat is handed, resolved once and stamped on the
+  // live result, so an `unverifiable` seat is diagnosable without stderr.
+  const panelWorkspace = resolvePanelWorkspace(opts?.workspace);
+  const result = await executeVotingInner(input, logger, { ...opts, project, panelWorkspace });
+  // #6735 backstop: a cancel that landed after the seats settled (during the
+  // contrarian check or escalation) must not stamp or record a decision either.
+  throwIfVoteCancelled(opts?.signal, result.votes, result.votes.length);
+  result.project = project;
+  // A simulated panel pointed no seat at a directory, so it names none.
+  if (!input.simulateVotes) result.workspace = panelWorkspace;
+  // An escalated full-panel result was finalized (and recorded) by its recursive
+  // executeVoting call. Remember that state so this outer quick-mode frame does
+  // not persist the same full-panel proposal twice.
+  const correlationAlreadyRecorded = result.decision !== undefined;
+  // #4135: stamp the response-layer decision (incl. `no_quorum`) ONCE, using the
+  // SAME `resolveVoteDecision` `buildResponse` consumes, so pipeline consumers can
+  // honor a quorum void instead of misreading it as a rejection — without
+  // recomputing the policy math (DRY; the decision can't diverge). `errorCount`
+  // uses the identical definition `buildResponse` uses.
+  const errorCount = result.votes.filter((v) => v.source === 'error').length;
+  // #4472: when the proposal declared options, the leading option must clear
+  // the bar too. Applied BEFORE the decision is stamped so the record and the
+  // response both reflect the gated verdict — a veto that only reached the
+  // response would leave the audit trail claiming an approval that did not
+  // happen. No-op when no options were declared.
+  applyOptionGate(input, result);
+  const resolved = resolveVoteDecision(input, result, errorCount);
+  result.decision = resolved.decision;
+  stampDecisionReason(result, resolved.degradeReason);
+  // #6735: the tracker write stays here, not after the ledger append. It runs
+  // with no `await` since the backstop above, so a cancel observed before the
+  // verdict never reaches it. A cancel that lands later (during the ledger-lock
+  // wait) leaves this observation in place on purpose: it is per-voter
+  // agreement from a panel whose every seat settled and whose verdict was
+  // computed before the cancel. It is a statistic, not a decision record, and
+  // it binds nothing. Moving it would change all five `executeVoting` callers.
+  if (
+    !correlationAlreadyRecorded &&
+    (result.decision === 'approved' || result.decision === 'rejected')
+  ) {
+    recordVotesToTracker(result.votes, result.decision, logger);
+  }
+  return result;
+}
+
+/**
+ * Veto an approved verdict whose declared-option split failed its bar.
+ *
+ * Mutates `result` in place: `executeVoting` owns it and has not yet published
+ * it. Only ever flips approved to rejected, never the reverse — and the
+ * resulting `decision` must be `rejected`, not `no_quorum` (#4529): the panel
+ * convened and disagreed, which is the opposite of a voided vote.
+ *
+ * Exported for the composition test (#4529): the defect this guards against
+ * lives in how this function's output feeds `resolveVoteDecision` on the very
+ * next line of `executeVoting`, not in either function alone.
+ */
+export function applyOptionGate(input: ConsensusVoteInput, result: ExtendedVotingResult): void {
+  const declaredOptions = input.options;
+  if (declaredOptions === undefined || declaredOptions.length === 0) return;
+
+  const outcome = evaluateOptionGate(
+    result.votes,
+    declaredOptions,
+    optionThresholdFor(result.strategy, input.threshold),
+    result.result.outcome === 'approved'
+  );
+
+  if (!outcome.vetoed) {
+    result.optionGate = outcome.verdict;
+    return;
+  }
+
+  result.result.outcome = 'rejected';
+  // #4529: the reason rides on the verdict, NOT on policyReason. policyReason
+  // means "an error policy voided this vote", and resolveVoteDecision
+  // short-circuits any non-undefined value straight to `no_quorum` — so
+  // borrowing the field filed a measured split as "nothing was decided", and
+  // `--on-no-quorum=retry` then re-rolled the panel and discarded the dissent
+  // the gate had just detected. Decided by a 7-voter higher_order panel
+  // (6 approvers, all selecting this shape).
+  result.optionGate =
+    outcome.reason !== undefined ? { ...outcome.verdict, reason: outcome.reason } : outcome.verdict;
+}
+
+// eslint-disable-next-line max-lines-per-function -- see block comment above
+async function executeVotingInner(
+  input: ConsensusVoteInput,
+  logger: ILogger,
+  // Required here, normalized by `executeVoting`. Every `opts.` inside was a
+  // branch against the same never-null value; taking the option away at this
+  // boundary removes them all rather than adding one more (#5393).
+  opts: {
+    voteTimeoutMs?: number;
+    /** CLI ratification checkout, retained through escalation. */
+    workspace?: string | undefined;
+    workspaceSha?: string | undefined;
+    gatewayAdapters?: readonly IModelAdapter[] | undefined;
+    /** Internal callers budget these exact preassigned seats before completion. */
+    roleAdapters?: ReadonlyMap<VoterRole, IModelAdapter> | undefined;
+    /** #5393: stops LAUNCHING un-started voters when `cancel_job` fires. */
+    signal?: AbortSignal | undefined;
+    /** #6110: the target project, resolved once by `executeVoting`. */
+    project: ResolvedVoterProject;
+    /** #6258: the directory the seats are handed — the value `executeVoting` stamps. */
+    panelWorkspace: string;
+    /** #6162: per-seat heartbeat, forwarded to `collectRealVotes`. */
+    onVoteCollected?: ((vote: AgentVoteResult) => void) | undefined;
+  }
+): Promise<ExtendedVotingResult> {
+  const strategy = resolveStrategy(input);
+  const algorithm = strategyToAlgorithm(strategy);
+  const roles = getVoterRoles(input.quickMode);
+  const startTime = getTimeProvider().now();
+  const errorPolicy = input.errorPolicy ?? getDefaultErrorPolicy(strategy);
+
+  logger.info('Starting consensus vote', {
+    strategy,
+    algorithm,
+    roleCount: roles.length,
+    errorPolicy,
+  });
+  const votes = await collectRealVotes({
+    roles,
+    proposal: input.proposal,
+    simulate: input.simulateVotes,
+    ...(opts.voteTimeoutMs !== undefined && { timeoutMs: opts.voteTimeoutMs }),
+    ...(opts.gatewayAdapters !== undefined && { gatewayAdapters: opts.gatewayAdapters }),
+    roleAdapters: opts.roleAdapters,
+    declaredOptions: input.options,
+    // #6110: every seat's system prompt names the caller's project.
+    project: opts.project.name,
+    workspace: opts.panelWorkspace,
+    workspaceSha: opts.workspaceSha,
+    signal: opts.signal,
+    onVoteCollected: opts.onVoteCollected,
+  });
+  // #6735: a cancelled vote stops here, before the engine, with only the
+  // seats that cast a vote — no verdict is computed from a partial panel.
+  throwIfVoteCancelled(opts.signal, votes, roles.length);
+
+  // Error-policy gate (#2630): hard floor + fail_closed + reduce_denominator /
+  // count_as_abstain transformation. Engine sees the resulting shape.
+  const policyDecision = applyErrorPolicy(votes, errorPolicy);
+  if (policyDecision.shortCircuit) {
+    return buildPolicyShortCircuitResult({
+      input,
+      strategy,
+      algorithm,
+      roles,
+      votes,
+      errorPolicy,
+      reason: policyDecision.reason ?? 'error policy short-circuit',
+      startTime,
+      logger,
+    });
+  }
+
+  // Check for early cascade and process votes (#1765)
+  const { engineResult, higherOrderResult, outcome, cascaded } = await processVotesWithCascade(
+    policyDecision.engineVotes,
+    {
+      totalRoles: roles.length,
+      proposal: input.proposal,
+      algorithm,
+      strategy,
+      log: logger,
+    }
+  );
+
+  const escalation = await maybeEscalateContrarian(
+    input,
+    outcome,
+    { strategy, posteriorApproval: higherOrderResult?.posteriorApproval, revote: executeVoting },
+    logger,
+    opts
+  );
+  // #6111: an escalated full-panel result reports the quick-mode check that
+  // produced it (`ok` when the contrarian triggered the re-vote, `skipped` when
+  // the posterior floor pre-empted the call), not the inner frame's `skipped`.
+  if (escalation.escalated !== undefined) {
+    return { ...escalation.escalated, contrarianCheck: escalation.contrarianCheck };
+  }
+
+  const finalized = finalizeVotingResult({
+    input,
+    strategy,
+    algorithm,
+    roles,
+    engineResult,
+    higherOrderResult,
+    votes,
+    outcome,
+    cascaded,
+    errorPolicy,
+    startTime,
+    logger,
+  });
+  // #4132 / #M1: an errored contrarian under absolute_quorum or an unmet artifact floor
+  // voids the quorum — stamp policyReason so buildResponse and resolveVoteDecision
+  // downgrade to no_quorum rather than misreporting as a rejection.
+  const degradeReason = resolveDegradeReason(escalation.degradeReason, engineResult);
+  return applyContrarianDegrade(
+    { ...finalized, contrarianCheck: escalation.contrarianCheck },
+    degradeReason
+  );
+}
+
+/**
+ * #4132 / #M1: resolve degrade reason from contrarian escalation or unmet artifact floor.
+ */
+function resolveDegradeReason(
+  escalationReason: string | undefined,
+  engineResult: { reason?: string | undefined; artifactFloorUnmet?: boolean | undefined }
+): string | undefined {
+  if (escalationReason !== undefined) {
+    return escalationReason;
+  }
+  if (
+    engineResult.artifactFloorUnmet === true ||
+    engineResult.reason?.includes('inspected the required artifact') === true
+  ) {
+    return `no_quorum: ${engineResult.reason ?? 'Insufficient eligible voters inspected the required artifact'}`;
+  }
+  return undefined;
+}
+
+/**
+ * #7412: retain the canonical decision's cause without changing error-policy
+ * semantics. Separate assignment keeps executeVoting within its complexity budget.
+ */
+function stampDecisionReason(
+  result: ExtendedVotingResult,
+  degradeReason: string | undefined
+): void {
+  const reason = degradeReason ?? result.policyReason;
+  if (reason !== undefined) result.decisionReason = reason;
+  else delete result.decisionReason; // Re-evaluation must not retain a stale cause.
+}
+
+/**
+ * #4132: stamp the contrarian-check-errored degrade reason onto a finalized
+ * result (unless an upstream short-circuit already set one). A no-op when the
+ * contrarian check ran cleanly (`degradeReason` undefined).
+ */
+function applyContrarianDegrade(
+  result: ExtendedVotingResult,
+  degradeReason: string | undefined
+): ExtendedVotingResult {
+  if (degradeReason === undefined || result.policyReason !== undefined) return result;
+  return { ...result, policyReason: degradeReason };
+}
+
+/**
+ * Run a consensus vote with a plain goal as the proposal, default settings
+ * (real voters, default strategy). The strategy executor the unified `run`
+ * entry point dispatches to for the `consensus` strategy (#3575). Non-simulated.
+ */
+export async function runConsensusForGoal(
+  goal: string,
+  logger: ILogger = createLogger({ tool: 'consensus_vote' }),
+  gatewayAdapters?: readonly IModelAdapter[],
+  /** #6162: per-seat heartbeat when the caller is an async job body. */
+  onVoteCollected?: (vote: AgentVoteResult) => void,
+  /** `run`'s async-job cancel signal (#6305): stops launching un-started voters. */
+  signal?: AbortSignal
+): Promise<ExtendedVotingResult> {
+  // Parse through the schema so defaults (quickMode, simulateVotes:false) apply.
+  // #4042: thread the in-process gateway adapters so the run/MetaOrchestrator
+  // consensus path routes voters through the gateway like consensus_vote (#4040),
+  // not the CLI subprocess.
+  return executeVoting(ConsensusVoteInputSchema.parse({ proposal: goal }), logger, {
+    ...(gatewayAdapters !== undefined && { gatewayAdapters }),
+    onVoteCollected,
+    ...(signal !== undefined && { signal }),
+  });
+}
+
+/** Build the final `ExtendedVotingResult` once the engine + cascade settle. */
+function finalizeVotingResult(args: {
+  input: ConsensusVoteInput;
+  strategy: VotingStrategy;
+  algorithm: ConsensusAlgorithm;
+  roles: readonly VoterRole[];
+  engineResult: ConsensusResult;
+  higherOrderResult: ReturnType<typeof runHigherOrderVoting>;
+  votes: readonly AgentVoteResult[];
+  outcome: 'approved' | 'rejected';
+  cascaded: boolean;
+  /** #6211: the RESOLVED policy the tally above was computed under. */
+  errorPolicy: ErrorPolicy;
+  startTime: number;
+  logger: ILogger;
+}): ExtendedVotingResult {
+  const totalTimeMs = getTimeProvider().now() - args.startTime;
+  args.logger.info('Consensus vote completed', {
+    strategy: args.strategy,
+    outcome: args.outcome,
+    durationMs: totalTimeMs,
+    cascaded: args.cascaded,
+  });
+  const result: ExtendedVotingResult = {
+    proposal: args.input.proposal,
+    threshold: args.algorithm,
+    result: args.engineResult,
+    votes: args.votes,
+    totalTimeMs,
+    simulateVotes: args.input.simulateVotes,
+    strategy: args.strategy,
+    // #4132: PANEL_SIZE + contrarian-presence for the absolute_quorum predicate.
+    panelSize: args.roles.length,
+    contrarianRequested: args.roles.includes('catfish'),
+    // #6211: carried to the persisted record; the response never needed it
+    // because `buildResponse` still holds the input, but the record does not.
+    errorPolicy: args.errorPolicy,
+  };
+  if (args.higherOrderResult !== undefined) result.higherOrderResult = args.higherOrderResult;
+  return result;
+}
+
+// --- Handler & Registration ---
+/** What the tool input declared that the voting result does not carry. */
+function declaredByCaller(
+  args: ConsensusVoteInput,
+  signal?: AbortSignal,
+  jobId?: string
+): Parameters<typeof recordCompletedVote>[3] {
+  return {
+    options: args.options,
+    jobId,
+    signal,
+    ...(args.ratifies !== undefined ? { ratifies: args.ratifies } : {}),
+    ...(args.ratifiesPr !== undefined ? { ratifiesPr: args.ratifiesPr } : {}),
+  };
+}
+
+async function handleConsensusVote(
+  deps: ConsensusVoteDeps,
+  args: ConsensusVoteInput,
+  signal?: AbortSignal,
+  /** #6162: `runAsJob`'s heartbeat, fired per settled seat. Absent in sync mode. */
+  onVoteCollected?: (vote: AgentVoteResult) => void,
+  jobId?: string
+): Promise<{ ok: true; value: ConsensusVoteResponse } | { ok: false; error: string }> {
+  const logger = deps.logger ?? createLogger({ tool: 'consensus_vote' });
+  try {
+    const result = await executeVoting(args, logger, {
+      ...(deps.gatewayAdapters !== undefined && { gatewayAdapters: deps.gatewayAdapters }),
+      signal,
+      onVoteCollected,
+    });
+    // #6735: the ledger append goes first. It throws VoteCancelledError when a
+    // cancel landed during its lock wait, and a cancelled vote must not then
+    // be recorded to memory or the outcome store as a success either.
+    const { costSummary, voteRecord } = await recordCompletedVote(
+      args.proposal,
+      result,
+      logger,
+      declaredByCaller(args, signal, jobId)
+    );
+    // Close the self-tuning loop: a rejected vote emits signal.vote_rejected
+    // onto the typed pipeline bus for the shadow TuneStage (#3147; #3289 Option 2).
+    emitVoteRejectedSignal(result.result, getPipelineEventBus(), logger);
+    return { ok: true, value: buildResponse(args, result, costSummary, voteRecord) };
+  } catch (error) {
+    if (error instanceof AllVotersFailedError) return { ok: false, error: error.message };
+    // #6735: a cancel is not a vote failure — it reaches the async dispatcher,
+    // which attaches the cast seats to the cancelled record.
+    if (error instanceof VoteCancelledError) throw error;
+    const message = getErrorMessage(error);
+    const cause = error instanceof Error ? error : new Error(message);
+    logger.error('Consensus vote failed', cause);
+    recordVoteError(args.proposal, message);
+    return { ok: false, error: `Voting failed: ${message}` };
+  }
+}
+
+type ConsensusVoteToolResponse = ToolResult;
+
+/**
+ * Dispatch the vote on a background promise + return a pending envelope
+ * (#3045 / epic #2631 Stage 4). Mirrors run_workflow / orchestrate.
+ *
+ * Cancellation semantics (#5393). This paragraph previously claimed
+ * `collectRealVotes` "honors per-voter signals" via plumbing from #3038. It did
+ * not — the function had no signal parameter at all, so `cancel_job` marked the
+ * job cancelled while every remaining voter still ran. The comment describing a
+ * capability that did not exist is plausibly why that went unnoticed.
+ *
+ * What happens now: the signal is threaded to the vote launcher, which checks it
+ * after each stagger delay and does NOT launch the voters that have not started,
+ * recording them as error results rather than as any decision. Since #6729 it
+ * also reaches every seat's adapter call, combined with the seat's deadline, so
+ * a voter in flight is aborted rather than left to run for the length of its
+ * slowest seat while the job holds its concurrency slot. The job record stays
+ * `cancelled` (the terminal writers no-op, #4022). Since #6735 the body stops
+ * before any verdict and the seats that had cast a vote are attached to that
+ * record as `cancelledPartial` — never as a decision, and never on the ledger.
+ *
+ * Concurrency cap is enforced via `tryAcquire('consensus_vote')`
+ * (default 2; voting is 7-fan-out so caps multiply adapter load fast).
+ */
+/**
+ * Reject when the vote failed, so `runAsJob` records the job `failed` rather
+ * than `complete` (#4362). Increment 2 (#4363) folds this fail-closed check into
+ * `runAsJob` itself for every caller.
+ *
+ * Exported so the transform can be asserted without standing up a live voter
+ * panel (the success path initializes the whole memory substrate).
+ * @internal
+ */
+export async function unwrapVoteOrThrow(
+  pending: ReturnType<typeof handleConsensusVote>
+): Promise<Awaited<ReturnType<typeof handleConsensusVote>>> {
+  const result = await pending;
+  if (!result.ok) throw new Error(result.error);
+  return result;
+}
+
+function dispatchAsyncConsensusVote(
+  deps: ConsensusVoteDeps,
+  args: import('./consensus-vote-types.js').ConsensusVoteInput
+): ConsensusVoteToolResponse {
+  // #3729: dispatch via the shared `runAsJob` helper — the exact sequence this
+  // function used to inline. consensus_vote's only diff is the freshJobId; its
+  // pending/busy/replay/collision envelopes are byte-for-byte the helper's
+  // ToolResult defaults, so no per-tool `toEnvelope` is needed.
+  return runAsJob<
+    import('./consensus-vote-types.js').ConsensusVoteInput,
+    Awaited<ReturnType<typeof handleConsensusVote>>
+  >({
+    toolName: 'consensus_vote',
+    input: args,
+    idempotencyKey: args.idempotencyKey,
+    freshJobId: () => `job-vote-${randomUUID()}`,
+    // #5066: structured envelopes — this tool declares an outputSchema, and
+    // the SDK rejects a non-error result that carries no structured content.
+    toEnvelope: ASYNC_ENVELOPES,
+    // #6735: on a cancel the body throws VoteCancelledError; the seats it had
+    // cast are attached to the `cancelled` record, which keeps its status.
+    // #4362: `handleConsensusVote`'s `{ ok: false }` used to flow into the job
+    // record verbatim, and `runAsJob` records `complete` for anything its `run`
+    // callback RESOLVES — so a dead voter panel produced a job a caller polling
+    // `get_job_result` read as a success. Reject instead, mirroring the sync
+    // sibling's `toolStructuredError` on the same condition.
+    // #5393: arity 4 — signal + #6162 progress. `runAsJob` derives
+    // `signalAccepted` from `run.length`, so taking the signal is what makes the
+    // job record say cancellation works — the claim follows the capability.
+    // `progress` is the liveness heartbeat, fired as each seat settles, so a
+    // panel allowed past the standard MCP ceiling is never called wedged while
+    // its seats keep landing.
+    run: (jobId, input, signal, progress) =>
+      attachPartialsOnCancel(
+        jobId,
+        'consensus_vote',
+        unwrapVoteOrThrow(handleConsensusVote(deps, input, signal, progress, jobId))
+      ),
+    ...(deps.logger !== undefined ? { logger: deps.logger } : {}),
+  });
+}
+
+/**
+ * Run the synchronous vote path + format the response. Extracted from
+ * the handler so the async-mode branch keeps the per-function size cap
+ * (#3045 added a branch + dispatcher call site to the handler).
+ */
+async function runSyncConsensusVote(
+  deps: ConsensusVoteDeps,
+  notifier: IMcpNotifier,
+  args: import('./consensus-vote-types.js').ConsensusVoteInput
+): Promise<ConsensusVoteToolResponse> {
+  const result = await withProgressHeartbeat('consensus_vote', notifier, () =>
+    handleConsensusVote(deps, args)
+  );
+  if (!result.ok) {
+    return toolStructuredError({ errorCategory: 'internal', message: result.error });
+  }
+  for (const vote of result.value.votes) {
+    notifier.debug('consensus_vote', {
+      event: 'vote_collected',
+      role: vote.role,
+      decision: vote.decision,
+    });
+  }
+  notifier.info('consensus_vote', {
+    event: 'vote_complete',
+    decision: result.value.decision,
+    approvalPercentage: result.value.approvalPercentage,
+    voteCount: result.value.votes.length,
+  });
+  return structuredToolSuccess(z.object(CONSENSUS_VOTE_OUTPUT_SCHEMA), { ...result.value });
+}
+
+/** Resolve once before dispatch so seats and the recorder consume the same artifact. */
+async function prepareVoteArtifact(
+  input: ConsensusVoteInput
+): Promise<{ ok: true; value: ConsensusVoteInput } | { ok: false; error: ToolResult }> {
+  if (input.artifactPath === undefined) return { ok: true, value: input };
+  const resolved = resolveInsideRoot(input.artifactPath);
+  if (resolved === null) {
+    return {
+      ok: false,
+      error: toolStructuredError({
+        errorCategory: 'permission',
+        message: 'Path traversal denied: artifactPath must be within the repository root.',
+      }),
+    };
+  }
+  try {
+    const proposal = await inlineVoteArtifact(
+      input.proposal,
+      resolved,
+      basename(input.artifactPath)
+    );
+    return { ok: true, value: { ...input, proposal } };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      error: toolStructuredError({ errorCategory: 'validation', message: getErrorMessage(error) }),
+    };
+  }
+}
+
+function createConsensusVoteHandler(deps: ConsensusVoteDeps) {
+  const notifier = deps.notifier ?? NOOP_NOTIFIER;
+  return async (args: unknown, ctx: HandlerContext): Promise<ConsensusVoteToolResponse> => {
+    const validationResult = ConsensusVoteInputSchema.safeParse(args);
+    if (!validationResult.success) {
+      return toolStructuredError({
+        errorCategory: 'validation',
+        message: `Validation error: ${formatZodError(validationResult.error)}`,
+      });
+    }
+    // #4170: simulateVotes fails CLOSED outside test runners — checked in the
+    // sync prelude BEFORE the async runAsJob dispatch so sync and async modes
+    // reject identically (no pending envelope for a random panel).
+    if (validationResult.data.simulateVotes) {
+      const simCheck = checkSimulationAllowed('consensus_vote', ctx.logger);
+      if (!simCheck.allowed) return simulationDeniedResult(simCheck.reason);
+    }
+    const prepared = await prepareVoteArtifact(validationResult.data);
+    if (!prepared.ok) return prepared.error;
+    const input = prepared.value;
+    const strategy = input.strategy ?? 'simple_majority';
+    const dispatch = input.dispatch;
+    ctx.logger.debug('Starting consensus vote', {
+      strategy,
+      quickMode: input.quickMode,
+      ...(dispatch !== undefined ? { dispatch } : {}),
+    });
+    notifier.info('consensus_vote', {
+      event: 'vote_start',
+      proposalLength: input.proposal.length,
+      strategy,
+    });
+    // #3045 / epic #2631 Stage 4 — async dispatch.
+    if (dispatch === 'async') {
+      const asyncResult = dispatchAsyncConsensusVote(deps, input);
+      notifier.info('consensus_vote', {
+        event: 'vote_dispatched_async',
+        proposalLength: input.proposal.length,
+        strategy,
+      });
+      return asyncResult;
+    }
+    return runSyncConsensusVote(deps, notifier, input);
+  };
+}
+
+/**
+ * Async-dispatch envelopes carrying `structuredContent` (#5066).
+ *
+ * `runAsJob`'s defaults are text-only. Because this tool declares an
+ * `outputSchema`, the SDK requires structured content on every non-error
+ * result, so every `dispatch: 'async'` call failed with -32602 — the mode the
+ * tool's own description recommends for 7-voter panels.
+ */
+const ASYNC_ENVELOPES: JobEnvelopeBuilders<ToolResult> = {
+  pending: (jobId) =>
+    structuredToolSuccess(z.object(CONSENSUS_VOTE_OUTPUT_SCHEMA), {
+      status: 'pending',
+      jobId,
+      pollTool: 'get_job_result',
+      note: 'Poll via get_job_result({ jobId }) until status !== "pending".',
+    }),
+  busy: (retryAfterMs, toolName) =>
+    structuredToolSuccess(z.object(CONSENSUS_VOTE_OUTPUT_SCHEMA), {
+      status: 'busy',
+      retryAfterMs,
+      note: `Async-mode concurrency cap reached for ${toolName}. Retry later or use dispatch: "sync".`,
+    }),
+  replay: (jobId) =>
+    structuredToolSuccess(z.object(CONSENSUS_VOTE_OUTPUT_SCHEMA), {
+      status: 'replay',
+      jobId,
+      pollTool: 'get_job_result',
+      note: 'Poll via get_job_result({ jobId }) until status !== "pending".',
+    }),
+  collision: defaultCollisionEnvelope,
+};
+
+/**
+ * Output schema for consensus_vote tool (Issue #1117, #1246).
+ *
+ * Every vote field is optional because this tool has TWO response shapes and
+ * `registerTool` takes a `ZodRawShape`, which cannot express a discriminated
+ * union (#5066). `status` tells them apart: present means an async-dispatch
+ * envelope, absent means a completed vote.
+ *
+ * What that gives up is requiredness. What it keeps is the guarantee that
+ * actually protects the protocol: the SDK validates with
+ * `additionalProperties: false`, so an UNDECLARED response field still fails
+ * every call — the #5044 regression this schema exists to catch.
+ */
+export const CONSENSUS_VOTE_OUTPUT_SCHEMA = {
+  /** Async-dispatch envelope discriminator — absent on a completed vote. */
+  status: z.enum(['pending', 'busy', 'replay']).optional(),
+  jobId: z.string().max(200).optional(),
+  pollTool: z.literal('get_job_result').optional(),
+  note: z.string().max(500).optional(),
+  retryAfterMs: z.number().optional(),
+  proposal: z.string().optional(),
+  strategy: VotingStrategySchema.optional(),
+  // Reuses the canonical VoteDecisionStatusSchema (single source) — a hand-listed
+  // subset here (was ['approved','rejected','no_quorum']) omitted the reachable
+  // 'timeout'/'pending' outcomes and made strict clients reject those votes (#4032).
+  decision: VoteDecisionStatusSchema.optional(),
+  approvalPercentage: z.number().optional(),
+  voteCounts: z
+    .object({
+      approve: z.number(),
+      reject: z.number(),
+      abstain: z.number(),
+      error: z.number(),
+      /** #6094: seats that could not read the artifact; always present. */
+      unverifiable: z.number(),
+    })
+    .optional(),
+  // #6111: the quick-mode contrarian check is not a seat, so `voteCounts.error`
+  // cannot count it. Present on every completed vote (`skipped` when it did not
+  // run); optional here only because the async envelope shares this schema.
+  contrarianCheck: ContrarianCheckStatusSchema.optional(),
+  votes: z
+    .array(
+      z.object({
+        role: z.string().max(100),
+        decision: z.enum(['approve', 'reject', 'abstain']),
+        confidence: z.number(),
+        reasoning: z.string().max(4000),
+        simulated: z.boolean(),
+        error: z.boolean(),
+        retried: z.boolean().optional(),
+        retriedFrom: z
+          .object({
+            source: z.enum(['error', 'unverifiable']),
+            error: z.string().optional(),
+            errorTruncated: z.literal(true).optional(),
+          })
+          .optional(),
+        /** #6094: present only when the seat could not read the artifact. */
+        unverifiable: z.literal(true).optional(),
+        /** #6115: present only when the seat answered elsewhere than assigned. */
+        fallback: z
+          .object({
+            fromCli: z.string().max(100),
+            fromModel: z.string().max(100).optional(),
+            reason: z.enum(['rate-limit', 'capacity', 'auth', 'timeout', 'sandbox', 'unknown']),
+          })
+          .optional(),
+        modelUsed: z.string().max(100).optional(),
+        assignedModel: z.string().max(100).optional(),
+        rejectionCategories: z
+          .array(
+            z.enum([
+              'YAGNI',
+              'DRY_VIOLATION',
+              'OVER_ENGINEERING',
+              'SCOPE_CREEP',
+              'SECURITY_RISK',
+              'MISALIGNED',
+              'INSUFFICIENT_EVIDENCE',
+            ])
+          )
+          .optional(),
+      })
+    )
+    .optional(),
+  threshold: VoteThresholdSchema.optional(),
+  durationMs: z.number().optional(),
+  simulateVotes: z.boolean().optional(),
+  // #6110: the project the panel judged and how the name was decided. Always
+  // on the response; optional here like every field, because the async
+  // `pending` envelope shares this schema.
+  project: z
+    .object({
+      name: z.string().max(200),
+      source: z.enum(['input', 'derived', 'default']),
+    })
+    .optional(),
+  // #6258: the working directory the panel's seats were pointed at. Absent
+  // when no live seat ran (simulated panel) and on the async envelope.
+  workspace: z.string().max(4096).optional(),
+  higherOrderMetadata: z
+    .object({
+      posteriorApproval: z.number(),
+      posteriorRejection: z.number(),
+      effectiveVoteCount: z.number(),
+      method: z.enum(['ow', 'isp', 'simple']),
+      appliedToDecision: z.boolean(),
+      usedCorrelationData: z.boolean(),
+      improvementOverBaseline: z.number(),
+      downweightedAgents: z.array(z.string().max(100)).max(10),
+      reasoning: z.string().max(2000),
+    })
+    .optional(),
+  // #3124: explains a `rejected` decision that coexists with a high
+  // approvalPercentage (an error-policy short-circuit, e.g. fail_closed).
+  policyReason: z.string().max(200).optional(),
+  // #3991: whether the authentic vote record was persisted at vote time. Post-
+  // #3991 it routes through nexusDataPath under governance/, so true is the
+  // normal case; false means all-simulated (skipped by design) or write-failed
+  // (data dir unwritable) — voteRecordNote carries the actionable reason. Makes
+  // a previously WARN-only skip visible to MCP callers.
+  voteRecordPersisted: z.boolean().optional(),
+  voteRecordNote: z.string().max(500).optional(),
+  // #5130: the persisted record's id, so the caller-commits script can name it.
+  voteRecordId: z.string().max(200).optional(),
+  // #3587: set when the panel DEGRADED (some voters errored), so the decision
+  // rests on fewer voters than requested. Part of the response since #3587 but
+  // omitted from this schema until #4032 — its absence made a strict MCP client
+  // reject any degraded-panel vote (`-32602 additional properties`).
+  panelWarning: z.string().optional(),
+  // #6115: distinct answering models and seats that answered elsewhere than
+  // assigned. Always on the response (explicit zeros); optional here only
+  // because the async `pending` envelope shares this schema.
+  panelDiversity: z
+    .object({
+      distinctModels: z.number().int().nonnegative(),
+      // #6606: distinct vendor families among the answering seats, and the
+      // answering seats whose model names no recognised vendor.
+      distinctFamilies: z.number().int().nonnegative(),
+      unclassifiedSeats: z.number().int().nonnegative(),
+      // #6660: answering seats whose model never resolved. Always set by
+      // panelDiversityOf; optional so the published schema widens additively.
+      unresolvedSeats: z.number().int().nonnegative().optional(),
+      fallbacks: z.number().int().nonnegative(),
+      reportCoverage: z
+        .object({
+          reported: z.number().int().nonnegative(),
+          total: z.number().int().nonnegative(),
+        })
+        .optional(),
+    })
+    .optional(),
+  // Assigned roster includes errored and abstaining seats. Absent when no
+  // assignment resolved, including a zero-seat roster.
+  assignedDistinctModels: z.number().int().nonnegative().optional(),
+  assignedDistinctFamilies: z.number().int().nonnegative().optional(),
+  assignedCoverage: z
+    .object({
+      reported: z.number().int().nonnegative(),
+      total: z.number().int().nonnegative(),
+    })
+    .optional(),
+  // #3855: per-decision cost rollup. Same omission as panelWarning (#4032) — it
+  // is present on the response whenever cost recording succeeds (common in `api`
+  // billing mode). Shared schema lives with the type (single source of truth).
+  costSummary: DecisionCostSummarySchema.optional(),
+  // #4472: declared-option outcome. Present whenever the proposal declared
+  // `options`. `unattributedApprovals` is part of the contract, not telemetry:
+  // without it a caller cannot tell a real split from unreadable responses.
+  optionOutcome: z
+    .object({
+      tally: z.array(z.object({ option: z.string(), count: z.number().int().nonnegative() })),
+      leadingOption: z.string().optional(),
+      leadingShare: z.number().min(0).max(1),
+      approverCount: z.number().int().nonnegative(),
+      selectedCount: z.number().int().nonnegative(),
+      unattributedApprovals: z.number().int().nonnegative(),
+      thresholdMet: z.boolean(),
+      // #4529: present only on a veto. Declared here because a strict MCP
+      // client rejects any property the advertised schema omits — the same
+      // drift that made degraded-panel votes unusable before #4032.
+      vetoReason: z.string().max(400).optional(),
+    })
+    .optional(),
+};
+
+/** Advertised MCP input schema for consensus_vote (hoisted to keep the register fn within its line budget). */
+/**
+ * The schema advertised to MCP clients.
+ *
+ * Registered from {@link ConsensusVoteInputSchema}'s shape rather than
+ * hand-copied. A subset drifts: `options` shipped internally in #4494 and was
+ * unreachable through the tool until someone noticed, and `mode` stayed
+ * unadvertised while this tool's own description told callers to pass it —
+ * so the documented async path could not be invoked at all (#4969).
+ */
+export const CONSENSUS_VOTE_TOOL_SCHEMA = ConsensusVoteInputSchema.shape;
+
+/** Advertised MCP tool description for consensus_vote. */
+const CONSENSUS_VOTE_DESCRIPTION =
+  'Execute multi-model consensus voting on a proposal. ' +
+  'Uses 7 roles by default (architect, security, devex, ai_ml, pm, catfish, scope_steward) ' +
+  'or 3 with quickMode (architect, security, scope_steward), voting with configurable strategies. ' +
+  'higher_order does NOT decide the verdict by correlation-aware aggregation (#4701): approve/reject ' +
+  'is a simple tally of the panel, so correlated voters each carry full independent weight. The ' +
+  'Bayesian correlation analysis is computed and feeds contrarian escalation only. Choose it for the ' +
+  'escalation behaviour, not for a weighted verdict. ' +
+  "Supports async dispatch (dispatch: 'async') — returns a jobId to poll via get_job_result. " +
+  'Pass ratifies=<subject> to bind an authority-ladder ratification vote into its authentic record, ' +
+  'and ratifiesPr={pr, headSha} to bind a governor-path PR ratification to the head the panel saw (#5130); ' +
+  'the result carries voteRecordId for the caller-commits append. ' +
+  'If your proposal asks voters to choose among named alternatives, you MUST pass them in ' +
+  '`options` (#4472) — the threshold is then measured over WHICH option won, and the record ' +
+  'carries the per-option tally plus selection coverage. WITHOUT `options` the tally is ' +
+  'approve/reject/abstain only, so every voter who engages returns `approve` and a 6-1 split on ' +
+  'which option persists as 7-0, 100% (#4452). ' +
+  'The response separates responding panelDiversity from optional assignedDistinctModels and assignedDistinctFamilies, and votes[].assignedModel shows each resolved assignment, including errored or abstaining seats. assignedCoverage reports resolved assignments out of all seats; assignment counts are omitted when unmeasured. panelWarning names ignored model pins and includes an artifactPath hint when unverifiable seats had no supplied artifact.';
+
+/**
+ * Registers the consensus_vote tool with the MCP server.
+ * Uses createSecureHandler (Issue #531) with timeout protection (Issue #271).
+ * @category MCP
+ */
+export function registerConsensusVoteTool(server: McpServer, deps: ConsensusVoteDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'consensus_vote' });
+  const notifier = deps.notifier ?? createMcpNotifier(server);
+  const depsWithNotifier = { ...deps, notifier };
+
+  const secureHandler = createSecureHandler(createConsensusVoteHandler(depsWithNotifier), {
+    toolName: 'consensus_vote',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const timeoutMs = getToolTimeout('consensus_vote', deps.security);
+  const wrappedHandler = wrapToolWithTimeout('consensus_vote', secureHandler, {
+    timeoutMs,
+    logger,
+  });
+
+  registerStructuredTool(
+    server,
+    'consensus_vote',
+    {
+      description: CONSENSUS_VOTE_DESCRIPTION,
+      inputSchema: CONSENSUS_VOTE_TOOL_SCHEMA,
+      outputSchema: CONSENSUS_VOTE_OUTPUT_SCHEMA,
+      annotations: getToolAnnotations('consensus_vote'),
+    },
+    toSdkCallbackWithTimeoutCheck(wrappedHandler, 'consensus_vote', timeoutMs, logger)
+  );
+  logger.info('Registered consensus_vote tool with secure handler and timeout protection');
+}

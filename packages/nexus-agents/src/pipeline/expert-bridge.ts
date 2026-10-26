@@ -1,0 +1,661 @@
+/**
+ * Expert Bridge — Programmatic access to the execute_expert pipeline (#1693)
+ *
+ * Provides a clean wrapper for calling experts with the full pipeline:
+ * timeout, fallback cascade, degradation detection, heartbeat, outcome recording.
+ *
+ * DRY: reuses createBuiltInExpert + CompositeRouter instead of reimplementing.
+ *
+ * @module pipeline/expert-bridge
+ */
+
+import { createLogger, getTimeProvider } from '../core/index.js';
+import type { ExecutionAccessMode } from '../core/index.js';
+import type { CommandWrapper } from '../cli-adapters/exec-file-tree.js';
+import type { GeneratedMcpConfig } from '../cli-adapters/child-mcp-config.js';
+import {
+  assertAccessMode,
+  requestedAccessModeOf,
+  servedAccessOf,
+  withRequestedAccessMode,
+  type ServedAccess,
+} from './expert-access-mode.js';
+import type { BuiltInExpertType } from '../agents/experts/expert-config.js';
+import { isRateLimitText } from '../adapters/rate-limit-detector.js';
+import {
+  ensureGatewayDiscovered,
+  gatewayDiscoveryGeneration,
+} from '../adapters/gateway-rediscovery.js';
+import { resolveCliSlot } from '../config/model-availability.js';
+import type { CliNameLiteral } from '../config/model-capabilities-types.js';
+import type { OutcomeRoutedBy } from '../orchestration/outcomes/outcome-types.js';
+import type {
+  CliPermissionDenial,
+  EndpointArmId,
+  RoutingArmId,
+} from '../cli-adapters/types-core.js';
+
+/**
+ * Resolves a CLI slot from the model string a (CLI or API) adapter returned.
+ * Known models resolve to their exact slot; **unknown** models — new releases
+ * or API/openrouter models not in the curated registry — fall back to the
+ * vendor-derived slot (#3317 / #3293) so the outcome is recorded against a real
+ * slot instead of being dropped with an undefined cli (the api-mode gap).
+ * Returns undefined only when no model is present (the bridge failed before
+ * dispatch — no execution to attribute).
+ */
+function resolveCliFromModelString(model: string | undefined): CliNameLiteral | undefined {
+  return resolveCliSlot(model);
+}
+
+const logger = createLogger({ component: 'expert-bridge' });
+
+/** Base delay for rate limit retry backoff (ms). Scales linearly: 3s, 6s, 9s. */
+const RATE_LIMIT_BASE_DELAY_MS = 3000;
+
+/** Result of an expert execution. */
+export interface ExpertBridgeResult {
+  readonly success: boolean;
+  readonly text: string;
+  readonly expertType: BuiltInExpertType;
+  readonly durationMs: number;
+  readonly error?: string;
+  /**
+   * The access mode the arm that served the call reported enforcing (#6792),
+   * after routing. Absent when no arm served it (a failed route, a refusal)
+   * or the arm did not report one; {@link routedArm} / {@link cli} name the
+   * arm. Compare {@link requestedAccessMode}.
+   */
+  readonly accessMode?: ExecutionAccessMode;
+  /**
+   * The access mode the caller asked for (#6792), `'default'` when it named
+   * none. `executeExpert` always sets it; optional on the published type.
+   */
+  readonly requestedAccessMode?: ExecutionAccessMode;
+  /**
+   * True when the arm that served the call runs nothing on the host (#6792):
+   * a direct-API or gateway arm. No file was read or edited, whatever the
+   * access mode allowed; the text is the whole output.
+   */
+  readonly textOnly?: true;
+  /** Tool calls the serving CLI's permission layer refused (#6792). */
+  readonly permissionDenials?: readonly CliPermissionDenial[];
+  /**
+   * CLI that actually executed the task, resolved from the underlying
+   * `CliResponse.model` via `getCliForModelId`. Undefined when the bridge
+   * failed before dispatch (no adapters / circuit-open / rate-limit cap).
+   * Callers writing to OutcomeStore should use this rather than hardcoding
+   * a cli — see #2823 (#1154 regression).
+   */
+  readonly cli?: CliNameLiteral;
+  /**
+   * Routing arm id the router ran (#6552), when it names one: `api:anthropic`
+   * for the Anthropic API arm, where {@link cli} reads the `claude` slot. An
+   * outcome row records this, so warm start credits the arm that ran.
+   * Undefined when no arm ran, or when the router named only a slot.
+   */
+  readonly routedArm?: RoutingArmId;
+  /**
+   * `'composite-router'` when `CompositeRouter.executeTask` selected the CLI
+   * that produced this result, success or failure (#6521). Set where the
+   * router's decision and the execution meet (`adaptCompositeRouter`), so an
+   * outcome recorder copies it rather than asserting routing on its own.
+   * Undefined when no arm ran: routing failed, no adapters, circuit open.
+   */
+  readonly routedBy?: OutcomeRoutedBy;
+  /**
+   * Wall time of the routed arm's call alone (#6521), from the router. Unlike
+   * {@link durationMs} it excludes expert import, MCP-config setup and
+   * rate-limit backoff. Undefined when no arm ran.
+   */
+  readonly routedDurationMs?: number;
+  /**
+   * Total tokens (input + output) the underlying CLI/adapter reported for this
+   * call, when available (#3396). Best-effort: `CliResponse.usage` is optional
+   * — CLI-subprocess paths whose `extractUsage` returns null leave this
+   * undefined. Consumers (budget enforcement #3395, model.called attribution
+   * #3387, routing-experience metrics) must tolerate `undefined`.
+   */
+  readonly tokensUsed?: number;
+  /**
+   * Concrete model id the underlying adapter reported (`CliResponse.model`),
+   * when present (#3387). Distinct from {@link cli} (the slot): one CLI can run
+   * several models. Undefined when the adapter didn't report a model or the
+   * bridge failed before dispatch. Required to emit a `model.called` event.
+   */
+  readonly model?: string;
+  /**
+   * Input/output token split from the adapter's `CliResponse.usage` (#3387),
+   * when reported. Best-effort like {@link tokensUsed}; both undefined together
+   * when no usage was available. `tokensIn + tokensOut` reconciles with
+   * `tokensUsed` (single source of truth — both derive from the same record).
+   */
+  readonly tokensIn?: number;
+  readonly tokensOut?: number;
+  /**
+   * The gateway arm that served {@link model}, when a gateway model answered
+   * (#6624, `CliResponse.gatewayArm`). An outcome writer prices the call by
+   * the arm's declaration instead of the model's list rate.
+   */
+  readonly gatewayArm?: EndpointArmId;
+}
+
+/** Attribution of a routed arm's run, on success and on failure (#6521). */
+interface RoutedAttribution {
+  cli?: CliNameLiteral;
+  routedArm?: RoutingArmId;
+  routedBy?: OutcomeRoutedBy;
+  routedDurationMs?: number;
+}
+
+/** The task the bridge hands the router. */
+interface BridgeTask {
+  wrapper?: CommandWrapper | undefined;
+  content: string;
+  options?: Record<string, unknown> | undefined;
+  /** Host access the routed call may use (#6768); absent means the default. */
+  accessMode?: ExecutionAccessMode | undefined;
+}
+
+/** Minimal router interface for the bridge. */
+interface RouterLike {
+  executeTask(
+    task: BridgeTask,
+    /** #6736: aborts the routed CLI call (stage deadline, job cancel). */
+    execution?: { signal?: AbortSignal | undefined }
+  ): Promise<{
+    ok: boolean;
+    value: RoutedAttribution & {
+      text: string;
+      tokensUsed?: number;
+      model?: string;
+      tokensIn?: number;
+      tokensOut?: number;
+      gatewayArm?: EndpointArmId;
+    } & ServedAccess;
+    error: RoutedAttribution & { message: string };
+  }>;
+}
+
+/**
+ * The bridge's attribution for a router result (#6521). The router's own
+ * `routedCli` is authoritative: the model string can name another vendor's
+ * slot (an `api:custom-openai` arm shows as opencode while serving a GPT
+ * model). The model-derived CLI is the fallback only when no arm is named.
+ * No `routedCli` on a failure means routing failed before an arm ran, and
+ * then there is nothing to attribute.
+ */
+function routedAttribution(
+  routed: { routedCli?: CliNameLiteral; routedArm?: RoutingArmId; routedDurationMs?: number },
+  model: string | undefined
+): RoutedAttribution {
+  const cli = routed.routedCli ?? resolveCliFromModelString(model);
+  return {
+    ...(cli !== undefined && { cli }),
+    ...(routed.routedArm !== undefined && { routedArm: routed.routedArm }),
+    ...(routed.routedCli !== undefined && { routedBy: 'composite-router' as const }),
+    ...(routed.routedDurationMs !== undefined && { routedDurationMs: routed.routedDurationMs }),
+  };
+}
+
+// Cached router — lazily initialized, reused across calls within a session
+let cachedRouter: RouterLike | null = null;
+
+// Each expert owns its config through all router retries (#4631). The server
+// shutdown path can also release configs for calls interrupted by shutdown.
+const activeMcpConfigs = new Set<GeneratedMcpConfig>();
+
+/** Release active expert configs during server shutdown; safe to repeat. */
+export async function shutdownExpertBridge(): Promise<void> {
+  const configs = [...activeMcpConfigs];
+  activeMcpConfigs.clear();
+  const cleanups = configs.map(async (config) => config.cleanup());
+  for (const result of await Promise.allSettled(cleanups)) {
+    if (result.status === 'rejected') {
+      const error: unknown = result.reason;
+      logger.debug('Expert-bridge MCP-config cleanup failed', { error: String(error) });
+    }
+  }
+}
+
+/** Keep a call-owned config alive through dispatch and rate-limit backoff. */
+async function dispatchWithMcpConfig(
+  router: RouterLike,
+  content: string,
+  expertType: BuiltInExpertType,
+  start: number,
+  options: ExpertCallOptions | undefined
+): Promise<ExpertBridgeResult> {
+  let config: GeneratedMcpConfig | undefined;
+  if (requestedAccessModeOf(options) === 'default') {
+    try {
+      const { generateMcpConfig } = await import('../cli-adapters/child-mcp-config.js');
+      config = await generateMcpConfig();
+      activeMcpConfigs.add(config);
+    } catch (error: unknown) {
+      logger.debug('Expert MCP-config unavailable', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  try {
+    const task = buildBridgeTask(content, options, config?.configPath);
+    return await dispatchWithRateLimitRetry(router, task, expertType, start, options?.signal);
+  } finally {
+    if (config !== undefined) {
+      await config.cleanup();
+      activeMcpConfigs.delete(config);
+    }
+  }
+}
+
+/** Cached circuit breaker for health monitoring (#1766). */
+let cachedCircuitBreaker: {
+  getHealthStatus(): {
+    systemHealthy: boolean;
+    healthyCount: number;
+    clis: ReadonlyArray<{ name: string; healthy: boolean }>;
+  };
+} | null = null;
+
+/**
+ * Adapt a CompositeRouter to the narrower RouterLike interface used by this
+ * bridge. Previously did `as unknown as RouterLike` which hid any structural
+ * mismatch between CompositeRouter's `Result<CliResponse, CliError>` and
+ * RouterLike's flat `{ ok, value: { text }, error: { message } }` shape.
+ * If CliResponse renames `.text` → `.output` (or similar), this adapter
+ * breaks at compile time instead of silently returning wrong data (#1921).
+ */
+/**
+ * Total tokens from a best-effort `CliResponse.usage` record (#3396). Prefers
+ * the reported `totalTokens`; falls back to input+output; returns undefined
+ * when no usage was reported (so callers can distinguish "0 tokens" — which
+ * never happens for a real call — from "unknown").
+ */
+export function totalTokensFromUsage(
+  usage: { totalTokens?: number; inputTokens?: number; outputTokens?: number } | undefined
+): number | undefined {
+  if (usage === undefined) return undefined;
+  if (typeof usage.totalTokens === 'number') return usage.totalTokens;
+  const total = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+  return total > 0 ? total : undefined;
+}
+
+/**
+ * Per-direction token split from a best-effort `CliResponse.usage` record
+ * (#3387). Unlike {@link totalTokensFromUsage} this keeps `tokensIn`/`tokensOut`
+ * separate — the granularity `ModelCalledEvent` requires for attribution.
+ * Returns undefined when no usage was reported or both directions are zero (no
+ * real call), so callers skip emitting a noise event instead of recording
+ * zeros. Reconciles with the total: `tokensIn + tokensOut === totalTokensFromUsage`.
+ */
+export function tokenSplitFromUsage(
+  usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined
+): { tokensIn: number; tokensOut: number } | undefined {
+  if (usage === undefined) return undefined;
+  const tokensIn = usage.inputTokens ?? 0;
+  const tokensOut = usage.outputTokens ?? 0;
+  if (tokensIn + tokensOut === 0) return undefined;
+  return { tokensIn, tokensOut };
+}
+
+/** The router's `CliTask` for a bridge task; absent fields stay absent. */
+function toCliTask(task: BridgeTask): import('../cli-adapters/types.js').CliTask {
+  return {
+    content: task.content,
+    ...(task.wrapper !== undefined ? { wrapper: task.wrapper } : {}),
+    ...(task.options !== undefined ? { options: task.options } : {}),
+    ...(task.accessMode !== undefined ? { accessMode: task.accessMode } : {}),
+  };
+}
+
+function adaptCompositeRouter(
+  compositeRouter: import('../cli-adapters/composite-router.js').ICompositeRouter
+): RouterLike {
+  return {
+    async executeTask(task, execution): ReturnType<RouterLike['executeTask']> {
+      const cliTask = toCliTask(task);
+      const result =
+        execution?.signal === undefined
+          ? await compositeRouter.executeTask(cliTask)
+          : await compositeRouter.executeTask(cliTask, { signal: execution.signal });
+      if (result.ok) {
+        // #2823: surface which CLI actually executed so callers writing to
+        // OutcomeStore don't have to hardcode 'claude' (the bug #1154 fixed
+        // and that regressed into the pipeline/ tree). Derive via the
+        // canonical model→cli mapping in the registry — if the underlying
+        // adapter didn't set `model` or the model isn't in the registry,
+        // cli stays undefined and downstream code can skip the record
+        // rather than lie.
+        // #6521: the arm the router ran is the attribution; see routedAttribution.
+        const attribution = routedAttribution(result.value, result.value.model);
+        // #3396: surface token usage (best-effort) so budget enforcement,
+        // attribution, and routing-experience metrics get real numbers instead
+        // of zeros. `usage` is optional and `totalTokens` may be absent — fall
+        // back to input+output, and leave undefined when no usage was reported.
+        const tokensUsed = totalTokensFromUsage(result.value.usage);
+        // #3387: also surface the concrete model + per-direction token split so
+        // a meaningful `model.called` event can be emitted. Both derive from the
+        // same CliResponse, so tokensIn+tokensOut reconciles with tokensUsed.
+        const model = result.value.model;
+        const split = tokenSplitFromUsage(result.value.usage);
+        return {
+          ok: true,
+          value: {
+            text: result.value.text,
+            ...attribution,
+            ...(tokensUsed !== undefined && { tokensUsed }),
+            ...(model !== undefined && { model }),
+            ...(split !== undefined && { tokensIn: split.tokensIn, tokensOut: split.tokensOut }),
+            // #6624: which gateway served the model, so its cost is priced by
+            // the gateway's declaration.
+            ...(result.value.gatewayArm !== undefined && { gatewayArm: result.value.gatewayArm }),
+            // #6792: what the served arm reported about its host access.
+            ...servedAccessOf(result.value),
+          },
+          error: { message: '' },
+        };
+      }
+      // #6521 I1: a routed failure keeps its arm, so it is recorded and the
+      // loop does not see only the arm's successes.
+      const routed = 'routedCli' in result.error ? result.error : {};
+      return {
+        ok: false,
+        value: { text: '' },
+        error: { message: result.error.message, ...routedAttribution(routed, undefined) },
+      };
+    },
+  };
+}
+
+// Coalesces concurrent router init under concurrent expert fan-out
+// (closes #2969). N=7 voter fan-out previously ran createAllAdapters() N times
+// — N sets of CLI probe subprocesses, all but one discarded.
+let routerInitPromise: Promise<RouterLike | null> | null = null;
+// The gateway discovery generation the cached router (or its in-flight build)
+// belongs to (#6667). Gateway slot arms exist only if the slot catalogue was
+// set when the router was built, so a router built while the gateway was down
+// never sees it; a late discovery bumps the generation and the next call
+// rebuilds.
+let routerGeneration = 0;
+
+/**
+ * Get or create a cached CompositeRouter with circuit breaker monitoring.
+ *
+ * Triggers lazy gateway re-discovery first (#6667): a no-op with no gateway
+ * configured or once it is wired, otherwise at most one attempt per backoff,
+ * bounded by the discovery request's own timeout. When a late discovery has
+ * landed since the router was built, the router is rebuilt from
+ * `createAllAdapters()` — never resilient-wrapped (#5191).
+ */
+async function getRouter(): Promise<RouterLike | null> {
+  await ensureGatewayDiscovered();
+  const generation = gatewayDiscoveryGeneration();
+  if (generation !== routerGeneration) {
+    cachedRouter = null;
+    routerInitPromise = null;
+    routerGeneration = generation;
+  }
+  if (cachedRouter !== null) return cachedRouter;
+  routerInitPromise ??= (async (): Promise<RouterLike | null> => {
+    // ROUTER CONSTRUCTION, a distinct operation from adapter acquisition
+    // (#5191, ratified 5/6). `createCompositeRouter` needs
+    // `Map<RoutingArmId, ICliAdapter>`; `getGlobalRegistry()` returns
+    // `IResilientAdapter` (extends `IModelAdapter`) one CLI at a time, so the
+    // canonical path cannot type-check here.
+    //
+    // It also should not be used: the router IS the selection/failover layer,
+    // so resilient-wrapped arms would nest two failover mechanisms, and the
+    // shared circuit breaker would make an arm report unavailable without the
+    // router ever testing it. That is the doctor-probe defect (#5209) applied
+    // to routing — and this map is the LinUCB arm space, so a coupled arm
+    // availability would distort exploration signals.
+    //
+    // Pinned by `router-operation.test.ts`.
+    const { createAllAdapters } = await import('../cli-adapters/factory.js');
+    const { createCompositeRouter } = await import('../cli-adapters/composite-router.js');
+    const adapters = createAllAdapters();
+    // A late discovery landed during this build and a newer build owns the
+    // cache: serve this call, but leave the cache to the newer build.
+    const superseded = generation !== routerGeneration;
+    if (adapters.size === 0) {
+      if (!superseded) routerInitPromise = null; // allow retry once adapters become available
+      return null;
+    }
+    const router = adaptCompositeRouter(createCompositeRouter(adapters));
+    if (superseded) return router;
+    cachedRouter = router;
+
+    // Initialize circuit breaker monitoring (#1766)
+    try {
+      const { createCliCircuitBreakerIntegration } =
+        await import('../cli-adapters/cli-circuit-breaker.js');
+      cachedCircuitBreaker = createCliCircuitBreakerIntegration([...adapters.values()]);
+    } catch (error: unknown) {
+      // Circuit breaker not available — continue without it. Log so we can
+      // notice if initialization silently stops working (#1913 Class B).
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.debug('Circuit breaker init failed; continuing without it', { error: msg });
+    }
+
+    return router;
+  })();
+  return routerInitPromise;
+}
+
+/** Check CLI health before dispatch (#1766). */
+function checkCircuitHealth(): { healthy: boolean; message: string } {
+  if (cachedCircuitBreaker === null) return { healthy: true, message: '' };
+  const status = cachedCircuitBreaker.getHealthStatus();
+  if (!status.systemHealthy) {
+    return {
+      healthy: false,
+      message: `All CLI circuits open (${String(status.healthyCount)}/${String(status.clis.length)} healthy)`,
+    };
+  }
+  return { healthy: true, message: '' };
+}
+
+/** The attribution fields present on `source`; absent ones stay absent. */
+function attributionOf(source: RoutedAttribution): RoutedAttribution {
+  return {
+    ...(source.cli !== undefined && { cli: source.cli }),
+    ...(source.routedArm !== undefined && { routedArm: source.routedArm }),
+    ...(source.routedBy !== undefined && { routedBy: source.routedBy }),
+    ...(source.routedDurationMs !== undefined && { routedDurationMs: source.routedDurationMs }),
+  };
+}
+
+/** A successful router result as an {@link ExpertBridgeResult}; absent fields stay absent. */
+function toSuccessResult(
+  value: Awaited<ReturnType<RouterLike['executeTask']>>['value'],
+  expertType: BuiltInExpertType,
+  durationMs: number
+): ExpertBridgeResult {
+  return {
+    success: true,
+    text: value.text,
+    expertType,
+    durationMs,
+    ...attributionOf(value),
+    ...(value.tokensUsed !== undefined && { tokensUsed: value.tokensUsed }),
+    ...(value.model !== undefined && { model: value.model }),
+    ...(value.tokensIn !== undefined && { tokensIn: value.tokensIn }),
+    ...(value.tokensOut !== undefined && { tokensOut: value.tokensOut }),
+    ...(value.gatewayArm !== undefined && { gatewayArm: value.gatewayArm }),
+    ...servedAccessOf(value),
+  };
+}
+
+/** Dispatch task to router with rate limit retry (#1802). */
+async function dispatchWithRateLimitRetry(
+  router: RouterLike,
+  task: BridgeTask,
+  expertType: BuiltInExpertType,
+  start: number,
+  signal: AbortSignal | undefined
+): Promise<ExpertBridgeResult> {
+  const maxAttempts = 3;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const result =
+      signal === undefined
+        ? await router.executeTask(task)
+        : await router.executeTask(task, { signal });
+    const durationMs = getTimeProvider().now() - start;
+
+    if (result.ok) {
+      logger.info('Expert executed successfully', {
+        expertType,
+        durationMs,
+        cli: result.value.cli,
+      });
+      return toSuccessResult(result.value, expertType, durationMs);
+    }
+
+    const isRateLimit = isRateLimitText(result.error.message);
+    // #6736: an aborted call is not retried — the stage it served has ended.
+    if (isRateLimit && attempt < maxAttempts - 1 && signal?.aborted !== true) {
+      const backoffMs = RATE_LIMIT_BASE_DELAY_MS * (attempt + 1);
+      logger.warn('Expert rate limited, retrying', { expertType, attempt: attempt + 1, backoffMs });
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      continue;
+    }
+
+    // Only the final attempt is attributed: a rate-limited attempt that is
+    // retried is not recorded as a routed outcome of its own.
+    logger.warn('Expert execution failed', { expertType, error: result.error.message });
+    return {
+      success: false,
+      text: '',
+      expertType,
+      durationMs,
+      error: result.error.message,
+      ...attributionOf(result.error),
+    };
+  }
+
+  return {
+    success: false,
+    text: '',
+    expertType,
+    durationMs: getTimeProvider().now() - start,
+    error: 'Max retry attempts exceeded',
+  };
+}
+
+/** The options `executeExpert` and its call path take. */
+interface ExpertCallOptions {
+  /** Confine CLI startup, project configuration and hooks within the scratch sandbox. */
+  wrapper?: CommandWrapper | undefined;
+  workDir?: string | undefined;
+  signal?: AbortSignal | undefined;
+  /** Restricted modes omit the MCP config and require an enforcing adapter. */
+  accessMode?: ExecutionAccessMode | undefined;
+}
+
+/**
+ * The router task for an expert call. Experts get the nexus-agents MCP config
+ * so they can call its tools (#1708), but only in the default mode: under
+ * read-only analysis (#6768) or workspace-edit (#6792) an MCP server's tools
+ * fall outside the mode's allow list, and the claude adapter refuses a
+ * restricted task that names an MCP config.
+ */
+function buildBridgeTask(
+  content: string,
+  options: ExpertCallOptions | undefined,
+  mcpConfigPath: string | undefined
+): BridgeTask {
+  const task: BridgeTask = { content };
+  if (options?.wrapper !== undefined) task.wrapper = options.wrapper;
+  if (mcpConfigPath !== undefined) task.options = { mcpConfigPath };
+  if (options?.workDir !== undefined) {
+    task.options = { ...task.options, workDir: options.workDir };
+  }
+  if (options?.accessMode !== undefined) task.accessMode = options.accessMode;
+  return task;
+}
+
+/**
+ * Execute an expert task with the full nexus-agents expert pipeline.
+ *
+ * Creates a built-in expert, executes via CompositeRouter (for intelligent
+ * CLI routing), and records outcomes. Falls back gracefully on failure.
+ *
+ * @param expertType - Built-in expert type (code, architecture, security, qa, etc.)
+ * @param prompt - Task prompt for the expert
+ * @returns Expert result with text output
+ * @throws TypeError when `options.accessMode` is not an {@link ExecutionAccessMode}
+ */
+export function executeExpert(
+  expertType: BuiltInExpertType,
+  prompt: string
+): Promise<ExpertBridgeResult>;
+export function executeExpert(
+  expertType: BuiltInExpertType,
+  prompt: string,
+  // eslint-disable-next-line @typescript-eslint/unified-signatures -- Preserve the published two-argument API signature.
+  options: ExpertCallOptions
+): Promise<ExpertBridgeResult>;
+/**
+ * Execute with an optional working directory for the expert's CLI subprocess,
+ * an optional signal that aborts the routed call (#6736), and an optional
+ * access mode (#6768). The optional wrapper confines CLI startup, project
+ * configuration and hooks to the scratch sandbox.
+ */
+export async function executeExpert(
+  expertType: BuiltInExpertType,
+  prompt: string,
+  options?: ExpertCallOptions
+): Promise<ExpertBridgeResult> {
+  // Thrown, not returned as a failed call: a bad mode is a caller error, and a
+  // failure result would read as the expert failing.
+  assertAccessMode(options?.accessMode);
+  const result = await runExpertCall(expertType, prompt, options);
+  // #6792: the audit trail states the requested and the enforced mode.
+  return withRequestedAccessMode(result, requestedAccessModeOf(options), expertType);
+}
+
+/** {@link executeExpert} after its access mode has been validated. */
+async function runExpertCall(
+  expertType: BuiltInExpertType,
+  prompt: string,
+  options: ExpertCallOptions | undefined
+): Promise<ExpertBridgeResult> {
+  const start = getTimeProvider().now();
+  try {
+    const { BUILT_IN_EXPERTS } = await import('../agents/experts/expert-config.js');
+    const config = BUILT_IN_EXPERTS[expertType];
+    const fullPrompt = `${config.systemPrompt}\n\n${prompt}`;
+
+    const router = await getRouter();
+    if (router === null) {
+      return {
+        success: false,
+        text: `[No adapters] ${prompt}`,
+        expertType,
+        durationMs: getTimeProvider().now() - start,
+        error: 'No CLI adapters available',
+      };
+    }
+
+    // Check circuit breaker health before dispatch (#1766)
+    const health = checkCircuitHealth();
+    if (!health.healthy) {
+      logger.warn('Circuit breaker: all CLIs unavailable', { expertType, reason: health.message });
+      return {
+        success: false,
+        text: '',
+        expertType,
+        durationMs: getTimeProvider().now() - start,
+        error: health.message,
+      };
+    }
+
+    return await dispatchWithMcpConfig(router, fullPrompt, expertType, start, options);
+  } catch (error) {
+    const durationMs = getTimeProvider().now() - start;
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.warn('Expert bridge error', { expertType, error: msg });
+    return { success: false, text: '', expertType, durationMs, error: msg };
+  }
+}

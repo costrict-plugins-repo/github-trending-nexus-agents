@@ -1,0 +1,1094 @@
+/**
+ * Agent Executor Tests — Central Workflow Hub enrichment (#1711)
+ *
+ * Tests that createAgentStages integrates research_discover, weather_report,
+ * and outcome store context into the pipeline stages.
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const {
+  mockExecuteExpert,
+  mockGetOutcomeSummaryText,
+  mockGetOutcomeStore,
+  mockGenerateWeatherReport,
+  mockDetectTrend,
+  mockSearchLearnings,
+  mockRecordExperience,
+  mockRecordLearning,
+  mockRecordError,
+  mockEndSession,
+  mockEmit,
+  mockExecuteDiscovery,
+  mockAnalyzeGaps,
+  mockExecuteVoting,
+  mockCheckSecurityScan,
+} = vi.hoisted(() => ({
+  mockExecuteExpert: vi.fn(),
+  mockExecuteDiscovery: vi.fn(),
+  mockAnalyzeGaps: vi.fn(),
+  mockExecuteVoting: vi.fn(),
+  mockCheckSecurityScan: vi.fn(),
+  mockGetOutcomeSummaryText: vi.fn(),
+  mockGetOutcomeStore: vi.fn(() => ({ append: vi.fn(), query: vi.fn().mockReturnValue([]) })),
+  mockGenerateWeatherReport: vi.fn(),
+  mockDetectTrend: vi.fn().mockReturnValue('stable'),
+  mockSearchLearnings: vi.fn().mockReturnValue([]),
+  mockRecordExperience: vi.fn(),
+  mockRecordLearning: vi.fn().mockReturnValue({ ok: true, value: undefined }),
+  mockRecordError: vi.fn().mockReturnValue({ ok: true, value: undefined }),
+  mockEndSession: vi.fn().mockReturnValue({ ok: true, value: {} }),
+  mockEmit: vi.fn(),
+}));
+
+vi.mock('./expert-bridge.js', () => ({
+  executeExpert: mockExecuteExpert,
+}));
+
+// #3372: the research stage now calls the research tools DIRECTLY. Fully stub the
+// module (no importActual — that pulls the real research deps + the heavy
+// outcome-store chain into this test). The stage calls
+// `ResearchDiscoverInputSchema.parse({ topic })`, so the stub provides a
+// passthrough `.parse`; the mocked executeDiscovery ignores its input anyway.
+vi.mock('../mcp/tools/research-discover.js', () => ({
+  executeDiscovery: mockExecuteDiscovery,
+  ResearchDiscoverInputSchema: { parse: (x: unknown) => x },
+}));
+
+vi.mock('../mcp/tools/research-analyze.js', () => ({
+  analyzeGaps: mockAnalyzeGaps,
+}));
+
+vi.mock('../orchestration/outcomes/outcome-store.js', () => ({
+  getOutcomeStore: mockGetOutcomeStore,
+  getOutcomeSummaryText: mockGetOutcomeSummaryText,
+}));
+
+vi.mock('../orchestration/outcomes/adaptive-thresholds.js', () => ({
+  detectTrend: mockDetectTrend,
+}));
+
+vi.mock('../mcp/tools/weather-report.js', () => ({
+  generateWeatherReport: mockGenerateWeatherReport,
+}));
+
+vi.mock('../context/session-memory.js', () => ({
+  createSessionMemory: () => ({
+    searchLearnings: mockSearchLearnings,
+    startSession: vi.fn().mockReturnValue({ ok: true, value: [] }),
+    recordLearning: mockRecordLearning,
+    recordError: mockRecordError,
+    endSession: mockEndSession,
+  }),
+}));
+
+vi.mock('../config/learning-persistence.js', () => ({
+  getLearningDir: () => '/tmp/test-learning',
+}));
+
+vi.mock('../context/routing-memory.js', () => ({
+  createRoutingMemory: () => ({ recordExperience: mockRecordExperience }),
+}));
+
+vi.mock('./event-bus.js', () => ({
+  getPipelineEventBus: () => ({ emit: mockEmit }),
+}));
+
+vi.mock('./security-gate.js', () => ({
+  checkSecurityScan: () => mockCheckSecurityScan,
+}));
+
+// #4135: the vote stage dynamically imports executeVoting — stub it so the vote
+// stage can be driven by a fixed decision (approved/rejected/no_quorum).
+vi.mock('../mcp/tools/consensus-vote.js', () => ({
+  executeVoting: mockExecuteVoting,
+}));
+
+// Classification fixtures omit the complete voting result. Durable recording
+// is exercised with real results in agent-executor-vote-recording.test.ts (#6872).
+// The stub keeps the real return shape: the stage reads `voteRecord` (#7181).
+vi.mock('../mcp/tools/consensus-vote-completed-recording.js', () => ({
+  recordCompletedVote: vi.fn().mockResolvedValue({
+    voteRecord: { persisted: false, reason: 'all-simulated', detail: 'stubbed recorder' },
+  }),
+}));
+
+import { createAgentStages, buildVoteProposal } from './agent-executor.js';
+
+describe('createAgentStages — central workflow hub', () => {
+  beforeEach(() => {
+    mockExecuteExpert.mockReset();
+    mockGetOutcomeSummaryText.mockReset();
+    mockGetOutcomeStore
+      .mockReset()
+      .mockReturnValue({ append: vi.fn(), query: vi.fn().mockReturnValue([]) });
+    mockGenerateWeatherReport.mockReset();
+    mockDetectTrend.mockReset().mockReturnValue('stable');
+    mockSearchLearnings.mockReset().mockReturnValue([]);
+    mockRecordExperience.mockReset();
+    mockRecordLearning.mockReset().mockReturnValue({ ok: true, value: undefined });
+    mockRecordError.mockReset().mockReturnValue({ ok: true, value: undefined });
+    mockEndSession.mockReset().mockReturnValue({ ok: true, value: {} });
+    mockEmit.mockReset();
+    // #3372: safe defaults so any test calling research() has a structured source.
+    mockExecuteDiscovery.mockReset().mockResolvedValue({
+      topic: 't',
+      sourcesQueried: [],
+      failedSources: [],
+      items: [],
+      totalFound: 0,
+      alreadyInRegistry: 0,
+      newItems: 0,
+      filteredByRelevance: 0,
+    });
+    mockAnalyzeGaps
+      .mockReset()
+      .mockResolvedValue({ focus: 'gaps', success: true, analysis: {}, recommendations: [] });
+    mockCheckSecurityScan.mockReset().mockResolvedValue({ verdict: 'pass', details: 'ok' });
+  });
+
+  it('passes through a skipped security-scan verdict', async () => {
+    mockCheckSecurityScan.mockResolvedValue({
+      verdict: 'skip',
+      details: 'semgrep not installed',
+    });
+
+    const result = await createAgentStages().securityScan();
+
+    expect(result).toEqual({
+      passed: false,
+      verdict: 'skip',
+      feedback: 'semgrep not installed',
+    });
+  });
+
+  describe('research stage (#1712 / #3372 structured)', () => {
+    it('calls research_discover + analyze DIRECTLY and returns deterministic structured text', async () => {
+      mockExecuteDiscovery.mockResolvedValue({
+        topic: 'implement feature z',
+        sourcesQueried: ['arxiv'],
+        failedSources: [],
+        items: [
+          {
+            source: 'arxiv',
+            title: 'Paper A',
+            url: 'https://arxiv.org/abs/1',
+            description: 'd',
+            alreadyInRegistry: false,
+            discoveredAt: '2026-01-01',
+            relevanceScore: 0.9,
+          },
+        ],
+        totalFound: 3,
+        alreadyInRegistry: 1,
+        newItems: 2,
+        filteredByRelevance: 0,
+      });
+      mockAnalyzeGaps.mockResolvedValue({
+        focus: 'gaps',
+        success: true,
+        analysis: {},
+        recommendations: ['missing X'],
+      });
+
+      const stages = createAgentStages();
+      const result = await stages.research('implement feature Z');
+
+      // Direct calls — NOT the LLM expert path.
+      expect(mockExecuteDiscovery).toHaveBeenCalledTimes(1);
+      expect(mockAnalyzeGaps).toHaveBeenCalledTimes(1);
+      expect(mockExecuteExpert).not.toHaveBeenCalled();
+      // #3234: research() returns a ResearchContext; .text carries the signals.
+      expect(result.text).toContain('Paper A');
+      expect(result.text).toMatch(/0\.9/);
+      expect(result.text).toContain('missing X');
+      expect(result.text).toMatch(/2 new/i);
+      expect(result.metadata.discoveredItems[0]?.title).toBe('Paper A');
+    });
+
+    it('fails gracefully when discovery throws (fail-safe text, never throws)', async () => {
+      mockExecuteDiscovery.mockRejectedValue(new Error('arxiv down'));
+      mockAnalyzeGaps.mockResolvedValue({
+        focus: 'gaps',
+        success: true,
+        analysis: {},
+        recommendations: [],
+      });
+
+      const stages = createAgentStages();
+      const result = await stages.research('some task');
+
+      expect(result.text).toContain('[Research failed]');
+      expect(mockExecuteExpert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('plan stage (#1713 + #1714)', () => {
+    it('includes outcome context in plan prompt', async () => {
+      mockGetOutcomeSummaryText.mockReturnValue(
+        '## Outcome Context (50 tasks, 82% success)\nRecent failures:\ntimeout: codex timed out'
+      );
+      mockGenerateWeatherReport.mockReturnValue({
+        overall: { totalTasks: 50, successRate: 0.82, avgDurationMs: 3000 },
+        recommendedMappings: [{ category: 'code_generation', cli: 'claude' }],
+      });
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan: step 1',
+        durationMs: 200,
+        expertType: 'architecture',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('implement X', 'research context', undefined);
+
+      const call = mockExecuteExpert.mock.calls[0] as [string, string];
+      expect(call[0]).toBe('architecture');
+      expect(call[1]).toContain('82%');
+      expect(call[1]).toContain('timeout');
+    });
+
+    it('includes weather recommended mappings in plan prompt', async () => {
+      mockGetOutcomeSummaryText.mockReturnValue('');
+      mockGenerateWeatherReport.mockReturnValue({
+        overall: { totalTasks: 30, successRate: 0.9, avgDurationMs: 2000 },
+        // Real RecommendedMapping shape — `recommendedCli`, not `cli`.
+        // Pre-#2718 the consumer read `m.cli` (which doesn't exist on the
+        // real type) and emitted "category → undefined"; this mock had
+        // propagated the same wrong shape, hiding the bug from tests.
+        recommendedMappings: [
+          { category: 'code_generation', recommendedCli: 'claude' },
+          { category: 'research', recommendedCli: 'gemini' },
+        ],
+      });
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan ready',
+        durationMs: 150,
+        expertType: 'architecture',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('task', 'research', undefined);
+
+      const call = mockExecuteExpert.mock.calls[0] as [string, string];
+      expect(call[1]).toContain('code_generation');
+      expect(call[1]).toContain('claude');
+      expect(call[1]).toContain('gemini');
+      // Drift gate: the prompt must NOT contain the literal "undefined"
+      // string the pre-fix consumer was producing.
+      expect(call[1]).not.toContain('→ undefined');
+    });
+
+    it('handles empty outcome store gracefully', async () => {
+      mockGetOutcomeSummaryText.mockReturnValue('');
+      mockGenerateWeatherReport.mockReturnValue({
+        overall: { totalTasks: 0, successRate: 0, avgDurationMs: 0 },
+      });
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan',
+        durationMs: 100,
+        expertType: 'architecture',
+      });
+
+      const stages = createAgentStages();
+      const result = await stages.plan('task', 'research', undefined);
+
+      expect(result).toBe('Plan');
+    });
+
+    it('includes feedback when revising plan', async () => {
+      mockGetOutcomeSummaryText.mockReturnValue('');
+      mockGenerateWeatherReport.mockReturnValue({
+        overall: { totalTasks: 10, successRate: 0.7, avgDurationMs: 1000 },
+        recommendedMappings: [],
+      });
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Revised plan',
+        durationMs: 200,
+        expertType: 'architecture',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('task', 'research', 'need more detail on step 2');
+
+      const call = mockExecuteExpert.mock.calls[0] as [string, string];
+      expect(call[1]).toContain('Revise plan');
+      expect(call[1]).toContain('need more detail on step 2');
+    });
+  });
+
+  describe('memory context enrichment (#1716)', () => {
+    it('appends prior learnings to the research result (#3372: no LLM prompt to seed)', async () => {
+      mockSearchLearnings.mockReturnValue([
+        { pattern: 'Use compositeRouter for routing', confidence: 0.9, context: '' },
+      ]);
+
+      const stages = createAgentStages();
+      // #3372: research now calls the tools directly, so prior learnings are
+      // appended to the returned text rather than seeded into an LLM prompt.
+      const result = await stages.research('improve routing');
+
+      expect(result.text).toContain('Prior Learnings');
+      expect(result.text).toContain('compositeRouter');
+    });
+
+    it('includes trend warning in plan prompt when declining', async () => {
+      mockGetOutcomeSummaryText.mockReturnValue('');
+      mockGetOutcomeStore.mockReturnValue({
+        append: vi.fn(),
+        query: vi.fn().mockReturnValue(new Array(20).fill({ success: false })),
+      });
+      mockDetectTrend.mockReturnValue('declining');
+      mockGenerateWeatherReport.mockReturnValue({
+        overall: { totalTasks: 20, successRate: 0.4, avgDurationMs: 5000 },
+        recommendedMappings: [],
+      });
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan',
+        durationMs: 100,
+        expertType: 'architecture',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('task', 'research', undefined);
+
+      const call = mockExecuteExpert.mock.calls[0] as [string, string];
+      expect(call[1]).toContain('DECLINING');
+    });
+  });
+
+  describe('routing memory write-back (#1718)', () => {
+    it('records routing experience after implement stage', async () => {
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'implementation code',
+        durationMs: 300,
+        expertType: 'code',
+      });
+
+      const stages = createAgentStages();
+      await stages.implement({
+        id: 't1',
+        title: 'Task',
+        description: 'Desc',
+        assignedTo: 'coder',
+        status: 'pending',
+      });
+
+      // Allow async fire-and-forget to settle
+      await new Promise((r) => {
+        setTimeout(r, 10);
+      });
+      expect(mockRecordExperience).toHaveBeenCalledWith('code_generation', ['claude'], true, {
+        durationMs: 300,
+        tokensUsed: 0,
+      });
+    });
+  });
+
+  describe('implement stage failure marker (#6331)', () => {
+    it('names an unknown error rather than interpolating undefined', async () => {
+      mockExecuteExpert.mockResolvedValue({
+        success: false,
+        text: '',
+        durationMs: 5,
+        expertType: 'code',
+        error: undefined,
+      });
+
+      const result = await createAgentStages().implement({
+        id: 't1',
+        title: 'Task',
+        description: 'Desc',
+        assignedTo: 'coder',
+        status: 'pending',
+      });
+
+      expect(result).toContain('[Implementation failed: unknown error]');
+      expect(result).not.toContain('undefined');
+    });
+  });
+
+  describe('memory write-back on QA outcomes (#1716)', () => {
+    it('records learning on QA pass', async () => {
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'PASS: looks good',
+        durationMs: 100,
+        expertType: 'qa',
+      });
+
+      const stages = createAgentStages();
+      await stages.qaReview(
+        { id: 't1', title: 'My Task', description: '', assignedTo: 'coder', status: 'review' },
+        'some implementation'
+      );
+
+      await new Promise((r) => {
+        setTimeout(r, 10);
+      });
+      expect(mockRecordLearning).toHaveBeenCalled();
+    });
+
+    it('records error on QA rejection', async () => {
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'NEEDS_WORK: missing tests',
+        durationMs: 100,
+        expertType: 'qa',
+      });
+
+      const stages = createAgentStages();
+      await stages.qaReview(
+        { id: 't1', title: 'My Task', description: '', assignedTo: 'coder', status: 'review' },
+        'some implementation'
+      );
+
+      await new Promise((r) => {
+        setTimeout(r, 10);
+      });
+      expect(mockRecordError).toHaveBeenCalled();
+    });
+  });
+
+  // #6776: a QA review that failed or could not be read was recorded as `pass`
+  // (runExpert returns `text: ''` on failure; the parser defaulted to pass).
+  describe('QA verdict fails closed (#6776)', () => {
+    const task = {
+      id: 'q6776',
+      title: 'Task',
+      description: '',
+      assignedTo: 'coder' as const,
+      status: 'review' as const,
+    };
+
+    function qaReply(over: Record<string, unknown>): void {
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: '',
+        durationMs: 10,
+        expertType: 'qa',
+        ...over,
+      });
+    }
+
+    function appendSpyStore(): ReturnType<typeof vi.fn> {
+      const appendSpy = vi.fn();
+      mockGetOutcomeStore.mockReturnValue({
+        append: appendSpy,
+        query: vi.fn().mockReturnValue([]),
+      });
+      return appendSpy;
+    }
+
+    it('a failed expert call is never a pass, and carries the error', async () => {
+      const appendSpy = appendSpyStore();
+      qaReply({ success: false, text: '', error: 'budget exhausted', cli: 'claude' });
+
+      const review = await createAgentStages().qaReview(task, 'impl');
+
+      expect(review.verdict).toBe('needs_work');
+      expect(review.feedback).toContain('unmeasured');
+      expect(review.feedback).toContain('budget exhausted');
+      expect(mockRecordLearning).not.toHaveBeenCalled();
+      const row = appendSpy.mock.calls
+        .map((c: unknown[]) => c[0] as Record<string, unknown>)
+        .find((r) => String(r['id']).startsWith('pipeline-q6776-'));
+      expect(row?.['qualitySignals']).toEqual([
+        'qa-verdict:needs_work',
+        'qa-unmeasured:call-failed',
+      ]);
+    });
+
+    it('empty text from a "successful" call is not a pass', async () => {
+      qaReply({ text: '' });
+      const review = await createAgentStages().qaReview(task, 'impl');
+      expect(review.verdict).toBe('needs_work');
+      expect(review.feedback).toContain('unmeasured');
+    });
+
+    it('an off-format reply is not a pass', async () => {
+      const appendSpy = appendSpyStore();
+      qaReply({ text: 'Looks fine to me.', cli: 'claude' });
+      const review = await createAgentStages().qaReview(task, 'impl');
+      expect(review.verdict).toBe('needs_work');
+      expect(review.feedback).toContain('Looks fine to me.');
+      const row = appendSpy.mock.calls
+        .map((c: unknown[]) => c[0] as Record<string, unknown>)
+        .find((r) => String(r['id']).startsWith('pipeline-q6776-'));
+      expect(row?.['qualitySignals']).toEqual([
+        'qa-verdict:needs_work',
+        'qa-unmeasured:unreadable',
+      ]);
+    });
+
+    it('"reject" inside a PASS explanation stays a pass (positive control)', async () => {
+      qaReply({ text: 'PASS: no reason to reject; tests cover the edge cases.' });
+      const review = await createAgentStages().qaReview(task, 'impl');
+      expect(review.verdict).toBe('pass');
+      expect(mockRecordLearning).toHaveBeenCalled();
+    });
+
+    it('a failing reviewer exhausts the bounded QA loop and the task is not approved', async () => {
+      const { runQaLoop } = await import('../orchestration/qa-loop.js');
+      mockExecuteExpert.mockImplementation((expertType: string) =>
+        Promise.resolve(
+          expertType === 'qa'
+            ? { success: false, text: '', durationMs: 1, expertType: 'qa', error: 'timeout' }
+            : { success: true, text: 'impl', durationMs: 1, expertType: 'code' }
+        )
+      );
+      const stages = createAgentStages();
+
+      const result = await runQaLoop(
+        () => stages.implement(task),
+        (impl) => stages.qaReview(task, impl),
+        3
+      );
+
+      expect(result.approved).toBe(false);
+      expect(result.iterations).toBe(3);
+      expect(result.feedback).toContain('timeout');
+    });
+  });
+
+  // #2823: regression coverage. recordOutcome used to hardcode `cli: 'claude'`,
+  // poisoning the OutcomeStore + LinUCB cold-start warmStart on every run.
+  // The threaded `cli` now comes from `r.cli` (executeExpert's resolved CLI);
+  // when undefined (bridge failed before dispatch, or non-CLI stage like
+  // local security scan) the record is skipped rather than fabricated.
+  describe('routed marker on stage outcomes (#6521)', () => {
+    function findRecord(spy: ReturnType<typeof vi.fn>, prefix: string): Record<string, unknown> {
+      const call = spy.mock.calls.find(
+        (c: unknown[]) => (c[0] as { id?: string }).id?.startsWith(prefix) === true
+      );
+      if (call === undefined) throw new Error(`no ${prefix} record`);
+      return call[0] as Record<string, unknown>;
+    }
+
+    it.each(['session-6858-unusual', undefined])(
+      'records each CLI stage against its reachable session %s',
+      async (sessionId) => {
+        const appendSpy = vi.fn();
+        mockGetOutcomeStore.mockReturnValue({
+          append: appendSpy,
+          query: vi.fn().mockReturnValue([]),
+        });
+        const call = { success: true, durationMs: 17, cli: 'codex' };
+        mockExecuteExpert
+          .mockResolvedValueOnce({ ...call, text: 'Plan for the seam', expertType: 'architecture' })
+          .mockResolvedValueOnce({
+            ...call,
+            expertType: 'pm',
+            text: '[{"id":"artifact-6858-unusual","title":"x","description":"y","assignedTo":"dev"}]',
+          })
+          .mockResolvedValueOnce({ ...call, text: 'implementation', expertType: 'code' })
+          .mockResolvedValueOnce({ ...call, text: 'PASS', expertType: 'qa' });
+        const stages = createAgentStages({ sessionId });
+        await stages.plan('task', 'research');
+        const tasks = await stages.decompose('plan');
+        const implementation = await stages.implement(tasks[0]!);
+        await stages.qaReview(tasks[0]!, implementation);
+        expect(appendSpy).toHaveBeenCalledTimes(4);
+        for (const [row] of appendSpy.mock.calls as [Record<string, unknown>][]) {
+          if (sessionId === undefined) expect(row).not.toHaveProperty('traceId');
+          else expect(row['traceId']).toBe(`pipeline-${sessionId}`);
+        }
+      }
+    );
+
+    it('copies routedBy from a routed bridge result onto every CLI stage record', async () => {
+      const appendSpy = vi.fn();
+      mockGetOutcomeStore.mockReturnValue({
+        append: appendSpy,
+        query: vi.fn().mockReturnValue([]),
+      });
+      const routed = { success: true, durationMs: 90, cli: 'codex', routedBy: 'composite-router' };
+      mockExecuteExpert
+        .mockResolvedValueOnce({ ...routed, text: 'Plan v1', expertType: 'architecture' })
+        .mockResolvedValueOnce({
+          ...routed,
+          text: '[{"id":"t1","title":"x","description":"y","assignedTo":"dev"}]',
+          expertType: 'pm',
+        })
+        .mockResolvedValueOnce({ ...routed, text: 'implementation done', expertType: 'code' });
+
+      const stages = createAgentStages();
+      await stages.plan('build feature A', '');
+      const tasks = await stages.decompose('plan');
+      await stages.implement(tasks[0]!);
+
+      for (const prefix of ['pipeline-plan-', 'pipeline-decompose-', 'pipeline-t1-']) {
+        expect(findRecord(appendSpy, prefix)['routedBy']).toBe('composite-router');
+      }
+    });
+
+    it('records QA as the review call succeeding, with the verdict as a signal (#6521 I2)', async () => {
+      const appendSpy = vi.fn();
+      mockGetOutcomeStore.mockReturnValue({
+        append: appendSpy,
+        query: vi.fn().mockReturnValue([]),
+      });
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'REJECT: missing tests',
+        durationMs: 500,
+        routedDurationMs: 300,
+        expertType: 'qa',
+        cli: 'gemini',
+        routedBy: 'composite-router',
+      });
+
+      const stages = createAgentStages();
+      const review = await stages.qaReview(
+        { id: 'q1', title: 'x', description: 'y', assignedTo: 'coder', status: 'review' },
+        'impl'
+      );
+
+      expect(review.verdict).toBe('reject');
+      const row = findRecord(appendSpy, 'pipeline-q1-');
+      expect(row['success']).toBe(true);
+      expect(row['routedBy']).toBe('composite-router');
+      expect(row['category']).toBe('code_review');
+      expect(row['qualitySignals']).toEqual(['qa-verdict:reject']);
+      expect(row['durationMs']).toBe(300);
+    });
+
+    it('records a routed failure against its arm, classified, with the arm run time (#6521 I1)', async () => {
+      const appendSpy = vi.fn();
+      mockGetOutcomeStore.mockReturnValue({
+        append: appendSpy,
+        query: vi.fn().mockReturnValue([]),
+      });
+      mockExecuteExpert.mockResolvedValue({
+        success: false,
+        text: '',
+        durationMs: 900,
+        routedDurationMs: 120,
+        expertType: 'architecture',
+        cli: 'codex',
+        routedBy: 'composite-router',
+        error: 'Request timed out after 120000ms',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('build feature A', '');
+
+      const row = findRecord(appendSpy, 'pipeline-plan-');
+      expect(row).toMatchObject({
+        success: false,
+        cli: 'codex',
+        routedBy: 'composite-router',
+        durationMs: 120,
+        failureCategory: 'timeout',
+      });
+    });
+
+    it('leaves the marker off when the bridge result was not routed', async () => {
+      const appendSpy = vi.fn();
+      mockGetOutcomeStore.mockReturnValue({
+        append: appendSpy,
+        query: vi.fn().mockReturnValue([]),
+      });
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan v1',
+        durationMs: 90,
+        expertType: 'architecture',
+        cli: 'gemini',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('build feature A', '');
+
+      expect(Object.keys(findRecord(appendSpy, 'pipeline-plan-'))).not.toContain('routedBy');
+    });
+  });
+
+  describe('served model and cost on stage records (#6624)', () => {
+    function planRecord(spy: ReturnType<typeof vi.fn>): Record<string, unknown> {
+      const call = spy.mock.calls.find(
+        (c: unknown[]) => (c[0] as { id?: string }).id?.startsWith('pipeline-plan-') === true
+      );
+      if (call === undefined) throw new Error('no pipeline-plan- record');
+      return call[0] as Record<string, unknown>;
+    }
+
+    function stubStore(): ReturnType<typeof vi.fn> {
+      const appendSpy = vi.fn();
+      mockGetOutcomeStore.mockReturnValue({
+        append: appendSpy,
+        query: vi.fn().mockReturnValue([]),
+      });
+      return appendSpy;
+    }
+
+    it('records the served model and its cost beside the pipeline marker', async () => {
+      const appendSpy = stubStore();
+      // claude-sonnet is $3 / $15 per 1M: 1000 in + 2000 out = 0.033.
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan v1',
+        durationMs: 200,
+        expertType: 'architecture',
+        cli: 'claude',
+        model: 'claude-sonnet',
+        tokensIn: 1_000,
+        tokensOut: 2_000,
+      });
+
+      await createAgentStages().plan('build feature A', '');
+
+      const record = planRecord(appendSpy);
+      expect(record['model']).toBe('pipeline');
+      expect(record['servedModel']).toBe('claude-sonnet');
+      expect(record['costUsd']).toBe(0.033);
+      expect(record['priceBasis']).toBe('list');
+    });
+
+    it('records an unpriced served model as an unknown cost, not $0', async () => {
+      const appendSpy = stubStore();
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan v1',
+        durationMs: 200,
+        expertType: 'architecture',
+        cli: 'claude',
+        model: 'acme-unpriced-model-xyz',
+        tokensIn: 1_000,
+        tokensOut: 2_000,
+      });
+
+      await createAgentStages().plan('build feature A', '');
+
+      const record = planRecord(appendSpy);
+      expect(record['servedModel']).toBe('acme-unpriced-model-xyz');
+      expect(record['priceBasis']).toBe('unknown');
+      expect('costUsd' in record).toBe(false);
+    });
+
+    it('prices a gateway-served model by the gateway, not its list rate', async () => {
+      vi.stubEnv('NEXUS_GATEWAY_COST', undefined);
+      const appendSpy = stubStore();
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan v1',
+        durationMs: 200,
+        expertType: 'architecture',
+        cli: 'claude',
+        model: 'claude-sonnet',
+        gatewayArm: 'api:custom-openai',
+        tokensIn: 1_000,
+        tokensOut: 2_000,
+      });
+
+      await createAgentStages().plan('build feature A', '');
+      vi.unstubAllEnvs();
+
+      // An undeclared gateway is unpriced; the list rate would read 0.033.
+      const record = planRecord(appendSpy);
+      expect(record['servedModel']).toBe('claude-sonnet');
+      expect(record['priceBasis']).toBe('unknown');
+      expect('costUsd' in record).toBe(false);
+    });
+
+    it('adds no served fields when the adapter reported no model', async () => {
+      const appendSpy = stubStore();
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan v1',
+        durationMs: 200,
+        expertType: 'architecture',
+        cli: 'codex',
+      });
+
+      await createAgentStages().plan('build feature A', '');
+
+      const record = planRecord(appendSpy);
+      for (const key of ['servedModel', 'costUsd', 'priceBasis']) {
+        expect(key in record).toBe(false);
+      }
+    });
+  });
+
+  describe('recordOutcome cli threading (#2823)', () => {
+    it('writes the actual cli from executeExpert, never hardcoded claude', async () => {
+      const appendSpy = vi.fn();
+      mockGetOutcomeStore.mockReturnValue({
+        append: appendSpy,
+        query: vi.fn().mockReturnValue([]),
+      });
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan v1',
+        durationMs: 200,
+        expertType: 'architecture',
+        cli: 'gemini',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('build feature A', '');
+
+      const planRecord = appendSpy.mock.calls.find(
+        (c: unknown[]) => (c[0] as { id?: string }).id?.startsWith('pipeline-plan-') === true
+      );
+      expect(planRecord).toBeDefined();
+      expect((planRecord![0] as { cli: string }).cli).toBe('gemini');
+    });
+
+    it('skips the record when cli is undefined (bridge failed before dispatch)', async () => {
+      const appendSpy = vi.fn();
+      mockGetOutcomeStore.mockReturnValue({
+        append: appendSpy,
+        query: vi.fn().mockReturnValue([]),
+      });
+      // No `cli` field — bridge failed before any CLI ran (no adapter / circuit-open).
+      mockExecuteExpert.mockResolvedValue({
+        success: false,
+        text: '',
+        durationMs: 5,
+        expertType: 'architecture',
+        error: 'No adapters available',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('build feature A', '');
+
+      const planRecord = appendSpy.mock.calls.find(
+        (c: unknown[]) => (c[0] as { id?: string }).id?.startsWith('pipeline-plan-') === true
+      );
+      // The whole point of #2823: no append at all, rather than a fabricated
+      // `cli: 'claude'` record polluting routing learner.
+      expect(planRecord).toBeUndefined();
+    });
+
+    it('threads each CLI distinctly across stages (#2823)', async () => {
+      const appendSpy = vi.fn();
+      mockGetOutcomeStore.mockReturnValue({
+        append: appendSpy,
+        query: vi.fn().mockReturnValue([]),
+      });
+      // Decompose returns codex; implement returns claude.
+      mockExecuteExpert
+        .mockResolvedValueOnce({
+          success: true,
+          text: '[{"id":"t1","title":"x","description":"y","assignedTo":"dev"}]',
+          durationMs: 80,
+          expertType: 'pm',
+          cli: 'codex',
+        })
+        .mockResolvedValueOnce({
+          success: true,
+          text: 'implementation done',
+          durationMs: 1200,
+          expertType: 'code',
+          cli: 'claude',
+        });
+
+      const stages = createAgentStages();
+      const tasks = await stages.decompose('plan');
+      await stages.implement(tasks[0]!);
+
+      const decomposeRecord = appendSpy.mock.calls.find(
+        (c: unknown[]) => (c[0] as { id?: string }).id?.startsWith('pipeline-decompose-') === true
+      );
+      const implRecord = appendSpy.mock.calls.find(
+        (c: unknown[]) => (c[0] as { id?: string }).id?.startsWith('pipeline-t1-') === true
+      );
+      expect((decomposeRecord![0] as { cli: string }).cli).toBe('codex');
+      expect((implRecord![0] as { cli: string }).cli).toBe('claude');
+    });
+  });
+
+  describe('model.called emission (#3387)', () => {
+    /** Find the model.called event among all emitted pipeline events. */
+    function findModelCalled(): Record<string, unknown> | undefined {
+      return mockEmit.mock.calls
+        .map((c: unknown[]) => c[0] as Record<string, unknown>)
+        .find((e) => e['type'] === 'model.called');
+    }
+
+    it('emits model.called with real cli/model/token attribution after a successful call', async () => {
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan v1',
+        durationMs: 200,
+        expertType: 'architecture',
+        cli: 'gemini',
+        model: 'gemini-3-pro',
+        tokensIn: 120,
+        tokensOut: 80,
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('build feature A', '');
+
+      const event = findModelCalled();
+      expect(event).toMatchObject({
+        type: 'model.called',
+        executionId: 'plan',
+        cli: 'gemini',
+        model: 'gemini-3-pro',
+        tokensIn: 120,
+        tokensOut: 80,
+        durationMs: 200,
+      });
+    });
+
+    it('skips emission when token usage is absent (no zeros)', async () => {
+      // CLI-subprocess path whose extractUsage() returned null: cli + model
+      // known, but no tokensIn/tokensOut → skip rather than emit a zero event.
+      mockExecuteExpert.mockResolvedValue({
+        success: true,
+        text: 'Plan v1',
+        durationMs: 200,
+        expertType: 'architecture',
+        cli: 'gemini',
+        model: 'gemini-3-pro',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('build feature A', '');
+
+      expect(findModelCalled()).toBeUndefined();
+    });
+
+    it('skips emission when the bridge failed before dispatch', async () => {
+      mockExecuteExpert.mockResolvedValue({
+        success: false,
+        text: '',
+        durationMs: 5,
+        expertType: 'architecture',
+        error: 'No adapters available',
+      });
+
+      const stages = createAgentStages();
+      await stages.plan('build feature A', '');
+
+      expect(findModelCalled()).toBeUndefined();
+    });
+  });
+});
+
+describe('vote stage — no_quorum handling (#4135)', () => {
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+  function votingResult(opts: {
+    decision?: string;
+    outcome: string;
+    approve: number;
+    reject: number;
+  }) {
+    return {
+      ...(opts.decision !== undefined ? { decision: opts.decision } : {}),
+      result: {
+        outcome: opts.outcome,
+        voteCounts: { approve: opts.approve, reject: opts.reject, abstain: 0, error: 0 },
+      },
+      votes: [{ vote: { decision: 'reject', reasoning: 'a concern' } }],
+    };
+  }
+
+  beforeEach(() => {
+    mockExecuteVoting.mockReset();
+  });
+
+  it('a no_quorum decision blocks + escalates — returns kind:no_quorum, NOT rejected-into-revision', async () => {
+    mockExecuteVoting.mockResolvedValue(
+      votingResult({ decision: 'no_quorum', outcome: 'rejected', approve: 5, reject: 1 })
+    );
+    const stages = createAgentStages({ simulateVotes: false });
+    const vote = await stages.vote('the plan', '');
+    expect(vote.kind).toBe('no_quorum');
+    // A no_quorum void carries no reviewer feedback (the plan is fine) — so it is
+    // NOT a { kind:'rejected', feedback } that would drive plan-revision.
+    expect(vote.kind).not.toBe('rejected');
+    if (vote.kind === 'no_quorum') {
+      expect(vote.reason).toContain('quorum');
+    }
+  });
+
+  it('#5506: an errored voter on an otherwise-approving panel uses absolute_quorum', async () => {
+    mockExecuteVoting.mockImplementation(
+      (input: { errorPolicy?: string }): Promise<ReturnType<typeof votingResult>> => {
+        const decision = input.errorPolicy === 'absolute_quorum' ? 'no_quorum' : 'approved';
+        const result = votingResult({ decision, outcome: 'approved', approve: 6, reject: 0 });
+        return Promise.resolve({
+          ...result,
+          votes: [
+            { vote: { decision: 'approve', reasoning: 'sound plan' }, source: 'llm' },
+            { vote: { decision: 'reject', reasoning: 'adapter error' }, source: 'error' },
+          ],
+        });
+      }
+    );
+    const stages = createAgentStages({ simulateVotes: false });
+
+    const vote = await stages.vote('the plan', 'the research');
+
+    expect(vote.kind).toBe('no_quorum');
+    expect(mockExecuteVoting).toHaveBeenCalledWith(
+      expect.objectContaining({ errorPolicy: 'absolute_quorum' }),
+      expect.anything(),
+      // #6736: no stage signal was supplied, so no options reach the panel.
+      undefined
+    );
+  });
+
+  it('#4143: a vote-stage infra error FAILS CLOSED to no_quorum, never auto-approved', async () => {
+    // Previously the catch block returned { kind:'approved' } ("Error (auto-approved)"),
+    // a fail-OPEN that would execute an unvoted plan. It now fails closed to no_quorum.
+    mockExecuteVoting.mockRejectedValue(new Error('all voters errored / adapter down'));
+    const stages = createAgentStages({ simulateVotes: false });
+    const vote = await stages.vote('the plan', '');
+    expect(vote.kind).toBe('no_quorum');
+    expect(vote.kind).not.toBe('approved');
+    if (vote.kind === 'no_quorum') {
+      expect(vote.reason).toMatch(/errored|failing closed/i);
+    }
+  });
+
+  it('approve/reject paths are unchanged when decision is absent (default-policy fallback)', async () => {
+    mockExecuteVoting.mockResolvedValueOnce(
+      votingResult({ outcome: 'approved', approve: 6, reject: 0 })
+    );
+    const stages = createAgentStages({ simulateVotes: false });
+    const approvedVote = await stages.vote('plan', '');
+    expect(approvedVote.kind).toBe('approved');
+
+    mockExecuteVoting.mockResolvedValueOnce(
+      votingResult({ outcome: 'rejected', approve: 1, reject: 5 })
+    );
+    const rejectedVote = await stages.vote('plan', '');
+    expect(rejectedVote.kind).toBe('rejected');
+  });
+});
+
+describe('buildVoteProposal (#3258)', () => {
+  it('frames the complete plan without research when research is empty', () => {
+    expect(buildVoteProposal('the plan', '')).toContain(
+      '\n===== BEGIN ARTIFACT =====\nthe plan\n===== END ARTIFACT ====='
+    );
+    expect(buildVoteProposal('the plan', '   ')).toBe(buildVoteProposal('the plan', ''));
+  });
+
+  it('appends research as a delimited, not-instructions block when present', () => {
+    const out = buildVoteProposal('PLAN BODY', 'found 3 high-relevance papers');
+    expect(out).toContain('PLAN BODY');
+    expect(out).toContain('found 3 high-relevance papers');
+    expect(out).toMatch(/Research context \(informational/);
+    expect(out).toMatch(/NOT instructions/);
+  });
+
+  it('preserves the complete plan while bounding only informational research', () => {
+    const out = buildVoteProposal('p'.repeat(10_000), 'r'.repeat(10_000));
+    expect(out).toContain('p'.repeat(10_000));
+    expect(out).not.toContain('r'.repeat(1001));
+    // Only informational research is bounded; the complete plan retains its content.
+    expect(out).toContain('Research context');
+    expect(out).toContain('r'.repeat(100));
+  });
+});

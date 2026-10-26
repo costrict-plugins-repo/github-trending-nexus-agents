@@ -1,0 +1,386 @@
+/**
+ * Type definitions for the Weather Report MCP tool.
+ *
+ * Surfaces observed model performance as a living "weather report"
+ * and computes adaptive routing bonuses from outcome data.
+ *
+ * @module mcp/tools/weather-report-types
+ * (Source: Issue #865 — Weather report with adaptive routing)
+ */
+
+import { z } from 'zod';
+import type { TaskCategory } from '../../config/task-specialization-types.js';
+import type { GroupStats } from '../../orchestration/outcomes/outcome-types.js';
+import { CLI_NAMES, type CliNameLiteral } from '../../config/model-capabilities-types.js';
+import type { DecisionCostReport } from '../../observability/decision-cost-aggregate.js';
+import type { ConsensusDecisionTokenReport } from '../../observability/consensus-decision-tokens.js';
+import type { StrategyCostProfileEntry } from '../../orchestration/strategy-manifest-registry.js';
+
+// ============================================================================
+// Input Schema
+// ============================================================================
+
+export const WeatherReportInputSchema = z.object({
+  /** Filter by CLI name. */
+  cli: z.enum(CLI_NAMES).optional().describe('Filter by CLI'),
+  /** Filter by task category. */
+  category: z
+    .enum([
+      'architecture',
+      'code_generation',
+      'code_review',
+      'research',
+      'security_review',
+      'planning',
+      'documentation',
+      'testing',
+      'devops',
+      'exploration',
+    ])
+    .optional()
+    .describe('Filter by task category'),
+  /** Include adaptive routing bonus data. */
+  includeAdaptive: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe('Include adaptive routing bonuses (default: true)'),
+});
+
+/** Validated MCP input (includeAdaptive is always populated after Zod parse). */
+export type WeatherReportInput = z.infer<typeof WeatherReportInputSchema>;
+
+/** Options for generateWeatherReport (all fields optional). */
+export interface WeatherReportOptions {
+  readonly cli?: CliNameLiteral;
+  readonly category?: string;
+  readonly includeAdaptive?: boolean;
+  /**
+   * Opt-in for the per-model telemetry lens (#4194). Default off (#4202):
+   * the lens scans the full store per distinct model, so the hot
+   * routing-bonus path (weather-bonus-stage) must not pay for it; the
+   * weather_report MCP tool always opts in.
+   */
+  readonly includeModelWeather?: boolean;
+  /** Opt-in trace/outcome joins for MCP/health display; default off to avoid routing trace IO. */
+  readonly includePipelineJoins?: boolean;
+}
+
+// ============================================================================
+// Output Types
+// ============================================================================
+
+/** Adapter attempt stats separating infra failures from model-quality failures (#1982). */
+export interface AdapterAttemptStats {
+  /**
+   * Success rate excluding adapter_unavailable failures. Represents model-quality
+   * success when the adapter could actually attempt the task. Rounded to 3 decimals.
+   */
+  readonly adapterAttemptSuccessRate: number;
+  /** Count of adapter_unavailable failures in the sample. */
+  readonly adapterUnavailableCount: number;
+  /**
+   * Fraction of total attempts that failed due to adapter_unavailable. Rounded
+   * to 3 decimals. Useful for comparing infra availability across CLIs/categories.
+   */
+  readonly adapterUnavailableRate: number;
+}
+
+/** Per-CLI performance stats in the weather report. */
+export interface CliWeather extends AdapterAttemptStats {
+  readonly cli: string;
+  readonly totalTasks: number;
+  readonly successRate: number;
+  readonly avgDurationMs: number;
+  readonly byCategory: ReadonlyMap<string, GroupStats>;
+}
+
+/** Adaptive bonus for a CLI+category pair. */
+export interface AdaptiveBonus {
+  readonly cli: string;
+  readonly category: TaskCategory;
+  readonly staticBonus: number;
+  readonly adaptiveBonus: number;
+  readonly sampleCount: number;
+  readonly sufficient: boolean;
+}
+
+/**
+ * Per-model performance lens entry (#4194). A telemetry surface computed from
+ * the same OutcomeStore records as the CLI×category bonuses, keyed by concrete
+ * model id via the #2548 family-fallback query path. NOT a routing input —
+ * adaptive bonuses stay CLI×category; per-model bonus consumption is
+ * #4196/#4197 scope.
+ */
+export interface ModelWeatherEntry {
+  /** Concrete model id observed in outcome records. */
+  readonly model: string;
+  /** Vendor resolved via the ModelRegistry (#2548). */
+  readonly vendor: string;
+  /** Family resolved via the ModelRegistry (#2548). */
+  readonly family: string;
+  /**
+   * Whether the stats come from literal-id samples or the family-broadened
+   * cold-start fallback (#2548). Family scope means sibling-model outcomes
+   * are included as priors.
+   */
+  readonly scope: 'literal' | 'family';
+  readonly sampleCount: number;
+  readonly successRate: number;
+  readonly avgDurationMs: number;
+}
+
+/** Tier recommendation surfaced in the weather report (#895). */
+export interface TierRecommendationEntry {
+  readonly category: string;
+  readonly direction: 'promote' | 'demote';
+  readonly currentTier: number;
+  readonly recommendedTier: number;
+  readonly successRate: number;
+  readonly sampleCount: number;
+  readonly reason: string;
+}
+
+/** Learning insight for a CLI+category pair (Issue #901, Phase 4). */
+export interface LearningInsight {
+  readonly cli: string;
+  readonly category: TaskCategory;
+  readonly trend: 'improving' | 'declining' | 'stable';
+  readonly confidence: number;
+  readonly adjustedBaseline: number;
+  readonly sampleCount: number;
+}
+
+/** Recommended CLI→category mapping for LinUCB cold-start (Epic #952, Phase 6). */
+export interface RecommendedMapping {
+  readonly category: TaskCategory;
+  readonly recommendedCli: string;
+  readonly successRate: number;
+  readonly sampleCount: number;
+  readonly confidence: 'high' | 'medium' | 'low';
+}
+
+/** Rate limit stats per provider (Issue #996). */
+export interface RateLimitReport {
+  readonly provider: string;
+  readonly totalHits: number;
+  /** ISO-8601 timestamp of the last recorded event. */
+  readonly lastHitAt: string;
+  readonly avgRetryAfterMs: number | undefined;
+}
+
+/** Per-tool performance stats (Issue #1022). */
+export interface ToolPerformanceEntry {
+  readonly toolName: string;
+  readonly totalCalls: number;
+  readonly successRate: number;
+  readonly avgDurationMs: number;
+  readonly errorCount: number;
+}
+
+/** Failure breakdown entry for the weather report (Issue #1025). */
+export interface FailureBreakdownEntry {
+  readonly category: string;
+  readonly count: number;
+  readonly percentage: number;
+}
+
+/** Per-expert-role performance stats from worker dispatch outcomes (Issue #1324, #1427). */
+export interface ExpertPerformanceEntry {
+  readonly role: string;
+  readonly totalTasks: number;
+  readonly successRate: number;
+  readonly avgDurationMs: number;
+  readonly dominantErrorPattern?: string;
+  /** Number of consecutive failures at tail of outcome history (Issue #1427). */
+  readonly consecutiveFailures: number;
+  /** ISO timestamp of last successful outcome (Issue #1427). */
+  readonly lastSuccessAt?: string;
+  /** True when successRate < 0.5 — signals operator attention needed (Issue #1427). */
+  readonly degraded: boolean;
+}
+
+/** Agent health summary from heartbeat monitor (Issue #1032). */
+export interface AgentHealthSummary {
+  readonly activeSessions: number;
+  readonly stalledSessions: number;
+  /**
+   * Sessions that have reported no progress yet (#4665), so their silence
+   * carries no information either way. Counted rather than listed: the
+   * per-session `health` union below is reachable from the exported
+   * `generateWeatherReport` return type, so adding `'unmeasured'` to it would
+   * break downstream readers. Widening it is tracked with the other
+   * return-position unions in #4740.
+   *
+   * `activeSessions - unmeasuredSessions` is the number this report can
+   * actually speak to.
+   */
+  readonly unmeasuredSessions?: number;
+  /** Sessions with a measured health verdict. Excludes unmeasured ones. */
+  readonly sessions: readonly AgentSessionEntry[];
+}
+
+/** Single agent session health entry. */
+export interface AgentSessionEntry {
+  readonly sessionId: string;
+  readonly expertId: string;
+  readonly health: 'alive' | 'slow' | 'stalled';
+  readonly elapsedMs: number;
+  readonly timeSinceHeartbeatMs: number;
+  readonly heartbeatCount: number;
+}
+
+/** Swarm health metrics dashboard (Issue #1403, Phase 6.2). */
+export interface SwarmHealthMetrics {
+  /** % of dispatched expert roles that produced at least one success. Target: 70-90%. */
+  readonly agentUtilization: number;
+  /** Successful tasks / total worker dispatches. Target: > 0.1. */
+  readonly collaborationEfficiency: number;
+  /** % of tasks routed to the empirically best CLI for their category. Target: > 80%. */
+  readonly routingAccuracy: number;
+  /**
+   * Avg gap between actual success rate and best-possible rate per category.
+   * Target: decreasing. Only meaningful when {@link analyzedCategories} > 0 —
+   * with no analysable category this is 0, which on a lower-is-better metric is
+   * the BEST possible value rather than an absent one (#6036).
+   */
+  readonly weeklyRegret: number;
+  /**
+   * Avg samples to reach 'high' confidence per category. Target: < 50.
+   * Only meaningful when {@link adaptationSpeedCategories} > 0 — with no
+   * category ever reaching confidence this is 0, i.e. the best achievable score
+   * for a workspace that has learned nothing (#6036).
+   */
+  readonly adaptationSpeed: number;
+  /** How many categories contributed to {@link adaptationSpeed}. 0 ⇒ unmeasured. */
+  readonly adaptationSpeedCategories: number;
+  /** Number of observed categories with sufficient data. */
+  readonly observedCategories: number;
+  /**
+   * Of {@link observedCategories}, how many produced a routing verdict — the
+   * denominator {@link weeklyRegret} is actually averaged over. 0 ⇒ unmeasured.
+   *
+   * Distinct from `observedCategories` on purpose: a category can clear
+   * ROUTING_MIN_SAMPLES and still be unanalysable, and counting it here
+   * inflated the denominator and understated regret (#6036).
+   */
+  readonly analyzedCategories: number;
+  /** Number of expert roles observed. */
+  readonly observedRoles: number;
+}
+
+/** Worker failure triage statistics (#1506). */
+export interface TriageStats {
+  /** Total outcomes that were retried via triage. */
+  readonly totalRetried: number;
+  /** Retry success rate (retried + success / total retried). */
+  readonly retrySuccessRate: number;
+  /** Breakdown by triage action. */
+  readonly actionBreakdown: readonly { readonly action: string; readonly count: number }[];
+}
+
+/**
+ * Cost section of the weather report (Epic G, #3856). Answers "what do governed
+ * decisions cost?" by surfacing the MEASURED per-decision cost aggregates
+ * (DecisionCostStore, #3855) windowed by gate type, alongside each strategy's
+ * coarse declared `costProfile` from the manifest registry. Both ride existing
+ * surfaces — no new MCP tool.
+ */
+export interface CostSection {
+  /** Measured per-gate-type cost aggregates over the lookback window (#3855/#3856). */
+  readonly decisionCosts: DecisionCostReport;
+  /** Joined consensus final-seat tokens per quorum-backed decision, a lower bound (#6809). */
+  readonly consensusDecisionTokens: ConsensusDecisionTokenReport;
+  /** Each strategy's declared coarse cost profile from the manifest registry. */
+  readonly strategyCostProfiles: readonly StrategyCostProfileEntry[];
+}
+
+/** Full weather report response. */
+export interface WeatherReportResponse {
+  readonly overall: AdapterAttemptStats & {
+    readonly totalTasks: number;
+    readonly successRate: number;
+    readonly avgDurationMs: number;
+  };
+  readonly cliWeather: readonly CliWeather[];
+  readonly adaptiveBonuses: readonly AdaptiveBonus[];
+  /** Outcome-driven tier change recommendations (#895). */
+  readonly tierRecommendations: readonly TierRecommendationEntry[];
+  /** Adaptive learning insights per CLI+category (#901). */
+  readonly learningInsights?: readonly LearningInsight[];
+  /** Recommended CLI mappings per category for LinUCB priors (Epic #952). */
+  readonly recommendedMappings?: readonly RecommendedMapping[];
+  /** Rate limit utilization per provider (Issue #996). */
+  readonly rateLimits?: readonly RateLimitReport[];
+  /** Per-tool invocation metrics (Issue #1022). */
+  readonly toolPerformance?: readonly ToolPerformanceEntry[];
+  /** Failure breakdown by category (Issue #1025). */
+  readonly failureBreakdown?: readonly FailureBreakdownEntry[];
+  /** Agent health from heartbeat monitor (Issue #1032). */
+  readonly agentHealth?: AgentHealthSummary;
+  /** Per-expert-role performance from worker dispatch outcomes (Issue #1324). */
+  readonly expertPerformance?: readonly ExpertPerformanceEntry[];
+  /** Swarm health metrics dashboard (Issue #1403). */
+  readonly swarmHealth?: SwarmHealthMetrics;
+  /** Worker failure triage statistics (#1506). */
+  readonly triageStats?: TriageStats;
+  /** Cost section: per-gate decision-cost aggregates + strategy cost profiles (Epic G, #3856). */
+  readonly costSection?: CostSection;
+  /**
+   * Per-model performance lens (#4194) — telemetry only; routing bonuses stay
+   * CLI×category. Present only when at least one model clears the min-sample
+   * threshold.
+   */
+  readonly modelWeather?: readonly ModelWeatherEntry[];
+  /** Recent performance within the lookback window (#1401). */
+  readonly recentWindow?: {
+    readonly windowMs: number;
+    readonly totalTasks: number;
+    readonly successRate: number;
+    readonly avgDurationMs: number;
+  };
+  readonly explorationRate: number;
+  readonly coldStartThreshold: number;
+  readonly collectedAt: string;
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/** Default lookback window: 7 days in milliseconds. */
+export const DEFAULT_OUTCOME_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+
+export const WeatherReportConfigSchema = z.object({
+  /** Minimum observations before adjusting bonuses (lowered for faster activation). */
+  coldStartThreshold: z.number().int().min(1).max(1000).default(3),
+  /** Exploration rate: fraction of random routing (0.0-1.0). */
+  explorationRate: z.number().min(0).max(1).default(0.1),
+  /** Max adaptive bonus adjustment (+/-). */
+  maxBonusAdjustment: z.number().min(0).max(20).default(10),
+  /**
+   * Lookback window for outcome queries (ms). Only outcomes within this
+   * window are used for adaptive bonuses. Falls back to all history if
+   * the window has fewer samples than coldStartThreshold. Default: 7 days.
+   */
+  outcomeLookbackMs: z.number().int().min(0).default(DEFAULT_OUTCOME_LOOKBACK_MS),
+});
+
+export type WeatherReportConfig = z.infer<typeof WeatherReportConfigSchema>;
+
+/** Creates default configuration. */
+export function createDefaultWeatherConfig(): WeatherReportConfig {
+  return WeatherReportConfigSchema.parse({});
+}
+
+// ============================================================================
+// Shared helpers
+// ============================================================================
+
+/** Round to 3 decimal places. */
+export function round3(n: number): number {
+  return Math.round(n * 1000) / 1000;
+}
+
+/** Worker model prefix used by recordWorkerOutcomes (Issue #1323). */
+export const WORKER_MODEL_PREFIX = 'worker-';

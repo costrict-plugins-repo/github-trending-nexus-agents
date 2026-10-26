@@ -1,0 +1,549 @@
+/**
+ * The response discloses panel model diversity and per-seat fallbacks (#6115).
+ *
+ * Three consecutive 7-seat panels on 2026-09-13 answered every seat on one
+ * gemini model after the claude and codex seats fell over, and the response
+ * read identically to a three-model panel. `panelDiversity` is always present
+ * (explicit zeros), the warning fires on a single-model panel of 3+ seats, and
+ * the per-voter cost row names the assigned CLI beside the model that answered.
+ */
+import { describe, it, expect } from 'vitest';
+
+import type { AgentVoteResult, VoterRole } from '../../cli/vote-types.js';
+import type { ConsensusResult } from '../../consensus/types.js';
+import { buildResponse, toAgentVoteSummary } from './consensus-vote-types.js';
+import type { ExtendedVotingResult } from './consensus-vote-types.js';
+import { votesToCostInputs } from './decision-cost-recording.js';
+import { rollupDecisionCost } from '../../observability/decision-cost.js';
+
+const SEVEN: readonly VoterRole[] = [
+  'architect',
+  'security',
+  'devex',
+  'ai_ml',
+  'pm',
+  'catfish',
+  'scope_steward',
+];
+
+function seat(role: VoterRole, over: Partial<AgentVoteResult> = {}): AgentVoteResult {
+  return {
+    role,
+    vote: { decision: 'approve', reasoning: 'ok', confidence: 0.8 },
+    processingTimeMs: 10,
+    source: 'llm',
+    cli: 'cli-gemini',
+    model: 'gemini-3.1-pro-preview',
+    assignedCli: 'gemini',
+    ...over,
+  };
+}
+
+function engineResultOver(votes: readonly AgentVoteResult[]): ConsensusResult {
+  const approve = votes.filter((v) => v.source === 'llm' && v.vote.decision === 'approve').length;
+  const now = '2026-09-13T00:00:00.000Z';
+  return {
+    proposalId: 'p',
+    proposal: { title: 't', description: 'd', algorithm: 'supermajority' },
+    outcome: 'approved',
+    votes: new Map(),
+    voteCounts: { approve, reject: 0, abstain: 0, total: approve },
+    approvalPercentage: 100,
+    quorumReached: true,
+    startedAt: now,
+    closedAt: now,
+    durationMs: 1,
+  };
+}
+
+function extended(votes: readonly AgentVoteResult[]): ExtendedVotingResult {
+  return {
+    proposal: 'Ratify commit abc',
+    threshold: 'supermajority',
+    result: engineResultOver(votes),
+    votes,
+    totalTimeMs: 10,
+    simulateVotes: false,
+    strategy: 'supermajority',
+    panelSize: votes.length,
+    contrarianRequested: votes.length === 7,
+  };
+}
+
+const INPUT = { proposal: 'Ratify commit abc', simulateVotes: false, quickMode: false } as const;
+
+describe('consensus_vote response: assigned roster diversity', () => {
+  it('covers every assignment in a mixed-fallback panel (#7295)', () => {
+    const votes = [
+      seat('architect', {
+        cli: 'cli-claude',
+        pinnedModel: 'pending-detection',
+        model: 'claude-fable-5',
+        servedModel: 'opus',
+        fallback: { fromCli: 'claude', fromModel: 'fable', reason: 'capacity' },
+      }),
+      seat('security', { pinnedModel: 'pending-detection', model: 'gpt-5.5' }),
+      seat('scope_steward', {
+        pinnedModel: 'claude-fable-5',
+        model: 'claude-opus',
+        servedModel: 'claude-opus',
+        fallback: { fromCli: 'claude', fromModel: 'fable', reason: 'capacity' },
+      }),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response.votes.map((v) => v.assignedModel)).toEqual([
+      'claude-fable-5',
+      'gpt-5.5',
+      'claude-fable-5',
+    ]);
+    expect(response).toMatchObject({
+      assignedDistinctModels: 2,
+      assignedDistinctFamilies: 2,
+      assignedCoverage: { reported: 3, total: 3 },
+    });
+    expect(response.votes.map((v) => v.modelUsed)).toEqual([
+      'claude-opus',
+      'gpt-5.5',
+      'claude-opus',
+    ]);
+  });
+
+  it('discloses partial assignment coverage without treating a fallback model as assigned', () => {
+    const votes = [
+      seat('architect', { pinnedModel: 'claude-fable-5', servedModel: 'claude-opus' }),
+      seat('security', {
+        pinnedModel: 'pending-detection',
+        model: 'claude-opus',
+        fallback: { fromCli: 'codex', reason: 'unknown' },
+      }),
+      seat('scope_steward', { source: 'error', model: undefined, pinnedModel: '' }),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response).toMatchObject({
+      assignedDistinctModels: 1,
+      assignedDistinctFamilies: 1,
+      assignedCoverage: { reported: 1, total: 3 },
+    });
+    expect(response.votes[1]).not.toHaveProperty('assignedModel');
+    expect(response.votes[2]).not.toHaveProperty('assignedModel');
+  });
+
+  it('qualifies assignment aliases against the original CLI after cross-CLI fallback', () => {
+    const votes = [
+      seat('architect', {
+        assignedCli: 'claude',
+        cli: 'cli-codex',
+        pinnedModel: 'pending-detection',
+        model: 'gpt-5.5',
+        servedModel: 'gpt-5.5',
+        fallback: { fromCli: 'claude', fromModel: 'fable', reason: 'capacity' },
+      }),
+      seat('security', { cli: 'cli-codex', model: 'gpt-5.5' }),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response.votes.map((v) => v.assignedModel)).toEqual(['claude-fable-5', 'gpt-5.5']);
+    expect(response).toMatchObject({
+      assignedDistinctModels: 2,
+      assignedDistinctFamilies: 2,
+      assignedCoverage: { reported: 2, total: 2 },
+    });
+    expect(response.panelDiversity).toMatchObject({ distinctModels: 1, distinctFamilies: 1 });
+  });
+
+  it('discloses every assignment when only one of three assigned seats responds', () => {
+    const votes = [
+      seat('architect', { pinnedModel: 'claude-opus', model: 'claude-opus' }),
+      seat('security', { pinnedModel: 'openai/o3', source: 'error', model: undefined }),
+      seat('pm', {
+        pinnedModel: 'gemini-3.1-pro-preview',
+        source: 'unverifiable',
+        vote: { decision: 'abstain', reasoning: 'Cannot inspect artifact', confidence: 0 },
+      }),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response).toMatchObject({ assignedDistinctModels: 3, assignedDistinctFamilies: 3 });
+    expect(response.panelDiversity).toMatchObject({ distinctModels: 1, distinctFamilies: 1 });
+    expect(response.votes.map((v) => v.assignedModel)).toEqual([
+      'claude-opus',
+      'openai/o3',
+      'gemini-3.1-pro-preview',
+    ]);
+  });
+
+  it('reports one assigned model when every seat is assigned the same model', () => {
+    const votes = SEVEN.map((role) => seat(role, { pinnedModel: 'openai/o3' }));
+    expect(buildResponse(INPUT, extended(votes))).toMatchObject({
+      assignedDistinctModels: 1,
+      assignedDistinctFamilies: 1,
+    });
+  });
+
+  it('omits assignment measurements for a zero-seat roster or an unresolved assignment', () => {
+    const response = buildResponse(INPUT, extended([]));
+    expect(response).not.toHaveProperty('assignedDistinctModels');
+    expect(response).not.toHaveProperty('assignedDistinctFamilies');
+    expect(response).toHaveProperty('assignedCoverage', { reported: 0, total: 0 });
+    // #7295: omit only genuinely unresolved assignments, not a resolved request.
+    expect(toAgentVoteSummary(seat('pm', { model: undefined }))).not.toHaveProperty(
+      'assignedModel'
+    );
+    expect(
+      toAgentVoteSummary(seat('pm', { model: undefined, pinnedModel: 'pending-detection' }))
+    ).not.toHaveProperty('assignedModel');
+  });
+});
+
+describe('consensus_vote response: panel diversity (#6115)', () => {
+  it('an all-one-model panel of 7 reports distinctModels 1 and appends the warning', () => {
+    const votes = SEVEN.map((role, i) =>
+      seat(
+        role,
+        i % 2 === 0
+          ? {
+              assignedCli: 'claude',
+              fallback: { fromCli: 'claude', fromModel: 'claude-fable-5', reason: 'capacity' },
+            }
+          : {}
+      )
+    );
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response.panelDiversity).toEqual({
+      reportCoverage: { reported: 0, total: 7 },
+      distinctModels: 1,
+      distinctFamilies: 1,
+      unclassifiedSeats: 0,
+      unresolvedSeats: 0,
+      fallbacks: 4,
+    });
+    expect(response.panelWarning).toContain(
+      'All 7 answering seats attributed to gemini-3.1-pro-preview; ' +
+        'serving-model reports 0/7; independence is weaker than assigned.'
+    );
+  });
+
+  it('a configured-only three-model panel reports zero fallbacks and unmeasured serving identities', () => {
+    const votes = [
+      seat('architect', { cli: 'cli-claude', model: 'claude-opus', assignedCli: 'claude' }),
+      seat('security', { cli: 'cli-codex', model: 'codex-5.3', assignedCli: 'codex' }),
+      seat('scope_steward'),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response.panelDiversity).toEqual({
+      reportCoverage: { reported: 0, total: 3 },
+      distinctModels: 3,
+      distinctFamilies: 3,
+      unclassifiedSeats: 0,
+      unresolvedSeats: 0,
+      fallbacks: 0,
+    });
+    expect(response.panelWarning).toBe(
+      'Serving-model reports 0/3; unreported serving identities are UNMEASURED. ' +
+        'Model/family counts include operational attribution.'
+    );
+  });
+
+  it('a fully reported three-model panel has complete coverage and no warning', () => {
+    const votes = [
+      seat('architect', {
+        cli: 'cli-claude',
+        model: 'claude-opus',
+        servedModel: 'claude-opus',
+        assignedCli: 'claude',
+      }),
+      seat('security', {
+        cli: 'cli-codex',
+        model: 'codex-5.3',
+        servedModel: 'codex-5.3',
+        assignedCli: 'codex',
+      }),
+      seat('scope_steward', { servedModel: 'gemini-3.1-pro-preview' }),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response.panelDiversity).toMatchObject({
+      distinctModels: 3,
+      distinctFamilies: 3,
+      reportCoverage: { reported: 3, total: 3 },
+    });
+    expect(response.panelWarning).toBeUndefined();
+  });
+
+  it('a partial report cannot turn configured or operational models into complete coverage', () => {
+    const votes = [
+      seat('architect', {
+        cli: 'cli-claude',
+        model: 'claude-opus',
+        servedModel: 'claude-opus',
+        assignedCli: 'claude',
+      }),
+      seat('security', {
+        cli: 'cli-codex',
+        model: 'codex-5.3',
+        operationalModel: 'codex-5.3',
+        assignedCli: 'codex',
+      }),
+      seat('scope_steward'),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response.panelDiversity).toMatchObject({
+      distinctModels: 3,
+      distinctFamilies: 3,
+      reportCoverage: { reported: 1, total: 3 },
+    });
+    expect(response.panelWarning).toBe(
+      'Serving-model reports 1/3; unreported serving identities are UNMEASURED. ' +
+        'Model/family counts include operational attribution.'
+    );
+  });
+
+  it('reports unclassified seats when an answering model names no recognised vendor', () => {
+    const votes = [
+      seat('architect', { cli: 'cli-claude', model: 'claude-opus', assignedCli: 'claude' }),
+      seat('security', { model: 'unrecognised-custom-model' }),
+      seat('scope_steward'),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response.panelDiversity).toEqual({
+      reportCoverage: { reported: 0, total: 3 },
+      distinctModels: 3,
+      distinctFamilies: 2,
+      unclassifiedSeats: 1,
+      unresolvedSeats: 0,
+      fallbacks: 0,
+    });
+  });
+
+  it('the empty case is explicit zeros on the response, never an absent key', () => {
+    const response = buildResponse(INPUT, extended([]));
+    expect(Object.keys(response)).toContain('panelDiversity');
+    expect(response.panelDiversity).toEqual({
+      reportCoverage: { reported: 0, total: 0 },
+      distinctModels: 0,
+      distinctFamilies: 0,
+      unclassifiedSeats: 0,
+      unresolvedSeats: 0,
+      fallbacks: 0,
+    });
+  });
+
+  it('the diversity warning is appended to an existing degradation warning, not assigned over it', () => {
+    const votes = [
+      ...SEVEN.slice(0, 6).map((role) => seat(role)),
+      seat('scope_steward', { source: 'error', model: undefined, error: 'boom' }),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response.panelWarning).toContain('Panel degraded: 1 of 7 voters errored');
+    expect(response.panelWarning).toContain(
+      'All 6 answering seats attributed to gemini-3.1-pro-preview'
+    );
+  });
+});
+
+describe('consensus_vote response: panel families (#6606)', () => {
+  const oneFamily = [
+    seat('architect', { cli: 'api:gw', model: 'gpt-5.2' }),
+    seat('security', { cli: 'api:gw', model: 'openai/o3' }),
+    seat('scope_steward', { cli: 'api:gw', model: 'openai/gpt-4o' }),
+  ];
+
+  it('a one-family panel reports distinctFamilies 1 and appends the family warning', () => {
+    const response = buildResponse(INPUT, extended(oneFamily));
+    expect(response.panelDiversity).toMatchObject({ distinctModels: 3, distinctFamilies: 1 });
+    expect(response.panelWarning).toContain(
+      'All 3 answering seats attributed to openai models (3 distinct); ' +
+        'serving-model reports 0/3; independence is weaker than assigned.'
+    );
+  });
+
+  it('counts only seats that voted: an errored seat on another family adds nothing', () => {
+    const votes = [
+      ...oneFamily,
+      seat('pm', { source: 'error', model: 'claude_4_5_opus', error: 'boom' }),
+    ];
+    const response = buildResponse(INPUT, extended(votes));
+    expect(response.panelDiversity.distinctFamilies).toBe(1);
+  });
+
+  it('each vote entry names the model that seat ran on', () => {
+    const response = buildResponse(INPUT, extended(oneFamily));
+    expect(response.votes.map((v) => v.modelUsed)).toEqual([
+      'gpt-5.2',
+      'openai/o3',
+      'openai/gpt-4o',
+    ]);
+  });
+
+  it('reports the served model while preserving the requested assignment (#7239)', () => {
+    const response = buildResponse(
+      INPUT,
+      extended([
+        seat('architect', {
+          cli: 'cli-claude',
+          model: 'claude-fable-5',
+          pinnedModel: 'claude-fable-5',
+          servedModel: 'claude-opus',
+        }),
+      ])
+    );
+    expect(response.votes[0]).toMatchObject({
+      modelUsed: 'claude-opus',
+      assignedModel: 'claude-fable-5',
+    });
+  });
+
+  it('qualifies a bare served alias against the CLI that answered', () => {
+    const summary = toAgentVoteSummary(
+      seat('architect', { cli: 'cli-claude', model: 'claude-fable-5', servedModel: 'opus' })
+    );
+    expect(summary.modelUsed).toBe('claude-opus');
+  });
+
+  it.each([undefined, '', 'pending-detection'])(
+    'falls back to the requested model when servedModel is %s',
+    (servedModel) => {
+      const summary = toAgentVoteSummary(seat('pm', { model: 'gpt-5.2', servedModel }));
+      expect(summary.modelUsed).toBe('gpt-5.2');
+    }
+  );
+
+  it('reports a known served model even when the requested model is unresolved', () => {
+    const summary = toAgentVoteSummary(
+      seat('pm', { model: 'pending-detection', servedModel: 'gpt-5.2' })
+    );
+    expect(summary.modelUsed).toBe('gpt-5.2');
+  });
+
+  it('clips the served model to the advertised output bound', () => {
+    const servedModel = `custom-${'x'.repeat(100)}`;
+    const summary = toAgentVoteSummary(seat('pm', { servedModel }));
+    expect(summary.modelUsed).toBe(`${servedModel.slice(0, 99)}…`);
+  });
+
+  it('a seat with no resolved model carries no modelUsed', () => {
+    expect('modelUsed' in toAgentVoteSummary(seat('pm', { model: undefined }))).toBe(false);
+    expect('modelUsed' in toAgentVoteSummary(seat('pm', { model: 'pending-detection' }))).toBe(
+      false
+    );
+  });
+});
+
+describe('per-seat fallback on the vote summary (#6115)', () => {
+  it('is present only on a seat that answered elsewhere', () => {
+    const moved = toAgentVoteSummary(
+      seat('devex', {
+        assignedCli: 'codex',
+        fallback: { fromCli: 'codex', reason: 'rate-limit' },
+      })
+    );
+    expect(moved.fallback).toEqual({ fromCli: 'codex', reason: 'rate-limit' });
+    expect('fallback' in toAgentVoteSummary(seat('devex'))).toBe(false);
+  });
+});
+
+describe('per-seat retriedFrom on the vote summary (#6246)', () => {
+  it('is present only on a seat the per-role retry replaced — a caller sees what the ledger will', () => {
+    const recovered = toAgentVoteSummary(
+      seat('catfish', {
+        retried: true,
+        retriedFrom: {
+          source: 'error',
+          error: 'Vote parsing failed: Unexpected end of JSON input',
+        },
+      })
+    );
+    expect(recovered.retried).toBe(true);
+    expect(recovered.retriedFrom).toEqual({
+      source: 'error',
+      error: 'Vote parsing failed: Unexpected end of JSON input',
+    });
+    expect('retriedFrom' in toAgentVoteSummary(seat('catfish'))).toBe(false);
+  });
+});
+
+describe('per-voter cost row names the assigned CLI (#6115)', () => {
+  it('carries assignedCli beside the model that answered', () => {
+    const inputs = votesToCostInputs([
+      seat('architect', { assignedCli: 'claude', servedModel: 'gemini-3.1-pro-preview' }),
+      seat('security', { assignedCli: undefined, servedModel: 'gemini-3.1-pro-preview' }),
+    ]);
+    expect(inputs[0]?.assignedCli).toBe('claude');
+    expect('assignedCli' in (inputs[1] ?? {})).toBe(false);
+    const summary = rollupDecisionCost(inputs, 'plan');
+    expect(summary.perVoter[0]).toMatchObject({
+      model: 'gemini-3.1-pro-preview',
+      assignedCli: 'claude',
+    });
+    expect('assignedCli' in (summary.perVoter[1] ?? {})).toBe(false);
+  });
+});
+
+describe('consensus_vote response: cross-family fallback (#7106)', () => {
+  const fallbackSeat = seat('security', {
+    assignedCli: 'codex',
+    cli: 'cli-claude',
+    model: 'claude-fable-5',
+    pinnedModel: 'gpt-6.1-sol',
+    fallback: { fromCli: 'codex', fromModel: 'gpt-6.1-sol', reason: 'unknown' },
+  });
+
+  it('names the role, assigned family and served family even when the panel remains diverse', () => {
+    const response = buildResponse(INPUT, extended([fallbackSeat, seat('architect')]));
+    expect(response.panelWarning).toContain('security');
+    expect(response.panelWarning).toContain('assigned openai');
+    expect(response.panelWarning).toContain('attributed to anthropic');
+  });
+
+  it('discloses an undetected Codex assignment using its assigned CLI family', () => {
+    const response = buildResponse(
+      INPUT,
+      extended([
+        {
+          ...fallbackSeat,
+          pinnedModel: 'pending-detection',
+          fallback: { fromCli: 'codex', reason: 'unknown' },
+        },
+      ])
+    );
+    expect(response.panelWarning).toContain('security: assigned openai, attributed to anthropic');
+  });
+
+  it('adds no fallback family warning for a same-family substitution', () => {
+    const response = buildResponse(
+      INPUT,
+      extended([
+        {
+          ...fallbackSeat,
+          assignedCli: 'claude',
+          pinnedModel: 'claude-opus',
+          fallback: { fromCli: 'claude', fromModel: 'claude-opus', reason: 'capacity' },
+        },
+      ])
+    );
+    expect(response.panelWarning).not.toContain('Cross-family fallback:');
+    expect(response.panelWarning).toContain('Serving-model reports 0/1');
+    expect(response.panelWarning).toContain('UNMEASURED');
+  });
+
+  it('appends fallback disclosure without losing an existing degradation warning', () => {
+    const response = buildResponse(
+      INPUT,
+      extended([
+        fallbackSeat,
+        seat('architect'),
+        seat('pm', { source: 'error', model: undefined, error: 'boom' }),
+      ])
+    );
+    expect(response.panelWarning).toContain('Panel degraded: 1 of 3 voters errored');
+    expect(response.panelWarning).toContain('security: assigned openai, attributed to anthropic');
+  });
+
+  it('does not claim a family change for unknown or unanswered seats or an empty panel', () => {
+    for (const votes of [
+      [],
+      [{ ...fallbackSeat, model: 'pending-detection' }],
+      [{ ...fallbackSeat, model: 'mystery-model' }],
+      [{ ...fallbackSeat, source: 'error' as const, error: 'boom' }],
+    ]) {
+      expect(buildResponse(INPUT, extended(votes)).panelWarning ?? '').not.toContain('served');
+    }
+  });
+});

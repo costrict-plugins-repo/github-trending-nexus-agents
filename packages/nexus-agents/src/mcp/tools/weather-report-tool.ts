@@ -1,0 +1,162 @@
+/**
+ * nexus-agents/mcp - Weather Report MCP Tool
+ *
+ * Read-only MCP tool that returns per-CLI, per-category performance
+ * data and adaptive routing bonuses from the OutcomeStore.
+ *
+ * @module mcp/tools/weather-report-tool
+ * (Source: Issue #865 — Weather report with adaptive routing)
+ */
+
+import { z } from 'zod';
+import type { McpServer } from '../sdk-types.js';
+import { createLogger, formatZodError } from '../../core/index.js';
+import { toolErrorResponse } from '../middleware/tool-error-handler.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { WeatherReportInputSchema } from './weather-report-types.js';
+import type { WeatherReportResponse, CliWeather, AdaptiveBonus } from './weather-report-types.js';
+import { generateWeatherReport } from './weather-report.js';
+import {
+  WEATHER_REPORT_OUTPUT_SCHEMA,
+  type SerializedCliWeather,
+  type SerializedWeatherReport,
+} from './weather-report-output-schema.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+import {
+  registerStructuredTool,
+  toolStructuredError,
+  structuredToolSuccess,
+  type BaseMcpToolDeps,
+  type ToolResult,
+} from './tool-result.js';
+
+// ============================================================================
+// Dependencies
+// ============================================================================
+
+export type WeatherReportDeps = BaseMcpToolDeps;
+
+const WEATHER_REPORT_DESCRIPTION =
+  'Get multi-CLI performance weather report. Shows per-CLI success rates, ' +
+  'per-category breakdowns, and adaptive routing bonus recommendations ' +
+  'based on observed task outcomes. Pipeline join coverage is unmeasured when trace invalid ' +
+  'losses are counted or unknown; validated retained logical joins remain visible.';
+
+// ============================================================================
+// Serialization
+// ============================================================================
+
+/** Converts Maps to plain objects for JSON serialization. */
+function serializeReport(report: WeatherReportResponse): SerializedWeatherReport {
+  return {
+    ...report,
+    cliWeather: report.cliWeather.map(serializeCliWeather),
+    adaptiveBonuses: report.adaptiveBonuses.map(serializeBonus),
+  };
+}
+
+function serializeCliWeather(cw: CliWeather): SerializedCliWeather {
+  return {
+    cli: cw.cli,
+    totalTasks: cw.totalTasks,
+    successRate: cw.successRate,
+    avgDurationMs: cw.avgDurationMs,
+    byCategory: Object.fromEntries(cw.byCategory),
+  };
+}
+
+function serializeBonus(b: AdaptiveBonus): AdaptiveBonus {
+  return { ...b };
+}
+
+// ============================================================================
+// Handler
+// ============================================================================
+
+function weatherReportHandler(args: unknown, ctx: HandlerContext): Promise<ToolResult> {
+  const parsed = WeatherReportInputSchema.safeParse(args);
+  if (!parsed.success) {
+    return Promise.resolve(
+      toolStructuredError({
+        errorCategory: 'validation',
+        message: `Validation error: ${formatZodError(parsed.error)}`,
+      })
+    );
+  }
+
+  try {
+    const { cli, category, includeAdaptive } = parsed.data;
+    const opts: import('./weather-report-types.js').WeatherReportOptions = {
+      ...(cli !== undefined && { cli }),
+      ...(category !== undefined && { category }),
+      includeAdaptive,
+      // The MCP tool always opts into the per-model lens (#4194/#4202);
+      // the routing-bonus path stays lens-free.
+      includeModelWeather: true,
+      includePipelineJoins: true,
+    };
+    const report = generateWeatherReport(opts);
+    const serialized = serializeReport(report);
+    return Promise.resolve(
+      structuredToolSuccess(z.object(WEATHER_REPORT_OUTPUT_SCHEMA), serialized)
+    );
+  } catch (caught) {
+    return Promise.resolve(toolErrorResponse('Weather report failed', caught, ctx.logger));
+  }
+}
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+/** @category MCP */
+export function registerWeatherReportTool(server: McpServer, deps: WeatherReportDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'weather_report' });
+  const toolSchema = {
+    cli: z.enum(['claude', 'gemini', 'codex', 'opencode']).optional().describe('Filter by CLI'),
+    category: z
+      .enum([
+        'architecture',
+        'code_generation',
+        'code_review',
+        'research',
+        'security_review',
+        'planning',
+        'documentation',
+        'testing',
+        'devops',
+        'exploration',
+      ])
+      .optional()
+      .describe('Filter by task category'),
+    includeAdaptive: z
+      .boolean()
+      .optional()
+      .describe('Include adaptive routing bonuses (default: true)'),
+  };
+
+  const secureHandler = createSecureHandler(weatherReportHandler, {
+    toolName: 'weather_report',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const wrappedHandler = wrapToolWithTimeout('weather_report', secureHandler, {
+    timeoutMs: getToolTimeout('weather_report', deps.security),
+    logger,
+  });
+
+  registerStructuredTool(
+    server,
+    'weather_report',
+    {
+      description: WEATHER_REPORT_DESCRIPTION,
+      inputSchema: toolSchema,
+      outputSchema: WEATHER_REPORT_OUTPUT_SCHEMA,
+      annotations: getToolAnnotations('weather_report'),
+    },
+    toSdkCallback(wrappedHandler)
+  );
+  logger.info('Registered weather_report tool');
+}

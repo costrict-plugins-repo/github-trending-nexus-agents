@@ -1,0 +1,658 @@
+/**
+ * nexus-agents/audit - Audit Logger Implementation
+ *
+ * Structured audit logger with file rotation and hash chain support.
+ * SIEM-compatible JSON-L output format.
+ *
+ * (Source: Issue #193 - Phase 3 structured audit logging)
+ *
+ * @module audit/audit-logger
+ */
+
+/* eslint-disable max-lines -- The stateful logger still has 417 counted lines after
+ * extracting hash-chain verification in #4702; retaining the existing exemption.
+ */
+
+import * as crypto from 'node:crypto';
+import type { ILogger } from '../core/logger.js';
+import { createLogger } from '../core/logger.js';
+import { getTimeProvider } from '../core/index.js';
+import type {
+  IAuditLogger,
+  IAuditStorage,
+  AuditEvent,
+  AuditEventInput,
+  AuditLogConfig,
+  AuditActor,
+  ToolInvocationAuditOpts,
+  PolicyDecisionAuditOpts,
+  PolicyAuditDecision,
+  AuditSeverity,
+  AuditOutcome,
+  SecurityEventAuditOpts,
+  RateLimitAuditOpts,
+  TierTransitionAuditOpts,
+  TierTransitionPayload,
+} from './audit-types.js';
+import {
+  AuditLogConfigSchema,
+  AuditError,
+  TierTransitionPayloadSchema,
+  TIER_TRANSITION_METADATA_KEY,
+  AUDIT_HASH_VERSION_TIER_TRANSITION,
+} from './audit-types.js';
+import { FileAuditStorage } from './audit-storage.js';
+import { hasTierTransitionPayload } from './tier-transition-hash.js';
+import { computeEventHash } from './audit-chain-verify.js';
+
+export { computeEventHash, verifyEvent, verifyChain, withCoverage } from './audit-chain-verify.js';
+export type { ChainVerification, ChainCoverage } from './audit-chain-verify.js';
+
+// ============================================================================
+// ID Generation
+// ============================================================================
+
+function generateEventId(): string {
+  const timestamp = getTimeProvider().now().toString(36);
+  const random = crypto.randomBytes(6).toString('hex');
+  return `aud_${timestamp}_${random}`;
+}
+
+// ============================================================================
+// Tier-Transition Extraction (Epic D / ADR-0017, #3842)
+// ============================================================================
+
+/**
+ * Recover the structured {@link TierTransitionPayload} from an audit event, or
+ * `null` if the event is not a (valid) tier-transition event. A tier-transition
+ * event is a `governance`-category event whose `metadata.tierTransition` parses
+ * against {@link TierTransitionPayloadSchema}. Used by the ratification gate to
+ * read transition events back out of the chained log. Gated on the SAME
+ * predicate the hash projection uses ({@link hasTierTransitionPayload}), so
+ * gate-consumption and hash-coverage cannot diverge (#3961).
+ */
+export function extractTierTransition(event: AuditEvent): TierTransitionPayload | null {
+  if (!hasTierTransitionPayload(event)) return null;
+  const raw = event.metadata?.[TIER_TRANSITION_METADATA_KEY];
+  const parsed = TierTransitionPayloadSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+// ============================================================================
+// System Actor (for internal events)
+// ============================================================================
+
+const SYSTEM_ACTOR: AuditActor = {
+  type: 'system',
+  id: 'nexus-agents',
+  name: 'Nexus Agents System',
+};
+
+/**
+ * Maps a policy verdict to the severity and outcome recorded on the chain
+ * (#4991).
+ *
+ * Written as an exhaustive switch rather than the two ternaries it replaces.
+ * Those were `decision === 'deny' ? 'warning' : 'info'` and
+ * `decision === 'allow' ? 'success' : 'denied'`, so adding a third verdict
+ * silently produced `info` + `denied` — understating the severity AND asserting
+ * the call was blocked when it ran. The `never` check makes the NEXT verdict a
+ * compile error instead of a quiet mis-mapping.
+ *
+ * `outcome` describes what happened to the OPERATION, so `would_deny` is a
+ * `success`: the call ran to completion. The policy verdict travels separately
+ * in `policyDecision`, which is what a soak query filters on.
+ */
+function policyDecisionFields(decision: PolicyAuditDecision): {
+  severity: AuditSeverity;
+  outcome: AuditOutcome;
+} {
+  switch (decision) {
+    case 'allow':
+      return { severity: 'info', outcome: 'success' };
+    case 'deny':
+      return { severity: 'warning', outcome: 'denied' };
+    case 'would_deny':
+      return { severity: 'warning', outcome: 'success' };
+    default: {
+      const unreachable: never = decision;
+      throw new Error(`Unhandled policy decision: ${String(unreachable)}`);
+    }
+  }
+}
+
+// ============================================================================
+// Audit Logger Implementation
+// ============================================================================
+
+/**
+ * One warn() per N dropped events to avoid log spam when the queue cap is
+ * saturated under sustained load. Picked so a 10k/s drop rate emits ~1 warn/s.
+ */
+const DROP_WARN_INTERVAL = 1000;
+
+/**
+ * close() needs at most two passes (the in-flight drain, then one for events
+ * logged during it — #6573); the third is slack before the bound reports.
+ */
+const MAX_CLOSE_DRAIN_PASSES = 3;
+
+export class AuditLogger implements IAuditLogger {
+  private readonly storage: IAuditStorage;
+  private readonly logger: ILogger;
+  private readonly enableHashChain: boolean;
+  private readonly minSeverity: 'info' | 'warning' | 'critical';
+  private readonly categories?: readonly string[] | undefined;
+  private readonly maxQueueDepth: number;
+  private lastHash: string | null = null;
+  private eventQueue: AuditEvent[] = [];
+  private flushTimer: NodeJS.Timeout | null = null;
+  private readonly flushIntervalMs: number;
+  private closed = false;
+  private inFlightFlush: Promise<void> | null = null;
+  private droppedEventCount = 0;
+  private persistFailureCount = 0;
+  private readonly onPersistFailure: ((error: Error) => void) | undefined;
+
+  constructor(
+    config: AuditLogConfig,
+    storage?: IAuditStorage,
+    logger?: ILogger,
+    onPersistFailure?: (error: Error) => void
+  ) {
+    const validated = AuditLogConfigSchema.safeParse(config);
+    if (!validated.success) {
+      const issues = validated.error.issues
+        .map((i) => i.path.join('.') + ': ' + i.message)
+        .join('; ');
+      throw new AuditError('Invalid AuditLogConfig: ' + issues);
+    }
+
+    this.logger = logger ?? createLogger({ component: 'AuditLogger' });
+    this.enableHashChain = validated.data.enableHashChain;
+    this.minSeverity = validated.data.minSeverity;
+    this.categories = validated.data.categories;
+    this.flushIntervalMs = validated.data.flushIntervalMs;
+    this.maxQueueDepth = validated.data.maxQueueDepth;
+    this.storage = storage ?? new FileAuditStorage(validated.data, this.logger);
+    this.onPersistFailure = onPersistFailure;
+
+    this.startFlushTimer();
+    this.logger.info('AuditLogger initialized', { logDir: config.logDir });
+  }
+
+  private startFlushTimer(): void {
+    // NOTE: `flush()` (not `flushQueue()`) — the in-memory queue must drain to
+    // storage AND storage's own buffer must drain to disk on each tick.
+    // See #2979.
+    this.flushTimer = setInterval(() => {
+      // The timer fires into nobody, so it cannot rethrow to a caller. flush()
+      // itself runs the fail-loud handler (error-log + counter + callback) on
+      // failure — #3916 / ADR-0017 — so the timer just absorbs the rethrow here
+      // to avoid an unhandled rejection. The failure is already observable.
+      this.flush().catch(() => {
+        /* fail-loud handling already ran inside flush(); swallow the rethrow */
+      });
+    }, this.flushIntervalMs);
+  }
+
+  /**
+   * Fail-loud handler for an audit-persist failure (#3916). A dropped/failed
+   * audit write undermines the tamper-evident hash chain (ADR-0017 /
+   * docs/security/audit-hash-chain-threat-model.md), so unlike the best-effort
+   * cost path this is NOT swallowed: it logs prominently at error level,
+   * increments a process-lifetime counter (exposed via
+   * {@link getPersistFailureCount}), and invokes the optional `onPersistFailure`
+   * hook so a governance consumer can escalate (e.g. raise/alert). Callers on the
+   * awaited flush()/close() path additionally receive the thrown error directly.
+   */
+  private recordPersistFailure(err: unknown): void {
+    this.persistFailureCount += 1;
+    const error = err instanceof Error ? err : new AuditError(String(err));
+    this.logger.error('AUDIT PERSIST FAILURE — audit event NOT durably written', error, {
+      totalPersistFailures: this.persistFailureCount,
+      hashChainEnabled: this.enableHashChain,
+    });
+    if (this.onPersistFailure !== undefined) {
+      // An escalation hook must never break the failure-recording path or mask
+      // the original audit error (it would otherwise throw past the counter +
+      // the flush() record-then-rethrow, replacing the real I/O error and — on
+      // a timer tick — risking an unhandled rejection). Isolate it.
+      try {
+        this.onPersistFailure(error);
+      } catch (hookErr) {
+        this.logger.error(
+          'AUDIT PERSIST FAILURE — onPersistFailure hook threw (original audit error preserved)',
+          hookErr instanceof Error ? hookErr : new AuditError(String(hookErr))
+        );
+      }
+    }
+  }
+
+  /**
+   * Process-lifetime count of audit flushes that FAILED to persist (#3916). A
+   * non-zero value means at least one audit event was not durably written — the
+   * hash chain may have a gap. Surfaced so the failure is observable rather than
+   * silent.
+   */
+  getPersistFailureCount(): number {
+    return this.persistFailureCount;
+  }
+
+  private shouldLog(input: AuditEventInput): boolean {
+    // Severity filter
+    const severityLevels = { info: 0, warning: 1, critical: 2 };
+    const inputLevel = severityLevels[input.severity];
+    const minLevel = severityLevels[this.minSeverity];
+    if (inputLevel < minLevel) return false;
+
+    // Category filter
+    if (this.categories !== undefined && !this.categories.includes(input.category)) return false;
+
+    return true;
+  }
+
+  private createEvent(input: AuditEventInput): AuditEvent {
+    const now = new Date(getTimeProvider().now());
+    const event: AuditEvent = {
+      id: generateEventId(),
+      version: '1.0',
+      timestamp: now.toISOString(),
+      timestampMs: now.getTime(),
+      category: input.category,
+      severity: input.severity,
+      outcome: input.outcome,
+      action: input.action,
+      description: input.description,
+      actor: input.actor,
+      resource: input.resource,
+      requestId: input.requestId,
+      traceId: input.traceId,
+      sessionId: input.sessionId,
+      toolName: input.toolName,
+      durationMs: input.durationMs,
+      metadata: input.metadata,
+      policyName: input.policyName,
+      policyDecision: input.policyDecision,
+      violationType: input.violationType,
+      // Linked at flush time by sealChain (#6546), not here.
+      previousHash: undefined,
+    };
+
+    // #3921: stamp the v2 hash version on a tier-transition event for
+    // observability/schema. NOTE: computeEventHash DERIVES the version from the
+    // covered head fields (see hasTierTransitionPayload), so this stamp is not
+    // load-bearing for integrity — it cannot be trusted to downgrade the hash.
+    if (hasTierTransitionPayload(event)) event.hashVersion = AUDIT_HASH_VERSION_TIER_TRANSITION;
+
+    // Snapshot in the persisted (JSON) form NOW (#6546 review): hashing waits
+    // for the flush, so the queued event must not share `actor`, `metadata` or
+    // `resource` objects the caller can still mutate after log() returns.
+    return JSON.parse(JSON.stringify(event)) as AuditEvent;
+  }
+
+  /**
+   * Link `events` onto the chain whose head is `tailHash` (#6546).
+   *
+   * Runs at flush time, not at log() time: the head of a shared log is only
+   * known under the storage's cross-process lock, after reading the last
+   * persisted event. `tailHash` undefined is the empty case — a fresh log —
+   * and the first event is then a genesis event with no `previousHash`.
+   */
+  private sealChain(events: AuditEvent[], tailHash: string | undefined): AuditEvent[] {
+    if (!this.enableHashChain) return events;
+    let prior = tailHash;
+    for (const event of events) {
+      event.previousHash = prior;
+      event.hash = computeEventHash(event);
+      prior = event.hash;
+    }
+    this.lastHash = prior ?? null;
+    return events;
+  }
+
+  log(input: AuditEventInput): void {
+    if (this.closed) {
+      this.logger.warn('Attempted to log after close');
+      return;
+    }
+
+    if (!this.shouldLog(input)) return;
+
+    let event: AuditEvent;
+    try {
+      event = this.createEvent(input);
+    } catch (err: unknown) {
+      // Not serializable (e.g. circular metadata): it could never be written.
+      this.recordPersistFailure(err);
+      return;
+    }
+    this.eventQueue.push(event);
+
+    if (this.eventQueue.length > this.maxQueueDepth) {
+      // Drop-oldest: under sustained pressure, recent events are more useful
+      // for correlation than the oldest unflushed ones. See #2979.
+      const dropCount = this.eventQueue.length - this.maxQueueDepth;
+      this.eventQueue.splice(0, dropCount);
+      const priorDropped = this.droppedEventCount;
+      this.droppedEventCount += dropCount;
+      const crossedThreshold =
+        Math.floor(this.droppedEventCount / DROP_WARN_INTERVAL) >
+        Math.floor(priorDropped / DROP_WARN_INTERVAL);
+      if (priorDropped === 0 || crossedThreshold) {
+        this.logger.warn('Audit event queue full; dropping oldest events', {
+          maxQueueDepth: this.maxQueueDepth,
+          totalDropped: this.droppedEventCount,
+        });
+      }
+    }
+
+    this.logger.debug('Audit event queued', {
+      id: event.id,
+      category: event.category,
+      action: event.action,
+    });
+  }
+
+  logToolInvocation(opts: ToolInvocationAuditOpts): void {
+    this.log({
+      category: 'tool_invocation',
+      severity: opts.outcome === 'failure' || opts.outcome === 'error' ? 'warning' : 'info',
+      outcome: opts.outcome,
+      action: 'tool.invoke',
+      description: opts.errorMessage,
+      actor: opts.actor,
+      resource: { type: 'tool', id: opts.toolName, name: opts.toolName },
+      requestId: opts.requestId,
+      toolName: opts.toolName,
+      durationMs: opts.durationMs,
+      ...(opts.policyDecision === undefined ? {} : { policyDecision: opts.policyDecision }),
+      metadata: opts.metadata,
+    });
+  }
+
+  logPolicyDecision(opts: PolicyDecisionAuditOpts): void {
+    this.log({
+      category: 'authorization',
+      ...policyDecisionFields(opts.decision),
+      action: 'policy.evaluate',
+      description: opts.reason,
+      actor: opts.actor,
+      resource: { type: 'tool', id: opts.toolName, name: opts.toolName },
+      requestId: opts.requestId,
+      policyName: opts.policyName,
+      policyDecision: opts.decision,
+      ...(opts.occurrence === undefined ? {} : { policyOccurrence: opts.occurrence }),
+      metadata: opts.metadata,
+    });
+  }
+
+  logSecurityEvent(opts: SecurityEventAuditOpts): void {
+    this.log({
+      category: 'security',
+      severity: opts.severity,
+      outcome: 'failure',
+      action: `security.${opts.eventType}`,
+      description: opts.description,
+      actor: opts.actor,
+      requestId: opts.requestId,
+      violationType: opts.eventType,
+      metadata: opts.metadata,
+    });
+  }
+
+  logRateLimitViolation(opts: RateLimitAuditOpts): void {
+    this.log({
+      category: 'security',
+      severity: 'warning',
+      outcome: 'denied',
+      action: 'rate_limit.exceeded',
+      description: `Rate limit exceeded: ${String(opts.currentRate)}/${String(opts.limitRate)} requests`,
+      actor: opts.actor,
+      resource: { type: 'tool', id: opts.toolName, name: opts.toolName },
+      requestId: opts.requestId,
+      toolName: opts.toolName,
+      metadata: { currentRate: opts.currentRate, limitRate: opts.limitRate },
+    });
+  }
+
+  /**
+   * Log an authority-tier transition (Epic D / ADR-0017, #3842). A promotion or
+   * demotion of a loop's authority tier is recorded as a hash-chained
+   * `governance`-category event whose `metadata.tierTransition` carries the
+   * structured {@link TierTransitionPayload} ({subject, fromTier, toTier,
+   * evidenceRef, ratificationVoteRef?}).
+   *
+   * The emitter does NOT itself enforce the ratification invariant (a promotion
+   * with no `ratificationVoteRef` is still chained — tampering with the log to
+   * remove the field must not erase the event). The invariant is enforced by the
+   * ratification gate (`scripts/check-authority-tier-drift.ts`), which reads the
+   * chained events back and FAILS a `promotion` lacking a vote ref. A promotion
+   * is emitted at `warning` severity (it grants authority) so it surfaces above
+   * the default info floor; a demotion is `info` (it is the safe direction).
+   */
+  logTierTransition(opts: TierTransitionAuditOpts): void {
+    const payload: TierTransitionPayload = TierTransitionPayloadSchema.parse({
+      kind: opts.kind,
+      subject: opts.subject,
+      fromTier: opts.fromTier,
+      toTier: opts.toTier,
+      evidenceRef: opts.evidenceRef,
+      ...(opts.ratificationVoteRef !== undefined
+        ? { ratificationVoteRef: opts.ratificationVoteRef }
+        : {}),
+    });
+    this.log({
+      category: 'governance',
+      severity: opts.kind === 'promotion' ? 'warning' : 'info',
+      outcome: 'success',
+      action: `tier.${opts.kind}`,
+      description: `Authority-tier ${opts.kind}: '${opts.subject}' ${opts.fromTier} → ${opts.toTier}`,
+      actor: opts.actor ?? SYSTEM_ACTOR,
+      resource: { type: 'loop', id: opts.subject, name: opts.subject },
+      requestId: opts.requestId,
+      metadata: { ...opts.metadata, [TIER_TRANSITION_METADATA_KEY]: payload },
+    });
+  }
+
+  /**
+   * Log that startup has begun (#5577).
+   *
+   * Emitted when the audit logger itself is constructed, which is long before
+   * authentication, tool registration and transport connect have run. The
+   * completion record is `system.startup`, written at the point the server
+   * reaches "waiting for requests" — see `logSystemStartup`.
+   *
+   * `outcome` is `success` because the enum has no in-progress value; the
+   * phase lives in the action name, not the outcome.
+   */
+  logSystemStartupBegin(metadata?: Record<string, unknown>): void {
+    this.log({
+      category: 'system',
+      severity: 'info',
+      outcome: 'success',
+      action: 'system.startup.begin',
+      description: 'Nexus Agents startup begun',
+      actor: SYSTEM_ACTOR,
+      metadata,
+    });
+  }
+
+  /**
+   * Log the startup COMPLETION record (#5577).
+   *
+   * Must be called only once startup has actually finished. Before #5577 this
+   * was written the moment the audit logger was constructed, so a throw in
+   * authentication, tool registration or transport connect left a durable
+   * "startup succeeded" record for a server that never started.
+   *
+   * @param metadata - Optional structured detail attached to the record.
+   * @param outcome - `success` when the server reached "waiting for requests";
+   *   `failure` when the startup sequence threw.
+   */
+  logSystemStartup(
+    metadata?: Record<string, unknown>,
+    outcome: 'success' | 'failure' = 'success'
+  ): void {
+    this.log({
+      category: 'system',
+      severity: outcome === 'failure' ? 'warning' : 'info',
+      outcome,
+      action: 'system.startup',
+      description:
+        outcome === 'failure' ? 'Nexus Agents startup failed' : 'Nexus Agents system started',
+      actor: SYSTEM_ACTOR,
+      metadata,
+    });
+  }
+
+  /**
+   * Log that shutdown has begun (#5577).
+   *
+   * There is deliberately no matching completion record. This logger is the
+   * FIRST thing closed in the cleanup handler — the EventBus, observer,
+   * memory, bridge and server are torn down after it — so by the time
+   * shutdown has actually completed the sink is closed and nothing can be
+   * written. The previous `system.shutdown` / `success` record claimed a
+   * completed shutdown that had not happened.
+   *
+   * Known consequence, raised by the panel that chose this shape: a
+   * `system.shutdown.begin` with no successor is indistinguishable from a
+   * hard kill. That cannot be resolved from inside a dying process; recording
+   * the real outcome needs a supervisor outside it. Absence of a completion
+   * record here is by construction, not a lost event.
+   */
+  logSystemShutdownBegin(metadata?: Record<string, unknown>): void {
+    this.log({
+      category: 'system',
+      severity: 'info',
+      outcome: 'success',
+      action: 'system.shutdown.begin',
+      description:
+        'Nexus Agents shutdown begun (no completion record — see logSystemShutdownBegin)',
+      actor: SYSTEM_ACTOR,
+      metadata,
+    });
+  }
+
+  private async drainAndFlushOnce(): Promise<void> {
+    if (this.eventQueue.length > 0) {
+      const events = this.eventQueue.splice(0, this.eventQueue.length);
+      if (this.storage.appendChained !== undefined) {
+        // #6546: seed from the persisted tail under the storage's lock, so a
+        // restarted or concurrent process continues the one chain on disk.
+        const progress = { sealed: false };
+        try {
+          await this.storage.appendChained((tailHash) => {
+            progress.sealed = true;
+            return this.sealChain(events, tailHash);
+          });
+        } catch (err: unknown) {
+          // Not yet linked (e.g. lock timeout): nothing was written, so the
+          // batch goes back to the queue rather than being lost.
+          if (!progress.sealed) this.eventQueue.unshift(...events);
+          throw err;
+        }
+        return;
+      }
+      for (const event of this.sealChain(events, this.lastHash ?? undefined)) {
+        await this.storage.write(event);
+      }
+    }
+    await this.storage.flush();
+  }
+
+  /**
+   * Drain the in-memory queue to storage AND flush the storage's own buffer
+   * to disk. Concurrent calls are coalesced into a single in-flight promise
+   * so an overlapping flush-timer tick cannot spawn parallel drains (see
+   * #2979). A caller arriving while a flush is already running awaits the
+   * existing promise; their newly-queued events, if any, are picked up by
+   * the next flush — the timer's, or the extra passes {@link close} runs
+   * (#6573).
+   */
+  async flush(): Promise<void> {
+    if (this.inFlightFlush !== null) return this.inFlightFlush;
+    // Record-then-rethrow: a failed flush is fail-loud both ways — the counter +
+    // error-log + callback fire (observable even when the caller ignores the
+    // promise), AND the error still propagates to an awaiting governance caller
+    // (#3916). The single in-flight drain is shared, so the timer's catch and a
+    // concurrent awaited flush() both observe the same failure exactly once.
+    const drain = this.drainAndFlushOnce()
+      .catch((err: unknown) => {
+        this.recordPersistFailure(err);
+        throw err;
+      })
+      .finally(() => {
+        this.inFlightFlush = null;
+      });
+    this.inFlightFlush = drain;
+    return drain;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+
+    await this.drainForClose();
+    await this.storage.close();
+    this.logger.info('AuditLogger closed');
+  }
+
+  /**
+   * Flush until the queue is empty (#6573).
+   *
+   * One flush() is not enough: when a drain is already in flight, flush()
+   * joins it, and that drain spliced the queue before any event logged during
+   * it — `system.shutdown.begin` among them — arrived. `closed` is set before
+   * this runs, so log() admits nothing new: the in-flight drain plus one fresh
+   * pass empties the queue. The bound turns a regression of that invariant
+   * into a reported failure instead of a spin.
+   *
+   * A failed pass is not retried here. flush() has already counted and
+   * reported it; a batch it could not link (lock timeout) is back in the queue
+   * unwritten, so nothing is written twice, and with no later flush to come it
+   * is stranded — named here so the loss is not silent.
+   */
+  private async drainForClose(): Promise<void> {
+    for (let pass = 0; pass < MAX_CLOSE_DRAIN_PASSES; pass++) {
+      try {
+        await this.flush();
+      } catch (err: unknown) {
+        if (this.eventQueue.length > 0) {
+          this.logger.error(
+            'AUDIT CLOSE — queued audit events were NOT persisted and will be lost',
+            err instanceof Error ? err : new AuditError(String(err)),
+            { strandedEvents: this.eventQueue.length }
+          );
+        }
+        throw err;
+      }
+      if (this.eventQueue.length === 0) return;
+    }
+    const error = new AuditError(
+      `${String(this.eventQueue.length)} audit events still queued after ` +
+        `${String(MAX_CLOSE_DRAIN_PASSES)} flush passes at close`
+    );
+    this.recordPersistFailure(error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// Factory Function
+// ============================================================================
+
+export function createAuditLogger(
+  config: AuditLogConfig,
+  storage?: IAuditStorage,
+  logger?: ILogger,
+  onPersistFailure?: (error: Error) => void
+): AuditLogger {
+  return new AuditLogger(config, storage, logger, onPersistFailure);
+}

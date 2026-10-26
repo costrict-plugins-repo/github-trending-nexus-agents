@@ -1,0 +1,187 @@
+/**
+ * nexus-agents/mcp - Run Workflow Tool Types
+ *
+ * Type definitions for the run_workflow MCP tool.
+ *
+ * @module mcp/tools/run-workflow-types
+ */
+
+import { z } from 'zod';
+import { asyncDispatchInput } from './async-dispatch-input.js';
+import type { IWorkflowEngine, WorkflowBudgetOutcome } from '../../core/index.js';
+import type { IMcpNotifier } from '../mcp-notifier.js';
+import type { BaseMcpToolDeps } from './tool-result.js';
+
+// ============================================================================
+// Input Schema
+// ============================================================================
+
+/**
+ * Input schema for the run_workflow tool.
+ */
+export const RunWorkflowInputSchema = z.object({
+  template: z.string().min(1).describe('Workflow template name (e.g., code-review) or file path'),
+  inputs: z.record(z.string(), z.unknown()).describe('Workflow inputs as key-value pairs'),
+  dryRun: z.boolean().optional().default(false).describe('Validate workflow without executing'),
+  /**
+   * Per-phase execution timeout in milliseconds (closes #3017). Wins over
+   * both `workflow.timeout` (set in the template YAML) and the engine's
+   * `defaultTimeoutMs`. Use for known-long workflow templates (e.g.,
+   * security-audit over a large repo) where the default phase budget
+   * isn't enough. Bounded to [1s, 30min] to prevent both flapping
+   * cancellations and unbounded hangs that would defeat the
+   * timeout-mismatch telemetry.
+   */
+  timeoutMs: z
+    .number()
+    .int()
+    .min(1000)
+    .max(1_800_000)
+    .optional()
+    .describe('Per-phase execution timeout in ms (overrides workflow.timeout)'),
+  /**
+   * Token ceiling for the whole run (#4754). Enforced only when
+   * `NEXUS_BUDGET_ENFORCE` is on AND this is set. Unlike run_pipeline there
+   * is no estimated fallback: the input-derived estimate (~1.2k tokens/step)
+   * sits far below real step spend (2.6k p25, 10k median), so it would fail
+   * ordinary workflows. Any uncapped run reports `budget.status: 'not_enforced'`
+   * when a ceiling was requested or the flag is on.
+   */
+  maxTokens: z
+    .number()
+    .int()
+    .positive()
+    .max(10_000_000)
+    .optional()
+    .describe(
+      'Token ceiling for the whole run. The ONLY source of a run_workflow cap: enforced when NEXUS_BUDGET_ENFORCE is on and this is set (no estimated default). Checked before each phase and before each step is dispatched; steps already running are not halted.'
+    ),
+  /**
+   * Async-mode dispatch (#3044, Stage 3 of epic #2631). Default `sync` —
+   * backward-compat invariant; existing callers see no behavior change.
+   * `async` returns `{ status: 'pending', jobId }` immediately; caller
+   * polls `get_job_result(jobId)` for the structured payload. Sidesteps
+   * the MCP-SDK 60s client-request timeout that's the #2631 root cause
+   * (per #2703 telemetry: run_workflow was the gate-firing tool at
+   * 28.6% timeout-shaped errors).
+   *
+   * Per the #3041 vote's binding staging order this lands AFTER
+   * Stage 1's protocol (#3048) was validated on orchestrate. Concurrency
+   * cap is enforced in-process via NEXUS_JOB_MAX_CONCURRENT_RUN_WORKFLOW;
+   * over-cap returns `{ status: 'busy', retryAfterMs }` synchronously.
+   *
+   * Use `dispatch`; the former `mode` alias is rejected (#6225). Omitted
+   * dispatch runs synchronously.
+   */
+  ...asyncDispatchInput(),
+  /**
+   * Idempotency key for async-mode replay-safety (#3042 Stage 1c / epic
+   * #2631). When set: identical (key, inputs) returns the existing job;
+   * same key with different inputs fails closed with
+   * `idempotency_key_collision`. Sync mode ignores this.
+   */
+  idempotencyKey: z
+    .string()
+    .min(1)
+    .max(256)
+    .optional()
+    .describe(
+      'Replay-safe key for async-mode dispatch (#3042 Stage 1c). Same (key, inputs) returns existing jobId.'
+    ),
+});
+
+export type RunWorkflowInput = z.infer<typeof RunWorkflowInputSchema>;
+
+// ============================================================================
+// Result Types
+// ============================================================================
+
+/**
+ * Workflow execution result returned by the tool.
+ */
+export interface WorkflowToolResult {
+  executionId: string;
+  workflowName: string;
+  status: 'completed' | 'failed';
+  stepResults: StepResultSummary[];
+  output: unknown;
+  durationMs: number;
+  /** Token-budget report (#4754). Absent when no ceiling was requested or resolved. */
+  budget?: WorkflowBudgetReport;
+}
+
+/**
+ * What run_workflow tells the caller about the run's token ceiling (#4754):
+ * the engine's measured outcome, or — when a caller asked for `maxTokens` but
+ * `NEXUS_BUDGET_ENFORCE` is off — `not_enforced`, reported rather than
+ * silently ignored.
+ */
+export type WorkflowBudgetReport =
+  WorkflowBudgetOutcome | { status: 'not_enforced'; requestedMaxTokens?: number; reason: string };
+
+/**
+ * Simplified step result for tool output.
+ */
+export interface StepResultSummary {
+  stepId: string;
+  status: 'success' | 'failed' | 'skipped';
+  durationMs: number;
+  error?: string;
+}
+
+/**
+ * Dry run validation result.
+ */
+export interface DryRunResult {
+  valid: boolean;
+  workflowName: string;
+  stepCount: number;
+  inputsProvided: string[];
+  inputsRequired: string[];
+  inputsMissing: string[];
+  validationErrors: string[];
+}
+
+// ============================================================================
+// Dependencies
+// ============================================================================
+
+/**
+ * Dependencies required by the run_workflow tool.
+ */
+export interface RunWorkflowDeps extends BaseMcpToolDeps {
+  /**
+   * Engine used to ENUMERATE and load templates — `listTemplates`,
+   * `getTemplateByName`, `loadTemplate`. Never used to execute.
+   *
+   * Listing needs no model adapter, so this engine is constructible on a fresh
+   * install with no credentials. That is the capability split #5116 turns on:
+   * enumerating workflows and running them have different prerequisites.
+   */
+  workflowEngine: IWorkflowEngine;
+  /**
+   * Resolves the engine that actually EXECUTES, at registration and call time.
+   *
+   * A THUNK rather than a value because constructing an executing engine throws
+   * `WorkflowExecutionUnavailableError` under the #507 fail-safe when nothing
+   * can execute for real. Registration catches only that structural error and
+   * disables `run_workflow` (#7043), keeping the rest of the server available.
+   *
+   * OPTIONAL rather than required, by unanimous panel decision. It was briefly
+   * required, which is how all eight internal call sites were enumerated by the
+   * compiler — that value is already banked. Keeping it required would make
+   * this a breaking change to a publicly exported type (`exports/mcp.ts`) and
+   * gate a p1 correctness fix behind a major version.
+   *
+   * Defaulting to `workflowEngine` is semantically correct for an external
+   * caller, not merely compile-compatible: their single engine genuinely serves
+   * both listing and execution, so the fallback preserves exactly what they had.
+   * The residual hazard — a future INTERNAL call site omitting this and
+   * executing against a listing engine — is covered two ways: a test asserting
+   * the production registration supplies it, and the listing engine failing
+   * closed rather than returning a fabricated success.
+   */
+  resolveExecutionEngine?: (() => IWorkflowEngine) | undefined;
+  /** MCP notifier for client-visible logging (Issue #974) */
+  notifier?: IMcpNotifier | undefined;
+}

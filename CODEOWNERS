@@ -1,0 +1,130 @@
+# CODEOWNERS — Enforce review requirements on security-critical paths
+# (Source: Issue #1184, 3-0 consensus vote)
+#
+# GitHub uses this file to auto-assign reviewers when PRs touch these paths.
+# Requires branch protection "Require review from Code Owners" to enforce.
+
+# Security modules — sanitizer, trust, policy-gate, corroboration
+/packages/nexus-agents/src/security/ @williamzujkowski
+
+# Pipeline core — TaskContract, PipelineRunner, PolicyEngine, EventBus
+/packages/nexus-agents/src/pipeline/ @williamzujkowski
+
+# CI/CD workflows — supply chain protection
+/.github/workflows/ @williamzujkowski
+
+# MCP server and tool registration
+/packages/nexus-agents/src/mcp/ @williamzujkowski
+
+# Consensus / voter configuration — the loop's own judge (#3653 self-mod guard)
+/packages/nexus-agents/src/consensus/ @williamzujkowski
+
+# @governor-section-start
+# Governor's own core — the governance-of-the-governor paths (#3830, Epic #3829).
+# These are NEVER auto-merged: human ratification is required. Admin-merge
+# discipline applies to them too — an agent-authored PR must not modify the
+# audit hash chain, governance source, or drift machinery without owner review.
+#
+# Audit hash chain
+/packages/nexus-agents/src/audit/ @williamzujkowski
+# Audit bridge decides what reaches the hash chain (#5125 owner decision).
+/packages/nexus-agents/src/security/audit-bridge.ts @williamzujkowski
+# Governance source
+/packages/nexus-agents/src/governance/ @williamzujkowski
+# Governance-drift injection machinery
+/scripts/inject-governance.ts @williamzujkowski
+# Claims registry — the durable claim inventory (#3825 lands it at
+# /governance/claims-registry.yaml). The directory pattern below covers the
+# registry once it exists; it is a no-op (no dangling match required) until then.
+/governance/ @williamzujkowski
+/governance/claims-registry.* @williamzujkowski
+# The keys a vote-record signature is verified against (#3927 item 4). Covered
+# by the directory pattern above; named so the entry is a reviewed act.
+/governance/allowed_signers @williamzujkowski
+
+# The governor's own gates (#4635). A gate an agent can quietly weaken without
+# tripping it is not a gate — these must route through ratification like the
+# paths they protect.
+/.github/workflows/governor-review.yml @williamzujkowski
+/scripts/check-governor-review.ts @williamzujkowski
+/scripts/check-governor-ratification.ts @williamzujkowski
+# #6343 — the manifest and checker pin required CI wiring inside this gate.
+/governance/required-jobs.json @williamzujkowski
+/scripts/check-required-jobs.ts @williamzujkowski
+/scripts/check-required-jobs.test.ts @williamzujkowski
+# #6387 — the one accepted aggregator shape (workflow root, job, step, env).
+/scripts/aggregator-shape.ts @williamzujkowski
+# #5130 step 2 — the committed-ledger half of the ratification gate; decides
+# what counts as a panel record that ratifies a PR.
+/scripts/governor-ledger-evidence.ts @williamzujkowski
+/scripts/governor-ledger-verdict.ts @williamzujkowski
+/scripts/governor-ledger-append-only.ts @williamzujkowski
+/scripts/governor-ledger-signature-policy.ts @williamzujkowski
+/scripts/governor-ledger-diversity.ts @williamzujkowski
+/scripts/governor-ledger-diversity.test.ts @williamzujkowski
+# #6256 — the same gate's env reader, git probe and printed line: what the
+# moved-head rule measures in the checkout, and the verdict the log reports.
+/scripts/governor-ledger-report.ts @williamzujkowski
+/scripts/governor-patch-identity.ts @williamzujkowski
+# #3927 item 4 — the signature half of that evidence: verifier and rendering.
+/scripts/governor-ledger-signature.ts @williamzujkowski
+#6366 — the ledger PRODUCERS: what they write is what the gate trusts
+/scripts/append-ratification-record.ts @williamzujkowski
+/scripts/append-ratification-signing.ts @williamzujkowski
+/scripts/append-ratification-args.ts @williamzujkowski
+/scripts/append-ratification-record.test.ts @williamzujkowski
+/scripts/redact-vote-record.ts @williamzujkowski
+/scripts/redact-vote-record-args.ts @williamzujkowski
+/scripts/redact-vote-record.test.ts @williamzujkowski
+# #6174 — asks GitHub's own parser whether this file is valid at the sha under review.
+/scripts/check-codeowners-errors.ts @williamzujkowski
+# #4802 — decides whether the pr_review audit gate and the CODEOWNERS parse run
+# at all (the `paths:` filter's replacement). A detector an agent could pin to
+# `false` unratified would silence both jobs on every governor PR.
+/scripts/governor-paths-touched.ts @williamzujkowski
+# #6369 — the stable dispatcher chooses which base-ref governance checks run.
+/scripts/governor-gate.ts @williamzujkowski
+# #6174 — files that must NOT exist. GitHub reads .github/CODEOWNERS over this
+# file and this file over docs/CODEOWNERS, while the governor gates parse only
+# this file. Creating either is itself a governor change; the gate fails closed.
+/.github/CODEOWNERS @williamzujkowski
+/docs/CODEOWNERS @williamzujkowski
+# #5944 — decides whether a CLAUDE.md/AGENTS.md diff may SKIP ratification.
+# A module that grants exemptions must itself be governed, or it is a bypass.
+/scripts/governance-stamp-exemption.ts @williamzujkowski
+/scripts/governor-section.ts @williamzujkowski
+
+# Governance rules — the review bar's own definition (#5997). `.rules/governance.md`
+# holds the voting thresholds and refactor gates, so a change here can lower the bar
+# every other governor path is measured against. It sat ABOVE the section start
+# until #5997, so the parser read it as an ordinary review-request while CLAUDE.md
+# claimed it required ratification. Keep it inside the directives.
+/.rules/ @williamzujkowski
+
+# The pure decision computation (#6000, step 3 — panel option D, refined). `.rules/`
+# declares the bar; these modules are the code that turns a tally plus a strategy
+# into approved/rejected/no_quorum, and the voter-role set that decides who sits on
+# the panel. Governing the NARROW extraction, not `src/consensus/` (which stays an
+# ordinary review-request above): engine.ts is IO/orchestration and must not need
+# ratification, while a one-line edit here changes what "approved" means.
+/packages/nexus-agents/src/consensus/decision/ @williamzujkowski
+/packages/nexus-agents/src/cli/voter-roles.ts @williamzujkowski
+
+# #4797 — the warrant ledger that can lower the security bar: an entry here mutes
+# a high-severity advisory that the REQUIRED Security Audit job (#4794) would block.
+/.github/audit-exceptions.json @williamzujkowski
+
+# Project governance
+/CLAUDE.md @williamzujkowski
+/AGENTS.md @williamzujkowski
+/CODEOWNERS @williamzujkowski
+
+# @governor-section-end
+# ^ Directive (#4683, #6048). The governor section is the lines between the
+# `# @governor-section-start` and `# @governor-section-end` directives above;
+# the parser (scripts/governor-section.ts) matches those two lines exactly and
+# nothing else — the "Governor's own core" heading under the start directive is
+# free prose. Entries BELOW this line are ordinary CODEOWNERS rules: they are
+# not governor paths, and their owners cannot ratify a governor change. Add new
+# governor paths ABOVE it. A missing, duplicated or reordered directive makes
+# both governor gates refuse with a named error, which fails closed.

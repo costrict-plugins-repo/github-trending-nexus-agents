@@ -1,0 +1,138 @@
+/**
+ * Tests for the doctor harness-alignment sub-check (Phase 3 of #2805).
+ *
+ * @module cli/doctor-harness-alignment.test
+ */
+
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { checkHarnessAlignment } from './doctor-harness-alignment.js';
+import { mkdtempOutsideRepo } from '../testing/non-repo-temp-dir.js';
+
+describe('checkHarnessAlignment', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempOutsideRepo('doctor-harness-');
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeAt(rel: string, content: string): void {
+    const abs = join(root, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, content, 'utf-8');
+  }
+
+  it('reports harness alignment as not applicable outside a project', () => {
+    const check = checkHarnessAlignment(root);
+    expect(check.inProject).toBe(false);
+    expect(check.agentsMdExists).toBe(false);
+  });
+
+  it('reports missing AGENTS.md inside a package project', () => {
+    writeAt('package.json', '{}');
+    const nested = join(root, 'src', 'nested');
+    mkdirSync(nested, { recursive: true });
+
+    const check = checkHarnessAlignment(nested);
+    expect(check.inProject).toBe(true);
+    expect(check.agentsMdExists).toBe(false);
+  });
+
+  it('finds AGENTS.md at the project root when run from a subdirectory (#6782)', () => {
+    // It looked only in the cwd while inProject walked up, so `doctor` from a
+    // subdirectory reported a false "MISSING — federation invariant broken".
+    writeAt('package.json', '{}');
+    writeAt('AGENTS.md', '# AGENTS.md');
+    const nested = join(root, 'src', 'nested');
+    mkdirSync(nested, { recursive: true });
+
+    const check = checkHarnessAlignment(nested);
+    expect(check.inProject).toBe(true);
+    expect(check.agentsMdExists).toBe(true);
+  });
+
+  it('prefers the git root over a nearer package.json, as in a monorepo (#6782)', () => {
+    mkdirSync(join(root, '.git'));
+    writeAt('AGENTS.md', '# AGENTS.md');
+    writeAt('.cursor/rules/agents.mdc', 'See AGENTS.md.');
+    writeAt('packages/app/package.json', '{}');
+    const nested = join(root, 'packages', 'app', 'src');
+    mkdirSync(nested, { recursive: true });
+
+    const check = checkHarnessAlignment(nested);
+    expect(check.agentsMdExists).toBe(true);
+    // The harness files are resolved at the same root, not the cwd.
+    expect(check.files.find((f) => f.harness === 'Cursor')?.redirectsToAgentsMd).toBe(true);
+  });
+
+  it('reports agentsMdExists=true when AGENTS.md is present in a project', () => {
+    writeAt('package.json', '{}');
+    writeAt('AGENTS.md', '# AGENTS.md');
+    const check = checkHarnessAlignment(root);
+    expect(check.inProject).toBe(true);
+    expect(check.agentsMdExists).toBe(true);
+  });
+
+  it('marks a harness as aligned when its file mentions AGENTS.md', () => {
+    writeAt('.cursor/rules/agents.mdc', '---\nalwaysApply: true\n---\nSee AGENTS.md.');
+    const check = checkHarnessAlignment(root);
+    const cursor = check.files.find((f) => f.harness === 'Cursor');
+    expect(cursor?.exists).toBe(true);
+    expect(cursor?.redirectsToAgentsMd).toBe(true);
+    expect(check.alignedCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('marks a harness as drift when the file exists but does not mention AGENTS.md', () => {
+    writeAt('.windsurf/rules/agents.md', '# Windsurf rules\n\nSome custom content here.');
+    const check = checkHarnessAlignment(root);
+    const windsurf = check.files.find((f) => f.harness === 'Windsurf');
+    expect(windsurf?.exists).toBe(true);
+    expect(windsurf?.redirectsToAgentsMd).toBe(false);
+    expect(check.driftCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('marks a harness as missing when its file is absent', () => {
+    const check = checkHarnessAlignment(root);
+    const aider = check.files.find((f) => f.harness === 'Aider');
+    expect(aider?.exists).toBe(false);
+    expect(aider?.redirectsToAgentsMd).toBe(false);
+    expect(check.missingCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('aggregates counts across all 6 known harnesses', () => {
+    writeAt('AGENTS.md', '# AGENTS.md');
+    writeAt('.cursor/rules/agents.mdc', 'See AGENTS.md');
+    writeAt('.windsurf/rules/agents.md', 'See AGENTS.md');
+    writeAt('.aider.conf.yml', 'read: [AGENTS.md]');
+    writeAt('.continue/rules/agents.md', 'See AGENTS.md');
+    writeAt('.clinerules/agents.md', 'See AGENTS.md');
+    writeAt('GEMINI.md', 'Federated to AGENTS.md'); // #3446 Phase 4
+
+    const check = checkHarnessAlignment(root);
+
+    expect(check.files).toHaveLength(6);
+    expect(check.alignedCount).toBe(6);
+    expect(check.driftCount).toBe(0);
+    expect(check.missingCount).toBe(0);
+  });
+
+  it('handles mixed alignment + drift + missing in one tree', () => {
+    writeAt('.cursor/rules/agents.mdc', 'See AGENTS.md'); // aligned
+    writeAt('.windsurf/rules/agents.md', 'Some unrelated content'); // drift
+    // Aider, Continue, Cline, Gemini absent → missing
+
+    const check = checkHarnessAlignment(root);
+    expect(check.alignedCount).toBe(1);
+    expect(check.driftCount).toBe(1);
+    expect(check.missingCount).toBe(4);
+  });
+
+  it('does not throw on unreadable files (filesystem race)', () => {
+    expect(() => checkHarnessAlignment('/proc/self/nonexistent')).not.toThrow();
+  });
+});

@@ -1,0 +1,406 @@
+/**
+ * nexus-agents/cli-adapters - Capability Type Definitions
+ *
+ * Capability types: ModelInfo, CapabilityProfile, CliTask, ICliAdapter, etc.
+ *
+ * (Source: cli-project_plan.md v2.1.0)
+ * (Source: docs/research/cli-integration-architecture.md)
+ */
+
+import type { Result, ILogger, ExecutionAccessMode } from '../core/index.js';
+import type { AuthProbeResult } from '../cli/cli-auth-probe.js';
+import type { LevelOutcome } from '../cli/cli-readiness.js';
+import type { CommandWrapper } from './exec-file-tree.js';
+import { NATIVE_EXECUTION_POLICY, type NativeExecutionPolicy } from './native-execution-policy.js';
+import type {
+  CliName,
+  RoutingArmId,
+  CliTransport,
+  CliResponse,
+  CliError,
+  TokenUsage,
+  HealthStatus,
+  CapacityStatus,
+} from './types-core.js';
+
+/**
+ * Model information from CLI.
+ */
+export interface ModelInfo {
+  /** Model identifier */
+  readonly id: string;
+  /** Model display name */
+  readonly name: string;
+  /** Maximum context window in tokens */
+  readonly contextWindow: number;
+  /** Maximum output tokens */
+  readonly maxOutput?: number;
+  /** Cost per 1M input tokens */
+  readonly costPerMillionInput?: number;
+  /** Cost per 1M output tokens */
+  readonly costPerMillionOutput?: number;
+}
+
+/**
+ * Base adapter constructor options shared by all CLI adapters.
+ * CLI-specific adapters extend this with additional fields.
+ */
+export interface BaseAdapterOptions {
+  /** Model to use (defaults to the CLI's default from the canonical registry) */
+  readonly model?: string;
+  /** Custom logger instance */
+  readonly logger?: ILogger;
+}
+
+/**
+ * Capability profile for task routing.
+ * (Source: cli-project_plan.md Capability Matching Matrix)
+ */
+export interface CapabilityProfile {
+  /** Complex reasoning ability (0-10) */
+  readonly reasoning: number;
+  /** Maximum context window in tokens */
+  readonly contextWindow: number;
+  /** Code generation quality (0-10) */
+  readonly codeGeneration: number;
+  /** Response speed (0-10, higher = faster) */
+  readonly speed: number;
+  /** Cost efficiency (0-10, higher = cheaper) */
+  readonly cost: number;
+}
+
+/**
+ * Task to execute on a CLI.
+ */
+export interface CliTask {
+  /** Task content/prompt */
+  readonly content: string;
+  /** Optional system prompt */
+  readonly systemPrompt?: string;
+  /** Preferred model (if any) */
+  readonly model?: string;
+  /** Session ID for continuation */
+  readonly sessionId?: string;
+  /** Maximum tokens to generate */
+  readonly maxTokens?: number;
+  /** Timeout in milliseconds */
+  readonly timeoutMs?: number;
+  /** Confine the complete subprocess, including CLI configuration and hooks. */
+  readonly wrapper?: CommandWrapper | undefined;
+  /** Additional CLI-specific options */
+  readonly options?: Record<string, unknown>;
+  /**
+   * Host access this task may use (#6754). Absent means `'default'`. Under
+   * `'read-only-analysis'` or `'workspace-edit'` (#6792) an adapter must apply
+   * its CLI's own enforcement of that mode, or refuse the task when it cannot.
+   */
+  readonly accessMode?: ExecutionAccessMode;
+}
+
+/**
+ * Internal resolved-options shape — every "default-able" field is
+ * required, but the per-call signal and internal host policy stay optional,
+ * with no default. Used by adapter internals (subprocess,
+ * codex-mcp) and tests as the "resolved" execution options. Public
+ * callers should keep using `ExecutionOptions` (everything optional).
+ */
+export type ResolvedExecutionOptions = Required<
+  Omit<ExecutionOptions, 'signal' | typeof NATIVE_EXECUTION_POLICY>
+> &
+  Pick<ExecutionOptions, 'signal' | typeof NATIVE_EXECUTION_POLICY>;
+
+/**
+ * Execution options for CLI adapters.
+ */
+export interface ExecutionOptions {
+  /** Internal, host-issued completion-spawn authority; never accepted from model JSON. */
+  readonly [NATIVE_EXECUTION_POLICY]?: NativeExecutionPolicy | undefined;
+  /** Timeout in milliseconds */
+  readonly timeoutMs?: number;
+  /** Whether to allow retries */
+  readonly allowRetry?: boolean;
+  /** Maximum retry attempts */
+  readonly maxRetries?: number;
+  /** Whether to track usage */
+  readonly trackUsage?: boolean;
+  /** Progress callback invoked on subprocess stdout activity (Issue #1087). */
+  readonly onProgress?: (() => void) | undefined;
+  /**
+   * Cancellation signal (#3026 finding 2). When the signal aborts, the
+   * adapter must cancel the in-flight execution promptly — for
+   * subprocess adapters that means SIGTERM (with SIGKILL escalation
+   * per #3026 finding 1). Without this, callers that use
+   * `Promise.race([adapter.execute(task), timeout])` for cancellation
+   * leak orphan subprocesses on race-loser: the timeout promise wins
+   * the race but the adapter call keeps running, posting late results
+   * into OutcomeStore + LinUCB state for a task whose decision has
+   * already been recorded.
+   *
+   * Typed as `AbortSignal | undefined` (not `AbortSignal?`) so
+   * `Required<ExecutionOptions>` — used pervasively by adapter
+   * internals + tests as a resolved-options shape — keeps accepting
+   * `signal: undefined` under `exactOptionalPropertyTypes`.
+   */
+  readonly signal?: AbortSignal | undefined;
+}
+
+/**
+ * CLI adapter interface.
+ * Abstracts CLI integration with transport-agnostic execution.
+ * (Source: cli-project_plan.md v2.1.0, Phase 2)
+ */
+export interface ICliAdapter {
+  /** CLI slot or independent API endpoint identity. */
+  readonly name: RoutingArmId;
+  /** Transport type */
+  readonly transport: CliTransport;
+  /** Capability profile */
+  readonly capabilities: CapabilityProfile;
+  /**
+   * True only when this adapter enforces `accessMode: 'read-only-analysis'`
+   * (#6754). Absent or false means it cannot, and a caller that asks for the
+   * mode must be refused rather than run with the adapter's defaults.
+   */
+  readonly enforcesReadOnlyAnalysis?: boolean;
+  /**
+   * True only when this adapter enforces `accessMode: 'workspace-edit'`
+   * (#6792): edits confined to the working directory, no command, network or
+   * MCP tool. Absent or false means it cannot, and a caller that asks for the
+   * mode must be refused. Declaring read-only analysis does not imply it.
+   */
+  readonly enforcesWorkspaceEdit?: boolean;
+
+  /**
+   * Executes a task on the CLI.
+   *
+   * @param task - Task to execute
+   * @param options - Execution options
+   * @returns Result with response or error
+   */
+  execute(task: CliTask, options?: ExecutionOptions): Promise<Result<CliResponse, CliError>>;
+
+  /**
+   * Performs a health check on the CLI.
+   *
+   * @returns Health status including version compatibility
+   */
+  healthCheck(): Promise<HealthStatus>;
+
+  /**
+   * Gets current capacity/rate limit status.
+   *
+   * @returns Capacity status
+   */
+  getCapacity(): Promise<CapacityStatus>;
+
+  /**
+   * Gets CLI version.
+   *
+   * @returns Version string
+   */
+  getVersion(): Promise<string>;
+
+  /**
+   * Gets model information.
+   *
+   * @returns Model info
+   */
+  getModelInfo(): ModelInfo;
+
+  /**
+   * Initializes the adapter (e.g., MCP connection).
+   * Called before first use.
+   */
+  initialize(): Promise<void>;
+
+  /**
+   * Cleans up resources (e.g., subprocess, MCP connection).
+   * Called on shutdown.
+   */
+  dispose(): Promise<void>;
+
+  /** Local auth evidence from the existing CLI probe; unknown is not authentication. */
+  authStatus?(): Promise<AuthProbeResult>;
+
+  /**
+   * Completion readiness: not-attempted by default. With live: true, delegates
+   * to the fixed-prompt probe, capped by the interactive operation-class guard
+   * and single-flight per adapter (spends quota, disables retries).
+   */
+  readiness?(options?: {
+    readonly live?: boolean;
+    readonly timeoutMs?: number;
+  }): Promise<LevelOutcome>;
+
+  /**
+   * Catalog support by canonical model identity, not live availability. Positive
+   * evidence returns yes; absent, empty, failed or nonmatching catalogs return
+   * unknown. Incomplete catalogs cannot establish no.
+   */
+  serves?(modelId: string): Promise<'yes' | 'no' | 'unknown'>;
+
+  /**
+   * (#2540) Optional: list models the underlying CLI installation/runtime
+   * has available. Implementations should cache for ~5 min and throw on
+   * failure so the caller can fall back. Adapters whose CLIs have no
+   * native list surface (claude, codex, gemini) leave this undefined.
+   */
+  listModels?(): Promise<readonly CliModelInfo[]>;
+}
+
+/**
+ * Resolve the model id to attribute to an adapter execution (#4194): prefer
+ * the response-reported model, else the adapter's configured
+ * `getModelInfo().id`. Failed/timed-out executions have no response-reported
+ * model, but the adapter still knows which model it was configured to run —
+ * that configured id is the honest attribution, not a placeholder. The
+ * `'unknown'` return is a last-resort guard for a throwing `getModelInfo()`
+ * (never observed for in-tree adapters), so callers can't crash a dispatch
+ * loop on attribution.
+ */
+export function resolveExecutionModelId(adapter: ICliAdapter, reportedModel?: string): string {
+  if (reportedModel !== undefined && reportedModel.length > 0) return reportedModel;
+  try {
+    return adapter.getModelInfo().id;
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * (#2540) One row from a CLI's `models`-listing surface. `id` matches what
+ * the CLI accepts as `--model`. `provider` is split out when the CLI uses
+ * `provider/model` ids (e.g. opencode `anthropic/claude-3-5-sonnet`).
+ */
+export interface CliModelInfo {
+  readonly id: string;
+  readonly provider?: string;
+}
+
+/**
+ * Response parser interface for defensive parsing.
+ * (Source: docs/research/cli-integration-architecture.md)
+ */
+export interface ICliResponseParser<T = unknown> {
+  /** Parser name (for logging) */
+  readonly name: string;
+  /** Supported version range (semver) */
+  readonly supportedVersionRange: string;
+
+  /**
+   * Parses raw CLI output to typed response.
+   *
+   * @param raw - Raw CLI output
+   * @returns Parsed response or null if unrecognized
+   */
+  parse(raw: string): T | null;
+
+  /**
+   * Extracts just the response text (most stable field).
+   *
+   * @param raw - Raw CLI output
+   * @returns Response text or null
+   */
+  extractResponse(raw: string): string | null;
+
+  /**
+   * Extracts a cost the CLI itself reported, in USD.
+   *
+   * OPTIONAL, and the optionality carries meaning (#5241). An ABSENT method
+   * says "this vendor does not report cost" — true of codex, gemini, opencode
+   * and agy. A PRESENT method returning `null` says "this vendor reports cost,
+   * and this response carried none". Collapsing those two into a missing number
+   * is what left `CliResponse.costUsd` with no producer while a consumer
+   * (`budget-router`) fell back to an estimate under a field named `actual`.
+   *
+   * The value is a MEASUREMENT from the vendor, not a rate-derived figure, so
+   * it does not pass through the token→USD pricing chain.
+   *
+   * @param raw - Raw CLI output
+   * @returns Vendor-reported cost in USD, or null if this response carried none
+   */
+  extractCostUsd?(raw: string): number | null;
+
+  /**
+   * Extracts an error-only message from a failure stream — when the CLI
+   * surfaced an error event but no usable assistant content (so
+   * {@link extractResponse} returns `null`). Optional: parsers that don't
+   * distinguish error-only streams omit it, and the caller falls back to the
+   * generic unparseable-output recovery. OpenCode's NDJSON `{"type":"error"}`
+   * events are the motivating case — without this the message is misclassified
+   * as PARSE_ERROR instead of NOT_AUTHENTICATED / RATE_LIMITED.
+   *
+   * @param raw - Raw CLI output
+   * @returns The extracted error message, or `null` if none / not applicable
+   */
+  extractErrorMessage?(raw: string): string | null;
+
+  /**
+   * Extracts token usage (may not be present).
+   *
+   * @param raw - Raw CLI output
+   * @returns Token usage or null
+   */
+  extractUsage(raw: string): TokenUsage | null;
+
+  /**
+   * Extracts session ID (for resumption).
+   *
+   * @param raw - Raw CLI output
+   * @returns Session ID or null
+   */
+  extractSessionId(raw: string): string | null;
+}
+
+/**
+ * Version requirements for CLIs.
+ */
+export interface VersionRequirements {
+  /** Minimum supported version */
+  readonly minimum: string;
+  /** Recommended version */
+  readonly recommended: string;
+  /** Known breaking versions */
+  readonly breaking: readonly string[];
+}
+
+/**
+ * CLI version requirements.
+ * (Source: docs/research/cli-integration-architecture.md)
+ */
+export const CLI_VERSION_REQUIREMENTS: Record<CliName, VersionRequirements> = {
+  claude: {
+    minimum: '2.0.0',
+    recommended: '2.0.76',
+    breaking: [],
+  },
+  // #4346: the `gemini` arm now runs the Antigravity CLI (`agy`), which
+  // replaced the retired standalone gemini CLI. Versions are agy's, not
+  // gemini's — an installed gemini 0.5x would fail the minimum, which is
+  // correct: it cannot serve.
+  gemini: {
+    minimum: '1.0.0',
+    recommended: '1.1.9',
+    breaking: [],
+  },
+  codex: {
+    minimum: '0.70.0',
+    recommended: '0.77.0',
+    breaking: [],
+  },
+  opencode: {
+    minimum: '0.1.0',
+    recommended: '0.1.0',
+    breaking: [],
+  },
+} as const;
+
+/**
+ * Default capability profiles for each CLI.
+ * Derived from the canonical model registry (Issue #807).
+ */
+
+import { buildCliCapabilityProfiles } from '../config/model-config-helpers.js';
+
+export const DEFAULT_CAPABILITIES: Record<CliName, CapabilityProfile> =
+  buildCliCapabilityProfiles();

@@ -1,0 +1,643 @@
+/**
+ * run_dev_pipeline MCP Tool (#1684)
+ *
+ * Exposes the multi-agent development pipeline as an MCP tool.
+ * Accepts input from direct instructions, a plan file, or a spec file.
+ *
+ * @module mcp/tools/dev-pipeline-tool
+ */
+
+import { z } from 'zod';
+import { VotingStrategySchema } from './consensus-vote-types.js';
+import { dispatchFieldDefaultSync, modeEnumErrorNamingDispatch } from './async-dispatch-input.js';
+import * as fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import type { McpServer } from '../sdk-types.js';
+import { createLogger, getErrorMessage, formatZodError, type ILogger } from '../../core/index.js';
+import { runDevPipeline } from '../../pipeline/dev-pipeline.js';
+import { truncateText } from '../../utils/text-utils.js';
+import { buildStructuredOutput } from './dev-pipeline-output.js';
+import { checkSimulationAllowed, simulationDeniedResult } from './simulation-guard.js';
+import { resolveInsideRoot } from '../../security/safe-path.js';
+import { getActiveWorkspaceRoot } from '../../config/nexus-data-dir.js';
+import { resolve } from 'node:path';
+import type { DevPipelineResult, DevPipelineOptions } from '../../pipeline/dev-pipeline.js';
+import { buildPipelineOptions } from './dev-pipeline-options.js';
+import type { IAuditLogger } from '../../audit/audit-types.js';
+import { createAgentStages, flushPipelineMemory } from '../../pipeline/agent-executor.js';
+import { createTaskTracker, detectBackend } from '../../pipeline/task-tracker.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { measuredTrustTier } from '../middleware/request-context.js';
+import type { TrustTier } from '../../security/trust-types.js';
+import { TaskSourceTrustTierSchema } from './task-source-trust-tier.js';
+import { measureInputSanitization } from './pipeline-input-sanitization.js';
+import {
+  toolStructuredError,
+  structuredToolSuccess,
+  type BaseMcpToolDeps,
+  type ToolResult,
+} from './tool-result.js';
+// #3726 / epic #2631: async-mode dispatch via the shared `runAsJob` helper.
+import { runAsJob, defaultReplayEnvelope, defaultCollisionEnvelope } from '../jobs/run-as-job.js';
+import { resolveIdempotency, registerIdempotentJob } from '../jobs/job-idempotency.js';
+
+/**
+ * Discoverability hint (#3726) prepended to sync run_dev_pipeline error/timeout
+ * envelopes. A real autonomous run can exceed the 900s MCP request timeout;
+ * async mode is the durable escape hatch.
+ */
+const DEV_PIPELINE_ASYNC_HINT =
+  'A full run_dev_pipeline run can exceed the 900s synchronous MCP timeout. ' +
+  "Retry with `dispatch: 'async'` to get a jobId immediately, then poll " +
+  'get_job_result({ jobId }) for the result.';
+
+/**
+ * What to tell a caller whose DRY run failed (#4933).
+ *
+ * `dispatch: 'async'` is ignored when `dryRun` is true, so the hint above is
+ * remediation the caller cannot take — following it verbatim produces another
+ * synchronous run. Say what is true instead.
+ */
+const DEV_PIPELINE_DRY_RUN_NOTE =
+  'This was a dry run (plan+vote), which always runs synchronously; async ' +
+  'dispatch is ignored for dry runs, so retrying with it changes nothing.';
+
+/** The failure-time note that matches the dispatch mode actually available. */
+function dispatchNoteFor(dryRun: boolean): string {
+  return dryRun ? DEV_PIPELINE_DRY_RUN_NOTE : DEV_PIPELINE_ASYNC_HINT;
+}
+
+// ============================================================================
+// Input Schema
+// ============================================================================
+
+export const DevPipelineInputSchema = z.object({
+  /** Direct task instructions. */
+  task: z.string().max(10000).optional().describe('Direct task instructions (what to build)'),
+  /** Declared provenance of the task text (#6795); omitted means '3'. */
+  sourceTrustTier: TaskSourceTrustTierSchema,
+  /** Path to a plan file (.md, .yaml, .txt) to use as input. */
+  planFile: z.string().max(500).optional().describe('Path to a plan/spec file to use as input'),
+  /** Whether to run in dry-run mode (plan+vote only, no implementation). */
+  dryRun: z.boolean().default(false).describe('If true, stop after plan+vote (no implementation)'),
+  /** Maximum vote iterations before proceeding (default: 3). */
+  maxVoteIterations: z.number().int().min(1).max(5).default(3).describe('Max plan→vote iterations'),
+  /** Maximum QA iterations per task (default: 3). */
+  maxQaIterations: z
+    .number()
+    .int()
+    .min(1)
+    .max(5)
+    .default(3)
+    .describe('Max QA review iterations per task'),
+  /** Working directory for the pipeline (default: cwd). Used for security scan and context. */
+  workingDir: z.string().max(500).optional().describe('Working directory (default: cwd)'),
+  /** GitHub issue number to track progress on. Updates posted as comments. */
+  issueNumber: z.number().int().positive().optional().describe('GitHub issue to post progress to'),
+  /** GitHub repo (owner/name) for issue tracking. */
+  repo: z
+    .string()
+    .max(200)
+    .optional()
+    .describe('GitHub repo for issue tracking (e.g., owner/repo)'),
+  /** Task tracking backend: github, gitlab, or json (default: json). */
+  trackerBackend: z
+    .enum(['github', 'gitlab', 'json'])
+    .default('json')
+    .describe('Task tracking backend for issue creation'),
+  /** Labels to apply to created issues. */
+  labels: z.array(z.string()).optional().describe('Labels for created issues'),
+  /** Session ID for checkpoint/resume. Enables crash recovery. */
+  sessionId: z
+    .string()
+    .max(128)
+    .regex(/^[a-zA-Z0-9_-]+$/)
+    .optional()
+    .describe('Session ID for checkpoint/resume (crash recovery)'),
+  /**
+   * TESTS ONLY — when true, voters return random decisions. Must not be used as
+   * a fallback when adapters are unavailable; configure an adapter instead. (#2319)
+   */
+  simulateVotes: z
+    .boolean()
+    .default(false)
+    .describe('TESTS ONLY — random output, must not be used for real decisions (#2319)'),
+  /** Voting strategy for consensus stages. */
+  votingStrategy: VotingStrategySchema.optional().describe(
+    'Voting strategy for plan approval (default: higher_order)'
+  ),
+  /** Start with the canonical quick panel; approvals may trigger a full-panel re-vote. */
+  quickMode: z
+    .boolean()
+    .default(false)
+    .describe(
+      'Start with 3 voters (architect, security, scope_steward) instead of 7. An approved quick vote may escalate to the full 7-role panel when the Bayesian posterior is borderline or a separate contrarian check rejects with high confidence, matching CLI --quick'
+    ),
+  /**
+   * Deadline for EACH stage call in milliseconds (min 30s, max 600s), not a
+   * budget for the whole run (#6736). Replaces every stage's default, the
+   * vote's included; clamped to the `pipeline` class guard.
+   */
+  timeoutMs: z
+    .number()
+    .int()
+    .min(30_000)
+    .max(600_000)
+    .optional()
+    .describe(
+      'Max time for EACH stage call in ms (30000-600000), not for the whole run; applies to every stage, the vote included, and to each plan/vote and implement/QA iteration. A stage past it fails with a timeout and its model calls are aborted. Default: the vote stage gets the multi-LLM panel guard (900000 unless overridden), other stages the pipeline guard (1800000 unless overridden)'
+    ),
+  /**
+   * Pipeline execution mode — a REAL field on this tool, unrelated to async
+   * dispatch. A caller who learned `mode: 'async'` elsewhere gets an error
+   * naming `dispatch` rather than the bare enum message (#4968).
+   */
+  mode: z
+    .enum(['autonomous', 'harness'], { error: modeEnumErrorNamingDispatch })
+    .default('autonomous')
+    .describe(
+      "'autonomous': full pipeline. 'harness': stops after decompose, returns tasks for caller to implement. (Not the async switch — that is `dispatch`.)"
+    ),
+  /**
+   * Async dispatch (#3726, canonical key per #4968). `sync` (default) runs the
+   * pipeline inline and returns the result — but a real autonomous run can
+   * exceed the 900s MCP request timeout. `async` returns a
+   * `{ status: 'pending', jobId }` envelope immediately and runs the pipeline
+   * in the background; poll `get_job_result({ jobId })` for the result.
+   * Ignored when `dryRun` is true (plan+vote completes fast, so dry runs
+   * always stay sync).
+   */
+  dispatch: dispatchFieldDefaultSync('Ignored for dryRun.'),
+  /** Local pre-ship quality gate (typecheck/lint/tests) mode (#3356). */
+  qualityGate: z
+    .enum(['off', 'advisory', 'blocking'])
+    .default('off')
+    .describe(
+      "Pre-ship local quality gate. 'off' (default): skip. 'advisory': run + record feedback, never fail. 'blocking': a red gate fails the pipeline."
+    ),
+  /** Opt-in per-run token budget — a safety cap for unattended runs (#3395). */
+  maxBudgetTokens: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      'Per-run token ceiling (#3395). When set, expert calls stop (returning failures) once cumulative usage crosses it — a hard-stop safety cap for unattended/multi-day runs. Omit to disable (default).'
+    ),
+});
+
+export type DevPipelineInput = z.infer<typeof DevPipelineInputSchema>;
+
+/**
+ * Deps for `run_dev_pipeline`. Extends the base with the server's single durable
+ * `auditLogger` (#3710) so the pipeline's consensus→execute policy gate can
+ * persist `policy.evaluated` decisions to the shared hash chain. Optional — when
+ * absent (pure-CLI path) the pipeline behaves exactly as before (no durability).
+ */
+export interface DevPipelineToolDeps extends BaseMcpToolDeps {
+  readonly auditLogger?: IAuditLogger | undefined;
+}
+
+// ============================================================================
+// Input Resolution
+// ============================================================================
+
+/**
+ * Resolve task input from direct instructions or file.
+ *
+ * Async because plan files can be large and the previous synchronous read
+ * blocked libuv for the duration, stalling concurrent MCP requests (#2354).
+ */
+async function resolveTaskInput(input: DevPipelineInput): Promise<string> {
+  if (input.task !== undefined && input.task.trim() !== '') {
+    return input.task;
+  }
+  if (input.planFile !== undefined) {
+    // Path traversal guard — restrict to the cwd subtree, following symlinks
+    // (security audit 2026-04-10).
+    const resolved = resolveInsideRoot(input.planFile);
+    if (resolved === null) {
+      throw new Error(`Path traversal denied: planFile must be within ${process.cwd()}`);
+    }
+    try {
+      return await fs.promises.readFile(resolved, 'utf-8');
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error(`Plan file not found: ${resolved}`);
+      }
+      throw err;
+    }
+  }
+  throw new Error('Either task or planFile must be provided');
+}
+
+/**
+ * Contain `workingDir` to the cwd subtree or the MCP client's declared
+ * workspace root, following symlinks. A globally installed server runs with
+ * cwd outside the user's repo (see `mcp/workspace-roots.ts`), so the
+ * workspace root is where a legitimate `workingDir` lives. `workingDir`
+ * becomes the security scan target, so anything outside both is refused
+ * rather than scanned and fed into the pipeline's context.
+ *
+ * @returns the canonical path, or `undefined` when `workingDir` was omitted
+ * @throws when `workingDir` resolves outside every allowed root
+ */
+function containWorkingDir(workingDir: string | undefined): string | undefined {
+  if (workingDir === undefined) return undefined;
+  const roots = [process.cwd()];
+  const workspaceRoot = getActiveWorkspaceRoot();
+  if (workspaceRoot !== undefined) roots.push(workspaceRoot);
+  // Relative paths keep resolving against cwd; only the root set widens.
+  const absolute = resolve(workingDir);
+  for (const root of roots) {
+    const contained = resolveInsideRoot(absolute, root);
+    if (contained !== null) return contained;
+  }
+  throw new Error(`Path traversal denied: workingDir must be within ${roots.join(' or ')}`);
+}
+
+// ============================================================================
+// Stub Stages (replaced by real agents when available)
+// ============================================================================
+
+/** Create pipeline stages wired to real agents via agent-executor. */
+async function createStages(
+  input: DevPipelineInput,
+  // The stage record describes caller authentication, independently of input changes.
+  trustTier: string | undefined,
+  inputSanitization: ReturnType<typeof measureInputSanitization>,
+  auditLogger?: IAuditLogger
+): Promise<ReturnType<typeof createAgentStages>> {
+  // Auto-detect tracker backend if set to 'auto' or default
+  const backendChoice = input.trackerBackend;
+  const backend =
+    backendChoice === 'json' && input.repo !== undefined ? await detectBackend() : backendChoice;
+  const tracker =
+    input.repo !== undefined
+      ? createTaskTracker({ backend, repo: input.repo, labels: input.labels })
+      : undefined;
+  return createAgentStages({
+    dryRun: input.dryRun,
+    ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+    ...(trustTier !== undefined ? { callerTrustTier: trustTier, trustTier } : {}),
+    ...inputSanitization,
+    scanTarget: containWorkingDir(input.workingDir),
+    simulateVotes: input.simulateVotes,
+    votingStrategy: input.votingStrategy,
+    quickMode: input.quickMode,
+    issueNumber: input.issueNumber,
+    repo: input.repo,
+    tracker,
+    ...(auditLogger !== undefined ? { auditLogger } : {}),
+    // #3395: thread the opt-in per-run token ceiling through to the budget guard.
+    ...(input.maxBudgetTokens !== undefined && {
+      budget: { maxTokens: input.maxBudgetTokens },
+    }),
+  });
+}
+
+/**
+ * Run the dev pipeline for a plain goal string with default (real, non-simulated)
+ * settings. The strategy executor the unified `run` entry point dispatches to for
+ * the `dev-pipeline` strategy (#3575). Wires real agents via {@link createStages};
+ * never simulates votes (schema default `simulateVotes: false`).
+ */
+export async function runDevPipelineForGoal(
+  goal: string,
+  trustTier?: string,
+  dryRun?: boolean,
+  /** `run`'s async-job cancel signal (#6305): checked before every stage. */
+  signal?: AbortSignal,
+  /** `run`'s declared provenance of the goal text (#6795); omitted means '3'. */
+  sourceTrustTier?: TrustTier
+): Promise<DevPipelineResult> {
+  // #4806: `dryRun` is the one pipeline option `run` forwards. `mode` and
+  // `qualityGate` stay pipeline-specific vocabulary — a caller who wants those
+  // has already decided on the strategy and should call `run_dev_pipeline`.
+  const input = DevPipelineInputSchema.parse({
+    task: goal,
+    ...(dryRun !== undefined ? { dryRun } : {}),
+  });
+  // This plain-goal entry point has no HandlerContext to measure input changes.
+  const stages = await createStages(input, trustTier, { inputSanitization: 'unmeasured' });
+  // #3712: thread the caller authentication tier into the
+  // consensus→execute policy snapshot. Undefined ⇒ seam fail-closes to tier 4
+  // (never infer trust from absence). The `run` entry point passes the caller's
+  // real RequestContext.trustTier here — closing the run-path hole where a
+  // possibly-untrusted goal ran a real research stage with an absent tier.
+  return runDevPipeline(goal, stages, {
+    ...(trustTier !== undefined ? { trustTier } : {}),
+    // #4806 said `dryRun` is the one pipeline option `run` forwards. It parsed
+    // the flag into `input` — which only `createStages` reads — and then built
+    // the options from `trustTier` alone, so the short-circuit at
+    // `dev-pipeline.ts:367` never fired and a dry run implemented for real.
+    ...(input.dryRun ? { dryRun: true as const } : {}),
+    ...(signal !== undefined ? { signal } : {}),
+    ...(sourceTrustTier !== undefined ? { sourceTrustTier } : {}),
+  });
+}
+
+// ============================================================================
+// Tool Registration
+// ============================================================================
+
+const RUN_DEV_PIPELINE_DESCRIPTION =
+  "Run the multi-agent development pipeline. Accepts direct task instructions, a plan file, or a spec file. Implement, QA and gates use a per-run scratch worktree pinned to HEAD. Isolation of scratch-bound expert, install, gate and change-capture subprocesses is an OS sandbox with the source read-only when changes.isolation.mode is os-sandbox. Otherwise isolation is best-effort and changes.isolation.reason explains why bwrap or sandbox setup is unavailable. Pipeline-owned git runs hermetically with repository-local GIT_* variables removed, optional index refresh disabled, fsmonitor disabled and source hooks disabled. Gate subprocesses receive the hermetic git environment. Installs are scratch-local with inherited directory overrides removed, copy imports and HUSKY=0, and are killed as a process tree on timeout. Changes to the source repository's shared git config are reported as a warning, or logged when the run throws or times out. Only in best-effort mode, an install descendant that ignores SIGTERM can write during the kill grace period before the config snapshot. The OS sandbox confines descendants too. Dependencies are installed inside the scratch, frozen from the HEAD root lockfile before implementation. OS-sandbox installs use private writable package stores and caches under a private TMPDIR with copy imports. Shared package stores and caches remain read-only. Best-effort installs prefer the local package cache and fetch missing packages. Returns changes (unified diff, baseSha, worktreePath, worktreeRemoved, dependencies, isolation, empty, status: changes, no_changes or tampered) for the operator to apply. changes.dependencies reports status installed, none or failed, with manager and failure reason when applicable. No root package.json or supported lockfile means none. Provisioning failure makes the quality gate unmeasured with the reason. worktreeRemoved reflects whether the scratch path exists after cleanup, and prune failures have a separate warning. Failed removal preserves the diff with a leftover-path warning. Dirty-source warnings identify HEAD and the number of omitted uncommitted paths. Scratch-bound expert CLIs and change capture run inside the same sandbox. The sandbox executable is pinned before execution. Change capture disables external diff and textconv. The scratch gitfile, commondir and gitdir are checked against their pre-run bytes. Modified metadata refuses the diff with status tampered and a warning. Cleanup removes only the scratch and worktree metadata paths recorded before execution, then prunes from the source repository. The sandbox permits writes to the scratch, its own git metadata and a private TMPDIR. Host IPC environment redirects are removed, /run/user is masked and existing Docker socket paths are masked. DNS resolver paths under /run remain available. Network and abstract-namespace sockets remain reachable. Supports dry-run (plan+vote only). Supports dispatch: 'async' (non-dryRun runs) — returns a jobId immediately, then poll get_job_result.";
+
+/**
+ * Validates input, runs the dev pipeline, and shapes the result.
+ *
+ * `trustTier` records caller authentication, threaded from
+ * `RequestContext.trustTier` by the registered 2-arg handler (#3712). When
+ * undefined (no caller context), the consensus→execute seam fail-closes to
+ * untrusted (tier 4) — absence is never treated as trusted.
+ */
+/**
+ * Run the pipeline body + shape the structured success envelope. The
+ * sync handler awaits this inline; the async dispatcher backgrounds it via
+ * {@link runAsJob}. `taskText` + `stages` + `pipelineOptions` are resolved by
+ * the sync prelude in {@link runDevPipelineHandler} so only the (long) pipeline
+ * body runs in the background (#3726).
+ */
+async function executeDevPipelineBody(
+  taskText: string,
+  stages: Awaited<ReturnType<typeof createStages>>,
+  pipelineOptions: DevPipelineOptions | undefined,
+  simulated: boolean
+): Promise<ToolResult> {
+  const result = await runDevPipeline(taskText, stages, pipelineOptions);
+  // Always flush memory session — including dry-run exits (#1716)
+  flushPipelineMemory();
+  const output = buildStructuredOutput(result, simulated);
+
+  // #5888. `runAsJob`'s fail-closed check inspects the ToolResult's ROOT keys
+  // only (`isError`/`ok`/`success`), and deliberately so — a deep scan would
+  // read a vote whose DECISION is reject as a failed job. `toolSuccessStructured`
+  // nests everything under `structuredContent`, so `completed: false` never
+  // reached it and a rejected pipeline was recorded `complete`. The contract is
+  // that the caller hoists; `pipeline-tool.ts` and `run-graph-workflow.ts` both
+  // do, and this was the one caller that did neither.
+  //
+  // A dry run and a harness run are `completed: false` BY REQUEST, not by
+  // fault, and each carries its own marker for exactly this reason. Erroring on
+  // them would trade a false success for a false failure.
+  if (!result.completed && result.dryRun !== true && result.harnessMode !== true) {
+    const error = toolStructuredError({
+      errorCategory: 'business',
+      message: describeIncompleteRun(result),
+      detail: output,
+    });
+    // #7297: enrich the display text without changing the metadata envelope.
+    return { ...error, content: [{ type: 'text', text: describeFailureText(result) }] };
+  }
+  return structuredToolSuccess(z.record(z.string(), z.unknown()), output);
+}
+
+/**
+ * Say WHY the pipeline did not complete, so the job record's `error` is
+ * actionable rather than a bare "failed".
+ */
+function describeIncompleteRun(result: DevPipelineResult): string {
+  if (result.planStatus !== undefined) {
+    return `Pipeline stopped at the planning gate (planStatus: ${result.planStatus})`;
+  }
+  if (result.securityRan === true && !result.securityPassed) {
+    return 'Pipeline did not complete: the security gate rejected the change';
+  }
+  if (result.taskStatus !== undefined && result.taskStatus !== 'all_done') {
+    return `Pipeline did not complete: tasks ${result.taskStatus}`;
+  }
+  if (result.changes?.status === 'no_changes') {
+    return 'Pipeline produced no_changes: implement left an empty diff';
+  }
+  return 'Pipeline did not complete';
+}
+
+/** Include produced failure evidence for callers that only consume text. */
+function describeFailureText(result: DevPipelineResult): string {
+  const details: string[] = [];
+  if (result.planStatus !== undefined) {
+    const reason = result.planVoteReason ?? result.planVoteFeedback;
+    if (reason !== undefined) details.push(`planning: ${reason}`);
+  }
+  if (!result.securityPassed && result.securityNote !== undefined) {
+    details.push(`security: ${result.securityNote}`);
+  }
+  details.push(...taskAndWarningDetails(result));
+  const text = [describeIncompleteRun(result), ...details].join('\n');
+  return truncateText(text, 2000, '…');
+}
+
+/** Promote the blocking gate cause while retaining other task/warning order (#7407). */
+function taskAndWarningDetails(result: Pick<DevPipelineResult, 'tasks' | 'warnings'>): string[] {
+  const details: string[] = [];
+  const warnings = result.warnings ?? [];
+  const gateWarning = warnings.findIndex((warning) => warning.startsWith('Quality gate failed:'));
+  const gateCause = gateWarning < 0 ? undefined : warnings[gateWarning];
+  if (gateCause !== undefined) details.push(`warning: ${gateCause}`);
+  details.push(...unfinishedTaskFeedback(result.tasks));
+  for (const [index, warning] of warnings.entries()) {
+    if (index !== gateWarning) details.push(`warning: ${warning}`);
+  }
+  return details;
+}
+
+/** Feedback belongs to unfinished tasks, not successful tasks. */
+function unfinishedTaskFeedback(tasks: DevPipelineResult['tasks']): string[] {
+  const details: string[] = [];
+  for (const task of tasks) {
+    if (task.status !== 'done' && task.feedback !== undefined) {
+      details.push(`tasks (${task.id}): ${task.feedback}`);
+    }
+  }
+  return details;
+}
+
+/**
+ * Parse the tool input and contain `workingDir`. An uncontained `workingDir`
+ * is refused here, before anything else runs, with a `permission` error rather
+ * than the generic pipeline-failure envelope.
+ */
+function parseHandlerInput(args: unknown): { input: DevPipelineInput } | { error: ToolResult } {
+  const parsed = DevPipelineInputSchema.safeParse(args);
+  if (!parsed.success) {
+    return {
+      error: toolStructuredError({
+        errorCategory: 'validation',
+        message: `Invalid input: ${formatZodError(parsed.error)}`,
+      }),
+    };
+  }
+  try {
+    const workingDir = containWorkingDir(parsed.data.workingDir);
+    return { input: workingDir === undefined ? parsed.data : { ...parsed.data, workingDir } };
+  } catch (err: unknown) {
+    return {
+      error: toolStructuredError({ errorCategory: 'permission', message: getErrorMessage(err) }),
+    };
+  }
+}
+
+async function runDevPipelineHandler(
+  args: unknown,
+  logger: ILogger,
+  trustTier?: string,
+  auditLogger?: IAuditLogger,
+  inputSanitization: ReturnType<typeof measureInputSanitization> = {
+    inputSanitization: 'unmeasured',
+  }
+): Promise<ToolResult> {
+  const validated = parseHandlerInput(args);
+  if ('error' in validated) return validated.error;
+  const { input } = validated;
+  // #4170: simulateVotes fails CLOSED outside test runners — BEFORE the try
+  // block (its catch categorizes as `internal`) and BEFORE the async dispatch
+  // (sync and async modes must reject identically).
+  let simulated = false;
+  if (input.simulateVotes) {
+    const simCheck = checkSimulationAllowed('run_dev_pipeline', logger);
+    if (!simCheck.allowed) return simulationDeniedResult(simCheck.reason);
+    simulated = simCheck.optedIn;
+  }
+
+  try {
+    // Sync prelude — fast: input resolution + stage wiring + option build.
+    // Only the pipeline BODY backgrounds in async mode (#3726).
+    const taskText = await resolveTaskInput(input);
+    const stages = await createStages(input, trustTier, inputSanitization, auditLogger);
+    const pipelineOptions = buildPipelineOptions(input, trustTier, auditLogger);
+    const hasOptions = Object.keys(pipelineOptions).length > 0;
+    const resolvedOptions = hasOptions ? pipelineOptions : undefined;
+    // #6305: the async dispatch passes `cancel_job`'s signal; the sync path
+    // passes none, so its options are unchanged.
+    const run = (signal?: AbortSignal): Promise<ToolResult> =>
+      executeDevPipelineBody(
+        taskText,
+        stages,
+        signal !== undefined ? { ...resolvedOptions, signal } : resolvedOptions,
+        simulated
+      );
+
+    // #3726: async dispatch for real (non-dryRun) runs — a full pipeline can
+    // exceed the 900s MCP request timeout. dryRun ALWAYS stays sync (plan+vote
+    // completes fast). Returns `{ status: 'pending', jobId }` immediately.
+    if (input.dispatch === 'async' && !input.dryRun) {
+      return dispatchAsyncDevPipeline(input, run, logger);
+    }
+
+    return await run();
+  } catch (error: unknown) {
+    // #3726 discoverability: a sync run that times out (or otherwise fails
+    // mid-pipeline) should point the caller at async mode — the durable fix
+    // for runs that exceed the 900s request timeout.
+    return toolStructuredError({
+      errorCategory: 'internal',
+      message: `${dispatchNoteFor(input.dryRun)} Pipeline error: ${getErrorMessage(error)}`,
+    });
+  }
+}
+
+/**
+ * Async-mode dispatcher (#3726). jobId === sessionId ONLY when the caller
+ * explicitly supplies one (enables task-state resume); otherwise a fresh
+ * `dp-<uuid>` is minted. A reused sessionId surfaces via the EXISTING
+ * idempotency envelope (replay/collision) — it NEVER silently returns another
+ * run's data. The background runner writes the result to the SIDECAR
+ * regardless of jobId (the Stage-2 task-state reader is flag-gated off by
+ * default), so `get_job_result({ jobId })` always resolves.
+ *
+ * Why the manual idempotency pre-check (vs `runAsJob`'s built-in key path):
+ * the shared helper's keyed path derives an opaque `job-<tool>-<hash>` jobId,
+ * but #3726 needs the jobId to BE the sessionId so a resumed run polls the
+ * same key. So we resolve idempotency here with the jobId PINNED to the
+ * sessionId, then dispatch through `runAsJob` keyless (freshJobId === the
+ * sessionId, used verbatim).
+ */
+function dispatchAsyncDevPipeline(
+  input: DevPipelineInput,
+  run: (signal: AbortSignal) => Promise<ToolResult>,
+  logger: ILogger
+): ToolResult {
+  // No sessionId → mint a fresh dp-<uuid>; no idempotency surface to track.
+  if (input.sessionId === undefined) {
+    return runAsJob<DevPipelineInput, ToolResult>({
+      toolName: 'run_dev_pipeline',
+      input,
+      freshJobId: () => `dp-${randomUUID()}`,
+      // #5393 / #6305: arity 3 — `runDevPipeline` checks the signal before every stage.
+      run: (_jobId, _input, signal) => run(signal),
+      logger,
+    });
+  }
+
+  // sessionId provided → jobId === sessionId, with collision-surfacing.
+  const sessionId = input.sessionId;
+  const resolution = resolveIdempotency('run_dev_pipeline', sessionId, input, () => sessionId);
+  if (resolution.kind === 'replay') {
+    return defaultReplayEnvelope(resolution.jobId);
+  }
+  if (resolution.kind === 'collision') {
+    return defaultCollisionEnvelope(resolution.existingJobId);
+  }
+  // Fresh dispatch: pin the index entry to jobId === sessionId so a rerun
+  // replays/collides against it, then dispatch keyless on that jobId.
+  registerIdempotentJob({
+    tool: 'run_dev_pipeline',
+    idempotencyKey: sessionId,
+    inputs: input,
+    jobId: sessionId,
+  });
+  return runAsJob<DevPipelineInput, ToolResult>({
+    toolName: 'run_dev_pipeline',
+    input,
+    freshJobId: () => sessionId,
+    // #5393 / #6305: arity 3 — same body as the keyless dispatch above.
+    run: (_jobId, _input, signal) => run(signal),
+    logger,
+  });
+}
+
+/**
+ * Register the run_dev_pipeline MCP tool.
+ *
+ * Routed through the standard `createSecureHandler → wrapToolWithTimeout →
+ * toSdkCallback` chain like every other tool (#2824): the bare-callback
+ * registration it used before had no rate-limiting, no abort-signal /
+ * progress-token plumbing, and surfaced a `ZodError` on bad input as a raw
+ * JSON-RPC `-32603` instead of a structured `validation` envelope.
+ */
+export function registerDevPipelineTool(server: McpServer, deps: DevPipelineToolDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'run_dev_pipeline' });
+  // 2-arg context-aware form (mirrors delegate-to-model.ts): thread the caller's
+  // real RequestContext.trustTier into the consensus→execute policy snapshot
+  // (#3712). createSecureHandler always supplies a HandlerContext with a derived
+  // trustTier; the handler still fail-closes (tier 4) if a tier never reaches
+  // the runDevPipeline seam. The server's durable auditLogger (#3710) is threaded
+  // so the gate persists policy decisions to the shared hash chain.
+  const secureHandler = createSecureHandler(
+    (args: unknown, ctx?: HandlerContext) =>
+      runDevPipelineHandler(
+        args,
+        logger,
+        ctx && measuredTrustTier(ctx.requestContext),
+        deps.auditLogger,
+        measureInputSanitization(ctx)
+      ),
+    { toolName: 'run_dev_pipeline', rateLimiter: deps.rateLimiter, logger }
+  );
+  const timeoutMs = getToolTimeout('run_dev_pipeline', deps.security);
+  const wrapped = wrapToolWithTimeout('run_dev_pipeline', secureHandler, { timeoutMs, logger });
+
+  server.registerTool(
+    'run_dev_pipeline',
+    {
+      description: RUN_DEV_PIPELINE_DESCRIPTION,
+      inputSchema: DevPipelineInputSchema.shape,
+      annotations: getToolAnnotations('run_dev_pipeline'),
+    },
+    toSdkCallback(wrapped)
+  );
+  logger.info('Registered run_dev_pipeline tool');
+}

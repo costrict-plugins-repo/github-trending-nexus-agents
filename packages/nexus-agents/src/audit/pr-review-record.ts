@@ -1,0 +1,662 @@
+/**
+ * nexus-agents/audit - PR-Review Audit Record (#3831, Epic B — governance of
+ * the governor).
+ *
+ * A committed, append-only, tamper-EVIDENT record of a completed `pr_review`
+ * over a GOVERNOR-PATH PR, persisted so a WARN-FIRST CI gate
+ * (`scripts/check-governor-review.ts`, #3831) can assert that a PR touching the
+ * governor's own paths (the /CODEOWNERS governance-of-the-governor list) carries
+ * a recorded, DIFF-BOUND review before merge — without the gate re-executing the
+ * review (it QUERIES the ledger; pr_review is never re-run in the gate).
+ *
+ * MODEL: TAMPER-EVIDENT RECORD SET + MONOTONIC SEQUENCE. This MIRRORS the
+ * authentic-vote-record model (#3927, `vote-record.ts`) exactly, for the same
+ * reason: the ledger is a multi-branch committable artifact, so a linear hash
+ * chain (whose `hash` folds in the prior record's hash) cannot survive a
+ * concurrent-branch git merge. Two branches each appending from the same tip
+ * produce records claiming the same `previousHash`, and any merge-concatenation
+ * breaks the back-link check. So this ledger is an UNORDERED SET of self-hashed
+ * records plus a monotonic `sequence`: each record's hash is POSITION-INDEPENDENT
+ * (covers `sequence` but NOT `previousHash`), stable across merges and reorders.
+ * `previousHash` is retained ADVISORILY for audit texture but does NOT
+ * participate in verification. Omission is detected via SEQUENCE GAPS; concurrent
+ * forks (two records sharing a sequence) are a BENIGN signal, not a failure.
+ *
+ * KNOWN GAP IN OMISSION DETECTION (#4011, mirrors vote-record.ts): sequence-gap
+ * detection only catches an omission that leaves a HOLE in the `0..maxSeq` run. It
+ * does NOT catch deletion of a FORK PARTNER — when ≥2 records share a sequence and
+ * one is removed, the survivor still occupies that sequence, so no gap appears and
+ * verification stays `ok`. Within the disclosed residual-trust boundary
+ * (author-typed records; cryptographic signing is #3927 item 4): a commit-access
+ * actor could equally never have written the partner, so it grants no new
+ * capability. Closing it folds into #3927 item 4.
+ *
+ * DIFF-BINDING (Option-C, #3831 ratification). The self-`hash` covers
+ * `prNumber` + **`baseSha`** + **`reviewedDiffHash`** + `verdict` + the review
+ * summary content. Binding the record to the exact reviewed DIFF is what makes the
+ * gate NOT theater: a record produced against a different diff does NOT satisfy a
+ * later push (the gate matches `prNumber` AND recomputes `reviewedDiffHash` from
+ * the committed PR's canonical diff), and the record's content cannot be edited to
+ * claim a different diff/verdict without breaking the hash. This replaces the
+ * rejected `headSha` binding (a head pointer is mutable; the reviewed bytes are
+ * what the voters actually saw).
+ *
+ * DIFF PROVENANCE (#4459). The binding says WHICH bytes were reviewed; it does not
+ * say where those bytes CAME FROM. `diffProvenance` closes that gap: `canonical-git`
+ * means the diff is the pinned `git diff` the gate itself recomputes, while
+ * `caller-supplied` means an MCP caller handed over opaque bytes that merely passed
+ * the `looksLikeUnifiedDiff` shape gate (#4451). It is HASH-COVERED like every other
+ * authenticity field — a provenance claim outside the hash could be upgraded by
+ * editing one word.
+ *
+ * WHY A DEDICATED PAYLOAD-COVERING HASH (and not the audit-event head hash).
+ * As in #3897/#3927: the audit-event chain (`computeEventHash` in
+ * audit-logger.ts) hashes only the stable HEAD fields and intentionally NOT
+ * `metadata`, so riding a metadata payload would leave the verdict OUTSIDE the
+ * hash — an attacker could flip `request_changes`→`approve` without breaking any
+ * hash. This record instead folds EVERY authenticity-bearing field (the PR
+ * number, the base sha, the reviewed-diff hash, the verdict, the verified flag,
+ * the vote counts, and the `sequence`) into the self-hash, so editing any of them
+ * is a `hash_mismatch`.
+ * Cryptographic signing/provenance is DEFERRED (mirrors the #3897 follow-up).
+ *
+ * @module audit/pr-review-record
+ */
+
+import * as crypto from 'node:crypto';
+
+import { z } from 'zod';
+
+import { censusSequences, firstSequenceGap, forkSequences } from './sequence-census.js';
+
+/**
+ * The aggregate verdict a `pr_review` resolves to, mirroring the pr-review
+ * decision vocabulary (`approve` / `request_changes` / `abstain`).
+ */
+export const PrReviewVerdictSchema = z.enum(['approve', 'request_changes', 'abstain']);
+export type PrReviewVerdict = z.infer<typeof PrReviewVerdictSchema>;
+
+/** The per-review voter-tally summary mirrored from the pr_review aggregate. */
+export const PrReviewVoteCountsSchema = z
+  .object({
+    approve: z.number().int().nonnegative(),
+    request_changes: z.number().int().nonnegative(),
+    abstain: z.number().int().nonnegative(),
+    error: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+  })
+  .strict();
+export type PrReviewVoteCounts = z.infer<typeof PrReviewVoteCountsSchema>;
+
+/**
+ * Where the bytes behind `reviewedDiffHash` came from (#4459). Only two values
+ * exist because only two non-test producers write records:
+ *  - `canonical-git` — the diff is the pinned `git diff <base>..<head>` output
+ *    (`audit/reviewed-diff-hash.ts`), the same invocation the CI gate recomputes.
+ *    Written by `scripts/pr-review-local-ledger.ts`.
+ *  - `caller-supplied` — the diff arrived as opaque `prDiff` input on the
+ *    `pr_review` MCP call. It PASSED the `looksLikeUnifiedDiff` shape gate
+ *    (#4451), but nothing establishes that it is the PR's actual diff. Written
+ *    by `mcp/tools/pr-review-tool.ts`.
+ *
+ * There is deliberately NO `gh-api` member: the `gh` v3.diff fallback in
+ * `scripts/pr-review-local.ts` skips the ledger entirely (it sets
+ * `canonicalDiff: undefined`, and the feeder writes no record), so a `gh-api`
+ * record cannot be produced. An enum member no producer can emit is a value a
+ * consumer would have to handle without ever meeting it.
+ */
+export const PrReviewDiffSourceSchema = z.enum(['canonical-git', 'caller-supplied']);
+export type PrReviewDiffSource = z.infer<typeof PrReviewDiffSourceSchema>;
+
+/**
+ * What the record was DERIVED FROM — the provenance descriptor a consumer reads
+ * to decide how much the record's diff-binding is worth (#4459).
+ *
+ * Both fields are HASH-COVERED (see {@link computePrReviewRecordHash}). That is
+ * the whole point: a provenance claim outside the self-hash could be upgraded
+ * from `caller-supplied` to `canonical-git` by editing one word in the ledger,
+ * with no `hash_mismatch` — the record would then assert a stronger derivation
+ * than it has, which is exactly the "record that misreports" failure mode.
+ */
+export const PrReviewDiffProvenanceSchema = z
+  .object({
+    /** How the reviewed diff was obtained. */
+    source: PrReviewDiffSourceSchema,
+    /**
+     * Whether the reviewed diff carried parseable `^diff --git` FILE BOUNDARIES
+     * (sourced from the real `splitByFile` result, not a second regex). The one
+     * signal a consumer genuinely CANNOT re-derive from the other record fields:
+     * `looksLikeUnifiedDiff` deliberately accepts plain `diff -u` output, which
+     * has no `diff --git` headers, so a record can be bound to a real diff whose
+     * per-file attribution is unavailable. `false` means "a diff, but the packer
+     * saw it as one undifferentiated blob".
+     */
+    fileBoundaries: z.boolean(),
+  })
+  .strict();
+export type PrReviewDiffProvenance = z.infer<typeof PrReviewDiffProvenanceSchema>;
+
+/**
+ * What the SANITIZER did to the diff between the raw bytes the binding covers
+ * and the text the reviewers actually read (#5385).
+ *
+ * `reviewedDiffHash` binds the RAW diff, because that is the only artifact the
+ * governor gate can recompute from git. But the MCP middleware sanitizes tool
+ * input before the handler sees it — it strips HTML comments and XML-like tags
+ * — so on a repo whose governance PRs carry `<!-- GENERATED:… -->` markers, the
+ * voters demonstrably read different bytes than the record binds.
+ *
+ * That difference is legitimate. Recording the raw hash WITHOUT saying so would
+ * not be: the record would assert "these bytes were reviewed" about bytes no
+ * voter saw. So the disclosure travels with the binding, hash-covered, and a
+ * consumer can tell "the bound bytes survived sanitization" from "a stripped
+ * rendering of them did" by comparing the two hashes.
+ *
+ * ABSENT vs `commentsRemoved: 0`: absence means NO sanitizer was in this
+ * producer's path at all (the local-ledger script reads git directly), which is
+ * a different claim from "a sanitizer ran and removed nothing". Both are honest;
+ * collapsing them would not be.
+ */
+export const PrReviewSanitizationSchema = z
+  .object({
+    /**
+     * The canonical hash (same {@link computeReviewedDiffHash} form) of the
+     * once-sanitized FULL diff. Equal to the record's `reviewedDiffHash` exactly
+     * when the sanitizer changed nothing in `prDiff`.
+     *
+     * NOT "the bytes the voters read", and deliberately not named that. Under
+     * #4140 an over-budget diff is packed to a security-prioritized SUBSET
+     * before the panel prompt is built, so on that path the voters read less
+     * than this hash covers. That reduction is a DIFFERENT one, disclosed
+     * separately in the hash-covered `coverage` record field (#6190; and,
+     * human-readably, the `[partial coverage: …]` summary stamp) and enforced
+     * by `applyPartialCoverageGate`.
+     *
+     * Keeping them apart is the point: one hash covering both reductions could
+     * not tell an auditor WHICH one moved it. This field isolates the
+     * sanitization gap, which is the one `reviewedDiffHash` alone cannot show.
+     */
+    sanitizedDiffHash: z.string().length(64),
+    /**
+     * HTML comments the middleware stripped before dispatch. Non-zero with an
+     * EQUAL `sanitizedDiffHash` is not a contradiction: the counter is over the
+     * whole args object, the hash only over `prDiff`, so a comment stripped from
+     * a sibling field increments one without moving the other.
+     */
+    commentsRemoved: z.number().int().nonnegative(),
+    /**
+     * How many FIELDS the sanitizer changed at all.
+     *
+     * Required alongside the comment counter because the sanitizer removes TWO
+     * things and `commentsRemoved` counts one: XML-like injection tags
+     * (`<system>`, `<context>`, …) are stripped through a separate counter.
+     * Without this, `commentsRemoved: 0` with equal hashes is ambiguous between
+     * a genuine no-op and a tag stripped from a sibling field — and a consumer
+     * reporting the former would be asserting "nothing was removed" about an
+     * input a prompt-injection tag had just been taken out of.
+     *
+     * `fieldsModified === 0` is therefore the ONLY state that licenses "the
+     * sanitizer removed nothing".
+     */
+    fieldsModified: z.number().int().nonnegative(),
+    /**
+     * XML-like conversation-structure tags the sanitizer removed.
+     *
+     * Recorded separately because it CANNOT be derived from the other two.
+     * `fieldsModified` counts FIELDS, so a comment and a tag in one field is a
+     * single modified field, byte-identical to a lone comment — the record could
+     * not represent a masked tag strip at all, and a reader would be told the
+     * removal was routine. That is the reassurance an attacker wants, and it
+     * costs them only an HTML comment.
+     */
+    tagsRemoved: z.number().int().nonnegative(),
+  })
+  .strict();
+export type PrReviewSanitization = z.infer<typeof PrReviewSanitizationSchema>;
+
+/**
+ * Where the panel-read budget came from (#6003). Mirrors the mcp
+ * `PanelBudgetSource` union; the producer's field-by-field mapping is what
+ * keeps them equal — a value added there fails to compile until it is added
+ * here, so the ledger never carries a source this schema would reject.
+ */
+export const PrReviewBudgetSourceSchema = z.enum(['registry', 'binding-cap-fallback']);
+
+/**
+ * What the PANEL read of the diff (#4140, #6003, #6190). Present when the
+ * producer measured coverage at all — the pr_review tool does, whenever the
+ * panel read was partial OR the hash binds only a prefix; the local-ledger
+ * script (which never packs) does not. Absent ⇒ the producer stated nothing;
+ * a consumer must NOT read that as "the panel read everything".
+ *
+ * Structured and HASH-COVERED because the summary could not carry it: the
+ * store caps `summary` at 500 chars and the fixed part of the two stamps is
+ * ~273 of them, so a review that dropped forty files lost most of the
+ * dropped-file list and, past the cap, the binding stamp entirely (#6190). The
+ * one per-review fact that grows without bound — WHICH files the panel never
+ * saw — is exactly the evidence an auditor of a partial review needs, and a
+ * list that is silently cut is a partial review recorded as a fuller one.
+ *
+ * Shape mirrors the mcp `PrReviewBindingCoverage` (minus the constant
+ * `strategy` and the derivable `partial`); every byte field is UTF-8, the unit
+ * the hash truncates on.
+ */
+export const PrReviewPanelCoverageSchema = z
+  .object({
+    /** `'full'` — the panel was sent the whole diff; `'partial'` — a packed subset. */
+    panelRead: z.enum(['full', 'partial']),
+    /** Files whose full diff the panel actually reviewed. */
+    reviewedFiles: z.number().int().nonnegative(),
+    /** Files in the original diff. */
+    totalFiles: z.number().int().nonnegative(),
+    /**
+     * EVERY path the panel did not fully review — the complete list, never a
+     * prefix of it. The summary stamp lists at most a few of these and says
+     * `N dropped (k listed)`; this field is where the rest live.
+     */
+    droppedFiles: z.array(z.string()),
+    /** UTF-8 bytes of the diff text the panel actually read. */
+    reviewedBytes: z.number().int().nonnegative(),
+    /** UTF-8 bytes of the input diff. */
+    totalBytes: z.number().int().nonnegative(),
+    /** Where the panel-read budget came from. */
+    budgetSource: PrReviewBudgetSourceSchema,
+    /** The budget derivation (registry) or the fallback reason, verbatim. */
+    budgetDetail: z.string(),
+  })
+  .strict();
+export type PrReviewPanelCoverage = z.infer<typeof PrReviewPanelCoverageSchema>;
+
+/**
+ * The BOUNDS of what the record's `reviewedDiffHash` binds (#6003, #6190):
+ * every byte of the diff, or only its first `boundBytes`. A separate field
+ * from {@link PrReviewPanelCoverageSchema} because it answers a different
+ * question — the panel may read the whole diff while the hash binds a prefix,
+ * and a record must be able to say both (the two-budget contract, #6003).
+ *
+ * Named `bindingBounds`, not `binding`, on the #6221 ratification panel's
+ * objection: a field called `binding` that carries no hash could be passed
+ * around as if it were the cryptographic binding. It is not. It carries no
+ * hash of its own: the record's `reviewedDiffHash` IS the binding hash, and a
+ * second copy inside another hash-covered field would be one more place for
+ * the two to disagree. This field only says how far that hash reaches.
+ *
+ * Measured over the bytes the hash covers (#6177, closing the #6226 window):
+ * the producer decides `kind` and `boundBytes` from the RAW measurement the
+ * middleware carries (`rawFieldBytes`), the same bytes `reviewedDiffHash`
+ * hashes. When an older middleware hashed but did not measure, the producer
+ * falls back to the sanitized text and DISCLOSES it — the summary stamp
+ * carries `sanitized-fallback` — so a bound that could differ from the hash
+ * by whatever the sanitizer stripped is never presented as a raw one.
+ */
+export const PrReviewBindingBoundsSchema = z
+  .object({
+    /** `'full'` — the hash covers every byte; `'prefix'` — only the first `boundBytes`. */
+    kind: z.enum(['full', 'prefix']),
+    /**
+     * UTF-8 bytes the hash binds: `min(<raw bytes the hash covers>, MAX_REVIEWED_DIFF_BYTES)`.
+     * Not `coverage.totalBytes`, which is the panel-read denominator (the
+     * sanitized text on the MCP path) and differs by whatever the sanitizer
+     * stripped (#6226).
+     */
+    boundBytes: z.number().int().nonnegative(),
+  })
+  .strict();
+export type PrReviewBindingBounds = z.infer<typeof PrReviewBindingBoundsSchema>;
+
+/**
+ * One authentic, self-hashed pr-review record. The `hash` covers every
+ * authenticity field INCLUDING `prNumber`, `baseSha`, `reviewedDiffHash`, `verdict`,
+ * `diffProvenance`, `coverage`, `bindingBounds`, and `sequence`
+ * but EXCLUDING `previousHash`, so the record is tamper-EVIDENT and
+ * POSITION-INDEPENDENT: any edit to a persisted line is detected by
+ * {@link verifyPrReviewRecordSet} as a `hash_mismatch`, while reordering file
+ * lines or merging concurrent branches does NOT break the hash.
+ */
+export const PrReviewRecordSchema = z
+  .object({
+    /**
+     * Schema version. '1.1' was the Option-C binding (#3831): the record binds to
+     * `{prNumber, baseSha, reviewedDiffHash}` instead of the rejected `headSha`.
+     * '1.2' (#4459) marks the boundary at which records began carrying
+     * {@link diffProvenance} — an honest pre/post marker so a reader can tell
+     * "this record predates provenance" from "this record's provenance was
+     * dropped". Clean break, as with '1.0'→'1.1': the committed
+     * `governance/pr-review-records.jsonl` ledger is EMPTY on every install (0
+     * records at the time of this bump), so there is no data to migrate and no
+     * reason to keep a tolerant version union.
+     * '1.3' (#5385) marks the boundary at which {@link reviewedDiffHash} began
+     * binding the PRE-sanitization diff (so it can agree with the gate's git
+     * recompute) and records began carrying {@link sanitization}. Same clean
+     * break for the same reason: the committed ledger is still EMPTY (0 records
+     * at this bump), so no record exists whose hash a version literal would
+     * invalidate. Reading a '1.2' record as if it were '1.3' would be the unsafe
+     * move — its hash may bind SANITIZED bytes the gate can never reproduce.
+     * '1.4' (#6190) marks the boundary at which records began carrying
+     * {@link coverage} and {@link bindingBounds} as structured fields. NOT a clean
+     * break this time: a '1.3' record is still accepted and — because both new
+     * fields are folded into the hash ONLY when present, like `diffProvenance`
+     * and `sanitization` — re-hashes byte-identically (the pinned 1.3 golden in
+     * pr-review-record.test.ts is the guard). This is the vote-record tier
+     * model (`vote-record.ts`, #6179): a 1.3 record differs from a 1.4 one only
+     * in which fields it CAN carry, and reading it as 1.4 is safe because its
+     * hash binds the same raw bytes. Tiers are labels; nothing orders them.
+     */
+    version: z.enum(['1.3', '1.4']),
+    /**
+     * Monotonic sequence number (integer ≥ 0). Assigned as (max existing
+     * sequence)+1 at write time. Sorted, the set of sequences must cover
+     * 0..maxSeq with no gap (omission detection); DUPLICATE sequences are a
+     * benign concurrent-fork signal, not tampering.
+     */
+    sequence: z.number().int().nonnegative(),
+    /** The PR number the review covers. */
+    prNumber: z.number().int().positive(),
+    /**
+     * The 40-hex BASE commit SHA the reviewed diff was computed against (the
+     * `<base>..<head>` range base). Part of the Option-C binding so the gate knows
+     * which range to recompute {@link reviewedDiffHash} over.
+     */
+    baseSha: z
+      .string()
+      .regex(/^[0-9a-f]{40}$/, 'baseSha must be a 40-char lowercase hex commit sha'),
+    /**
+     * DIFF-BINDING (Option-C, #3831): sha256 of the canonical reviewed diff bytes
+     * (see `audit/reviewed-diff-hash.ts` — pinned `git diff` invocation + 50k
+     * byte-truncation). The gate recomputes this from the committed PR's diff and
+     * matches it, so a record only satisfies a PR whose reviewed diff is
+     * byte-identical to what the voters saw. Covered by the self-hash below, so it
+     * cannot be edited to claim a different reviewed diff.
+     */
+    reviewedDiffHash: z.string().length(64),
+    /** ISO-8601 timestamp the review was recorded. */
+    recordedAt: z.string().min(1),
+    /** The resolved aggregate verdict. */
+    verdict: PrReviewVerdictSchema,
+    /**
+     * Whether the aggregate carried a VERIFIED finding (the 4-point gate). A
+     * `request_changes` with `verified: true` is a strict blocker; covered by the
+     * hash so it cannot be flipped without detection.
+     */
+    verified: z.boolean(),
+    /** Per-decision voter tally from the pr_review aggregate. */
+    voteCounts: PrReviewVoteCountsSchema,
+    /** Truncated human-readable review summary for the reviewer record. */
+    summary: z.string(),
+    /** Aggregate explanation; absent on older records. Hash-covered when present. */
+    reason: z.string().optional(),
+    /** Optional correlation/decision id linking to the cost rollup / trace. */
+    correlationId: z.string().min(1).optional(),
+    /**
+     * What this record was DERIVED FROM (#4459). OPTIONAL by necessity: the
+     * schema is `.strict()`, so a required field would reject every record
+     * written before it existed. Absent ⇒ the producer did not state a
+     * provenance; a consumer must NOT read that as `canonical-git`.
+     */
+    diffProvenance: PrReviewDiffProvenanceSchema.optional(),
+    /**
+     * What a sanitizer removed between the bound bytes and the reviewed text
+     * (#5385). OPTIONAL for the same reason {@link diffProvenance} is: the
+     * schema is `.strict()`, and a producer with no sanitizer in its path must
+     * be able to decline to say. Absent ⇒ the producer stated nothing; a
+     * consumer must NOT read that as "nothing was removed".
+     */
+    sanitization: PrReviewSanitizationSchema.optional(),
+    /**
+     * What the panel READ (#6190). OPTIONAL for the same reason the two above
+     * are: the schema is `.strict()`, a '1.3' record has no such field, and a
+     * producer that does not measure coverage (the local-ledger script) must be
+     * able to decline to say. Absent ⇒ nothing stated; NOT "read everything".
+     */
+    coverage: PrReviewPanelCoverageSchema.optional(),
+    /**
+     * How far the hash BINDS (#6190). Same optionality rule. Written together
+     * with {@link coverage} by the pr_review producer; absent ⇒ nothing stated,
+     * and a consumer that needs the answer recomputes it from the diff length
+     * against `MAX_REVIEWED_DIFF_BYTES` (which the governor gate does).
+     */
+    bindingBounds: PrReviewBindingBoundsSchema.optional(),
+    /**
+     * ADVISORY hash of the tip record at write time (absent for the first).
+     * Retained for audit texture but NOT covered by `hash` and NOT verified —
+     * the record-set model is position-independent (mirrors #3927).
+     */
+    previousHash: z.string().length(64).optional(),
+    /** SHA-256 over every field above EXCEPT `previousHash` (and except `hash`). */
+    hash: z.string().length(64),
+  })
+  .strict();
+export type PrReviewRecord = z.infer<typeof PrReviewRecordSchema>;
+
+/** The payload fields (everything except `hash`) — the self-hash projection. */
+type PrReviewRecordPayload = Omit<PrReviewRecord, 'hash'>;
+
+/**
+ * Rebuild the panel coverage in schema order for the hash (#6190). The
+ * dropped-file list is the point: outside the hash, a path could be deleted
+ * from a persisted record and a partial review would read as a fuller one
+ * with no `hash_mismatch`. Field-by-field, the array copied, so the canonical
+ * string depends on neither the caller's key order nor its object (#3962).
+ */
+function projectPanelCoverage(c: PrReviewPanelCoverage): PrReviewPanelCoverage {
+  return {
+    panelRead: c.panelRead,
+    reviewedFiles: c.reviewedFiles,
+    totalFiles: c.totalFiles,
+    droppedFiles: [...c.droppedFiles],
+    reviewedBytes: c.reviewedBytes,
+    totalBytes: c.totalBytes,
+    budgetSource: c.budgetSource,
+    budgetDetail: c.budgetDetail,
+  };
+}
+
+/** Rebuild the binding bounds in schema order for the hash (#6190): `kind`, then `boundBytes`. */
+function projectBindingBounds(b: PrReviewBindingBounds): PrReviewBindingBounds {
+  return { kind: b.kind, boundBytes: b.boundBytes };
+}
+
+/**
+ * Compute the SHA-256 over the canonical payload projection. Folds in EVERY
+ * authenticity-bearing field — crucially `prNumber`, `baseSha`, `reviewedDiffHash`, and `verdict`
+ * (the diff-binding, Option-C), `diffProvenance` (#4459), `sanitization`
+ * (#5385), `coverage` and `bindingBounds` (#6190), plus the monotonic
+ * `sequence` — but EXCLUDES
+ * `previousHash`, so the hash is position-independent and stable across
+ * concurrent-branch merges and file reorders. Built field-by-field (not
+ * `JSON.stringify(record)`) so key-order is deterministic regardless of how the
+ * object was constructed; the nested `voteCounts` is likewise rebuilt in schema
+ * order so a formatter / `jq -S` / merge tool that reorders keys must NOT flip a
+ * legitimate record to `hash_mismatch` (mirrors #3962).
+ */
+export function computePrReviewRecordHash(payload: PrReviewRecordPayload): string {
+  const canonical = JSON.stringify({
+    version: payload.version,
+    sequence: payload.sequence,
+    prNumber: payload.prNumber,
+    baseSha: payload.baseSha,
+    reviewedDiffHash: payload.reviewedDiffHash,
+    recordedAt: payload.recordedAt,
+    verdict: payload.verdict,
+    verified: payload.verified,
+    // Rebuild voteCounts in schema order so the hash does not depend on how the
+    // nested object's keys were ordered (mirrors #3962).
+    voteCounts: {
+      approve: payload.voteCounts.approve,
+      request_changes: payload.voteCounts.request_changes,
+      abstain: payload.voteCounts.abstain,
+      error: payload.voteCounts.error,
+      total: payload.voteCounts.total,
+    },
+    summary: payload.summary,
+    ...(payload.reason !== undefined ? { reason: payload.reason } : {}),
+    correlationId: payload.correlationId ?? null,
+    // #4459 provenance, INSIDE the hash. This projection is an explicit
+    // allowlist, so a schema field omitted here would sit OUTSIDE
+    // tamper-evidence — `caller-supplied` could be edited to `canonical-git`
+    // with no `hash_mismatch`.
+    //
+    // Absent ⇒ the key is OMITTED entirely (not emitted as `null`, unlike
+    // `correlationId` which has always been in the projection). `JSON.stringify`
+    // drops `undefined` values, so a record written WITHOUT provenance produces
+    // a canonical string byte-identical to the pre-#4459 one and keeps its hash.
+    // Emitting `null` here would flip every such record to `hash_mismatch`.
+    // Rebuilt in schema order for the same reason `voteCounts` is (#3962).
+    ...(payload.diffProvenance !== undefined
+      ? {
+          diffProvenance: {
+            source: payload.diffProvenance.source,
+            fileBoundaries: payload.diffProvenance.fileBoundaries,
+          },
+        }
+      : {}),
+    // #5385 sanitization disclosure, INSIDE the hash. Outside it, an editor
+    // could delete the block from a persisted line and turn "the voters read a
+    // stripped rendering of these bytes" into "no sanitizer was in the path"
+    // with no `hash_mismatch` — the record would then claim a cleaner
+    // derivation than it has. Present-only, for the same reason
+    // `diffProvenance` is: omitting the key keeps a record written without a
+    // disclosure byte-identical to its pre-#5385 canonical string.
+    ...(payload.sanitization !== undefined
+      ? {
+          sanitization: {
+            sanitizedDiffHash: payload.sanitization.sanitizedDiffHash,
+            commentsRemoved: payload.sanitization.commentsRemoved,
+            fieldsModified: payload.sanitization.fieldsModified,
+            tagsRemoved: payload.sanitization.tagsRemoved,
+          },
+        }
+      : {}),
+    // #6190 panel coverage and binding bounds, INSIDE the hash. Present-only on the
+    // same rule as the two blocks above, so a 1.3 record projects
+    // byte-identically (the pinned golden is the guard).
+    ...(payload.coverage !== undefined ? { coverage: projectPanelCoverage(payload.coverage) } : {}),
+    ...(payload.bindingBounds !== undefined
+      ? { bindingBounds: projectBindingBounds(payload.bindingBounds) }
+      : {}),
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * Discriminated result from {@link verifyPrReviewRecordSet}. On success it may
+ * surface `forks` — the sequence numbers that appear on more than one record (a
+ * benign concurrent-branch signal, NOT tampering). On failure it names the
+ * tamper/omission signal: `hash_mismatch` (a record's content was edited),
+ * `missing_hash` (a record carries no hash), or `sequence_gap` (a record is
+ * missing from the 0..maxSeq run — an omission).
+ *
+ * NOT detected (#4011): deletion of a fork PARTNER (a record sharing a sequence
+ * with a survivor) leaves no gap, so `ok` stays true. Bounded by the residual-trust
+ * boundary (author-typed records; signing deferred to #3927 item 4) — module header.
+ */
+export type PrReviewRecordVerification =
+  | {
+      ok: true;
+      recordCount: number;
+      forks?: number[];
+      /**
+       * Set when the verified set was EMPTY, so nothing was checked (#5818).
+       *
+       * `ok: true` alone does not distinguish a verified set from an absent
+       * one — the "default reported as a measurement" shape the mission text
+       * rules out. Same field name, value and meaning as `verifyChain`'s
+       * `notVerified: 'empty'` (`audit-logger.ts`), which was added for exactly
+       * this reason; two of the verifiers in this directory already spoke that
+       * vocabulary and these two did not.
+       *
+       * The verdict is deliberately still `ok: true`: an empty ledger is not
+       * evidence of tampering, and failing on it would block every governor PR
+       * while the ledger has no producer. It is the CALLER's job to say
+       * "verified nothing" rather than printing a bare pass.
+       */
+      notVerified?: 'empty';
+    }
+  | {
+      ok: false;
+      reason: 'hash_mismatch' | 'missing_hash' | 'sequence_gap';
+      recordIndex: number;
+      prNumber: number;
+      detail: string;
+    };
+
+/** Per-record self-hash check; null when the record passes. */
+function verifyPrReviewRecord(
+  record: PrReviewRecord,
+  index: number
+): PrReviewRecordVerification | null {
+  if (record.hash.length === 0) {
+    return {
+      ok: false,
+      reason: 'missing_hash',
+      recordIndex: index,
+      prNumber: record.prNumber,
+      detail: `record at index ${String(index)} has no hash`,
+    };
+  }
+  const recomputed = computePrReviewRecordHash(record);
+  if (recomputed !== record.hash) {
+    return {
+      ok: false,
+      reason: 'hash_mismatch',
+      recordIndex: index,
+      prNumber: record.prNumber,
+      detail: `record at index ${String(index)} stored hash=${record.hash} does not match recomputed=${recomputed}`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Verify a tamper-evident SET of pr-review records (mirrors
+ * {@link verifyVoteRecordSet}, #3927). For each record, the self-hash must
+ * recompute from its payload (covers `prNumber`/`baseSha`/`reviewedDiffHash`/`verdict`/`sequence`,
+ * excludes `previousHash`). Order of the array does NOT matter — it is a set, not
+ * a chain. Semantics:
+ *
+ * - Any record whose content was edited → `hash_mismatch`. Empty hash →
+ *   `missing_hash`. Returns the first such record (array-order scan).
+ * - The set of sequence numbers, sorted, must cover `0..maxSeq` with no missing
+ *   value. A GAP (an omitted/deleted record) → `sequence_gap` naming the first
+ *   missing sequence.
+ * - DUPLICATE sequence numbers are a BENIGN concurrent-fork signal (two branches
+ *   appended from the same tip, then merged): NOT a failure. They are surfaced on
+ *   the success result as `forks` (the duplicated sequence numbers, ascending).
+ *
+ * LIMIT (#4011): a duplicate sequence being benign means deleting ONE partner of a
+ * fork leaves the survivor on that sequence — no gap, so this returns `ok`.
+ * Sequence-gap omission detection does NOT cover a deleted fork partner; that
+ * guarantee waits on cryptographic signing (#3927 item 4), not `verification.ok`.
+ *
+ * An empty set verifies trivially.
+ */
+export function verifyPrReviewRecordSet(
+  records: readonly PrReviewRecord[]
+): PrReviewRecordVerification {
+  // 1) Self-hash every record (order-independent).
+  for (let i = 0; i < records.length; i++) {
+    const failure = verifyPrReviewRecord(records[i] as PrReviewRecord, i);
+    if (failure !== null) return failure;
+  }
+
+  if (records.length === 0) return { ok: true, recordCount: 0, notVerified: 'empty' };
+
+  // 2) Sequence coverage: 0..maxSeq with no gap (omission); forks are benign.
+  const census = censusSequences(records);
+  const gap = firstSequenceGap(census);
+  if (gap !== null) {
+    const anchor = records[0] as PrReviewRecord;
+    return {
+      ok: false,
+      reason: 'sequence_gap',
+      recordIndex: 0,
+      prNumber: anchor.prNumber,
+      detail: `sequence gap: missing sequence ${String(gap)} in run 0..${String(census.maxSeq)}`,
+    };
+  }
+
+  const forks = forkSequences(census);
+  return forks.length > 0
+    ? { ok: true, recordCount: records.length, forks }
+    : { ok: true, recordCount: records.length };
+}

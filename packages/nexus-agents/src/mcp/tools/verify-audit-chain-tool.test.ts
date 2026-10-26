@@ -1,0 +1,480 @@
+/**
+ * Tests for verify_audit_chain MCP tool (#2281 follow-up).
+ *
+ * @module mcp/tools/verify-audit-chain-tool.test
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as crypto from 'node:crypto';
+import type { AuditEvent } from '../../audit/audit-types.js';
+import {
+  VerifyAuditChainInputSchema,
+  registerVerifyAuditChainTool,
+  type VerifyAuditChainResponse,
+} from './verify-audit-chain-tool.js';
+import {
+  _resetActiveWorkspaceRootForTests,
+  getNexusDataDir,
+  nexusDataPath,
+  setActiveWorkspaceRoot,
+} from '../../config/nexus-data-dir.js';
+import {
+  createSymlinkEscapeFixture,
+  type SymlinkEscapeFixture,
+} from '../../testing/symlink-escape-fixture.js';
+
+let tmpDir: string;
+
+// Under the data dir, the one audit-log root that holds in every checkout:
+// `os.tmpdir()` sits inside the cwd-local `.nexus-agents` root only when the
+// runner keeps TMPDIR in-repo, which a long checkout path prevents (#6615), and
+// the handler then refuses the fixture dir before reading it.
+beforeEach(() => {
+  fs.mkdirSync(getNexusDataDir(), { recursive: true });
+  tmpDir = fs.mkdtempSync(path.join(getNexusDataDir(), 'nexus-verify-audit-'));
+});
+
+afterEach(() => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+function realHash(event: AuditEvent): string {
+  const data = JSON.stringify({
+    id: event.id,
+    timestamp: event.timestamp,
+    category: event.category,
+    action: event.action,
+    outcome: event.outcome,
+    actor: event.actor,
+    previousHash: event.previousHash,
+  });
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+function makeEvent(
+  id: string,
+  previousHash: string | undefined,
+  overrides: Partial<AuditEvent> = {}
+): AuditEvent {
+  const base: AuditEvent = {
+    id,
+    version: '1.0',
+    timestamp: '2026-04-28T12:00:00.000Z',
+    timestampMs: 1745842800000,
+    category: 'system',
+    severity: 'info',
+    outcome: 'success',
+    action: 'test.action',
+    actor: { type: 'system', id: 'nexus-agents', name: 'Test System' },
+    previousHash,
+    ...overrides,
+  };
+  return { ...base, hash: realHash(base) };
+}
+
+function writeAuditFile(filename: string, events: readonly AuditEvent[]): void {
+  const content = events.map((e) => JSON.stringify(e)).join('\n') + '\n';
+  fs.writeFileSync(path.join(tmpDir, filename), content);
+}
+
+function chain(count: number): AuditEvent[] {
+  const events: AuditEvent[] = [];
+  let prev: string | undefined = undefined;
+  for (let i = 0; i < count; i++) {
+    const e = makeEvent(`aud_${String(i)}`, prev);
+    events.push(e);
+    prev = e.hash;
+  }
+  return events;
+}
+
+describe('VerifyAuditChainInputSchema', () => {
+  it('accepts a valid logDir', () => {
+    const result = VerifyAuditChainInputSchema.safeParse({ logDir: '/var/log/nexus-agents' });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects empty logDir', () => {
+    const result = VerifyAuditChainInputSchema.safeParse({ logDir: '' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects logDir over 512 chars', () => {
+    const result = VerifyAuditChainInputSchema.safeParse({ logDir: 'x'.repeat(513) });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects missing logDir', () => {
+    const result = VerifyAuditChainInputSchema.safeParse({});
+    expect(result.success).toBe(false);
+  });
+});
+
+// The handler is internal but exercised through registerVerifyAuditChainTool;
+// we test the behavior via direct file-system fixtures + the exported types.
+// Each fixture writes audit-*.jsonl files into tmpDir, then we re-export the
+// internal loadAuditEvents+verify pipeline by importing the wrapper module
+// indirectly through its public surface.
+
+describe('verify_audit_chain handler behavior', () => {
+  // Re-implement the file-loader path here to test the contract: this tool
+  // reads audit-*.jsonl files, sorts them lexicographically, parses events,
+  // skips malformed lines, and returns a VerifyAuditChainResponse.
+  //
+  // Direct handler invocation is via registerVerifyAuditChainTool — these
+  // tests verify the response shape we expect from the handler when given
+  // representative fixtures.
+
+  it('verifies a clean single-file chain', async () => {
+    const events = chain(3);
+    writeAuditFile('audit-2026-04-28-12-00-00.jsonl', events);
+
+    // Mimic the handler's loadAuditEvents + verifyChain pipeline.
+    const { verifyChain } = await import('../../audit/audit-logger.js');
+    const result = verifyChain(events);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.eventCount).toBe(3);
+  });
+
+  it('returns segmented diagnostics and detects later tampering without rewriting files', async () => {
+    const first = chain(2);
+    const restart = makeEvent('restart', undefined);
+    const tampered = { ...makeEvent('tampered', restart.hash), action: 'changed' };
+    writeAuditFile('audit-2026-04-28-12-00-00.jsonl', first);
+    writeAuditFile('audit-2026-04-28-13-00-00.jsonl', [restart, tampered]);
+    const filenames = fs.readdirSync(tmpDir).sort();
+    const before = filenames.map((name) => fs.readFileSync(path.join(tmpDir, name), 'utf8'));
+    type Captured =
+      ((a: unknown, c: unknown) => Promise<{ content: Array<{ text: string }> }>) | undefined;
+    let captured: Captured;
+    const server = {
+      registerTool: (_n: string, _s: unknown, h: unknown) => {
+        captured = h as Captured;
+      },
+    };
+    registerVerifyAuditChainTool(server as never, {} as never);
+    expect(captured).toBeDefined();
+    const response = await captured?.({ logDir: tmpDir }, {});
+    const body = JSON.parse(response?.content[0]?.text ?? '{}') as VerifyAuditChainResponse;
+    expect(body.verification).toMatchObject({
+      ok: false,
+      reason: 'previous_hash_mismatch',
+      eventIndex: 2,
+      eventCount: 4,
+      breakCount: 2,
+      segmentCount: 3,
+      tamperedCount: 1,
+      breaks: [
+        { index: 2, kind: 'restart' },
+        { index: 3, kind: 'mismatch' },
+      ],
+      segments: [
+        { start: 0, end: 1, ok: true },
+        { start: 2, end: 2, ok: true },
+        { start: 3, end: 3, ok: false, firstFailure: { index: 3, kind: 'tampered' } },
+      ],
+    });
+    expect(filenames.map((name) => fs.readFileSync(path.join(tmpDir, name), 'utf8'))).toEqual(
+      before
+    );
+  });
+
+  // #4768: the handler serialises the whole verdict, so the unverified marker
+  // reaches the caller without extra wiring — asserted through the REGISTERED
+  // handler rather than by re-calling verifyChain, because "the field exists"
+  // and "a caller sees it" are different claims.
+  it('surfaces notVerified through the tool response for an empty directory', async () => {
+    type Captured =
+      ((a: unknown, c: unknown) => Promise<{ content: Array<{ text: string }> }>) | undefined;
+    let captured: Captured;
+    const server = {
+      registerTool: (_n: string, _s: unknown, h: unknown) => {
+        captured = h as Captured;
+      },
+    };
+    registerVerifyAuditChainTool(server as never, {} as never);
+    expect(captured).toBeDefined();
+
+    const res = await captured?.({ logDir: tmpDir }, {});
+    const body = res?.content[0]?.text ?? '';
+
+    // The directory has no audit files in this test, so the verdict must say so.
+    expect(body).toContain('"notVerified"');
+    expect(body).toContain('empty');
+  });
+
+  // #4787: the loader drops unreadable files and unparseable/invalid lines with
+  // nothing but a logger.warn, so a verdict computed over PART of the log was
+  // reported identically to one computed over all of it. A bounded read is
+  // fine; a bounded read recorded as complete is the failure.
+  describe('coverage reporting (#4787)', () => {
+    /** Invokes the registered handler and returns the parsed response body. */
+    async function callHandler(dir: string): Promise<VerifyAuditChainResponse> {
+      type Captured =
+        ((a: unknown, c: unknown) => Promise<{ content: Array<{ text: string }> }>) | undefined;
+      let captured: Captured;
+      const server = {
+        registerTool: (_n: string, _s: unknown, h: unknown) => {
+          captured = h as Captured;
+        },
+      };
+      registerVerifyAuditChainTool(server as never, {} as never);
+      const res = await captured?.({ logDir: dir }, {});
+      return JSON.parse(res?.content[0]?.text ?? '{}') as VerifyAuditChainResponse;
+    }
+
+    it('reports the number of lines it could not read', async () => {
+      const events = chain(3);
+      const good = events.map((e) => JSON.stringify(e));
+      // Two lines an adversary or a truncated write would leave behind: one
+      // that is not JSON at all, one that is JSON but not an AuditEvent.
+      fs.writeFileSync(
+        path.join(tmpDir, 'audit-2026-04-28-12-00-00.jsonl'),
+        [good[0]!, 'not json at all', good[1]!, '{"id":"x"}', good[2]!].join('\n') + '\n'
+      );
+
+      const body = await callHandler(tmpDir);
+
+      expect(body.skippedLines).toBe(2);
+      // The parsed subset still chains, so without the count this reads as a
+      // clean verdict over the whole log.
+      expect(body.eventCount).toBe(3);
+      expect(body.verification.ok).toBe(true);
+    });
+
+    it('states the partial read on the verdict itself, not only beside it (#4805)', async () => {
+      // The sibling `skippedLines` above is read only by a caller who knows to
+      // look. `ChainVerification` is the artifact that gets serialized and
+      // passed on alone, so the coverage has to travel with it. Panel Option A,
+      // 4-1.
+      const good = chain(3).map((e) => JSON.stringify(e));
+      fs.writeFileSync(
+        path.join(tmpDir, 'audit-2026-04-28-12-00-00.jsonl'),
+        [good[0]!, 'not json at all', good[1]!, '{"id":"x"}', good[2]!].join('\n') + '\n'
+      );
+
+      const body = await callHandler(tmpDir);
+
+      expect(body.verification.ok).toBe(true);
+      if (!body.verification.ok) return;
+      expect(body.verification.coverage).toEqual({ skipped: 2, unreadableFiles: 0 });
+    });
+
+    it('states full coverage positively when nothing was skipped (#4805)', async () => {
+      // The pair. A tool that hardcoded `skipped: 0` would satisfy nothing
+      // above and everything here, so both directions are needed.
+      writeAuditFile('audit-2026-04-28-12-00-00.jsonl', chain(3));
+
+      const body = await callHandler(tmpDir);
+
+      expect(body.verification.ok).toBe(true);
+      if (!body.verification.ok) return;
+      expect(body.verification.coverage).toEqual({ skipped: 0, unreadableFiles: 0 });
+    });
+
+    it('omits the count when nothing was skipped, so absence stays meaningful', async () => {
+      writeAuditFile('audit-2026-04-28-12-00-00.jsonl', chain(3));
+
+      const body = await callHandler(tmpDir);
+
+      expect(body.skippedLines).toBeUndefined();
+      expect(body.unreadableFiles).toBeUndefined();
+    });
+
+    it('counts a file it could not open at all', async () => {
+      // A directory named like a log file: `readFile` throws EISDIR, taking the
+      // loader's unreadable-file path. Portable, and does not depend on running
+      // as a non-root user the way a chmod-000 fixture would.
+      //
+      // #4788 shipped this counter with no test — deleting `unreadableFiles++`
+      // left all twelve tests green, because every fixture exercised unparseable
+      // LINES and none an unopenable FILE.
+      writeAuditFile('audit-2026-04-28-12-00-00.jsonl', chain(2));
+      fs.mkdirSync(path.join(tmpDir, 'audit-2026-04-28-13-00-00.jsonl'));
+
+      const body = await callHandler(tmpDir);
+
+      expect(body.unreadableFiles).toBe(1);
+      // The readable file still verifies — resilient reading is the policy;
+      // the caller is just told what it cost.
+      expect(body.eventCount).toBe(2);
+      expect(body.fileCount).toBe(2);
+    });
+
+    it('distinguishes a wholly unparseable log from an empty one', async () => {
+      // The worst case: every line is garbage. Before this the response was
+      // eventCount 0 + notVerified "empty" — identical to an empty directory.
+      fs.writeFileSync(
+        path.join(tmpDir, 'audit-2026-04-28-12-00-00.jsonl'),
+        ['garbage', 'more garbage'].join('\n') + '\n'
+      );
+
+      const body = await callHandler(tmpDir);
+
+      expect(body.eventCount).toBe(0);
+      expect(body.skippedLines).toBe(2);
+      expect(body.fileCount).toBe(1);
+    });
+  });
+
+  it('verifies a clean multi-file chain in lexicographic order', async () => {
+    const all = chain(6);
+    writeAuditFile('audit-2026-04-28-12-00-00.jsonl', all.slice(0, 3));
+    writeAuditFile('audit-2026-04-28-13-00-00.jsonl', all.slice(3));
+
+    const { verifyChain } = await import('../../audit/audit-logger.js');
+    const result = verifyChain(all);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.eventCount).toBe(6);
+  });
+
+  it('detects tampering when an event body is modified across files', async () => {
+    const all = chain(4);
+    const tampered = { ...all[2]!, action: 'malicious.action' };
+    const concatenated = [all[0]!, all[1]!, tampered, all[3]!];
+
+    const { verifyChain } = await import('../../audit/audit-logger.js');
+    const result = verifyChain(concatenated);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('hash_mismatch');
+      expect(result.eventIndex).toBe(2);
+    }
+  });
+
+  it('produces a VerifyAuditChainResponse with the expected shape', () => {
+    const response: VerifyAuditChainResponse = {
+      logDir: '/tmp/test-audit',
+      fileCount: 2,
+      eventCount: 6,
+      verification: { ok: true, eventCount: 6 },
+    };
+    expect(response.fileCount).toBe(2);
+    expect(response.verification.ok).toBe(true);
+  });
+});
+
+// logDir is a caller-supplied path the tool reads every matching file under,
+// so it is contained to the roots that legitimately hold audit logs.
+describe('verify_audit_chain logDir containment', () => {
+  let fx: SymlinkEscapeFixture;
+
+  beforeEach(() => {
+    fx = createSymlinkEscapeFixture();
+  });
+
+  afterEach(() => {
+    fx.cleanup();
+  });
+
+  type Captured =
+    | ((a: unknown, c: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>)
+    | undefined;
+
+  async function call(
+    logDir: string,
+    deps: Record<string, unknown> = {}
+  ): Promise<{ isError: boolean; text: string }> {
+    let captured: Captured;
+    const server = {
+      registerTool: (_n: string, _s: unknown, h: unknown) => {
+        captured = h as Captured;
+      },
+    };
+    registerVerifyAuditChainTool(server as never, deps as never);
+    const res = await captured?.({ logDir }, {});
+    return { isError: res?.isError === true, text: res?.content[0]?.text ?? '' };
+  }
+
+  it('accepts the default audit directory', async () => {
+    const defaultDir = nexusDataPath('audit');
+    fs.mkdirSync(defaultDir, { recursive: true });
+
+    const res = await call(defaultDir);
+
+    expect(res.isError).toBe(false);
+    expect((JSON.parse(res.text) as VerifyAuditChainResponse).logDir).toBe(
+      fs.realpathSync(defaultDir)
+    );
+  });
+
+  it('rejects a directory outside every data root', async () => {
+    const res = await call(fx.outsideDir);
+
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/logDir must be within/);
+  });
+
+  it('rejects a ../ path that climbs out of the data root', async () => {
+    const res = await call(path.join(nexusDataPath('audit'), '..', '..', '..', '..', '..', '..'));
+
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/logDir must be within/);
+  });
+
+  it('rejects a sibling directory that shares the data root as a name prefix', async () => {
+    // The cwd-local `.nexus-agents` root is the one whose parent is not
+    // itself a root in the test run, so its prefix-sibling is outside them all.
+    const sibling = `${path.resolve('.nexus-agents')}EVIL`;
+    fs.mkdirSync(sibling, { recursive: true });
+    try {
+      const res = await call(sibling);
+      expect(res.isError).toBe(true);
+      expect(res.text).toMatch(/logDir must be within/);
+    } finally {
+      fs.rmSync(sibling, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a symlink inside the data root whose target is outside it', async () => {
+    const link = path.join(getNexusDataDir(), `escape-${crypto.randomUUID()}`);
+    fs.mkdirSync(getNexusDataDir(), { recursive: true });
+    fs.symlinkSync(fx.outsideDir, link, 'dir');
+    try {
+      const res = await call(link);
+      expect(res.isError).toBe(true);
+      expect(res.text).toMatch(/logDir must be within/);
+    } finally {
+      fs.rmSync(link, { force: true });
+    }
+  });
+
+  describe('repo-local .nexus-agents root', () => {
+    afterEach(() => {
+      _resetActiveWorkspaceRootForTests();
+    });
+
+    it('accepts an audit dir under a real repo-local .nexus-agents', async () => {
+      const repo = path.join(fx.insideDir, 'repo-real');
+      const auditDir = path.join(repo, '.nexus-agents', 'audit');
+      fs.mkdirSync(auditDir, { recursive: true });
+      expect(setActiveWorkspaceRoot(repo)).toBe(true);
+
+      const res = await call(auditDir);
+
+      expect(res.isError).toBe(false);
+    });
+
+    it('drops a .nexus-agents that is a symlink resolving outside its repo', async () => {
+      const repo = path.join(fx.insideDir, 'repo-linked');
+      fs.mkdirSync(repo);
+      fs.symlinkSync('/', path.join(repo, '.nexus-agents'), 'dir');
+      expect(setActiveWorkspaceRoot(repo)).toBe(true);
+
+      const res = await call(fx.outsideDir);
+
+      expect(res.isError).toBe(true);
+      expect(res.text).toMatch(/logDir must be within/);
+    });
+  });
+
+  it('accepts the logDir the audit logger is configured to write', async () => {
+    const res = await call(fx.outsideDir, {
+      security: { audit: { enabled: true, logDir: fx.outsideDir } },
+    });
+
+    expect(res.isError).toBe(false);
+  });
+});

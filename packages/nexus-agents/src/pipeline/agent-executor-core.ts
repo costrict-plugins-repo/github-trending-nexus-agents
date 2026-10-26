@@ -1,0 +1,433 @@
+/**
+ * Agent Executor core — the helpers every pipeline stage shares (#1684, #6331).
+ *
+ * Stage-event emission, OutcomeStore recording, the budget-guarded expert
+ * call, progress comments and the executor config. Extracted from
+ * `agent-executor.ts` so each stage module imports one seam instead of the
+ * whole executor.
+ *
+ * @module pipeline/agent-executor-core
+ */
+
+import { createLogger, getTimeProvider } from '../core/index.js';
+import type { ExecutionAccessMode } from '../core/index.js';
+import type { CommandWrapper } from '../cli-adapters/exec-file-tree.js';
+import type { IAuditLogger } from '../audit/audit-types.js';
+import type { ITaskTracker } from './task-tracker.js';
+import type { SecurityBaseline, SecurityGateResult } from './security-gate.js';
+import type { DevPipelineStages } from './dev-pipeline.js';
+import { executeExpert, type ExpertBridgeResult } from './expert-bridge.js';
+import type { BudgetGuard, AgentBudgetConfig } from './budget-guard.js';
+import type { BuiltInExpertType } from '../agents/experts/expert-config.js';
+import { getOutcomeStore } from '../orchestration/outcomes/outcome-store.js';
+import {
+  accessModeSignal,
+  outcomeFailureFields,
+  TRACE_ID_MAX_LENGTH,
+} from '../orchestration/outcomes/outcome-types.js';
+import { pipelineRunId } from './pipeline-run-id.js';
+import { emitPipelineStageEvent, emitModelCalled } from './pipeline-observability.js';
+import type { OutcomeCli, OutcomeRoutedBy } from '../orchestration/outcomes/outcome-types.js';
+import {
+  servedOutcomeFields,
+  type ServedCall,
+} from '../orchestration/outcomes/outcome-served-model.js';
+
+/**
+ * The run id a stage outcome joins its trace on (#6858). Absent when there is no
+ * session, or when the id would exceed the persisted cap: an over-long traceId
+ * makes the whole row fail validation on reload, so the row is kept and simply
+ * counted as unmatched.
+ */
+function pipelineTraceId(sessionId: string | undefined): { traceId?: string } {
+  if (sessionId === undefined) return {};
+  const traceId = pipelineRunId(sessionId);
+  return traceId.length <= TRACE_ID_MAX_LENGTH ? { traceId } : {};
+}
+
+const logger = createLogger({ component: 'agent-executor' });
+
+// DRY: delegate to shared pipeline-observability.ts (#1734 Phase 1.1)
+/**
+ * What a stage records when no trust tier reached it (#4694).
+ *
+ * The empty case is NAMED rather than defaulted. Recording an absent tier as
+ * `'1'`, or omitting the field, would make an unmeasured run indistinguishable
+ * from a trusted one — and four voters made this an explicit condition of
+ * approving the record-first approach: "a check that cannot fail is not a
+ * check, and neither is a recorder that fills in trusted-by-default."
+ */
+export const UNMEASURED_TRUST_TIER = 'unmeasured';
+
+export function emitStageEvent(
+  stage: string,
+  status: 'started' | 'completed' | 'failed',
+  details?: Record<string, unknown>
+): void {
+  emitPipelineStageEvent('dev-pipeline', stage, status, details);
+}
+
+/** Options bundle for {@link recordOutcome} (collapses to satisfy max-params). */
+interface RecordOutcomeArgs {
+  /** Reachable pipeline session; absent means this row cannot join a run trace. */
+  sessionId: string | undefined;
+  taskId: string;
+  category: string;
+  /**
+   * CLI that actually executed the stage. Pre-#2823 this helper hardcoded
+   * `cli: 'claude'`, which was a regression of the bug #1154 fixed elsewhere
+   * and silently corrupted weather-report + LinUCB cold-start warmStart()
+   * with false `claude` credit on every pipeline run.
+   *
+   * When `undefined` (the bridge failed before dispatch — no adapter,
+   * circuit-open, rate-limit cap — or the stage is non-CLI, like local
+   * security scan) we *skip the record* rather than lie. The stage event
+   * is still emitted; only the cli-attributed outcome that would poison
+   * the routing learner is suppressed.
+   * Explicit `unknown` records a failure without attributing it to a routing
+   * arm, such as a vote stage that could not obtain a decision.
+   */
+  cli: OutcomeCli | undefined;
+  /**
+   * The bridge result's `routedBy` (#6521), copied onto the outcome. Required
+   * (though it may be `undefined`) so every call site states it: a stage that
+   * forgot to forward it would silently drop the routed marker, and the
+   * compiler is what names the call sites.
+   */
+  routedBy: OutcomeRoutedBy | undefined;
+  /**
+   * The model that served the stage and its token usage (#6624), recorded as
+   * `servedModel` and its cost beside the `pipeline` marker in `model`.
+   * Required (though it may be `undefined`) for the same reason as
+   * {@link routedBy}: a stage that forgot to forward it would silently lose the
+   * served model, and the compiler is what names the call sites.
+   */
+  served: ServedCall | undefined;
+  /**
+   * The access mode the arm that served the expert call reported enforcing
+   * (#6792), recorded as an `access-mode:<mode>` quality signal so the audit
+   * trail shows which calls ran unrestricted. Required (though it may be
+   * `undefined`) for the same reason as {@link routedBy}. `undefined` means
+   * no arm reported one; see {@link requestedAccessMode}.
+   */
+  accessMode: ExecutionAccessMode | undefined;
+  /**
+   * The mode the caller asked for (#6792). Recorded as
+   * `access-mode-requested:<mode>` only when {@link accessMode} is absent, so
+   * a failed call still says what it asked for without claiming enforcement.
+   * `undefined` on a stage without an expert call: no signal at all.
+   */
+  requestedAccessMode: ExecutionAccessMode | undefined;
+  success: boolean;
+  durationMs: number;
+  /** Failure message; classified into `failureCategory` on a failed row (#6521). */
+  error?: string | undefined;
+  /** Extra signals, e.g. the QA verdict, kept out of `success` (#6521 I2). */
+  qualitySignals?: readonly string[];
+  routingStage?: string;
+  retryCount?: number;
+}
+
+/**
+ * Outcome fields of an expert call, derived in one place (#6521).
+ *
+ * `success` is the CALL's success: whether the routed arm ran the task. A
+ * stage's own verdict (QA pass/reject) is a judgement of other work and goes
+ * in `qualitySignals`, not here. `durationMs` is the arm's own run time when
+ * the router reported it, else the bridge's wall time.
+ */
+export function outcomeFieldsFromBridge(
+  r: ExpertBridgeResult
+): Pick<
+  RecordOutcomeArgs,
+  | 'cli'
+  | 'routedBy'
+  | 'served'
+  | 'accessMode'
+  | 'requestedAccessMode'
+  | 'success'
+  | 'durationMs'
+  | 'error'
+> {
+  return {
+    // #6552: the arm that ran; `r.cli` is its display slot.
+    cli: r.routedArm ?? r.cli,
+    routedBy: r.routedBy,
+    // #6792: what the served arm enforced, and what was asked for.
+    accessMode: r.accessMode,
+    requestedAccessMode: r.requestedAccessMode,
+    // #6624: the model that answered, priced by its gateway when one served it.
+    served: {
+      model: r.model,
+      gatewayArm: r.gatewayArm,
+      inputTokens: r.tokensIn,
+      outputTokens: r.tokensOut,
+    },
+    success: r.success,
+    durationMs: r.routedDurationMs ?? r.durationMs,
+    error: r.error,
+  };
+}
+
+/** Record a pipeline-stage outcome to the OutcomeStore. See {@link RecordOutcomeArgs}. */
+export function recordOutcome(args: RecordOutcomeArgs): void {
+  if (args.cli === undefined) {
+    logger.debug('Skipping outcome record — no cli (bridge failed or non-CLI stage)', {
+      taskId: args.taskId,
+      category: args.category,
+      success: args.success,
+    });
+    return;
+  }
+  try {
+    // #2961: persisted outcome IDs/timestamps must go through the time
+    // provider so replay/snapshot tests can reproduce.
+    const nowMs = getTimeProvider().now();
+    const qualitySignals = outcomeQualitySignals(args);
+    getOutcomeStore().append({
+      id: `pipeline-${args.taskId}-${String(nowMs)}`,
+      ...pipelineTraceId(args.sessionId),
+      cli: args.cli,
+      category: args.category as 'code_generation',
+      model: 'pipeline',
+      success: args.success,
+      durationMs: args.durationMs,
+      timestamp: new Date(nowMs).toISOString(),
+      source: 'delegate' as const,
+      routingStage: args.routingStage,
+      retryCount: args.retryCount,
+      ...(args.routedBy !== undefined && { routedBy: args.routedBy }),
+      ...servedOutcomeFields(args.served),
+      ...(qualitySignals.length > 0 && { qualitySignals }),
+      ...outcomeFailureFields(args.success, args.error),
+    });
+  } catch (error) {
+    logger.debug('Failed to record outcome', { taskId: args.taskId, error: String(error) });
+  }
+}
+
+/**
+ * A row's quality signals: the stage's own, then the call's access mode
+ * (#6792). Empty when there are none, so the row carries no `qualitySignals`
+ * field, as before.
+ */
+function outcomeQualitySignals(args: RecordOutcomeArgs): string[] {
+  return [...(args.qualitySignals ?? []), ...accessModeSignals(args)];
+}
+
+/** The row's access-mode signal: enforced when an arm reported it, else requested. */
+function accessModeSignals(args: RecordOutcomeArgs): string[] {
+  if (args.accessMode !== undefined) return [accessModeSignal(args.accessMode, 'enforced')];
+  if (args.requestedAccessMode !== undefined) {
+    return [accessModeSignal(args.requestedAccessMode, 'requested')];
+  }
+  return [];
+}
+
+/** Configuration for the agent executor. */
+export interface AgentExecutorConfig {
+  /** Restrict every expert stage to read-only analysis during a dry run. */
+  readonly dryRun?: boolean | undefined;
+  /** Pipeline checkpoint session, also used by the run trace; absent means unscoped. */
+  readonly sessionId?: string | undefined;
+  readonly scanTarget?: string | undefined;
+  /** The pipeline's pinned base commit and its source repository. */
+  readonly securityBaseline?: SecurityBaseline | undefined;
+  readonly simulateVotes?: boolean | undefined;
+  /** Voting strategy for consensus stages (default: higher_order). */
+  readonly votingStrategy?:
+    'simple_majority' | 'supermajority' | 'unanimous' | 'higher_order' | 'opinion_wise' | undefined;
+  /** Use 3 agents instead of the full 7-role panel for faster voting (default: false). */
+  readonly quickMode?: boolean | undefined;
+  readonly tracker?: ITaskTracker | undefined;
+  readonly issueNumber?: number | undefined;
+  readonly repo?: string | undefined;
+  /**
+   * Opt-in per-run token budget (#3395). When set, expert calls are metered
+   * through a {@link BudgetGuard}: once cumulative usage crosses the ceiling,
+   * further expert calls short-circuit to a failure result (stopping spend)
+   * rather than aborting mid-pipeline. Absent → no enforcement (default).
+   */
+  readonly budget?: AgentBudgetConfig | undefined;
+  /**
+   * Caller authentication from measuredTrustTier(), recorded at stage entry.
+   * Absent callerInfo means 'unmeasured'; the MCP server supplies the connected
+   * transport as callerInfo (#6795), so a stdio caller records Tier 1.
+   * Enforced at startStage for execute stages (#4694). Takes precedence over trustTier.
+   */
+  readonly callerTrustTier?: string | undefined;
+  /**
+   * Caller authentication, emitted with the same value as callerTrustTier.
+   * @deprecated Use callerTrustTier. Removal is scheduled for the next major.
+   */
+  readonly trustTier?: string | undefined;
+  /** Whether the handler's sanitizer changed its input; absent means 'unmeasured'. */
+  readonly inputSanitization?: 'unmeasured' | 'unmodified' | 'modified' | undefined;
+  /** Sanitizer counts, emitted beside inputSanitization only when it is 'modified'. */
+  readonly inputSanitizationCounts?:
+    | {
+        readonly tagsRemoved: number;
+        readonly commentsRemoved: number;
+        readonly fieldsModified: number;
+      }
+    | undefined;
+  /** Server's durable audit logger for hash-chained policy records (#4694). */
+  readonly auditLogger?: IAuditLogger | undefined;
+}
+
+/** Preserve the security gate's structured evidence in the execution-stage result. */
+export function securityStageResult(
+  result: SecurityGateResult,
+  passed: boolean
+): Awaited<ReturnType<DevPipelineStages['securityScan']>> {
+  return {
+    passed,
+    verdict: result.verdict,
+    feedback: result.details,
+    ...(result.comparison !== undefined ? { comparison: result.comparison } : {}),
+    ...(result.coverageNote !== undefined ? { coverageNote: result.coverageNote } : {}),
+  };
+}
+
+/**
+ * Throw once the stage's signal has fired (#6736): the abort's own reason when
+ * it is an Error (a stage-deadline `TimeoutError`, a job cancel), else a
+ * generic one. Read through a call, never inline: TypeScript narrows
+ * `signal.aborted` after one check, which is unsound across the `await` of the
+ * expert call.
+ */
+function throwIfAborted(signal: AbortSignal | undefined, expertType: BuiltInExpertType): void {
+  if (signal?.aborted !== true) return;
+  const reason: unknown = signal.reason;
+  throw reason instanceof Error ? reason : new Error(`${expertType} expert call aborted`);
+}
+
+/** Per-call options for {@link runExpert}. */
+interface RunExpertOptions {
+  /** Sandbox the complete expert subprocess when bound to scratch. */
+  readonly wrapper?: CommandWrapper | undefined;
+  /** Explicit working directory for scratch-bound implementation and review. */
+  readonly workDir?: string | undefined;
+  /**
+   * The stage's abort signal (#6736): it reaches the routed CLI call, and once
+   * it has fired {@link runExpert} THROWS instead of returning a failure
+   * result, so a stage that was cancelled or timed out does not go on to
+   * record the aborted call as the model's failure.
+   */
+  readonly signal?: AbortSignal | undefined;
+  /**
+   * Host access the expert's call may use (#6768, #6958). Planning, review
+   * and dry-run stages set `'read-only-analysis'`; absent means the default.
+   */
+  readonly accessMode?: ExecutionAccessMode | undefined;
+}
+
+/**
+ * Run an expert through the per-run budget guard (#3395): skip (and return a
+ * failure result) once the budget is exhausted, otherwise execute and record
+ * the tokens consumed. A no-budget guard makes this a transparent passthrough.
+ */
+export async function runExpert(
+  guard: BudgetGuard,
+  expertType: BuiltInExpertType,
+  prompt: string,
+  executionId?: string,
+  options: RunExpertOptions = {}
+): Promise<ExpertBridgeResult> {
+  const { signal, accessMode, workDir, wrapper } = options;
+  throwIfAborted(signal, expertType);
+  if (guard.isExhausted()) {
+    // Observable escalation (#3262): a budget short-circuit must not be silent.
+    // Emit a pipeline event + structured log so operators can see the run was
+    // capped by its estimate-relative budget rather than failing for another
+    // reason. Still a fail-CLOSED skip (no further token spend).
+    emitPipelineStageEvent('dev-pipeline', 'budget', 'failed', {
+      reason: 'budget_exceeded',
+      expertType,
+      ...(executionId !== undefined ? { executionId } : {}),
+    });
+    logger.warn('Budget exhausted — expert call skipped (#3262/#3395)', {
+      expertType,
+      ...(executionId !== undefined ? { executionId } : {}),
+    });
+    return {
+      success: false,
+      text: '',
+      expertType,
+      durationMs: 0,
+      error: 'Budget exhausted — expert call skipped (estimate-relative cap, #3262/#3395)',
+    };
+  }
+  const bridgeOptions = {
+    ...(wrapper !== undefined && { wrapper }),
+    ...(workDir !== undefined && { workDir }),
+    ...(signal !== undefined && { signal }),
+    ...(accessMode !== undefined && { accessMode }),
+  };
+  const result =
+    Object.keys(bridgeOptions).length === 0
+      ? await executeExpert(expertType, prompt)
+      : await executeExpert(expertType, prompt, bridgeOptions);
+  guard.record(result.tokensUsed);
+  throwIfAborted(signal, expertType);
+  maybeEmitModelCalled(executionId, result);
+  return result;
+}
+
+/**
+ * Emit a `model.called` observability event (#3387) for a completed expert call
+ * — but only a *meaningful* one. We require, per the consensus refinements:
+ *  - a successful call (never a partial event on failure),
+ *  - an `executionId` to attribute it to (skip rather than emit an empty id),
+ *  - a known `cli` + `model`, and real token usage (`tokensIn`/`tokensOut`).
+ * When usage is absent (CLI-subprocess paths whose extractUsage returns null) we
+ * skip rather than emit zeros — same "skip, don't lie" rule as recordOutcome.
+ * This is purely additive: OutcomeStore stays the single outcome authority, so
+ * there is no double-counting.
+ */
+function maybeEmitModelCalled(executionId: string | undefined, result: ExpertBridgeResult): void {
+  if (!result.success || executionId === undefined) return;
+  if (result.cli === undefined || result.model === undefined) return;
+  if (result.tokensIn === undefined || result.tokensOut === undefined) return;
+  emitModelCalled({
+    executionId,
+    cli: result.cli,
+    model: result.model,
+    tokensIn: result.tokensIn,
+    tokensOut: result.tokensOut,
+    durationMs: result.durationMs,
+  });
+}
+
+/** What every stage closure needs from the executor. */
+export interface StageDeps {
+  /** Authoritative scratch root for security coverage of the captured patch. */
+  readonly workspaceRoot?: string | undefined;
+  readonly wrapper?: import('../cli-adapters/exec-file-tree.js').CommandWrapper | undefined;
+  readonly workspaceDependencies?: import('./dev-pipeline.js').DevPipelineDependencies | undefined;
+  readonly config: AgentExecutorConfig;
+  /** Per-run budget guard (#3395). No-op unless config.budget is set. */
+  readonly guard: BudgetGuard;
+  /** Emits the stage `started` event and enforces trust-tier policy (#4694, #4733). */
+  readonly startStage: (stage: string, stageType?: 'plan' | 'execute') => void;
+}
+
+// ============================================================================
+// Progress Tracking
+// ============================================================================
+
+export async function postProgress(
+  config: AgentExecutorConfig,
+  stage: string,
+  message: string
+): Promise<void> {
+  // DRY: tracker.postComment() is the canonical path — delegates to GitHubProvider/GitLabProvider
+  // Raw gh CLI calls removed (#1711): tracker already handles this via scm/github-provider.ts
+  if (config.tracker !== undefined && config.issueNumber !== undefined) {
+    try {
+      await config.tracker.postComment(String(config.issueNumber), `**[${stage}]** ${message}`);
+    } catch {
+      logger.debug('Failed to post progress', { stage, issueNumber: config.issueNumber });
+    }
+  }
+}

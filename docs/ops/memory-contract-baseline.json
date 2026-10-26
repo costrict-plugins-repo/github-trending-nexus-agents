@@ -1,0 +1,24 @@
+{
+  "entries": [
+    {
+      "file": "packages/nexus-agents/src/config/learning-persistence.ts",
+      "probeId": "outcomes-jsonl-path",
+      "note": "return join(getLearningDir(), 'outcomes.jsonl');"
+    },
+    {
+      "file": "packages/nexus-agents/src/config/learning-persistence.ts",
+      "probeId": "outcomes-jsonl-path",
+      "note": "return join(getLearningDir(), 'meta-outcomes.jsonl');"
+    },
+    {
+      "file": "packages/nexus-agents/src/context/mobimem.ts",
+      "probeId": "mobimem-direct-construct",
+      "note": "return new MobiMem(config);"
+    },
+    {
+      "file": "packages/nexus-agents/src/context/mobimem.ts",
+      "probeId": "mobimem-direct-construct",
+      "note": "sharedInstance ??= new MobiMem({ dbPath: resolveSharedDbPath() });"
+    }
+  ]
+}

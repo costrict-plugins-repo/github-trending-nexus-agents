@@ -1,0 +1,509 @@
+/**
+ * Overall-deadline racing for consensus voting (Issue #1871).
+ *
+ * Defensive layer above per-vote timeouts: even if a single
+ * executeAgentVote() promise never settles (subprocess adapter hang,
+ * IPC wait that swallows timeout, etc.), this helper guarantees the
+ * whole consensus call returns bounded partial results.
+ *
+ * Each role's vote promise is raced against a shared wall-clock
+ * deadline. Any role whose promise has not settled when the deadline
+ * fires is filled with createErrorVoteResult('overall consensus
+ * deadline exceeded'), preserving role order so downstream aggregation
+ * stays deterministic.
+ */
+import type { IModelAdapter, ILogger } from '../core/index.js';
+import type {
+  AgentVoteResult,
+  SeatAttemptTiming,
+  VoterRole,
+  VoteExecutionOverrides,
+} from './vote-types.js';
+import { createErrorVoteResult, delay } from './voter-execution.js';
+import { crossCliFallback, withAssignedCli } from './voter-fallback.js';
+import { carryAttemptUsage } from './voter-attempt-usage.js';
+import {
+  VoterAttemptCollector,
+  withVoterAttemptTelemetry,
+  preserveVoterAttemptTelemetry,
+  type VoterAttemptKind,
+} from './voter-attempt-events.js';
+import { observeLateVoter } from './voter-late-settlement.js';
+import { getMcpSafeDeadlineMs, VOTE_TIMEOUTS } from '../config/timeouts.js';
+import { reaskUnresolvedOption } from './voter-option-reask.js';
+
+/** Worst-case legitimate vote time plus stagger and buffer (#1871). */
+export function computeOverallConsensusDeadlineMs(
+  timeoutMs: number,
+  maxRetries: number,
+  roleCount: number,
+  interDelayMs: number
+): number {
+  const perVoteBudget = timeoutMs * (maxRetries + 1);
+  const staggerBudget = Math.max(0, roleCount - 1) * interDelayMs;
+  return perVoteBudget + staggerBudget + VOTE_TIMEOUTS.overallDeadlineBufferMs;
+}
+
+/** One deadline for first pass, backoff, and retry; clamped below the MCP wrapper (#2105). */
+export function resolvePanelDeadline(
+  timeoutMs: number,
+  maxRetries: number,
+  roleCount: number,
+  interDelayMs: number,
+  logger: ILogger
+): { overallDeadlineMs: number; deadlineAtMs: number } {
+  const computedDeadlineMs = computeOverallConsensusDeadlineMs(
+    timeoutMs,
+    maxRetries,
+    roleCount,
+    interDelayMs
+  );
+  const overallDeadlineMs = getMcpSafeDeadlineMs(computedDeadlineMs, 'consensus_vote');
+  if (overallDeadlineMs < computedDeadlineMs) {
+    logger.debug('Consensus deadline clamped to MCP wrapper timeout', {
+      computedDeadlineMs,
+      overallDeadlineMs,
+    });
+  }
+  return { overallDeadlineMs, deadlineAtMs: Date.now() + overallDeadlineMs };
+}
+
+export interface VoteOptions extends Pick<
+  VoteExecutionOverrides,
+  'declaredOptions' | 'project' | 'workspace' | 'workspaceSha'
+> {
+  readonly timeoutMs: number;
+  readonly maxRetries: number;
+  readonly allowSimulation: boolean;
+  /** The panel's cancel (#6729); combined with this seat's overall cutoff at launch. */
+  readonly signal?: AbortSignal | undefined;
+  readonly attemptCollector?: VoterAttemptCollector | undefined;
+  readonly attemptKind?: VoterAttemptKind | undefined;
+  readonly withinRoleRetry?: boolean | undefined;
+}
+
+export type VoteFn = (
+  role: VoterRole,
+  proposal: string,
+  adapter: IModelAdapter,
+  logger: ILogger,
+  options: VoteOptions
+) => Promise<AgentVoteResult>;
+
+export interface LaunchVotesInput {
+  readonly roles: readonly VoterRole[];
+  readonly proposal: string;
+  readonly roleAdapters: ReadonlyMap<VoterRole, IModelAdapter>;
+  readonly fallbackAdapter: IModelAdapter;
+  readonly logger: ILogger;
+  readonly voteOptions: VoteOptions;
+  readonly interDelay: number;
+  readonly overallDeadlineMs: number;
+  /** Absolute wall-clock cutoff shared with an optional per-role retry pass. */
+  readonly deadlineAtMs?: number;
+  /** Vote launcher (injected by caller — typically executeAgentVote). */
+  readonly voteFn: VoteFn;
+  /**
+   * Called as each seat settles — first pass, fallback and retry alike — with
+   * that seat's result (#6162). The async-job liveness heartbeat: a vote body
+   * running past the standard MCP ceiling reports progress per seat through
+   * this, so a panel whose seats keep landing is never failed as wedged.
+   */
+  readonly onVoteCollected?: ((vote: AgentVoteResult) => void) | undefined;
+  /**
+   * Cancellation for in-flight panels (#5393).
+   *
+   * Checked after each stagger delay, so a cancel stops LAUNCHING the voters
+   * that have not started, and before the cross-CLI fallback. Aborting the
+   * seats already in flight is not done here: the same signal rides in
+   * `voteOptions` to each seat's adapter call (#6729), where it is combined
+   * with the seat's deadline.
+   *
+   * Absent or un-aborted changes nothing.
+   */
+  readonly signal?: AbortSignal | undefined;
+}
+
+export const DEADLINE_MESSAGE = 'overall consensus deadline exceeded';
+/**
+ * #5393: reported for a voter the panel never launched. An ERROR result, never
+ * a default decision — a cancelled voter returning `approve` would manufacture
+ * consensus out of work that never ran.
+ */
+const CANCELLED_MESSAGE = 'cancelled before this voter was launched';
+
+/**
+ * #3587: a voter routed to a diverse CLI that hard-fails (e.g. an OpenRouter
+ * model without tool-use → "no endpoints that support tool use", which the
+ * responseFormat retry can't fix) would silently shrink the panel. Retry once on
+ * the known-good fallback adapter so one bad CLI cannot drop a voter.
+ *
+ * Should a failed vote be retried on the fallback adapter? Only when the diverse
+ * adapter produced a genuine error (not the overall-deadline filler, which means
+ * there's no time left) AND it wasn't already the fallback (#3587).
+ */
+function shouldRetryOnFallback(
+  result: AgentVoteResult,
+  used: IModelAdapter,
+  fallback: IModelAdapter
+): boolean {
+  return (
+    result.source === 'error' &&
+    result.error !== DEADLINE_MESSAGE &&
+    adapterCliKey(used) !== adapterCliKey(fallback)
+  );
+}
+
+/** Stable per-CLI key for an adapter; CLI adapters carry the CLI name. */
+function adapterCliKey(adapter: IModelAdapter): string {
+  return (adapter as { name?: string }).name ?? adapter.providerId;
+}
+
+/**
+ * Preserve the panel resolver's primary assignment across fallback execution:
+ * the model it pinned, and (#6115) the CLI it chose, which unlike the model is
+ * known before detection and so survives the `pending-detection` placeholder.
+ */
+function withAssignment(
+  result: AgentVoteResult,
+  pinnedModel: string,
+  assignedKey: string
+): AgentVoteResult {
+  return withAssignedCli({ ...result, pinnedModel }, assignedKey);
+}
+
+/**
+ * How many same-CLI seats may run at once (#6103). The default is one — the
+ * #3348 serialization: concurrent subprocesses of one CLI each triggered its
+ * OAuth access-token refresh, and with refresh-token rotation the first call
+ * rotated the token and the rest failed "refresh token already used".
+ *
+ * `cli-claude` is widened to two on measurement: the first `Seat timing`
+ * readout (#6387 panel, 2026-09-16) put 871 s of a ~12-minute panel in the
+ * claude lane's queue — fallback seats waited 244–398 s behind three primary
+ * claude runs — and a probe of 15 concurrent `claude -p` calls (2- and
+ * 3-way) produced no refresh error. A collision at an actual refresh is
+ * still possible; it surfaces as a retried attempt (`voter-retry.ts`) and
+ * as a second attempt on the seat's timing line, which is the signal to
+ * narrow this again. Cross-CLI parallelism is unchanged.
+ */
+const CLI_LANE_WIDTH: Readonly<Record<string, number>> = { 'cli-claude': 2 };
+const DEFAULT_LANE_WIDTH = 1;
+
+/** The lane width for a CLI key: the table's entry, else one. */
+function laneWidthOf(key: string): number {
+  return Object.hasOwn(CLI_LANE_WIDTH, key)
+    ? (CLI_LANE_WIDTH[key] ?? DEFAULT_LANE_WIDTH)
+    : DEFAULT_LANE_WIDTH;
+}
+
+/**
+ * Per-key lane (#3348, widened per key by {@link CLI_LANE_WIDTH} in #6103).
+ * Returns a `run(key, fn)` that admits at most `laneWidthOf(key)` fns per
+ * key at a time, in FIFO order; a rejected fn frees its slot like a resolved
+ * one so one failure cannot wedge the lane. Different keys run concurrently.
+ */
+function createKeyedSerializer(): <T>(key: string, fn: () => Promise<T>) => Promise<T> {
+  const lanes = new Map<string, { active: number; waiting: (() => void)[] }>();
+  const laneFor = (key: string): { active: number; waiting: (() => void)[] } => {
+    const existing = lanes.get(key);
+    if (existing !== undefined) return existing;
+    const created = { active: 0, waiting: [] };
+    lanes.set(key, created);
+    return created;
+  };
+  return async <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+    const lane = laneFor(key);
+    if (lane.active >= laneWidthOf(key)) {
+      await new Promise<void>((resolve) => lane.waiting.push(resolve));
+    }
+    lane.active += 1;
+    try {
+      return await fn();
+    } finally {
+      lane.active -= 1;
+      lane.waiting.shift()?.();
+    }
+  };
+}
+
+function raceWithDeadline(
+  run: (signal: AbortSignal) => Promise<AgentVoteResult>,
+  role: VoterRole,
+  deadlineMs: number,
+  cancel: AbortSignal | undefined,
+  afterDeadline: (vote: Promise<AgentVoteResult>, reason: DOMException, deadlineAt: number) => void
+): Promise<AgentVoteResult> {
+  const deadlineController = new AbortController();
+  const signal =
+    cancel === undefined
+      ? deadlineController.signal
+      : AbortSignal.any([deadlineController.signal, cancel]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutP = new Promise<AgentVoteResult>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(createErrorVoteResult(role, DEADLINE_MESSAGE, deadlineMs));
+      const reason = new DOMException(DEADLINE_MESSAGE, 'TimeoutError');
+      // Resolve the recorded deadline error first: an adapter that reacts to
+      // abort immediately must not turn this seat into a cancellation result.
+      const deadlineAt = Date.now();
+      deadlineController.abort(reason);
+      afterDeadline(voteP, reason, deadlineAt);
+    }, deadlineMs);
+  });
+  const voteP = Promise.resolve().then(() => run(signal));
+  return Promise.race([voteP, timeoutP]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+/**
+ * Read through a function, not inline (#5393): after one
+ * `signal?.aborted === true` check TypeScript narrows the field to `false` for
+ * the rest of the enclosing closure, which is unsound across an `await` — the
+ * whole point is that it can flip while a vote is in flight.
+ */
+function cancelled(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
+}
+
+/** Both attempts travel with a recovered seat (#6103): the failed primary's timing first. */
+function withPrimaryAttempts(
+  primary: AgentVoteResult,
+  recovered: AgentVoteResult
+): AgentVoteResult {
+  const carried = carryAttemptUsage(primary, recovered);
+  return preserveVoterAttemptTelemetry(carried, {
+    // #6821: the failed primary's settled completions were billed too.
+    ...carried,
+    timing: {
+      attempts: [...(primary.timing?.attempts ?? []), ...(recovered.timing?.attempts ?? [])],
+    },
+  });
+}
+
+type VoteOnAdapter = (
+  role: VoterRole,
+  adapter: IModelAdapter,
+  fallback: boolean
+) => Promise<AgentVoteResult>;
+
+/** Start a seat only while the shared cutoff still has time. */
+function voteBeforeDeadline(
+  input: LaunchVotesInput,
+  role: VoterRole,
+  adapter: IModelAdapter,
+  remaining: number
+): Promise<AgentVoteResult> {
+  if (remaining <= 0) {
+    return Promise.resolve(createErrorVoteResult(role, DEADLINE_MESSAGE, input.overallDeadlineMs));
+  }
+  const observer = observeLateVoter(adapter, role, input.logger);
+  const collector = new VoterAttemptCollector();
+  const result = raceWithDeadline(
+    (signal) => {
+      observer.register(signal);
+      return input.voteFn(role, input.proposal, adapter, input.logger, {
+        ...input.voteOptions,
+        attemptCollector: collector,
+        signal,
+      });
+    },
+    role,
+    remaining,
+    input.signal,
+    (vote, reason, deadlineAt) => {
+      // A measurement must never take down the deadline path: this runs in a
+      // timer callback, where a throw is an uncaught exception (#6851).
+      try {
+        observer.afterDeadline(vote, reason, deadlineAt);
+      } catch (error) {
+        input.logger.warn('Late-settlement observer failed; deadline unaffected', {
+          role,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  );
+  return result.then((vote) =>
+    withVoterAttemptTelemetry(vote, () => vote.attemptTelemetry ?? collector.snapshot())
+  );
+}
+
+type ReaskVotesInput = Pick<
+  LaunchVotesInput,
+  'proposal' | 'roleAdapters' | 'fallbackAdapter' | 'logger' | 'voteOptions' | 'signal'
+>;
+
+/** The received verdict survives a supplementary selection timeout. */
+function finishOptionSelection(
+  vote: AgentVoteResult,
+  input: ReaskVotesInput,
+  context: { adapter: IModelAdapter; deadlineAtMs: number }
+): Promise<AgentVoteResult> {
+  const settings = input.voteOptions;
+  return reaskUnresolvedOption(vote, {
+    adapter: context.adapter,
+    proposal: input.proposal,
+    logger: input.logger,
+    timeoutMs: Math.min(settings.timeoutMs, Math.max(1, context.deadlineAtMs - Date.now())),
+    options: settings.declaredOptions,
+    project: settings.project,
+    workspace: settings.workspace,
+    workspaceSha: settings.workspaceSha,
+    signal: input.signal,
+    withinRoleRetry:
+      vote.retried === true ||
+      settings.withinRoleRetry === true ||
+      settings.attemptKind === 'role_retry',
+  });
+}
+
+async function launchRoleVote(
+  role: VoterRole,
+  index: number,
+  input: LaunchVotesInput,
+  voteOnAdapter: VoteOnAdapter,
+  deadlineAtMs: number
+): Promise<AgentVoteResult> {
+  // A retry can begin with less time left than the nominal stagger delay.
+  const staggerWaitMs = Math.min(input.interDelay, Math.max(0, deadlineAtMs - Date.now()));
+  if (index > 0 && staggerWaitMs > 0) await delay(staggerWaitMs);
+  const adapter = input.roleAdapters.get(role) ?? input.fallbackAdapter;
+  const pinnedModel = adapter.modelId;
+  const assignedKey = adapterCliKey(adapter);
+  const stamp = (r: AgentVoteResult): AgentVoteResult =>
+    preserveVoterAttemptTelemetry(r, withAssignment(r, pinnedModel, assignedKey));
+  if (cancelled(input.signal)) {
+    // Refused before any attempt: the timing says so with an empty list.
+    return stamp({
+      ...createErrorVoteResult(role, CANCELLED_MESSAGE, 0),
+      timing: { attempts: [] },
+    });
+  }
+  const primary = await voteOnAdapter(role, adapter, false);
+  if (!shouldRetryOnFallback(primary, adapter, input.fallbackAdapter)) return stamp(primary);
+  if (cancelled(input.signal)) return stamp(primary);
+  input.logger.warn('Voter failed on diverse adapter; retrying on fallback (#3587)', {
+    role,
+    failedCli: assignedKey,
+    fallbackCli: adapterCliKey(input.fallbackAdapter),
+    error: primary.error,
+  });
+  const recovered = withPrimaryAttempts(
+    primary,
+    await voteOnAdapter(role, input.fallbackAdapter, true)
+  );
+  if (recovered.source === 'error') return stamp(recovered);
+  // #6115: the seat ANSWERED somewhere other than where it was assigned. Say
+  // where it was meant to answer and which error class moved it, so a panel
+  // that collapsed onto one model during a capacity window is legible in the
+  // result rather than only in this log line. A seat that errored on the
+  // fallback too answered nowhere and carries no fallback.
+  const fallback = crossCliFallback(adapter, assignedKey, primary.error ?? '');
+  return stamp(preserveVoterAttemptTelemetry(recovered, { ...recovered, fallback }));
+}
+
+function createTimedVoteLauncher(
+  input: LaunchVotesInput,
+  deadlineAtMs: number,
+  serialize: ReturnType<typeof createKeyedSerializer>
+): VoteOnAdapter {
+  // One serialized, deadline-bounded vote attempt on a specific adapter.
+  // #6103: the attempt's timing rides on the result — queued (enqueue → start)
+  // and ran (start → settle) — so a slow panel can be attributed to the lane
+  // or to the model. The caller folds attempts into the seat's `timing`.
+  const voteOnAdapter = (
+    role: VoterRole,
+    adapter: IModelAdapter,
+    fallback: boolean
+  ): Promise<AgentVoteResult> => {
+    const cli = adapterCliKey(adapter);
+    const enqueuedAt = Date.now();
+    // Serialize per CLI so concurrent same-CLI calls don't race that CLI's
+    // OAuth refresh (#3348). The deadline is measured when the vote actually
+    // starts, so a queued role still gets a correct remaining budget.
+    return serialize(cli, async () => {
+      const runStartedAt = Date.now();
+      const remaining = deadlineAtMs - runStartedAt;
+      // A role can wait past the cutoff in a stagger or serialized CLI lane.
+      // Record absence as an error; do not start an adapter with a fresh 1 ms.
+      const result = await voteBeforeDeadline(
+        {
+          ...input,
+          voteOptions: {
+            ...input.voteOptions,
+            attemptKind: fallback ? 'cli_fallback' : input.voteOptions.attemptKind,
+            withinRoleRetry:
+              input.voteOptions.withinRoleRetry === true ||
+              input.voteOptions.attemptKind === 'role_retry',
+          },
+        },
+        role,
+        adapter,
+        remaining
+      );
+      const attempt: SeatAttemptTiming = {
+        cli,
+        queuedMs: runStartedAt - enqueuedAt,
+        ranMs: Date.now() - runStartedAt,
+        fallback,
+      };
+      return withVoterAttemptTelemetry(
+        { ...result, timing: { attempts: [...(result.timing?.attempts ?? []), attempt] } },
+        () => result.attemptTelemetry ?? { events: [], observableAttempts: 0 }
+      );
+    });
+  };
+
+  return voteOnAdapter;
+}
+
+/** Re-ask the final seat set once, after first-pass and retry verdicts settle. */
+export async function reaskUnresolvedOptions(
+  votes: readonly AgentVoteResult[],
+  input: ReaskVotesInput,
+  deadlineAtMs: number
+): Promise<readonly AgentVoteResult[]> {
+  const serialize = createKeyedSerializer();
+  return Promise.all(
+    votes.map((vote) => {
+      const adapter =
+        vote.timing?.attempts.at(-1)?.fallback === true
+          ? input.fallbackAdapter
+          : (input.roleAdapters.get(vote.role) ?? input.fallbackAdapter);
+      return serialize(adapterCliKey(adapter), () =>
+        finishOptionSelection(vote, input, { adapter, deadlineAtMs })
+      );
+    })
+  );
+}
+
+export async function launchVotesWithOverallDeadline(
+  input: LaunchVotesInput
+): Promise<readonly AgentVoteResult[]> {
+  const { roles, logger, overallDeadlineMs } = input;
+
+  const deadlineAtMs = input.deadlineAtMs ?? Date.now() + overallDeadlineMs;
+  const serialize = createKeyedSerializer();
+  const voteOnAdapter = createTimedVoteLauncher(input, deadlineAtMs, serialize);
+
+  const wrapped = roles.map((role, index) =>
+    launchRoleVote(role, index, input, voteOnAdapter, deadlineAtMs).then((result) => {
+      input.onVoteCollected?.(result);
+      return result;
+    })
+  );
+
+  const results = await Promise.all(wrapped);
+
+  const expired = results.filter((r) => r.source === 'error' && r.error === DEADLINE_MESSAGE);
+  if (expired.length > 0) {
+    logger.warn('Consensus overall deadline reached; returning partial results', {
+      totalRoles: roles.length,
+      expiredRoles: expired.map((r) => r.role),
+      overallDeadlineMs,
+    });
+  }
+  return results;
+}

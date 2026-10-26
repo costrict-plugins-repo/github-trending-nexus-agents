@@ -1,0 +1,721 @@
+/**
+ * nexus-agents/mcp - PR Review Tool (#2233 Child 1)
+ *
+ * Wires the existing consensus voter infrastructure to GitHub PR review.
+ * Reuses `collectRealVotes` from voter-agents.ts; constructs a PR-review-
+ * specific proposal that includes the diff, then maps each voter's
+ * approve/reject/abstain decision into PR review semantics
+ * (approve/request_changes/abstain).
+ *
+ * NOT a full PR-review platform — this is the smallest valuable demonstration
+ * of the multi-voter pattern applied to code review, per the experiment
+ * design in #2233. Children 3-6 (verification gate wiring, sample dataset,
+ * analysis writeup, live PR enablement) are follow-up work.
+ *
+ * @module mcp/tools/pr-review-tool
+ */
+
+import { z } from 'zod';
+import { asyncDispatchInputDefaultSync } from './async-dispatch-input.js';
+import { randomUUID } from 'node:crypto';
+import type { McpServer } from '../sdk-types.js';
+import {
+  createLogger,
+  formatZodError,
+  getErrorMessage,
+  type ILogger,
+  type IModelAdapter,
+} from '../../core/index.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { computeReviewedDiffHash } from '../../audit/reviewed-diff-hash.js';
+import {
+  toolStructuredError,
+  toolSuccess,
+  type BaseMcpToolDeps,
+  type ToolResult,
+} from './tool-result.js';
+import type { AgentVoteResult, VoterRole } from '../../cli/vote-types.js';
+import { isAbsentSeat } from '../../cli/voter-unverifiable.js';
+import { collectRealVotes } from '../../cli/voter-agents.js';
+import {
+  resolveAndLogVoterProject,
+  VoterProjectInputSchema,
+  type ResolvedVoterProject,
+} from '../../cli/voter-project.js';
+import { checkSimulationAllowed, simulationDeniedResult } from './simulation-guard.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+import { recordDecisionCost } from './decision-cost-recording.js';
+import type { DecisionCostSummary } from '../../observability/decision-cost.js';
+// #3731 / epic #2631: async-mode dispatch via the shared `runAsJob` helper.
+import { runAsJob } from '../jobs/run-as-job.js';
+import { attachPartialsOnCancel, throwIfVoteCancelled } from './consensus-vote-cancelled.js';
+import type { Finding } from './pr-review-findings.js';
+import {
+  persistReviewRecord,
+  type PrReviewRecordOutcome,
+  type ReviewSanitizationInput,
+} from './pr-review-record-producer.js';
+import { sanitizationViewOf } from './pr-review-sanitization-view.js';
+// prettier-ignore
+import {
+  applyPartialCoverageGate,
+  looksLikeUnifiedDiff,
+  type PrReviewBindingCoverage,
+  type PrReviewCoverage,
+} from './pr-review-diff-budget.js';
+// #6003: what the panel reads is decided against the voters' context windows.
+import { preparePanelForReview } from './pr-review-panel-budget.js';
+// #4278: split out of this file to stay under the max-lines budget (no behavior change).
+import {
+  toPrReviewVote,
+  summarizeReviews,
+  aggregateBlockingFindings,
+  absoluteQuorumApprove,
+  discloseSeverityFloor,
+  aggregatePanelVerdict,
+} from './pr-review-result-mapping.js';
+
+export type { Finding, VerificationGate, FindingSeverity } from './pr-review-findings.js';
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/** Voter panel for PR review. PM and AI/ML excluded — they're proposal-level
+ * roles, not code-level. The 5 here are the ones with concrete claims about
+ * code (#2233). */
+export const PR_REVIEW_ROLES: readonly VoterRole[] = [
+  'architect',
+  'security',
+  'devex',
+  'catfish',
+  'scope_steward',
+];
+
+/** The BINDING cap, mirrored: the UTF-8 byte cap the canonical `reviewedDiffHash`
+ * binds to (`MAX_REVIEWED_DIFF_BYTES`, #3831). Since #6003 this is NOT the panel
+ * budget: what the 5-voter panel reads is bounded by the voters' context windows
+ * (`pr-review-panel-budget.ts`), and this cap is only the panel budget when that
+ * derivation fails closed. A diff over this cap is never rejected; the record
+ * states that the hash binds a prefix. Still the local-ledger script's diff cap. */
+export const MAX_DIFF_LENGTH = 50_000;
+/** DoS bound on `prDiff` INPUT (#4140). Diffs up to this size are ACCEPTED (no
+ * hard-fail, no caller-side truncation); those over the panel budget are packed
+ * to a security-prioritized, partially-reviewed subset. Two-number contract:
+ * `MAX_DIFF_INPUT_LENGTH` gates acceptance, the panel budget gates the panel. */
+export const MAX_DIFF_INPUT_LENGTH = 2_000_000;
+/** Max `repoContext` length; over-limit input hard-fails Zod validation (#4133). */
+export const MAX_REPO_CONTEXT_LENGTH = 2000;
+/** Max `prTitle` length (read back from the schema by the #6003 overhead test). */
+const MAX_TITLE_LENGTH = 500;
+
+/** Hard cap on PR description. */
+export const MAX_DESCRIPTION_LENGTH = 10_000;
+
+/**
+ * Discoverability hint (#3731) appended to sync pr_review error/timeout
+ * envelopes. The 5-voter panel runs live LLM calls in parallel and can exceed
+ * even the interim 900s per-tool cap; async mode is the durable escape hatch.
+ */
+const PR_REVIEW_ASYNC_HINT =
+  'A pr_review run fans out to 5 live LLM voters and can exceed the synchronous ' +
+  "MCP request timeout. Retry with `dispatch: 'async'` to get a jobId immediately, " +
+  'then poll get_job_result({ jobId }) for the result.';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export const PrReviewInputSchema = z.object({
+  prTitle: z.string().min(1).max(MAX_TITLE_LENGTH).describe('PR title'),
+  prDescription: z
+    .string()
+    .max(MAX_DESCRIPTION_LENGTH)
+    .optional()
+    .describe('PR body / description'),
+  prDiff: z
+    .string()
+    .min(1)
+    .max(MAX_DIFF_INPUT_LENGTH)
+    // #4451: previously length-validated only, so a prose summary produced a
+    // full panel review and a `verified: true` governance record that was
+    // indistinguishable from a real one — the panel approved a PR that
+    // warranted request_changes because it never saw any code. Fail closed on
+    // anything without unified-diff structure, per the untrusted-input rule.
+    .refine(looksLikeUnifiedDiff, {
+      message:
+        'prDiff must be a unified diff (expected a `diff --git`, `---`/`+++`, or `@@ … @@` line). ' +
+        'Prose descriptions of a change are rejected: a review of a summary is not a review of the code, ' +
+        'and would be recorded as though it were (#4451).',
+    })
+    .describe(
+      `Unified diff text (max ${String(MAX_DIFF_INPUT_LENGTH)} chars). REQUIRED SHAPE (#4451): must contain a \`diff --git\` header, an \`@@ … @@\` hunk header backed by +/- lines, or a \`---\`/\`+++\` header pair — a prose summary of the change is REJECTED, because reviewing a summary is not reviewing the code and would be recorded as though it were. (Stated here because Zod refinements do not survive JSON-schema generation, so this constraint is otherwise invisible to clients.) No need to truncate before calling: the panel reads the whole diff whenever it fits the voters' context windows (#6003); a diff larger than that is security-prioritized and PARTIALLY reviewed (lowest-priority whole files dropped; a partial panel read can block but never verified-approve). Separately, the audit record's hash binds only the first ${String(MAX_DIFF_LENGTH)} UTF-8 bytes; the response \`coverage\` and the record summary state both what the panel read and what the hash binds.`
+    ),
+  repoContext: z
+    .string()
+    .max(MAX_REPO_CONTEXT_LENGTH)
+    .optional()
+    .describe(
+      `Optional one-paragraph repo context (architecture, conventions; max ${String(MAX_REPO_CONTEXT_LENGTH)} chars; trim before calling)`
+    ),
+  baseRef: z.string().max(200).optional().describe('Base branch ref (e.g. main)'),
+  headRef: z.string().max(200).optional().describe('Head branch ref'),
+  /**
+   * Option-C audit binding (#4031). When BOTH `prNumber` and `baseSha` are
+   * supplied AND the review is live (not simulated), pr_review persists an
+   * authentic, self-hashed pr-review record binding {prNumber, baseSha,
+   * reviewedDiffHash(prDiff), verdict} to the governance ledger — the record the
+   * warn-first governor-review gate (#3831) queries. Omit either to skip
+   * persistence (a structured `recordOutcome` note explains why). IMPORTANT: for
+   * the gate to FIND the record, `prDiff`'s first 50_000 bytes must match the
+   * canonical `git diff <baseSha>..<headSha>` the gate recomputes (the hash
+   * truncates at that byte cap) — pass the canonical diff, not a reordered one.
+   * Since #5476 the gate computes that base as `git merge-base origin/<base_ref>
+   * <head>`, NOT the PR payload's `base.sha` (which is the base branch tip when
+   * the PR opened and drifts as main advances), so pass the merge-base as
+   * `baseSha` or the record will not match on an aged branch (#5692).
+   */
+  prNumber: z
+    .number()
+    .int()
+    .positive()
+    .max(1_000_000)
+    .optional()
+    .describe('PR number — with baseSha, enables Option-C audit-record persistence (#4031)'),
+  baseSha: z
+    .string()
+    .regex(/^[0-9a-f]{40}$/, 'baseSha must be a 40-char lowercase hex commit sha')
+    .optional()
+    .describe(
+      '40-hex base commit sha the reviewed diff was computed from — pass `git merge-base origin/<base> <head>`, the base the gate recomputes (Option-C binding, #4031, #5692)'
+    ),
+  repoPath: z
+    .string()
+    .max(1024)
+    .optional()
+    .describe(
+      'Repo root path for persisting the governance pr-review record (overrides cwd auto-detection). Must contain a .git ancestor — relative paths are resolved against cwd; ignored (falls back to cwd auto-detection) if it is not a real repo root. Env NEXUS_PR_REVIEW_RECORDS_PATH still takes precedence and is unrestricted.'
+    ),
+  simulate: z
+    .boolean()
+    .default(false)
+    .describe('Use simulated voters (testing only; never ship live with this true)'),
+  /**
+   * Error policy (#4132). `standard` (default) excludes absent voters but
+   * requires a majority of the requested panel to approve. `absolute_quorum` gates
+   * the verified-approve verdict on a COMPLETE, error-free panel with the
+   * contrarian (catfish) present and approving — any errored voter (especially
+   * catfish) degrades the verdict to a recoverable `{ decision: 'abstain',
+   * verified: false }` (the no_quorum analogue; `PrReviewAggregate` has no
+   * `no_quorum` state), so an induced voter error can never manufacture a
+   * verified approve. A genuine `request_changes` blocker still wins (Tiers 1-2
+   * run first).
+   */
+  errorPolicy: z
+    .enum(['standard', 'absolute_quorum'])
+    .default('standard')
+    .describe(
+      "Error policy (#4132). 'standard' (default): absent voters excluded; approval requires a majority of the requested panel. 'absolute_quorum': any errored voter — esp. the contrarian — degrades a would-be approve to a recoverable abstain (verified:false); never manufactures a verified approve from an induced error."
+    ),
+  // #6123: same field as consensus_vote — the panel judges the caller's project.
+  project: VoterProjectInputSchema,
+  /**
+   * Dispatch mode (#3731). `sync` (default) runs the 5-voter panel inline and
+   * returns the result — but a live fan-out can exceed the MCP request timeout.
+   * `async` returns a `{ status: 'pending', jobId }` envelope immediately and
+   * runs the panel in the background; poll `get_job_result({ jobId })` for the
+   * result.
+   */
+  ...asyncDispatchInputDefaultSync(),
+});
+
+export type PrReviewInput = z.infer<typeof PrReviewInputSchema>;
+
+export type PrReviewDecision = 'approve' | 'request_changes' | 'abstain';
+
+export interface PrReviewVote {
+  readonly role: VoterRole;
+  readonly decision: PrReviewDecision;
+  readonly confidence: number;
+  /** Free-form reasoning from the voter — full text including the
+   * findings YAML block (which is also parsed into `findings` below). */
+  readonly reasoning: string;
+  /** Structured findings parsed from the voter's reasoning per #2225 +
+   * #2233 Child 3. Each Finding has a verification gate output and a
+   * derived `verified` boolean. Only verified medium-or-higher findings trigger
+   * the finding tier; all request_changes votes count in the soft tier. */
+  readonly findings: readonly Finding[];
+  /** Derived from the canonical union so a new seat kind (#6094) cannot be dropped here. */
+  readonly source: AgentVoteResult['source'];
+  readonly cli?: string | undefined;
+  readonly processingTimeMs: number;
+  readonly errorMessage?: string;
+}
+
+/** Aggregate decision shape (#2250 Child 7). When `summary` is
+ * `request_changes`, `verified` distinguishes high-confidence
+ * blockers (two distinct roles corroborate verified medium-or-higher findings at the same
+ * file within ±3 lines) from unconfirmed findings and majority-dissent blocks.
+ * Reviewers should apply the verification gate themselves on
+ * unverified soft blocks. */
+export interface PrReviewAggregate {
+  readonly decision: PrReviewDecision;
+  readonly verified: boolean;
+  /** Explains sub-floor findings, unconfirmed findings or panel shortfalls.
+   * Under `absolute_quorum` (#4132), a degraded approval is represented by
+   * `abstain` + `verified:false` + `reason` because there is no `no_quorum` state.
+   * Absent when the verdict needs no such explanation. */
+  readonly reason?: string;
+}
+
+export interface PrReviewResponse {
+  /** Discloses sub-floor findings, unconfirmed findings or quorum shortfalls. */
+  readonly reason?: string;
+  readonly summary: PrReviewDecision;
+  /** True when the request_changes / approve outcome was driven by
+   * corroborated verified findings or complete unanimous approval; false for
+   * unconfirmed findings, majority dissent or an incomplete panel. */
+  readonly verified: boolean;
+  readonly approveCount: number;
+  readonly requestChangesCount: number;
+  readonly abstainCount: number;
+  readonly errorCount: number;
+  /** Seats that could not read the diff (#6094). Always present; not inside `abstainCount`. */
+  readonly unverifiableCount: number;
+  readonly reviews: readonly PrReviewVote[];
+  readonly totalDurationMs: number;
+  /**
+   * The project the panel judged and how the name was decided (#6123): the
+   * caller's `project` input, else derived from the server's working
+   * directory, else `nexus-agents`. Always present.
+   */
+  readonly project: ResolvedVoterProject;
+  /**
+   * Per-decision cost rollup (#3855): per-voter / per-model token + USD totals
+   * for this governed review. Rides the existing response — no new MCP tool.
+   * Totals are a floor when `costSummary.unmeasuredVoters > 0` (voters whose
+   * adapter reported no usage are counted as unmeasured, not a measured $0).
+   */
+  readonly costSummary?: DecisionCostSummary;
+  /**
+   * Option-C audit-record persistence outcome (#4031). Present on every
+   * response: `persisted: true` with the record's binding + sequence when an
+   * authentic record was written, otherwise `persisted: false` with the reason.
+   */
+  readonly recordOutcome?: PrReviewRecordOutcome;
+  /**
+   * Large-diff review coverage (#4140, #6003). Present when the panel read a
+   * packed subset (`panelRead: 'partial'`) OR the audit hash binds only a prefix
+   * of the diff (`binding: 'prefix'`); absent when both are full. Byte fields
+   * are UTF-8.
+   */
+  readonly coverage?: PrReviewBindingCoverage;
+}
+
+export interface PrReviewDeps extends BaseMcpToolDeps {
+  /**
+   * In-process gateway model adapters (#4040) — routes the review panel through
+   * the gateway (HTTP, in-process) instead of a CLI subprocess when configured.
+   * Omitted ⇒ CLI voter path.
+   */
+  gatewayAdapters?: readonly IModelAdapter[] | undefined;
+}
+
+// ============================================================================
+// Decision Mapping
+// ============================================================================
+
+/** Maps a voter's approve/reject/abstain to PR review semantics. */
+export function mapVoteDecisionToPrDecision(
+  voteDecision: 'approve' | 'reject' | 'abstain'
+): PrReviewDecision {
+  if (voteDecision === 'reject') return 'request_changes';
+  return voteDecision;
+}
+
+/** Threshold for soft-block aggregation: ≥3 of 5 non-error voters
+ * voting request_changes triggers a soft blocker per #2250 Child 7. */
+const SOFT_BLOCK_REQUEST_CHANGES_THRESHOLD = 3;
+
+/** Aggregates per-voter decisions into a single summary outcome with a
+ * verified/unverified tag (#2250 Child 7).
+ *
+ * Tiers, in order:
+ *
+ * 1. **Finding blocker** (`request_changes`) — verified medium-or-higher findings from two
+ *    distinct non-error request_changes roles at the same normalized file
+ *    within ±3 lines yield verified=true. A lone finding yields verified=false
+ *    with an unconfirmed reason. Security-role findings are at least medium.
+ * 2. **Soft blocker** (`request_changes`, verified=false) — ≥3 of 5
+ *    non-error voters voted `request_changes`, but none produced a
+ *    verified finding at the floor. Severity never excludes dissent.
+ *    The retest in #2241 showed voters reliably
+ *    flag diff-readable bugs at this rate even without producing the
+ *    YAML structure (#2245 covers why). Tagged unverified so reviewers
+ *    apply the verification gate themselves.
+ * 3. **Approve** — at least two voters and a majority of the requested panel unanimously approve;
+ *    verified=true requires a complete panel.
+ * 4. **Abstain** — anything else; verified reflects panel completeness.
+ *
+ * Why no "AND has any finding" guard on the soft path: the empirical
+ * data in `pr-review-experiment-results-v2.md` showed voters voting
+ * request_changes but emitting 0 findings (verified or otherwise).
+ * Adding the finding requirement would zero this path out and reproduce
+ * the baseline behavior.
+ */
+export function aggregatePrDecisions(
+  reviews: readonly PrReviewVote[],
+  errorPolicy: 'standard' | 'absolute_quorum' = 'standard',
+  repoPath?: string
+): PrReviewAggregate {
+  // #6094: an unverifiable seat is an absence like an errored one — it never
+  // read the diff, so it neither approves nor completes the panel.
+  const valid = reviews.filter((r) => !isAbsentSeat(r));
+  // #5017: `verified` is a claim about the PANEL, not about the decision, and
+  // it is the field a reader of a governance record trusts. An outcome reached
+  // over a denominator that excludes voters who could have disagreed cannot
+  // support it — including the empty case below, which asserted a complete
+  // panel for a vote in which nobody spoke. Decided by consensus vote.
+  const panelVerdict = (decision: PrReviewAggregate['decision']): PrReviewAggregate =>
+    aggregatePanelVerdict(reviews, valid, decision);
+
+  if (valid.length === 0) return panelVerdict('abstain');
+
+  // Tier 1 runs before quorum checks so an unconfirmed medium+ defect blocks approval.
+  const findingBlocker = aggregateBlockingFindings(valid, repoPath);
+  if (findingBlocker !== undefined) return discloseSeverityFloor(findingBlocker, valid);
+
+  // Tier 2: severity controls only finding verification/agreement, never turns
+  // a request_changes vote into abstain/approve or removes it from soft blocking.
+  const requestChangesVoters = valid.filter((r) => r.decision === 'request_changes').length;
+  if (requestChangesVoters >= SOFT_BLOCK_REQUEST_CHANGES_THRESHOLD) {
+    return discloseSeverityFloor({ decision: 'request_changes', verified: false }, valid);
+  }
+
+  // Tier 3: unanimous approve. Under absolute_quorum (#4132) the verified-approve
+  // is GATED on a complete, error-free panel with the contrarian (catfish)
+  // present and approving — an errored voter (esp. catfish) cannot manufacture a
+  // verified approve; it degrades to a recoverable abstain (verified:false), the
+  // no_quorum analogue. `valid.every(approve)` alone would silently drop the
+  // errored voter from the denominator and rubber-stamp the merge.
+  if (valid.every((r) => r.decision === 'approve')) {
+    if (errorPolicy === 'absolute_quorum') {
+      return discloseSeverityFloor(absoluteQuorumApprove(reviews, valid), valid);
+    }
+    if (valid.length < 2)
+      return discloseSeverityFloor(
+        {
+          decision: 'abstain',
+          verified: false,
+          reason: 'insufficient reviewers: 1 reviewer; needs second reviewer',
+        },
+        valid
+      );
+    // Standard permits missing seats above quorum; a minority cannot approve.
+    return panelVerdict('approve');
+  }
+
+  // Tier 4: ambiguous — abstain.
+  return panelVerdict('abstain');
+}
+
+// ============================================================================
+// Proposal Construction
+// ============================================================================
+
+export { buildPrReviewProposal } from './pr-review-proposal.js';
+
+// ============================================================================
+// Handler
+// ============================================================================
+
+/**
+ * Aggregate the panel, emit telemetry, and apply the #4140 C1 gate. Under
+ * absolute_quorum (#4132) an errored/incomplete panel degrades a would-be approve to
+ * a recoverable abstain (logged). Then the C1 gate bars a PARTIAL review from a
+ * verified-approve (degrade to the same no_quorum shape) while a genuine blocker from
+ * a reviewed file still wins — reference inequality signals the degrade for logging.
+ */
+function resolveAggregate(
+  reviews: readonly PrReviewVote[],
+  input: PrReviewInput,
+  absent: { readonly errorCount: number; readonly unverifiableCount: number },
+  coverage: PrReviewCoverage | undefined,
+  logger: ILogger
+): PrReviewAggregate {
+  const preGate = aggregatePrDecisions(reviews, input.errorPolicy, input.repoPath);
+  if (!preGate.verified && preGate.reason !== undefined) {
+    // #6094: the degraded-panel warning counts every absent seat, and names
+    // the two kinds separately so a reader can tell a dead adapter from a
+    // seat that answered blind.
+    logger.warn('pr_review aggregate is unverified', {
+      reason: preGate.reason,
+      absentCount: absent.errorCount + absent.unverifiableCount,
+      errorCount: absent.errorCount,
+      unverifiableCount: absent.unverifiableCount,
+    });
+  }
+  const aggregate = applyPartialCoverageGate(preGate, coverage);
+  if (aggregate !== preGate) {
+    logger.warn(
+      'pr_review partial review barred from verified-approve — degraded to no_quorum (#4140)',
+      { reason: aggregate.reason }
+    );
+  }
+  return aggregate === preGate
+    ? aggregate
+    : discloseSeverityFloor(
+        aggregate,
+        reviews.filter((r) => !isAbsentSeat(r))
+      );
+}
+
+/**
+ * #3855: roll up this review's per-voter cost onto the existing response (no new
+ * MCP tool). Best-effort by design — a rollup failure must not fail the review
+ * it is only observing, so it returns `undefined` rather than throwing.
+ *
+ * Extracted from `executePrReviewBody`, which was at exactly its 50-line cap
+ * (#5385): the disclosure parameter had nowhere to go until something moved out.
+ */
+function rollUpDecisionCost(
+  voteResults: Parameters<typeof recordDecisionCost>[0]['votes'],
+  logger: ILogger,
+  jobId?: string
+): DecisionCostSummary | undefined {
+  try {
+    return recordDecisionCost({
+      decisionId: `pr-${randomUUID().slice(0, 8)}`,
+      gate: 'pr_review',
+      ...(jobId !== undefined ? { jobId } : {}),
+      votes: voteResults,
+    });
+  } catch (costError) {
+    logger.warn('Per-decision cost rollup failed (non-fatal)', {
+      error: getErrorMessage(costError),
+    });
+    return undefined;
+  }
+}
+
+async function executePrReviewBody(
+  input: PrReviewInput,
+  logger: ILogger,
+  opts: {
+    gatewayAdapters?: readonly IModelAdapter[];
+    /** Actual async runner id; omitted for synchronous reviews. */
+    jobId?: string;
+    /**
+     * The middleware's pre-sanitization view (#5385). Grouped, and absent rather
+     * than zero-filled when this call did not come through the secure handler:
+     * a `{rawDiffHash: undefined, commentsRemoved: 0}` default would put a
+     * disclosure on the record asserting a sanitizer ran and removed nothing.
+     */
+    sanitization?: ReviewSanitizationInput;
+    /**
+     * `cancel_job`'s signal (#5393). Reaches the vote launcher, which stops
+     * LAUNCHING seats that have not started; a seat already inside its adapter
+     * call settles (its cost is incurred either way). Absent in sync mode.
+     */
+    signal?: AbortSignal | undefined;
+    /** `runAsJob`'s liveness heartbeat (#6162), fired per settled seat. Absent in sync mode. */
+    onVoteCollected?: (() => void) | undefined;
+  } = {}
+): Promise<ToolResult> {
+  const start = Date.now();
+  const { sanitization } = opts;
+  // #6003: seats resolved ONCE, budgeted, then handed to the vote below.
+  const panel = await preparePanelForReview(input, PR_REVIEW_ROLES, opts, logger);
+  // #6123: resolved ONCE per review; every seat's system prompt names it.
+  const project = resolveAndLogVoterProject(input.project, logger);
+  const voteResults = await collectReviewVotes(input, panel, project.name, logger, opts);
+  // #6750: a cancelled review stops here, before any verdict is aggregated.
+  throwIfVoteCancelled(opts.signal, voteResults, PR_REVIEW_ROLES.length);
+
+  const reviews = voteResults.map(toPrReviewVote);
+  const counts = summarizeReviews(reviews);
+  const aggregate = resolveAggregate(reviews, input, counts, panel.coverage, logger);
+  const costSummary = rollUpDecisionCost(voteResults, logger, opts.jobId);
+
+  // #4031: best-effort Option-C audit-record persistence. The producer surfaces
+  // every non-persist (binding absent / simulated / no quorum / write-failed) as
+  // a structured outcome and never throws — an audit sink must not break the
+  // review it observes.
+  const recordOutcome = persistReviewRecord({
+    // #4459: `input.prDiff` is opaque MCP input — it passed the unified-diff
+    // shape gate (#4451), but nothing here establishes it is the PR's real diff.
+    diffSource: 'caller-supplied',
+    // #5385: the middleware's pre-sanitization view, so the binding matches what
+    // the gate recomputes from git AND the record discloses what the voters
+    // actually read. `undefined` => no sanitizer was in this path.
+    sanitization,
+    input,
+    aggregate,
+    counts,
+    reviewCount: reviews.length,
+    logger,
+    ...(panel.coverage !== undefined ? { coverage: panel.coverage } : {}),
+    // #6750: re-checked immediately before the append.
+    cancellation: { signal: opts.signal, votes: voteResults, panelSize: PR_REVIEW_ROLES.length },
+  });
+
+  const response: PrReviewResponse = {
+    summary: aggregate.decision,
+    ...(aggregate.reason !== undefined ? { reason: aggregate.reason } : {}),
+    verified: aggregate.verified,
+    ...counts,
+    reviews,
+    totalDurationMs: Date.now() - start,
+    project,
+    ...(costSummary !== undefined ? { costSummary } : {}),
+    recordOutcome,
+    ...(panel.coverage !== undefined ? { coverage: panel.coverage } : {}),
+  };
+  return toolSuccess(JSON.stringify(response, null, 2));
+}
+
+/** The review panel's vote, over the seats `preparePanelForReview` resolved. */
+function collectReviewVotes(
+  input: PrReviewInput,
+  panel: Awaited<ReturnType<typeof preparePanelForReview>>,
+  project: string,
+  logger: ILogger,
+  opts: {
+    gatewayAdapters?: readonly IModelAdapter[];
+    signal?: AbortSignal | undefined;
+    onVoteCollected?: (() => void) | undefined;
+  }
+): Promise<readonly AgentVoteResult[]> {
+  return collectRealVotes({
+    roles: PR_REVIEW_ROLES,
+    proposal: panel.proposal,
+    simulate: input.simulate,
+    logger,
+    project,
+    ...(opts.gatewayAdapters !== undefined && { gatewayAdapters: opts.gatewayAdapters }),
+    ...(panel.seats?.ok === true && { roleAdapters: panel.seats.seats }),
+    signal: opts.signal,
+    onVoteCollected: opts.onVoteCollected,
+  });
+}
+
+/**
+ * Build the pr_review handler, capturing the in-process gateway adapters (#4040)
+ * so the review panel routes through the gateway instead of a CLI subprocess
+ * when one is configured.
+ */
+function makePrReviewHandler(gatewayAdapters?: readonly IModelAdapter[]) {
+  // #5385: the middleware's view carries what it stripped BEFORE dispatch and a
+  // hash of the RAW diff; without it the proposal's own count is 0, the record
+  // binds bytes no voter saw, and the disclosure is absent from the one path
+  // that persists a governance record.
+  const adapterOpt = gatewayAdapters !== undefined ? { gatewayAdapters } : {};
+  return async function prReviewHandler(args: unknown, ctx: HandlerContext): Promise<ToolResult> {
+    const parsed = PrReviewInputSchema.safeParse(args);
+    if (!parsed.success) {
+      return toolStructuredError({
+        errorCategory: 'validation',
+        message: `Validation error: ${formatZodError(parsed.error)}`,
+      });
+    }
+    const input = parsed.data;
+    // #4170: simulate fails CLOSED outside test runners — BEFORE the try block
+    // (its catch categorizes as `internal`) and BEFORE the async dispatch
+    // (sync and async modes must reject identically). Simulated review panels
+    // feed the same collectRealVotes → createSimulatedVotes machinery as
+    // consensus_vote, so they get the identical gate.
+    if (input.simulate) {
+      const simCheck = checkSimulationAllowed('pr_review', ctx.logger);
+      if (!simCheck.allowed) return simulationDeniedResult(simCheck.reason);
+    }
+
+    try {
+      const opts = { ...adapterOpt, sanitization: sanitizationViewOf(ctx) };
+      // #3731: async dispatch — the 5-voter live fan-out can exceed the MCP
+      // request timeout. pr_review has no sessionId, so a fresh `pr-<uuid>` jobId
+      // is always minted (no idempotency surface). Returns a pending envelope.
+      if (input.dispatch === 'async') {
+        return runAsJob<PrReviewInput, ToolResult>({
+          toolName: 'pr_review',
+          input,
+          freshJobId: () => `pr-${randomUUID()}`,
+          // #6750: on a cancel the body throws VoteCancelledError; the seats it
+          // had collected are attached to the `cancelled` record, with no verdict.
+          // #5393: arity 4 — signal + #6162 progress (heartbeat per settled
+          // seat). `runAsJob` derives `signalAccepted` from `run.length`, so
+          // taking the signal is what makes the job record say cancellation
+          // works — the claim follows the capability. The signal reaches
+          // `collectRealVotes`, so `cancel_job` stops the seats not yet launched.
+          run: (jobId, _input, signal, onVoteCollected) =>
+            attachPartialsOnCancel(
+              jobId,
+              'pr_review',
+              executePrReviewBody(input, ctx.logger, { ...opts, jobId, signal, onVoteCollected })
+            ),
+          logger: ctx.logger,
+        });
+      }
+      return await executePrReviewBody(input, ctx.logger, opts);
+    } catch (error) {
+      // #3731 discoverability: a sync run that times out (or otherwise fails)
+      // should point the caller at async mode — the durable fix for runs that
+      // exceed the request timeout.
+      return toolStructuredError({
+        errorCategory: 'internal',
+        message: `${PR_REVIEW_ASYNC_HINT} PR review failed: ${getErrorMessage(error)}`,
+      });
+    }
+  };
+}
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+/** @category MCP */
+export function registerPrReviewTool(server: McpServer, deps: PrReviewDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'pr_review' });
+  const description =
+    'Run multi-voter consensus review on a PR diff (#2233). 5 voters (architect, security, ' +
+    'devex, catfish, scope_steward) each emit approve/request_changes/abstain with reasoning ' +
+    'and citations. Reuses consensus_vote infra; experimental.';
+
+  const secureHandler = createSecureHandler(makePrReviewHandler(deps.gatewayAdapters), {
+    toolName: 'pr_review',
+    // Everything this tool reviews is attacker-controlled. `buildPrompt`
+    // interpolates `prDescription` and `prDiff` into the voter prompt a few
+    // lines above "Decide: should it be merged as-is? APPROVE if ...", so an
+    // injection payload in a PR body would sit beside the verdict instruction
+    // in front of five model voters. `.rules/untrusted-input.md` classifies PR
+    // bodies as Tier 2/3; without this the handler took the permissive
+    // 'standard' default and `checkSecurityTier` never ran.
+    securityTier: 'external',
+    // #5385: bind `reviewedDiffHash` to the bytes the governor gate can
+    // recompute from git, not to the sanitized text the voters read. Those
+    // diverge whenever the sanitizer fires -- HTML comments (#5258) and
+    // XML-like conversation tags -- which is routine, not rare: this repo's own
+    // governance-regeneration PRs carry `<!-- GENERATED:FROM_AGENTS:START -->`,
+    // so the gate could never match on exactly the PRs it exists for.
+    //
+    // The handler receives the HASH, never the raw diff, so restoring gate
+    // parity does not walk the unsanitized text back into prompt construction.
+    rawHashFields: { prDiff: computeReviewedDiffHash },
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const timeoutMs = getToolTimeout('pr_review', deps.security);
+  const wrappedHandler = wrapToolWithTimeout('pr_review', secureHandler, { timeoutMs, logger });
+
+  server.registerTool(
+    'pr_review',
+    {
+      description,
+      inputSchema: PrReviewInputSchema.shape,
+      annotations: getToolAnnotations('pr_review'),
+    },
+    toSdkCallback(wrappedHandler)
+  );
+  logger.info('Registered pr_review tool');
+}

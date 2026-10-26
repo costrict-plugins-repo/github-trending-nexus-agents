@@ -1,0 +1,234 @@
+/**
+ * MemoryRegistry — the single entry point for accessing memory backends.
+ *
+ * Every concept-space (experience, outcomes, beliefs, …) registers a
+ * backend; callers reach it via `registry.get('experience')` or, more
+ * commonly, the typed accessors that wrap the registry.
+ *
+ * Sharing a SQLite connection across backends keeps WAL-mode behavior
+ * coherent — one writer thread, many tables.
+ *
+ * @module nexus-memory/registry
+ */
+
+import type { SqliteDatabase as DatabaseType } from './backends/open-database.js';
+import type { z } from 'zod';
+import { InMemoryBackend } from './backends/memory.js';
+import { openSqliteDatabase } from './backends/open-database.js';
+import { SqliteBackend } from './backends/sqlite.js';
+import type { IMemoryBackend, JsonValue } from './types.js';
+
+export interface MemoryRegistryOptions {
+  /**
+   * SQLite file path. Use `':memory:'` for tests. When omitted, the
+   * registry creates `InMemoryBackend` instances and never touches disk
+   * — the standard test-isolation pattern (Phase 2 acceptance criterion).
+   */
+  readonly dbPath?: string;
+}
+
+export interface RegisterBackendOptions<TValue extends JsonValue> {
+  /** Stable domain identifier. Becomes the SQLite table name. */
+  readonly domain: string;
+  /** Optional Zod schema for cold-archive validation. */
+  readonly schema?: z.ZodType<TValue>;
+}
+
+/**
+ * The registry. One per `dbPath` (or one in-memory registry per test).
+ * `MemoryRegistry.get(domain)` is `O(1)` after registration.
+ */
+export class MemoryRegistry {
+  private readonly backends = new Map<string, IMemoryBackend<string, JsonValue>>();
+  private readonly db?: DatabaseType;
+  private closed = false;
+
+  constructor(options: MemoryRegistryOptions = {}) {
+    if (options.dbPath !== undefined) {
+      // #3995: open via the shared helper, which creates the parent dir
+      // first (fresh-install robustness) and enables WAL mode.
+      this.db = openSqliteDatabase(options.dbPath);
+    }
+  }
+
+  /**
+   * Register a backend for `domain`. Throws on duplicate domain.
+   *
+   * When the registry has a `dbPath`, the new backend is SQLite-backed
+   * and shares the registry's connection. Otherwise, an `InMemoryBackend`
+   * is created (used for tests).
+   */
+  register<TKey extends string, TValue extends JsonValue>(
+    options: RegisterBackendOptions<TValue>
+  ): IMemoryBackend<TKey, TValue> {
+    this.assertOpen();
+    if (this.backends.has(options.domain)) {
+      throw new Error(`nexus-memory: domain "${options.domain}" already registered`);
+    }
+    const backend: IMemoryBackend<TKey, TValue> =
+      this.db !== undefined
+        ? new SqliteBackend<TKey, TValue>({
+            domain: options.domain,
+            dbPath: '<shared>', // unused when db is supplied
+            db: this.db,
+            ...(options.schema !== undefined && { schema: options.schema }),
+          })
+        : new InMemoryBackend<TKey, TValue>({
+            domain: options.domain,
+            ...(options.schema !== undefined && { schema: options.schema }),
+          });
+    this.backends.set(options.domain, backend as IMemoryBackend<string, JsonValue>);
+    return backend;
+  }
+
+  /**
+   * Attach an externally-managed {@link IMemoryBackend}. Use this when the
+   * backend owns its own storage (e.g., a pre-existing SQLite file under
+   * `~/.nexus-agents/memory/agentic.db`) and you want it discoverable
+   * through the registry without changing its persistence.
+   *
+   * Phase 5–7 of the memory-unification epic use this to bring the
+   * tool-memory backends (`agentic`, `adaptive`, `typed`, `belief`),
+   * OutcomeStore, SICA, skills, etc. under a unified observability
+   * contract without rewriting their internals. Each attached backend
+   * still owns its own `.db` (or JSONL, etc.) until a follow-up migration
+   * folds the storage in fully.
+   */
+  attach<TKey extends string, TValue extends JsonValue>(
+    domain: string,
+    backend: IMemoryBackend<TKey, TValue>
+  ): IMemoryBackend<TKey, TValue> {
+    this.assertOpen();
+    if (this.backends.has(domain)) {
+      throw new Error(`nexus-memory: domain "${domain}" already registered`);
+    }
+    this.backends.set(domain, backend as IMemoryBackend<string, JsonValue>);
+    return backend;
+  }
+
+  /**
+   * Get a previously-registered backend. Returns `undefined` if the
+   * domain isn't registered — callers should treat that as "not yet
+   * migrated to the unified contract."
+   */
+  get<TKey extends string, TValue extends JsonValue>(
+    domain: string
+  ): IMemoryBackend<TKey, TValue> | undefined {
+    this.assertOpen();
+    const backend = this.backends.get(domain);
+    return backend as IMemoryBackend<TKey, TValue> | undefined;
+  }
+
+  /** List all registered domains. Useful for `memory_stats`-style readers. */
+  domains(): readonly string[] {
+    return [...this.backends.keys()];
+  }
+
+  /**
+   * Close every registered backend and the shared SQLite handle. After
+   * `close()` the registry rejects all further operations.
+   *
+   * Idempotent only once it has actually SUCCEEDED (#5776). It used to set
+   * `this.closed = true` before the loop and `await` each backend in turn, so
+   * one rejecting backend aborted the loop: every backend after it stayed open,
+   * `this.backends` was never cleared, and the shared SQLite handle — the one
+   * thing the registry itself owns — never closed. The retry a shutdown path
+   * would naturally make then hit `if (this.closed) return` and RESOLVED,
+   * reporting success for a close that never happened.
+   *
+   * Now every backend is attempted (`allSettled`), the owned handle closes
+   * regardless, and the registry IS marked closed — because by then everything
+   * it owns really is shut — but the first backend failure is re-thrown so the
+   * caller learns about it. A retry then returns early and resolves, which is
+   * honest: there is genuinely nothing left to close. Marking it open instead
+   * would be worse than the original bug — `assertOpen` would pass and the next
+   * operation would run against a closed SQLite handle.
+   */
+  async close(): Promise<void> {
+    if (this.closed) return;
+    const results = await Promise.allSettled(
+      [...this.backends.values()].map((backend) => backend.close())
+    );
+    // The shared handle is ours to close whether or not a backend misbehaved;
+    // leaking it is what turns one bad backend into a stuck process.
+    this.backends.clear();
+    if (this.db !== undefined) this.db.close();
+
+    // Set BEFORE the throw: everything this registry owns is shut, so any
+    // further operation must reject rather than reach a closed handle.
+    this.closed = true;
+
+    const failures = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failures.length > 0) {
+      throw failures[0]?.reason instanceof Error
+        ? failures[0].reason
+        : new Error(`nexus-memory: ${String(failures.length)} backend(s) failed to close`);
+    }
+  }
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new Error('nexus-memory: registry is closed');
+    }
+  }
+}
+
+// ============================================================================
+// Singleton accessor
+// ============================================================================
+
+let sharedRegistry: MemoryRegistry | null = null;
+
+/**
+ * Get the process-wide shared registry. Initializes on first call with
+ * `dbPath` from `NEXUS_DATA_DIR` (defaults to `~/.nexus-agents/memory/memory.db`)
+ * unless `setMemoryRegistry` was called first.
+ *
+ * Test code should call `setMemoryRegistry(createInMemoryMemoryRegistry())`
+ * in `beforeEach` — this matches the existing `setOutcomeStore` pattern.
+ */
+export function getMemoryRegistry(): MemoryRegistry {
+  if (sharedRegistry === null) {
+    // Default path resolution happens here, NOT at module load — so tests
+    // that call `setMemoryRegistry` before any `getMemoryRegistry` see
+    // their in-memory instance, not a side-effectful production path.
+    const dbPath = resolveDefaultDbPath();
+    sharedRegistry = new MemoryRegistry({ dbPath });
+  }
+  return sharedRegistry;
+}
+
+/**
+ * Inject a registry. Used by tests to swap in `InMemoryBackend`-backed
+ * registries. After test, call again with `null` to reset, or call
+ * `closeMemoryRegistry()` to dispose.
+ */
+export function setMemoryRegistry(registry: MemoryRegistry | null): void {
+  sharedRegistry = registry;
+}
+
+/**
+ * True when the shared registry has already been constructed or injected.
+ * Lets nexus-agents inject the canonical {@link nexusDataPath}-resolved DB
+ * path (#3995) WITHOUT clobbering a registry a test already set, and without
+ * triggering the lazy default-path resolution that `getMemoryRegistry()`
+ * would. Read-only — keeps nexus-memory dep-free.
+ */
+export function hasMemoryRegistry(): boolean {
+  return sharedRegistry !== null;
+}
+
+/** Close + null out the shared registry. Idempotent. */
+export async function closeMemoryRegistry(): Promise<void> {
+  if (sharedRegistry !== null) {
+    await sharedRegistry.close();
+    sharedRegistry = null;
+  }
+}
+
+function resolveDefaultDbPath(): string {
+  // Match `nexus-agents`'s `nexusDataPath` convention without importing it
+  // (keep nexus-memory free of inter-package deps for nexus-eval-* reuse).
+  const root = process.env['NEXUS_DATA_DIR'] ?? `${process.env['HOME'] ?? '/tmp'}/.nexus-agents`;
+  return `${root}/memory/memory.db`;
+}

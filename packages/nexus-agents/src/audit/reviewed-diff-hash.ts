@@ -1,0 +1,152 @@
+// @export-no-consumer-yet — see #3831. Consumed today by the governor gate
+// (scripts/check-governor-review.ts, outside src/); the in-src/ consumer is the
+// recordAuthenticPrReview producer, the tracked #3831 follow-up.
+/**
+ * Canonical reviewed-diff hashing for the Option-C pr_review binding (#3831).
+ *
+ * The authority `pr_review` record binds to `{prNumber, baseSha, reviewedDiffHash}`
+ * (replacing the rejected `headSha` binding). `reviewedDiffHash` must be computed
+ * BYTE-IDENTICALLY by the producer (over the diff the voters reviewed) and the
+ * governor gate (`scripts/check-governor-review.ts`, which recomputes it from the
+ * committed PR's diff). This module is the single shared definition so the two
+ * sides cannot drift.
+ *
+ * CANONICAL FORM (the binding contract — pinned per the #3831 ratification panel):
+ *  1. The diff bytes are produced by the EXACT git invocation
+ *     {@link CANONICAL_GIT_DIFF_ARGS} (pinned config so the bytes are stable across
+ *     git versions / local gitconfig). The gate runs this; the producer is handed
+ *     the same bytes (the pr_review tool reviews exactly this diff).
+ *  2. The UTF-8 bytes are truncated to {@link MAX_REVIEWED_DIFF_BYTES} at a BYTE
+ *     boundary (NOT a codepoint boundary — both sides truncate identically).
+ *  3. `sha256(truncatedBytes)` hex.
+ *
+ * KNOWN LIMITATION (#3831 condition B): because the truncation is part of the
+ * canonical form, content past {@link MAX_REVIEWED_DIFF_BYTES} is UNBOUND — two
+ * diffs sharing the first 50k bytes hash identically, so a record cannot attest
+ * anything beyond the cap. This is the BINDING cap only (#6003, #6188): the
+ * panel may read the whole diff — what the panel is sent is bounded by the
+ * voters' own context windows (`mcp/tools/pr-review-panel-budget.ts`), so a
+ * diff over this cap goes to the panel whole whenever it fits that budget. The
+ * two portions are stated separately on the record: `coverage` says what the
+ * panel read, `bindingBounds` says how far the hash reaches (#6190), and the summary
+ * stamp repeats both for a human reader. Producers MUST surface
+ * {@link reviewedDiffWasTruncated} so an over-cap review is visible.
+ *
+ * @module audit/reviewed-diff-hash
+ */
+
+import * as crypto from 'node:crypto';
+
+/**
+ * Max reviewed-diff size folded into the canonical hash, in BYTES (UTF-8). The
+ * BINDING cap: the hash attests the first this-many bytes and nothing past them
+ * (#3831 condition B). NOT the panel-read cap — since #6003 the panel may read
+ * past it, up to its seats' context windows; the pr_review tool's
+ * `MAX_DIFF_LENGTH` mirrors this value as the binding cap and as the panel
+ * budget only when that derivation fails closed. The record states which
+ * portion was read and which is bound (#6190).
+ */
+export const MAX_REVIEWED_DIFF_BYTES = 50_000;
+
+/**
+ * The pinned `git diff` argument vector that defines the canonical reviewed-diff
+ * bytes. Both the gate (which runs git) and any producer that recomputes locally
+ * MUST use these exact args so the output is byte-stable regardless of the host's
+ * git version or `~/.gitconfig`:
+ *  - `-c core.autocrlf=false` — never rewrite line endings.
+ *  - `-c diff.algorithm=myers` — pin the diff algorithm (patience/histogram/minimal
+ *    via local config would change the bytes).
+ *  - `-c diff.mnemonicprefix=false` / `-c diff.noprefix=false` — keep the default
+ *    `a/`,`b/` prefixes regardless of local config.
+ *  - `--no-color` / `--no-ext-diff` — no ANSI, no external differ.
+ *  - `--no-renames` — rename detection output is config/version-sensitive; off.
+ *  - `-U3` — pin the context-line count (git default is 3, but it is configurable).
+ *  - `<base>..<head>` — TWO-DOT range (base→head), NOT three-dot/merge-base.
+ * {@link canonicalGitDiffArgs} appends the range, then the `--` separator and the
+ * {@link LEDGER_EXCLUDE_PATHSPEC} exclude pathspec (see that constant for why).
+ */
+export const CANONICAL_GIT_DIFF_ARGS: readonly string[] = Object.freeze([
+  '-c',
+  'core.autocrlf=false',
+  '-c',
+  'diff.algorithm=myers',
+  '-c',
+  'diff.mnemonicprefix=false',
+  '-c',
+  'diff.noprefix=false',
+  'diff',
+  '--no-color',
+  '--no-ext-diff',
+  '--no-renames',
+  '-U3',
+]);
+
+/**
+ * Git pathspec (magic `:(exclude)` prefix) that removes the append-only pr-review
+ * ledger from the canonical reviewed diff (#4229). WHY it must be excluded from
+ * the authenticity primitive:
+ *
+ *   A pr_review record for PR N must be COMMITTED to PR N's head branch, because
+ *   the governor gate reads the ledger from the head checkout (`readFileSync`).
+ *   But committing the record advances head, so a naive `git diff base..head`
+ *   would then include the record line — changing the diff bytes and thus the
+ *   recomputed `reviewedDiffHash`, which no longer matches the hash stored IN that
+ *   record. The record would self-invalidate the moment it is committed. Excluding
+ *   the ledger from the canonical diff makes committing a record to head safe.
+ *
+ * The SAME {@link canonicalGitDiffArgs} is used by BOTH the producer (over the diff
+ * the voters reviewed) and the gate (`scripts/check-governor-review.ts` recompute),
+ * so the exclusion applies identically to both sides by construction — they cannot
+ * drift.
+ *
+ * SECURITY (pinned by tests in `reviewed-diff-hash.test.ts`):
+ *  - ONLY this EXACT path is excluded — the leading-space-free `:(exclude)` magic
+ *    matches one literal file, NOT a glob or directory, so it can never hide
+ *    reviewable code (e.g. `governance/other.jsonl` or `…records.jsonl.bak` stay
+ *    in the diff).
+ *  - The ledger's INTEGRITY is unaffected: it is still fully tamper-checked by
+ *    `verifyPrReviewRecordSet`. Excluding it from the *reviewed diff* does not
+ *    remove it from tamper-evidence.
+ *  - A PR that changes ledger content still cannot smuggle non-ledger changes: the
+ *    exclusion drops only the ledger file; every other changed path (code) remains
+ *    in the canonical diff and thus in the hash.
+ *
+ * The literal path is kept in sync with the store's `PR_REVIEW_RECORDS_REL_PATH`
+ * by a drift-guard test (this module stays dependency-minimal — only `node:crypto`
+ * — so it does not import the heavier store module here).
+ */
+export const LEDGER_EXCLUDE_PATHSPEC = ':(exclude)governance/pr-review-records.jsonl';
+
+/**
+ * Build the full canonical `git` argv for a base..head range (two-dot). The range
+ * is followed by `--` (revision/pathspec separator) and {@link LEDGER_EXCLUDE_PATHSPEC}
+ * so the append-only pr-review ledger is excluded from the reviewed diff (#4229) —
+ * committing a record to head then does not change the hash the record binds to.
+ */
+export function canonicalGitDiffArgs(baseSha: string, headSha: string): string[] {
+  return [...CANONICAL_GIT_DIFF_ARGS, `${baseSha}..${headSha}`, '--', LEDGER_EXCLUDE_PATHSPEC];
+}
+
+/**
+ * Compute the canonical `reviewedDiffHash` over a reviewed-diff string. Truncates
+ * the UTF-8 bytes to {@link MAX_REVIEWED_DIFF_BYTES} at a BYTE boundary, then
+ * sha256. The SAME function is called by the producer (over the diff the tool
+ * reviewed) and the gate (over {@link canonicalGitDiffArgs} output) so the hash
+ * reproduces iff the committed PR's canonical diff is byte-identical to what was
+ * reviewed.
+ */
+export function computeReviewedDiffHash(diff: string): string {
+  const bytes = Buffer.from(diff, 'utf-8');
+  const truncated =
+    bytes.byteLength > MAX_REVIEWED_DIFF_BYTES ? bytes.subarray(0, MAX_REVIEWED_DIFF_BYTES) : bytes;
+  return crypto.createHash('sha256').update(truncated).digest('hex');
+}
+
+/**
+ * Whether the reviewed diff exceeds the canonical cap (so the hash binds only the
+ * first {@link MAX_REVIEWED_DIFF_BYTES} bytes). Producers SHOULD log/warn when true
+ * (#3831 condition B) so an over-cap review is observable.
+ */
+export function reviewedDiffWasTruncated(diff: string): boolean {
+  return Buffer.byteLength(diff, 'utf-8') > MAX_REVIEWED_DIFF_BYTES;
+}

@@ -1,0 +1,305 @@
+/**
+ * Tests for core/logger.ts
+ *
+ * Covers sanitize, sanitizeDeep, createLogger, and secret redaction.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  sanitize,
+  sanitizeDeep,
+  createLogger,
+  setGlobalLogLevel,
+  getGlobalLogLevel,
+  type ILogger,
+  type LogLevel,
+} from './logger.js';
+import { FixedTimeProvider, setTimeProvider, resetTimeProvider } from './time-provider.js';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { nexusMkdtempSync } from '../config/nexus-tmp-dir.js';
+import {
+  FAKE_OPENAI_KEY,
+  FAKE_BEARER_TOKEN,
+  FAKE_GITHUB_PAT,
+  FAKE_AWS_KEY_ID,
+} from '../testing/test-secrets.js';
+
+// ============================================================================
+// Setup
+// ============================================================================
+
+const FIXED_TIME = 1700000000000;
+
+beforeEach(() => {
+  setTimeProvider(new FixedTimeProvider(FIXED_TIME));
+  return () => {
+    resetTimeProvider();
+  };
+});
+
+// ============================================================================
+// sanitize
+// ============================================================================
+
+describe('sanitize', () => {
+  it('redacts OpenAI API keys', () => {
+    const text = `key: ${FAKE_OPENAI_KEY}`;
+    expect(sanitize(text)).toContain('[REDACTED]');
+    expect(sanitize(text)).not.toContain('sk-TESTFAKE');
+  });
+
+  it('redacts Bearer tokens', () => {
+    const text = `Authorization: ${FAKE_BEARER_TOKEN}`;
+    expect(sanitize(text)).toContain('[REDACTED]');
+    expect(sanitize(text)).not.toContain('eyTEST');
+  });
+
+  it('redacts GitHub personal access tokens', () => {
+    const text = `token: ${FAKE_GITHUB_PAT}`;
+    expect(sanitize(text)).toContain('[REDACTED]');
+    expect(sanitize(text)).not.toContain('ghp_');
+  });
+
+  it('redacts AWS access key IDs', () => {
+    const text = `key: ${FAKE_AWS_KEY_ID}`;
+    expect(sanitize(text)).toContain('[REDACTED]');
+    expect(sanitize(text)).not.toContain('AKIATEST');
+  });
+
+  it('redacts password assignments', () => {
+    const text = 'password=my-secret-pass123';
+    expect(sanitize(text)).toContain('[REDACTED]');
+    expect(sanitize(text)).not.toContain('my-secret');
+  });
+
+  it('redacts Google AI API keys', () => {
+    const text = 'key: AIzaSyTEST-FAKE-KEY-NOT-REAL-0000000000';
+    expect(sanitize(text)).toContain('[REDACTED]');
+    expect(sanitize(text)).not.toContain('AIzaSy');
+  });
+
+  it('preserves non-secret text', () => {
+    const text = 'This is a normal log message with no secrets.';
+    expect(sanitize(text)).toBe(text);
+  });
+});
+
+// ============================================================================
+// sanitizeDeep
+// ============================================================================
+
+describe('sanitizeDeep', () => {
+  it('returns null for null', () => {
+    expect(sanitizeDeep(null)).toBeNull();
+  });
+
+  it('returns undefined for undefined', () => {
+    expect(sanitizeDeep(undefined)).toBeUndefined();
+  });
+
+  it('passes through numbers', () => {
+    expect(sanitizeDeep(42)).toBe(42);
+  });
+
+  it('passes through booleans', () => {
+    expect(sanitizeDeep(true)).toBe(true);
+  });
+
+  it('sanitizes strings', () => {
+    expect(sanitizeDeep(FAKE_OPENAI_KEY)).toContain('[REDACTED]');
+  });
+
+  it('sanitizes arrays', () => {
+    const result = sanitizeDeep(['normal', FAKE_OPENAI_KEY]);
+    expect(result).toEqual(['normal', expect.stringContaining('[REDACTED]')]);
+  });
+
+  it('redacts sensitive field names', () => {
+    const result = sanitizeDeep({ password: 'secret123', name: 'safe' });
+    expect(result).toEqual({ password: '[REDACTED]', name: 'safe' });
+  });
+
+  it('redacts nested sensitive fields', () => {
+    const result = sanitizeDeep({
+      user: { name: 'John', apiKey: 'my-key-123', level: 5 },
+    });
+    const sanitized = result as Record<string, Record<string, unknown>>;
+    expect(sanitized.user?.apiKey).toBe('[REDACTED]');
+    expect(sanitized.user?.name).toBe('John');
+    expect(sanitized.user?.level).toBe(5);
+  });
+
+  it('redacts x-api-key field names', () => {
+    const result = sanitizeDeep({ 'x-api-key': 'some-key-value' });
+    expect(result).toEqual({ 'x-api-key': '[REDACTED]' });
+  });
+
+  it('handles circular references', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const obj: any = { name: 'test' };
+
+    obj.self = obj;
+    const result = sanitizeDeep(obj) as Record<string, unknown>;
+    expect(result.self).toEqual({ _circular: '[Circular]' });
+  });
+
+  it('formats non-primitive types', () => {
+    expect(sanitizeDeep(Symbol('test'))).toBe('[symbol]');
+  });
+});
+
+// ============================================================================
+// createLogger
+// ============================================================================
+
+describe('createLogger', () => {
+  it('creates logger with default level', () => {
+    const logger = createLogger({ component: 'test' });
+    expect(logger).toBeDefined();
+    expect(logger.debug).toBeTypeOf('function');
+    expect(logger.info).toBeTypeOf('function');
+    expect(logger.warn).toBeTypeOf('function');
+    expect(logger.error).toBeTypeOf('function');
+  });
+
+  it('creates child logger with merged context', () => {
+    const parent = createLogger({ component: 'parent' });
+    const child = parent.child({ subComponent: 'child' });
+    expect(child).toBeDefined();
+    expect(child.debug).toBeTypeOf('function');
+  });
+
+  it('supports setLevel', () => {
+    const logger = createLogger({ component: 'test' });
+    expect(() => {
+      logger.setLevel('error');
+    }).not.toThrow();
+  });
+
+  it('does not throw when logging at any level', () => {
+    const logger = createLogger({ component: 'test' });
+    logger.setLevel('debug');
+    expect(() => {
+      logger.debug('debug msg');
+      logger.info('info msg');
+      logger.warn('warn msg');
+      logger.error('error msg', new Error('test'));
+    }).not.toThrow();
+  });
+
+  // Regression: stdio MCP transport reserves stdout for JSON-RPC frames.
+  // If the default log destination were stdout, the first logger call inside
+  // any tool handler would emit a non-JSON-RPC frame and the client would
+  // close the transport with a ZodError. The default must be stderr.
+  it('writes to stderr by default, not stdout', () => {
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const logger = createLogger({ component: 'test' });
+      logger.info('hello');
+      expect(stdoutSpy).not.toHaveBeenCalled();
+      expect(stderrSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+    }
+  });
+});
+
+// ============================================================================
+// Issue #2443 — module-level GLOBAL_LEVEL fallback
+// ============================================================================
+
+describe('setGlobalLogLevel (#2443)', () => {
+  let savedLevel: LogLevel;
+
+  beforeEach(() => {
+    savedLevel = getGlobalLogLevel();
+  });
+
+  afterEach(() => {
+    setGlobalLogLevel(savedLevel);
+  });
+
+  it('downgrades existing logger instances that have not been individually setLevel-d', () => {
+    setGlobalLogLevel('info');
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      // Create logger BEFORE setGlobalLogLevel('warn') — proves the global
+      // fallback applies to already-constructed instances.
+      const logger = createLogger({ component: 'global-fallback-test' });
+      setGlobalLogLevel('warn');
+      logger.info('should-be-suppressed-by-global-warn');
+      logger.warn('should-pass-through');
+      expect(stderrSpy).toHaveBeenCalledTimes(1);
+      const written = String(stderrSpy.mock.calls[0]?.[0] ?? '');
+      expect(written).toContain('should-pass-through');
+      expect(written).not.toContain('should-be-suppressed-by-global-warn');
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('per-instance setLevel still wins over the global fallback', () => {
+    setGlobalLogLevel('warn');
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const logger = createLogger({ component: 'per-instance-override-test' });
+      logger.setLevel('debug'); // pin this instance below the global threshold
+      logger.info('should-pass-through-because-instance-pinned-debug');
+      expect(stderrSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+});
+
+// ============================================================================
+// setDestination('file') (#6153)
+// ============================================================================
+
+describe("setDestination('file')", () => {
+  // The file branch used to reach `fs` through a bare `require('fs')` under a
+  // `no-require-imports` suppression. The package ships ESM only, so in the
+  // built bundle that call threw `Dynamic require of "fs" is not supported`
+  // on the first log line — the suppression was hiding a broken path, not a
+  // deliberate one (#6153). Vitest supplies a `require` shim, so this test
+  // locks the behaviour rather than reproducing the bundle failure; the
+  // reproduction is `node` against `dist/` before and after the fix.
+  let dir: string;
+  const logger = createLogger({ component: 'file-destination-test' });
+  // Optional on ILogger (a test double may omit it); createLogger always wires it.
+  const setDestination = (...args: Parameters<NonNullable<ILogger['setDestination']>>): void => {
+    if (logger.setDestination === undefined) throw new Error('createLogger omitted setDestination');
+    logger.setDestination(...args);
+  };
+
+  beforeEach(() => {
+    dir = nexusMkdtempSync('logger-file-dest-');
+  });
+
+  afterEach(() => {
+    setDestination('stderr');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('appends the log line to the configured file', async () => {
+    const target = join(dir, 'nexus.log');
+    setDestination('file', target);
+    logger.warn('written-to-file-6153');
+    // Switching away ends the stream; the flush is asynchronous.
+    setDestination('stderr');
+
+    const deadline = Date.now() + 2000;
+    let content = '';
+    while (Date.now() < deadline) {
+      content = existsSync(target) ? readFileSync(target, 'utf-8') : '';
+      if (content.includes('written-to-file-6153')) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(content).toContain('written-to-file-6153');
+    expect(content).toContain('"component":"file-destination-test"');
+  });
+});

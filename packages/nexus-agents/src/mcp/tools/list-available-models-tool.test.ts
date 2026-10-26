@@ -1,0 +1,350 @@
+/**
+ * Tests for the list_available_models validation tool handler (#3406).
+ */
+import { afterAll, afterEach, beforeAll, beforeEach, describe, it, expect, vi } from 'vitest';
+
+import { listAvailableModelsHandler } from './list-available-models-tool.js';
+import { createLogger } from '../../core/index.js';
+import type { AvailableModelsSource } from '../../config/available-models-cache.js';
+import { breakerKeys } from '../../cli-adapters/breaker-key.js';
+import { getDefaultCliCircuitBreakerRegistry } from '../../cli-adapters/cli-circuit-breaker.js';
+import { startFakeGateway, type FakeGateway } from '../../testing/gateway/fake-gateway.js';
+
+const logger = createLogger({ tool: 'test' });
+
+function src(name: string, ids: string[] | Error): AvailableModelsSource {
+  return {
+    name,
+    listModels: () =>
+      ids instanceof Error ? Promise.reject(ids) : Promise.resolve(ids.map((id) => ({ id }))),
+  };
+}
+
+function parse(text: string): {
+  totalTransports: number;
+  healthyTransports: number;
+  reachableTransports: number;
+  totalModels: number;
+  note: string;
+  breakerOpenTransports: string[];
+  transports: {
+    transport: string;
+    ok: boolean;
+    servesModels: boolean;
+    modelCount: number;
+    sampleModelIds: string[];
+    modelIds?: string[];
+    error?: string;
+    breakerOpen?: boolean;
+    catalogueCaveat?: string;
+  }[];
+} {
+  return JSON.parse(text) as ReturnType<typeof parse>;
+}
+
+describe('list_available_models handler (#3406)', () => {
+  it('reports per-transport health and totals', async () => {
+    const sourcesFactory = (): AvailableModelsSource[] => [
+      src('openrouter', ['a', 'b', 'c']),
+      src('claude', ['claude-x']),
+    ];
+    const res = await listAvailableModelsHandler({}, { sourcesFactory }, logger);
+    const data = parse(res.content[0]?.text ?? '');
+    expect(data.totalTransports).toBe(2);
+    expect(data.healthyTransports).toBe(2);
+    expect(data.totalModels).toBe(4);
+  });
+
+  it('marks a failing transport ok:false without failing the whole report', async () => {
+    const sourcesFactory = (): AvailableModelsSource[] => [
+      src('opencode', new Error('cli down')),
+      src('gemini', ['g-1']),
+    ];
+    const res = await listAvailableModelsHandler({}, { sourcesFactory }, logger);
+    const data = parse(res.content[0]?.text ?? '');
+    expect(data.healthyTransports).toBe(1);
+    const opencode = data.transports.find((t) => t.transport === 'opencode');
+    expect(opencode?.ok).toBe(false);
+    expect(opencode?.error).toContain('cli down');
+  });
+
+  it('returns a 5-id sample by default and the full list when includeModelIds=true', async () => {
+    const ids = ['a', 'b', 'c', 'd', 'e', 'f'];
+    const sourcesFactory = (): AvailableModelsSource[] => [src('openrouter', ids)];
+
+    const sample = parse(
+      (await listAvailableModelsHandler({}, { sourcesFactory }, logger)).content[0]?.text ?? ''
+    );
+    expect(sample.transports[0]?.sampleModelIds.length).toBe(5);
+    expect(sample.transports[0]?.modelIds).toBeUndefined();
+
+    const full = parse(
+      (await listAvailableModelsHandler({ includeModelIds: true }, { sourcesFactory }, logger))
+        .content[0]?.text ?? ''
+    );
+    expect(full.transports[0]?.modelIds?.length).toBe(6);
+  });
+
+  it('rejects invalid input', async () => {
+    const res = await listAvailableModelsHandler({ includeModelIds: 'yes' }, {}, logger);
+    expect(res.content[0]?.text).toContain('Validation error');
+  });
+});
+
+describe('reachable is not the same as usable (#5128)', () => {
+  /**
+   * A probe that succeeds and finds nothing used to report `ok: true,
+   * modelCount: 0` and count toward `healthyTransports`. Against a stale
+   * install, three of five transports reported exactly that and the summary
+   * still said every transport was healthy — a diagnostic that could not
+   * distinguish "reachable" from "usable", which is the one distinction it
+   * exists to make.
+   */
+  it('does not count an empty-but-successful probe as healthy', async () => {
+    const res = await listAvailableModelsHandler(
+      {},
+      {
+        sourcesFactory: (): AvailableModelsSource[] => [src('full', ['a', 'b']), src('empty', [])],
+      },
+      logger
+    );
+    const out = parse(res.content[0]?.text ?? '{}');
+
+    expect(out.healthyTransports).toBe(1);
+    expect(out.reachableTransports).toBe(2);
+  });
+
+  it('marks the empty transport as reachable but not serving', async () => {
+    const res = await listAvailableModelsHandler(
+      {},
+      { sourcesFactory: (): AvailableModelsSource[] => [src('empty', [])] },
+      logger
+    );
+    const out = parse(res.content[0]?.text ?? '{}');
+    const t = out.transports[0];
+
+    // Deliberately NOT ok:false. The probe genuinely succeeded, and saying it
+    // failed would trade one misreport for another.
+    expect(t?.ok).toBe(true);
+    expect(t?.servesModels).toBe(false);
+  });
+
+  it('counts a failed probe as neither reachable nor healthy', async () => {
+    const res = await listAvailableModelsHandler(
+      {},
+      {
+        sourcesFactory: (): AvailableModelsSource[] => [src('broken', new Error('probe exploded'))],
+      },
+      logger
+    );
+    const out = parse(res.content[0]?.text ?? '{}');
+
+    expect(out.healthyTransports).toBe(0);
+    expect(out.reachableTransports).toBe(0);
+    expect(out.transports[0]?.servesModels).toBe(false);
+  });
+
+  it('reports all three counts when every transport serves', async () => {
+    // The pair for the first test: without this, a bug making healthyTransports
+    // always 0 would still pass everything above.
+    const res = await listAvailableModelsHandler(
+      {},
+      { sourcesFactory: (): AvailableModelsSource[] => [src('a', ['x']), src('b', ['y'])] },
+      logger
+    );
+    const out = parse(res.content[0]?.text ?? '{}');
+
+    expect(out.healthyTransports).toBe(2);
+    expect(out.reachableTransports).toBe(2);
+    expect(out.totalTransports).toBe(2);
+  });
+});
+
+describe('list_available_models lists the gateway under the gateway (#6609)', () => {
+  let gateway: FakeGateway;
+  /** A routing arm that can list models, as `createAllAdapters` returns them. */
+  const lister = (ids: string[]): { listModels: () => Promise<{ id: string }[]> } => ({
+    listModels: () => Promise.resolve(ids.map((id) => ({ id }))),
+  });
+
+  beforeAll(async () => {
+    gateway = await startFakeGateway();
+  });
+  afterAll(async () => {
+    await gateway.close();
+  });
+  beforeEach(() => {
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_URL', gateway.baseUrl);
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_KEY', 'list-models-key-6609');
+    vi.stubEnv('NEXUS_CUSTOM_API_ALLOW_PRIVATE', '1');
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_MODELS', undefined);
+    vi.stubEnv('NEXUS_OPENCODE_CONFIG', undefined);
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  async function transports(
+    arms: ReadonlyMap<string, unknown>
+  ): Promise<ReturnType<typeof parse>['transports']> {
+    const res = await listAvailableModelsHandler(
+      { includeOpenRouter: false },
+      { adaptersFactory: () => arms },
+      logger
+    );
+    return parse(res.content[0]?.text ?? '').transports;
+  }
+
+  it('plan mode: lists the discovered chat catalogue as a gateway transport', async () => {
+    const report = await transports(new Map([['opencode', lister(['oc-1'])]]));
+
+    expect(report.map((t) => [t.transport, t.modelCount])).toEqual([
+      ['opencode', 1],
+      ['gateway', 12],
+    ]);
+  });
+
+  it('api mode: the api:custom-openai arm is not listed under "opencode"', async () => {
+    const arms = new Map<string, unknown>([
+      ['opencode', lister(['oc-1'])],
+      ['api:custom-openai', lister(['raw-1', 'raw-2'])],
+    ]);
+
+    const report = await transports(arms);
+
+    expect(report.map((t) => [t.transport, t.modelCount])).toEqual([
+      ['opencode', 1],
+      ['gateway', 12],
+    ]);
+  });
+
+  it('legacy single-model variables only: that arm is listed under "gateway"', async () => {
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_URL', undefined);
+
+    const report = await transports(new Map([['api:custom-openai', lister(['raw-1'])]]));
+
+    expect(report.map((t) => [t.transport, t.modelCount])).toEqual([['gateway', 1]]);
+  });
+
+  it('no gateway: no gateway transport', async () => {
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_URL', undefined);
+
+    const report = await transports(new Map([['opencode', lister(['oc-1'])]]));
+
+    expect(report.map((t) => t.transport)).toEqual(['opencode']);
+  });
+
+  it('an unreachable gateway is a failed gateway transport, not a missing one', async () => {
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_URL', 'http://127.0.0.1:1/v1');
+
+    const report = await transports(new Map());
+
+    expect(report).toHaveLength(1);
+    expect(report[0]).toMatchObject({ transport: 'gateway', ok: false, servesModels: false });
+    expect(report[0]?.error).toContain('127.0.0.1');
+    expect(JSON.stringify(report)).not.toContain('list-models-key-6609');
+  });
+});
+
+describe('list_available_models breaker state (#6769)', () => {
+  const breakers = getDefaultCliCircuitBreakerRegistry();
+
+  afterEach(() => {
+    breakers.resetAll();
+  });
+
+  it('flags a CLI transport whose shared breaker is open, and only that one', async () => {
+    const claude = breakers.getBreaker('claude');
+    for (let i = 0; i < 10 && claude.getState() !== 'open'; i++) claude.recordFailure('crash');
+    expect(breakers.isOpen('claude')).toBe(true);
+
+    const sourcesFactory = (): AvailableModelsSource[] => [
+      src('claude', ['claude-x']),
+      src('gemini', ['g-1']),
+      src('openrouter', ['a']),
+    ];
+    const res = await listAvailableModelsHandler({}, { sourcesFactory }, logger);
+    const data = parse(res.content[0]?.text ?? '');
+    const byName = new Map(data.transports.map((t) => [t.transport, t]));
+
+    // The probe still ran; open routes are excluded from the usable model list.
+    expect(byName.get('claude')).toMatchObject({
+      ok: true,
+      servesModels: false,
+      modelCount: 0,
+      breakerOpen: true,
+    });
+    expect(byName.get('gemini')).toMatchObject({ breakerOpen: false });
+    // No CLI breaker tracks openrouter: the field is absent, not a default `false`.
+    expect(byName.get('openrouter')).not.toHaveProperty('breakerOpen');
+    expect(data.breakerOpenTransports).toEqual(['claude']);
+  });
+
+  it('with no breaker open, every CLI transport reports breakerOpen:false', async () => {
+    const sourcesFactory = (): AvailableModelsSource[] => [src('codex', ['c-1'])];
+    const res = await listAvailableModelsHandler({}, { sourcesFactory }, logger);
+    const data = parse(res.content[0]?.text ?? '');
+
+    expect(data.transports[0]).toMatchObject({ transport: 'codex', breakerOpen: false });
+    expect(data.breakerOpenTransports).toEqual([]);
+  });
+});
+
+describe('the codex row is labelled a vendor-catalogue superset (#5086)', () => {
+  async function report(): Promise<ReturnType<typeof parse>> {
+    const sourcesFactory = (): AvailableModelsSource[] => [
+      src('codex', ['gpt-5.5', 'gpt-4']),
+      src('claude', ['claude-x']),
+      src('opencode', ['o-1']),
+    ];
+    const res = await listAvailableModelsHandler({}, { sourcesFactory }, logger);
+    return parse(res.content[0]?.text ?? '');
+  }
+
+  it('attaches a superset caveat to the codex transport', async () => {
+    const codex = (await report()).transports.find((t) => t.transport === 'codex');
+    expect(codex?.catalogueCaveat).toMatch(/superset/i);
+    expect(codex?.catalogueCaveat).toMatch(/not the runnable set/i);
+  });
+
+  it('leaves transports whose catalogue is what they serve uncaveated', async () => {
+    const byName = new Map((await report()).transports.map((t) => [t.transport, t]));
+    // Absent, not an empty string: no known caveat applies to these catalogues.
+    expect(byName.get('claude')).not.toHaveProperty('catalogueCaveat');
+    expect(byName.get('opencode')).not.toHaveProperty('catalogueCaveat');
+  });
+
+  it('points readers at the per-transport caveat in the top-level note', async () => {
+    expect((await report()).note).toMatch(/catalogueCaveat/);
+  });
+});
+
+describe('list_available_models route availability (#7070)', () => {
+  const breakers = getDefaultCliCircuitBreakerRegistry();
+  afterEach(() => {
+    breakers.resetAll();
+  });
+
+  it.each([
+    ['opencode-custom-sonnet', 'opencode-default', false],
+    ['opencode-default', 'opencode-custom-sonnet', true],
+  ])('omits unavailable %s while retaining %s', async (failed, healthy, defaultOpen) => {
+    const breaker = breakers.getArmBreaker(breakerKeys.forArm({ name: 'opencode', model: failed }));
+    for (let i = 0; i < breaker.getSnapshot().config.failureThreshold; i++) {
+      breaker.recordFailure('unknown');
+    }
+    const result = await listAvailableModelsHandler(
+      { includeModelIds: true },
+      { sourcesFactory: () => [src('opencode', [failed, healthy])] },
+      logger
+    );
+    const data = parse(result.content[0]?.text ?? '');
+    expect(data.transports[0]).toMatchObject({
+      modelIds: [healthy],
+      sampleModelIds: [healthy],
+      modelCount: 1,
+      servesModels: true,
+      breakerOpen: defaultOpen,
+    });
+  });
+});

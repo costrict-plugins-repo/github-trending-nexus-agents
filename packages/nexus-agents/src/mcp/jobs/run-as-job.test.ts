@@ -1,0 +1,1479 @@
+/**
+ * Tests for the shared async-job dispatcher `runAsJob` (#3729 / epic #2631).
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { runAsJob, runJobInBackground, extractFailureDetail } from './run-as-job.js';
+import {
+  heartbeatJob,
+  readJobResult,
+  writeJobPending,
+  writeJobCancelled,
+  JOB_RECORD_RETENTION_MS,
+} from './job-result-store.js';
+import { FAKE_ANTHROPIC_KEY } from '../../testing/test-secrets.js';
+import { stepBus } from '../../core/step-bus.js';
+import { abortJob } from './job-abort-registry.js';
+import { registerIdempotentJob, resolveIdempotency } from './job-idempotency.js';
+import {
+  _resetForTests as resetConcurrency,
+  getInFlight,
+  getJobCap,
+  tryAcquire,
+} from './job-concurrency.js';
+import { resetNexusDataDirCache, nexusDataPath } from '../../config/nexus-data-dir.js';
+import { VERSION } from '../../version.js';
+import { FixedTimeProvider, resetTimeProvider, setTimeProvider } from '../../core/index.js';
+import { initTaskState, readTaskState } from '../../context/structured-task-state.js';
+import { emitStageCompleted } from '../../pipeline/pipeline-observability.js';
+import { createCallerAbortCliError } from '../../cli-adapters/cli-error-helpers.js';
+import { isCallerCancelled } from '../../adapters/abort-utils.js';
+
+interface DummyInput {
+  readonly task: string;
+}
+
+/** Parse the JSON payload out of a ToolResult text envelope. */
+function parseEnvelope(result: { content: Array<{ text: string }> }): Record<string, unknown> {
+  return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+}
+
+describe('runAsJob', () => {
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-runasjob-test-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+  });
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('returns a pending envelope with the minted jobId', () => {
+    const result = runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'x' },
+      freshJobId: () => 'job-fixed-1',
+      run: () => new Promise(() => {}), // never resolves — keep it pending
+    });
+    const env = parseEnvelope(result);
+    expect(env['status']).toBe('pending');
+    expect(env['jobId']).toBe('job-fixed-1');
+    expect(env['pollTool']).toBe('get_job_result');
+  });
+
+  it('writes a pending job record + acquires a concurrency slot on dispatch', () => {
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'x' },
+      freshJobId: () => 'job-fixed-2',
+      run: () => new Promise(() => {}),
+    });
+    expect(readJobResult('job-fixed-2')?.status).toBe('pending');
+    expect(getInFlight('orchestrate')).toBe(1);
+  });
+
+  it('marks task state initialized by async-dispatched work', async () => {
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'x' },
+      freshJobId: () => 'job-task-state-async',
+      run: async (jobId) => {
+        await Promise.resolve();
+        initTaskState({
+          taskId: jobId,
+          stage: 'planning',
+          decisions: [],
+          blockers: [],
+          position: { currentStep: 'init' },
+          updatedAt: '2026-05-01T00:00:00Z',
+        });
+        initTaskState({
+          taskId: 'nested-sync-task',
+          stage: 'planning',
+          decisions: [],
+          blockers: [],
+          position: { currentStep: 'init' },
+          updatedAt: '2026-05-01T00:00:00Z',
+        });
+        return { ok: true };
+      },
+    });
+    await vi.waitFor(() => {
+      expect(readJobResult('job-task-state-async')?.status).toBe('complete');
+    });
+
+    const state = readTaskState('job-task-state-async');
+    expect(state.ok && state.value.dispatch).toBe('async');
+    const nested = readTaskState('nested-sync-task');
+    expect(nested.ok && nested.value.dispatch).toBeUndefined();
+  });
+
+  // #4972: `cancel_job` writes `cancelled` whether or not the tool can act on
+  // the signal — `cancel-job-tool.ts` is explicit that an ignoring tool "still
+  // runs to completion… but its record stays `cancelled`". None of the ten
+  // adopters accepts the signal today, so every cancelled record claims more
+  // than is known. The record now says which case it is.
+  it('records signalAccepted:false when the run callback does not take the signal', () => {
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'x' },
+      freshJobId: () => 'job-sig-none',
+      // Two parameters — the shape every current adopter uses.
+      run: (_jobId, _input) => new Promise(() => {}),
+    });
+
+    expect(readJobResult('job-sig-none')?.signalAccepted).toBe(false);
+  });
+
+  it('records signalAccepted:true when it does', () => {
+    // The pair: hardcoding false would be indistinguishable from today's state
+    // and would stay wrong as tools adopt the signal.
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'x' },
+      freshJobId: () => 'job-sig-yes',
+      run: (_jobId, _input, _signal) => new Promise(() => {}),
+    });
+
+    expect(readJobResult('job-sig-yes')?.signalAccepted).toBe(true);
+  });
+
+  it('returns a busy envelope when the per-tool cap is full', () => {
+    const cap = getJobCap('consensus_vote'); // 2 by default
+    for (let i = 0; i < cap; i++) {
+      runAsJob<DummyInput, { ok: true }>({
+        toolName: 'consensus_vote',
+        input: { task: `x${String(i)}` },
+        freshJobId: () => `job-cap-${String(i)}`,
+        run: () => new Promise(() => {}),
+      });
+    }
+    const result = runAsJob<DummyInput, { ok: true }>({
+      toolName: 'consensus_vote',
+      input: { task: 'overflow' },
+      freshJobId: () => 'job-cap-overflow',
+      run: () => new Promise(() => {}),
+    });
+    const env = parseEnvelope(result);
+    expect(env['status']).toBe('busy');
+    expect(typeof env['retryAfterMs']).toBe('number');
+    // Overflow dispatch must NOT have written a pending record.
+    expect(readJobResult('job-cap-overflow')).toBeNull();
+  });
+
+  it('records complete with the run result + releases the slot', async () => {
+    const params = {
+      toolName: 'orchestrate',
+      input: { task: 'ok' } as DummyInput,
+      freshJobId: () => 'job-complete-1',
+      run: () => Promise.resolve({ value: 42 }),
+    };
+    // Dispatch acquires the slot + writes pending; drive the background run
+    // deterministically rather than racing the detached promise.
+    runAsJob<DummyInput, { value: number }>({ ...params, run: () => new Promise(() => {}) });
+    await runJobInBackground('job-complete-1', params);
+    const record = readJobResult('job-complete-1');
+    expect(record?.status).toBe('complete');
+    expect(record?.result).toEqual({ value: 42 });
+    expect(getInFlight('orchestrate')).toBe(0);
+  });
+
+  it('records failed with the error message + releases the slot', async () => {
+    const params = {
+      toolName: 'orchestrate',
+      input: { task: 'boom' } as DummyInput,
+      freshJobId: () => 'job-fail-1',
+      run: () => Promise.reject(new Error('kaboom')),
+    };
+    runAsJob<DummyInput, never>({ ...params, run: () => new Promise(() => {}) });
+    await runJobInBackground('job-fail-1', params);
+    const record = readJobResult('job-fail-1');
+    expect(record?.status).toBe('failed');
+    expect(record?.error).toBe('kaboom');
+    expect(getInFlight('orchestrate')).toBe(0);
+  });
+
+  it('returns a replay envelope when an idempotency key matches a prior dispatch', () => {
+    const input: DummyInput = { task: 'idem' };
+    // Pre-seed an index entry as a prior dispatch would.
+    const resolved = resolveIdempotency('orchestrate', 'k1', input);
+    expect(resolved.kind).toBe('fresh');
+    if (resolved.kind === 'fresh') {
+      registerIdempotentJob({
+        tool: 'orchestrate',
+        idempotencyKey: 'k1',
+        inputs: input,
+        jobId: resolved.jobId,
+      });
+      const result = runAsJob<DummyInput, { ok: true }>({
+        toolName: 'orchestrate',
+        input,
+        idempotencyKey: 'k1',
+        freshJobId: () => 'should-not-be-used',
+        run: () => new Promise(() => {}),
+      });
+      const env = parseEnvelope(result);
+      expect(env['status']).toBe('replay');
+      expect(env['jobId']).toBe(resolved.jobId);
+      // Replay must NOT acquire a slot.
+      expect(getInFlight('orchestrate')).toBe(0);
+    }
+  });
+
+  it('returns a collision error envelope when a key is reused with different inputs', () => {
+    const first: DummyInput = { task: 'first' };
+    const resolved = resolveIdempotency('orchestrate', 'k2', first);
+    if (resolved.kind === 'fresh') {
+      registerIdempotentJob({
+        tool: 'orchestrate',
+        idempotencyKey: 'k2',
+        inputs: first,
+        jobId: resolved.jobId,
+      });
+    }
+    const result = runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'DIFFERENT' },
+      idempotencyKey: 'k2',
+      freshJobId: () => 'unused',
+      run: () => new Promise(() => {}),
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain('Idempotency key already used');
+    expect(getInFlight('orchestrate')).toBe(0);
+    expect(nexusDataPath('jobs')).toContain(tmpDir);
+  });
+
+  // ==========================================================================
+  // async-job-body runaway-guard (#3734)
+  // ==========================================================================
+
+  describe('async-job-body runaway-guard (#3734)', () => {
+    afterEach(() => {
+      delete process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'];
+      vi.useRealTimers();
+    });
+
+    it('does NOT apply a request timeout to the backgrounded body — pending returns immediately', () => {
+      // The dispatch returns synchronously while the body runs forever; no
+      // request timeout governs the body (that is the whole point of async mode).
+      const result = runAsJob<DummyInput, { ok: true }>({
+        toolName: 'orchestrate',
+        input: { task: 'long' },
+        freshJobId: () => 'job-async-body-1',
+        run: () => new Promise(() => {}), // never resolves
+      });
+      const env = parseEnvelope(result);
+      expect(env['status']).toBe('pending');
+      // The job is still pending (not failed) right after dispatch.
+      expect(readJobResult('job-async-body-1')?.status).toBe('pending');
+    });
+
+    it('fires the internal async-body guard → writeJobFailed("runaway guard exceeded") + releases', async () => {
+      // Shrink the async-job-body guard so the test is fast; use fake timers to
+      // drive it deterministically.
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = '1000';
+      vi.useFakeTimers();
+      const warn = vi.fn();
+      const logger = {
+        warn,
+        error: vi.fn(),
+        info: vi.fn(),
+        debug: vi.fn(),
+      } as unknown as import('../../core/index.js').ILogger;
+      const params = {
+        toolName: 'orchestrate',
+        input: { task: 'wedged' } as DummyInput,
+        freshJobId: () => 'job-runaway-1',
+        run: () => new Promise<{ ok: true }>(() => {}), // never resolves → guard wins
+        logger,
+      };
+      // Dispatch acquires the slot + writes pending.
+      runAsJob<DummyInput, { ok: true }>({ ...params, run: () => new Promise(() => {}) });
+      // Drive the background runner; advance past the (clamped) guard window.
+      const bg = runJobInBackground('job-runaway-1', params);
+      await vi.advanceTimersByTimeAsync(1_500);
+      await bg;
+      const record = readJobResult('job-runaway-1');
+      expect(record?.status).toBe('failed');
+      expect(record?.error).toBe('runaway guard exceeded');
+      // TELEMETRY: a near-timeout WARN must fire (at 0.5) BEFORE the guard.
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('approaching runaway guard'),
+        expect.objectContaining({ jobId: 'job-runaway-1' })
+      );
+      // The finally must still release the slot even on guard expiry.
+      expect(getInFlight('orchestrate')).toBe(0);
+    });
+
+    it('logs the effective guard once at job start, so job-duration telemetry has a baseline (#5995)', async () => {
+      // The 2h ceiling is opt-in; the panel's condition for it was that the
+      // guard a job actually runs under is recorded, not inferred from config.
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = '2000';
+      const info = vi.fn();
+      const logger = {
+        warn: vi.fn(),
+        error: vi.fn(),
+        info,
+        debug: vi.fn(),
+      } as unknown as import('../../core/index.js').ILogger;
+      const params = {
+        toolName: 'orchestrate',
+        input: { task: 'quick' } as DummyInput,
+        freshJobId: () => 'job-guard-log-1',
+        run: () => Promise.resolve({ ok: true as const }),
+        logger,
+      };
+      // The dispatch's own detached runner gets no logger, so every start log
+      // seen here comes from the one run driven below — "once" is per run.
+      runAsJob<DummyInput, { ok: true }>({
+        ...params,
+        run: () => new Promise(() => {}),
+        logger: undefined,
+      });
+      await runJobInBackground('job-guard-log-1', params);
+
+      const startLogs = info.mock.calls.filter(
+        (call: unknown[]) => typeof call[0] === 'string' && call[0].includes('runaway guard')
+      );
+      expect(startLogs).toHaveLength(1);
+      expect(startLogs[0]?.[1]).toEqual(
+        expect.objectContaining({
+          jobId: 'job-guard-log-1',
+          guardMs: 2000,
+          guardClass: 'async-job-body',
+        })
+      );
+    });
+
+    it('fires the near-timeout WARN at 0.5 of a guard raised to the 2h ceiling (#5995)', async () => {
+      // The exemption widens the guard; the WARN fraction is unchanged, so an
+      // operator who opts into 2h is warned at 1h, not at the old fixed point.
+      // Past the standard ceiling the body must heartbeat (#6162) — a silent
+      // one is wedged at 3/8 of the guard and never reaches the WARN — so this
+      // body beats once per interval.
+      const CEILING_MS = 7_200_000;
+      const INTERVAL_MS = CEILING_MS / 8;
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(CEILING_MS);
+      vi.useFakeTimers();
+      const warn = vi.fn();
+      const logger = {
+        warn,
+        error: vi.fn(),
+        info: vi.fn(),
+        debug: vi.fn(),
+      } as unknown as import('../../core/index.js').ILogger;
+      let finish: (value: { ok: true }) => void = () => {};
+      let heartbeat: () => void = () => {};
+      const params = {
+        toolName: 'orchestrate',
+        input: { task: 'long' } as DummyInput,
+        freshJobId: () => 'job-warn-raised-1',
+        run: (_jobId: string, _input: DummyInput, _signal: AbortSignal, progress: () => void) =>
+          new Promise<{ ok: true }>((resolve) => {
+            heartbeat = progress;
+            finish = resolve;
+          }),
+        logger,
+      };
+      // Acquire the slot + pending record by hand: a `runAsJob` dispatch would
+      // start a second, silent runner that the reaper fails at 3/8 of the guard.
+      tryAcquire('orchestrate');
+      writeJobPending('job-warn-raised-1', 'orchestrate');
+      const bg = runJobInBackground('job-warn-raised-1', params);
+
+      for (let elapsed = 0; elapsed < CEILING_MS / 2 - INTERVAL_MS; elapsed += INTERVAL_MS) {
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+        heartbeat();
+      }
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS - 1);
+      expect(warn).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('approaching runaway guard'),
+        expect.objectContaining({ jobId: 'job-warn-raised-1', guardMs: CEILING_MS })
+      );
+
+      finish({ ok: true });
+      await bg;
+      expect(readJobResult('job-warn-raised-1')?.status).toBe('complete');
+    });
+  });
+
+  // ==========================================================================
+  // liveness for a body allowed past the standard MCP ceiling (#6162 item 1)
+  // ==========================================================================
+
+  // #6159 let an operator raise the async-job-body guard past the 3.6M MCP
+  // ceiling, and the only signals over that extra hour were the start log and
+  // the 0.5 WARN — both say time passed, neither says the body is alive. A
+  // body that runs past the standard ceiling now has to prove progress via the
+  // `progress()` heartbeat `runAsJob` hands it; the reaper fails a silent body
+  // as wedged and releases its slot well before the guard fires.
+  describe('async-job-body liveness (#6162)', () => {
+    /** Above the 3.6M MCP ceiling, within the 7.2M class ceiling. */
+    const LONG_GUARD_MS = 4_000_000;
+    /** interval = guard / 8; wedged after 3 missed intervals = 3/8 of the guard. */
+    const INTERVAL_MS = LONG_GUARD_MS / 8;
+    const SILENCE_BUDGET_MS = 3 * INTERVAL_MS;
+    /** The standard ceiling itself — the largest guard that needs no heartbeat. */
+    const STANDARD_CEILING_MS = 3_600_000;
+
+    interface Driven {
+      readonly heartbeat: () => void;
+      readonly finish: (value: { ok: true }) => void;
+    }
+
+    /** Dispatch a job whose body exposes its heartbeat + resolver to the test. */
+    function dispatch(jobId: string): Driven {
+      let heartbeat: (() => void) | undefined;
+      let finish: ((value: { ok: true }) => void) | undefined;
+      runAsJob<DummyInput, { ok: true }>({
+        toolName: 'orchestrate',
+        input: { task: 'long' },
+        freshJobId: () => jobId,
+        run: (_jobId, _input, _signal, progress) =>
+          new Promise<{ ok: true }>((resolve) => {
+            heartbeat = progress;
+            finish = resolve;
+          }),
+      });
+      if (heartbeat === undefined || finish === undefined) {
+        throw new Error('run callback was not invoked synchronously with a progress() callback');
+      }
+      return { heartbeat, finish };
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      delete process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'];
+      vi.useRealTimers();
+    });
+
+    it('keeps a long-guard job that heartbeats running past N missed-interval budgets', async () => {
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+      const { heartbeat, finish } = dispatch('job-live-1');
+
+      // Heartbeat every 0.8 interval for 2x the silence budget (3,000,000 ms,
+      // inside the 4,000,000 ms guard) — twice past the point a silent body
+      // would have been failed.
+      const step = INTERVAL_MS * 0.8;
+      for (let elapsed = 0; elapsed < SILENCE_BUDGET_MS * 2; elapsed += step) {
+        await vi.advanceTimersByTimeAsync(step);
+        heartbeat();
+      }
+      expect(readJobResult('job-live-1')?.status).toBe('pending');
+      expect(getInFlight('orchestrate')).toBe(1);
+
+      finish({ ok: true });
+      await vi.waitFor(() => {
+        expect(readJobResult('job-live-1')?.status).toBe('complete');
+      });
+      expect(getInFlight('orchestrate')).toBe(0);
+    });
+
+    it('fails a long-guard job that stops heartbeating as wedged and releases its slot before the guard', async () => {
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+      const { heartbeat } = dispatch('job-wedged-1');
+
+      // One heartbeat at 0.8 interval, then silence: the watchdog fires one
+      // silence budget after that heartbeat (1,900,000 ms).
+      const lastBeatAt = INTERVAL_MS * 0.8;
+      await vi.advanceTimersByTimeAsync(lastBeatAt);
+      heartbeat();
+      const wedgedAt = lastBeatAt + SILENCE_BUDGET_MS;
+      await vi.advanceTimersByTimeAsync(wedgedAt - lastBeatAt - 1);
+      expect(readJobResult('job-wedged-1')?.status).toBe('pending');
+      expect(getInFlight('orchestrate')).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => {
+        expect(readJobResult('job-wedged-1')?.status).toBe('failed');
+      });
+      const record = readJobResult('job-wedged-1');
+      expect(record?.error).toBe(`wedged (no progress for ${String(wedgedAt - lastBeatAt)} ms)`);
+      // The slot is released at the wedge verdict — half the guard is still ahead.
+      expect(getInFlight('orchestrate')).toBe(0);
+      expect(wedgedAt).toBeLessThan(LONG_GUARD_MS);
+    });
+
+    it('is failed exactly one silence budget after the last heartbeat, wherever it landed (#6428)', async () => {
+      // A poller ticking every interval fires on the tick AFTER the budget is
+      // exceeded: a heartbeat landing just after a tick held the slot for up to
+      // four intervals while the contract says three. The reaper is a watchdog
+      // re-armed by every heartbeat, so the verdict lands at exactly
+      // lastHeartbeat + budget — here 500,001 + 1,500,000 — not at a tick.
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+      const { heartbeat } = dispatch('job-watchdog-1');
+      const lastBeatAt = INTERVAL_MS + 1;
+      await vi.advanceTimersByTimeAsync(lastBeatAt);
+      heartbeat();
+
+      await vi.advanceTimersByTimeAsync(SILENCE_BUDGET_MS - 1);
+      expect(readJobResult('job-watchdog-1')?.status).toBe('pending');
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => {
+        expect(readJobResult('job-watchdog-1')?.status).toBe('failed');
+      });
+      expect(readJobResult('job-watchdog-1')?.error).toBe(
+        `wedged (no progress for ${String(SILENCE_BUDGET_MS)} ms)`
+      );
+      expect(getInFlight('orchestrate')).toBe(0);
+    });
+
+    it('a heartbeat by jobId defers the watchdog like the callback does (#6428)', async () => {
+      // Arity-0/1 bodies heartbeat through `heartbeatJob(jobId)`; the watchdog
+      // measures from the record, so that path must count the same.
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+      const { finish } = dispatch('job-byid-1');
+      const step = INTERVAL_MS * 0.8;
+      for (let elapsed = 0; elapsed < SILENCE_BUDGET_MS * 2; elapsed += step) {
+        await vi.advanceTimersByTimeAsync(step);
+        heartbeatJob('job-byid-1');
+      }
+      expect(readJobResult('job-byid-1')?.status).toBe('pending');
+      finish({ ok: true });
+      await vi.waitFor(() => {
+        expect(readJobResult('job-byid-1')?.status).toBe('complete');
+      });
+    });
+
+    it('leaves a job under the standard ceiling alone when it never heartbeats', async () => {
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(STANDARD_CEILING_MS);
+      dispatch('job-standard-1');
+
+      // Past every point a long guard would have called it wedged, up to the
+      // last ms before its own guard: still pending, still holding its slot.
+      await vi.advanceTimersByTimeAsync(STANDARD_CEILING_MS - 1);
+      expect(readJobResult('job-standard-1')?.status).toBe('pending');
+      expect(getInFlight('orchestrate')).toBe(1);
+
+      // The runaway guard itself is unchanged.
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => {
+        expect(readJobResult('job-standard-1')?.status).toBe('failed');
+      });
+      expect(readJobResult('job-standard-1')?.error).toBe('runaway guard exceeded');
+    });
+
+    it('empty case: a body that never heartbeats is measured from job start', async () => {
+      // No heartbeat ever recorded → silence is counted from dispatch, so a
+      // long-guard body that never calls progress() is wedged by definition
+      // after exactly N intervals.
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+      dispatch('job-silent-1');
+
+      await vi.advanceTimersByTimeAsync(SILENCE_BUDGET_MS - 1);
+      expect(readJobResult('job-silent-1')?.status).toBe('pending');
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => {
+        expect(readJobResult('job-silent-1')?.status).toBe('failed');
+      });
+      expect(readJobResult('job-silent-1')?.error).toBe(
+        `wedged (no progress for ${String(SILENCE_BUDGET_MS)} ms)`
+      );
+      expect(getInFlight('orchestrate')).toBe(0);
+    });
+
+    it('a pipeline body heartbeats through the stage events it already emits', async () => {
+      // Pipeline bodies never call progress() themselves: every stage event on
+      // the pipeline bus that is emitted INSIDE this job's async context is
+      // its heartbeat. One bridge in runAsJob, not one per pipeline tool.
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+      // Stages settle every 0.8 interval for 2x the silence budget. Each emit
+      // runs in an `await` continuation, i.e. in the body's async context — the
+      // same place a real stage registry emits from. (A fake-timer callback
+      // would not: sinon invokes it from the test's context, unlike a real
+      // Node timer, which propagates AsyncLocalStorage.)
+      const stageEvery = INTERVAL_MS * 0.8;
+      const stages = Math.ceil((SILENCE_BUDGET_MS * 2) / stageEvery);
+      runAsJob<DummyInput, { ok: true }>({
+        toolName: 'run_pipeline',
+        input: { task: 'staged' },
+        freshJobId: () => 'job-stages-1',
+        run: async () => {
+          for (let i = 0; i < stages; i++) {
+            await new Promise((resolve) => setTimeout(resolve, stageEvery));
+            emitStageCompleted({ executionId: 'rp-x', stageId: `s${String(i)}`, durationMs: 1 });
+          }
+          return { ok: true };
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(SILENCE_BUDGET_MS * 2 - 1);
+      expect(readJobResult('job-stages-1')?.status).toBe('pending');
+      expect(readJobResult('job-stages-1')?.lastProgressAt).toBeDefined();
+      expect(getInFlight('run_pipeline')).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(stageEvery);
+      await vi.waitFor(() => {
+        expect(readJobResult('job-stages-1')?.status).toBe('complete');
+      });
+      expect(getInFlight('run_pipeline')).toBe(0);
+    });
+
+    it('a body whose agents emit step events heartbeats through them too (#6428)', async () => {
+      // orchestrate's main phase is the Orchestrator agent's model calls, which
+      // publish `withStep` events on `stepBus`, not on the pipeline bus. The
+      // bridge listens to both, with the same async-context attribution.
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+      const stepEvery = INTERVAL_MS * 0.8;
+      const steps = Math.ceil((SILENCE_BUDGET_MS * 2) / stepEvery);
+      runAsJob<DummyInput, { ok: true }>({
+        toolName: 'orchestrate',
+        input: { task: 'agentic' },
+        freshJobId: () => 'job-steps-1',
+        run: async () => {
+          for (let i = 0; i < steps; i++) {
+            await new Promise((resolve) => setTimeout(resolve, stepEvery));
+            stepBus.emit('step', {
+              event: 'step.completed',
+              stepId: `s${String(i)}`,
+              name: 'orchestrator.analyze',
+              durationMs: 1,
+              status: 'ok',
+            });
+          }
+          return { ok: true };
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(SILENCE_BUDGET_MS * 2 - 1);
+      expect(readJobResult('job-steps-1')?.status).toBe('pending');
+      expect(readJobResult('job-steps-1')?.lastProgressAt).toBeDefined();
+      await vi.advanceTimersByTimeAsync(stepEvery);
+      await vi.waitFor(() => {
+        expect(readJobResult('job-steps-1')?.status).toBe('complete');
+      });
+    });
+
+    it("another job's stage events are not this job's heartbeat", async () => {
+      // Attribution is by the async context the event is emitted from. A bus
+      // subscription without it would let any concurrent pipeline keep a
+      // wedged job alive — the misreport the heartbeat exists to prevent.
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+      dispatch('job-silent-neighbour');
+      // Emitted from OUTSIDE the job (the test's own context) every 0.8 interval.
+      const foreign = setInterval(() => {
+        emitStageCompleted({ executionId: 'other-job', stageId: 'impl', durationMs: 1 });
+      }, INTERVAL_MS * 0.8);
+      foreign.unref();
+
+      await vi.advanceTimersByTimeAsync(SILENCE_BUDGET_MS);
+      clearInterval(foreign);
+      await vi.waitFor(() => {
+        expect(readJobResult('job-silent-neighbour')?.status).toBe('failed');
+      });
+      expect(readJobResult('job-silent-neighbour')?.error).toMatch(/^wedged/);
+      expect(readJobResult('job-silent-neighbour')).not.toHaveProperty('lastProgressAt');
+    });
+
+    it('stamps lastProgressAt on the pending record at each heartbeat', async () => {
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+      vi.setSystemTime(new Date('2026-09-16T12:00:00.000Z'));
+      const { heartbeat, finish } = dispatch('job-stamp-1');
+      expect(readJobResult('job-stamp-1')).not.toHaveProperty('lastProgressAt');
+
+      await vi.advanceTimersByTimeAsync(90_000);
+      heartbeat();
+      expect(readJobResult('job-stamp-1')?.lastProgressAt).toBe('2026-09-16T12:01:30.000Z');
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      heartbeat();
+      expect(readJobResult('job-stamp-1')?.lastProgressAt).toBe('2026-09-16T12:02:30.000Z');
+      expect(readJobResult('job-stamp-1')?.status).toBe('pending');
+
+      finish({ ok: true });
+      await vi.waitFor(() => {
+        expect(readJobResult('job-stamp-1')?.status).toBe('complete');
+      });
+    });
+
+    it('stamps lastProgressAt under the standard ceiling too — the reaper is gated, the stamp is not', async () => {
+      process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(STANDARD_CEILING_MS);
+      vi.setSystemTime(new Date('2026-09-16T13:00:00.000Z'));
+      const { heartbeat, finish } = dispatch('job-stamp-std');
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      heartbeat();
+      expect(readJobResult('job-stamp-std')?.lastProgressAt).toBe('2026-09-16T13:00:05.000Z');
+
+      finish({ ok: true });
+      await vi.waitFor(() => {
+        expect(readJobResult('job-stamp-std')?.status).toBe('complete');
+      });
+    });
+  });
+
+  // ==========================================================================
+  // fail-closed default (#4363, increment 2 of the #4351 Option C decision)
+  // ==========================================================================
+
+  // `writeJobComplete` fired on ANY resolved value, so a callback that resolved
+  // a failure-shaped payload recorded `complete`: a caller polling
+  // `get_job_result` saw success and never looked inside. Increment 1 (#4362)
+  // normalized the two known offenders; this makes the chokepoint itself refuse
+  // the shape, so the next caller cannot reintroduce it by omission.
+  describe('fail-closed default (#4363)', () => {
+    /** Dispatch + drive one background run deterministically. */
+    async function runJob(
+      jobId: string,
+      result: unknown,
+      extra: Record<string, unknown> = {}
+    ): Promise<ReturnType<typeof readJobResult>> {
+      const params = {
+        toolName: 'orchestrate',
+        input: { task: 't' } as DummyInput,
+        freshJobId: () => jobId,
+        run: () => Promise.resolve(result),
+        ...extra,
+      };
+      runAsJob<DummyInput, unknown>({ ...params, run: () => new Promise(() => {}) });
+      await runJobInBackground(jobId, params);
+      return readJobResult(jobId);
+    }
+
+    it('refuses to record an isError ToolResult as complete', async () => {
+      const record = await runJob('job-fc-iserror', {
+        isError: true,
+        content: [{ type: 'text', text: 'adapter unauthorized' }],
+      });
+
+      expect(record?.status).toBe('failed');
+    });
+
+    it('refuses to record an { ok: false } result as complete', async () => {
+      expect((await runJob('job-fc-ok', { ok: false, error: 'no quorum' }))?.status).toBe('failed');
+    });
+
+    it('refuses to record a { success: false } result as complete', async () => {
+      expect((await runJob('job-fc-success', { success: false }))?.status).toBe('failed');
+    });
+
+    it('names the key that tripped, so the record is debuggable', async () => {
+      const record = await runJob('job-fc-why', { ok: false, error: 'no quorum' });
+
+      expect(record?.error).toContain('ok');
+      // …and carries the payload's own message rather than a bare "failed".
+      expect(record?.error).toContain('no quorum');
+    });
+
+    it('records an ordinary success as complete', async () => {
+      const record = await runJob('job-fc-happy', { value: 42 });
+
+      expect(record?.status).toBe('complete');
+      expect(record?.result).toEqual({ value: 42 });
+    });
+
+    // The false-positive class the #4351 panel made binding: fail-closed must
+    // not become fail-wrong. These payloads all describe work that SUCCEEDED.
+    describe('does not misread success payloads as failures', () => {
+      it('a rejected consensus verdict is a successful job', async () => {
+        const record = await runJob('job-fc-verdict', {
+          ok: true,
+          value: { decision: 'rejected', approvalPercentage: 28 },
+        });
+
+        expect(record?.status).toBe('complete');
+      });
+
+      it('a nested success:false carried as DATA is a successful job', async () => {
+        // A pipeline summary listing a stage it recovered from. Only root keys
+        // are checked — never a deep scan.
+        const record = await runJob('job-fc-nested', {
+          success: true,
+          stages: [
+            { id: 'plan', success: true },
+            { id: 'research', success: false, recovered: true },
+          ],
+        });
+
+        expect(record?.status).toBe('complete');
+      });
+
+      it('a root isError:false is a successful job', async () => {
+        expect((await runJob('job-fc-noterror', { isError: false }))?.status).toBe('complete');
+      });
+
+      it('a non-object payload is a successful job', async () => {
+        expect((await runJob('job-fc-scalar', 'plain text result'))?.status).toBe('complete');
+      });
+
+      it('a null payload is a successful job', async () => {
+        expect((await runJob('job-fc-null', null))?.status).toBe('complete');
+      });
+    });
+
+    describe('opt-out is explicit and observable', () => {
+      it('records complete when the caller opted out with a stated reason', async () => {
+        const record = await runJob(
+          'job-fc-optout',
+          { ok: false, error: 'partial vote set after cancel' },
+          { allowFailureShapedResult: 'partial results are the point of this tool' }
+        );
+
+        expect(record?.status).toBe('complete');
+      });
+
+      it('logs the opt-out when it actually suppresses a detection', async () => {
+        // In a governance substrate an opted-out caller is a policy decision and
+        // has to appear in the audit trail, not vanish into a silent kwarg.
+        const warn = vi.fn();
+        const logger = {
+          warn,
+          error: vi.fn(),
+          info: vi.fn(),
+          debug: vi.fn(),
+        } as unknown as import('../../core/index.js').ILogger;
+
+        await runJob(
+          'job-fc-optout-logged',
+          { ok: false },
+          { allowFailureShapedResult: 'documented reason', logger }
+        );
+
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining('failure-shaped'),
+          expect.objectContaining({
+            jobId: 'job-fc-optout-logged',
+            reason: 'documented reason',
+          })
+        );
+      });
+
+      it('does not log an opt-out that never had anything to suppress', async () => {
+        const warn = vi.fn();
+        const logger = {
+          warn,
+          error: vi.fn(),
+          info: vi.fn(),
+          debug: vi.fn(),
+        } as unknown as import('../../core/index.js').ILogger;
+
+        await runJob(
+          'job-fc-optout-quiet',
+          { value: 1 },
+          { allowFailureShapedResult: 'documented reason', logger }
+        );
+
+        expect(warn).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('structured adapter/transport failure detail in job records (#4375)', () => {
+    describe('extractFailureDetail', () => {
+      it('extracts detail from a CliError shape', () => {
+        const cliError = {
+          code: 'RATE_LIMITED',
+          message: 'Rate limit exceeded',
+          cli: 'claude',
+          retryable: true,
+        };
+        expect(extractFailureDetail(cliError)).toEqual({
+          adapter: 'claude',
+          transport: 'subprocess',
+          category: 'rate_limited',
+        });
+      });
+
+      it('extracts detail from Error with cause', () => {
+        const cause = {
+          code: 'TIMEOUT',
+          message: 'Process timed out',
+          cli: 'codex',
+          transport: 'mcp',
+        };
+        const err = new Error('Execution failed', { cause });
+        expect(extractFailureDetail(err)).toEqual({
+          adapter: 'codex',
+          transport: 'mcp',
+          category: 'timeout',
+        });
+      });
+
+      it('extracts capacity_exhausted category (#4373)', () => {
+        const err = Object.assign(new Error('Filter: capacity_exhausted'), {
+          adapter: 'gemini',
+          category: 'capacity_exhausted',
+        });
+        expect(extractFailureDetail(err)).toEqual({
+          adapter: 'gemini',
+          transport: 'subprocess',
+          category: 'capacity_exhausted',
+        });
+      });
+
+      it('extracts failureDetail from a failure-shaped result', () => {
+        const result = {
+          ok: false,
+          error: 'Rate limit hit',
+          failureDetail: {
+            adapter: 'opencode',
+            transport: 'subprocess',
+            category: 'rate_limited',
+          },
+        };
+        expect(extractFailureDetail(result)).toEqual({
+          adapter: 'opencode',
+          transport: 'subprocess',
+          category: 'rate_limited',
+        });
+      });
+
+      it('returns undefined for an error without adapter/transport info', () => {
+        expect(extractFailureDetail(new Error('Generic syntax error'))).toBeUndefined();
+        expect(
+          extractFailureDetail({ ok: false, error: 'missing required field' })
+        ).toBeUndefined();
+        expect(extractFailureDetail(null)).toBeUndefined();
+        expect(extractFailureDetail('string error')).toBeUndefined();
+      });
+
+      it('strips raw response bodies and prompts from the extracted detail', () => {
+        const err = Object.assign(new Error('Rate limit exceeded'), {
+          adapter: 'claude',
+          transport: 'subprocess',
+          category: 'rate_limited',
+          rawBody: `Error with key ${FAKE_ANTHROPIC_KEY} and prompt {"prompt": "secret"}`,
+          prompt: 'secret prompt text',
+        });
+        const detail = extractFailureDetail(err);
+        expect(detail).toEqual({
+          adapter: 'claude',
+          transport: 'subprocess',
+          category: 'rate_limited',
+        });
+        expect((detail as Record<string, unknown>)['rawBody']).toBeUndefined();
+        expect((detail as Record<string, unknown>)['prompt']).toBeUndefined();
+      });
+    });
+
+    describe('integration in runJobInBackground', () => {
+      it('records failureDetail when background job rejects with adapter error', async () => {
+        const jobId = 'job-bg-adapter-fail';
+        const err = Object.assign(new Error('API rate limited'), {
+          cli: 'claude',
+          code: 'RATE_LIMITED',
+        });
+
+        const params = {
+          toolName: 'orchestrate',
+          input: { task: 't' } as DummyInput,
+          freshJobId: () => jobId,
+          run: () => Promise.reject(err),
+        };
+        runAsJob<DummyInput, unknown>({ ...params, run: () => new Promise(() => {}) });
+        await runJobInBackground(jobId, params);
+
+        const record = readJobResult(jobId);
+        expect(record?.status).toBe('failed');
+        expect(record?.failureDetail).toEqual({
+          adapter: 'claude',
+          transport: 'subprocess',
+          category: 'rate_limited',
+        });
+      });
+
+      it('asserts background job rejection does NOT leak credentials or prompts to the job record', async () => {
+        const jobId = 'job-bg-leak-prevented';
+        const rawBody = `{"error": "bad request with key ${FAKE_ANTHROPIC_KEY}", "prompt": "confidential prompt text"}`;
+        const err = Object.assign(new Error(`Adapter failed: ${rawBody}`), {
+          cli: 'anthropic',
+          code: 'EXECUTION_ERROR',
+          rawResponse: rawBody,
+        });
+
+        const params = {
+          toolName: 'orchestrate',
+          input: { task: 't' } as DummyInput,
+          freshJobId: () => jobId,
+          run: () => Promise.reject(err),
+        };
+        runAsJob<DummyInput, unknown>({ ...params, run: () => new Promise(() => {}) });
+        await runJobInBackground(jobId, params);
+
+        const record = readJobResult(jobId);
+        expect(record?.status).toBe('failed');
+        const serialized = JSON.stringify(record);
+        expect(serialized).not.toContain(FAKE_ANTHROPIC_KEY);
+        expect(serialized).not.toContain('confidential prompt text');
+        expect(record?.failureDetail).toEqual({
+          adapter: 'anthropic',
+          transport: 'subprocess',
+          category: 'execution_error',
+        });
+      });
+
+      it('records failureDetail from a failure-shaped result', async () => {
+        const jobId = 'job-bg-failure-shaped-detail';
+        const result = {
+          isError: true,
+          content: [{ type: 'text', text: 'CLI exited with code 1' }],
+          failureDetail: {
+            adapter: 'codex',
+            transport: 'subprocess',
+            category: 'execution_error',
+          },
+        };
+
+        const params = {
+          toolName: 'orchestrate',
+          input: { task: 't' } as DummyInput,
+          freshJobId: () => jobId,
+          run: () => Promise.resolve(result),
+        };
+        runAsJob<DummyInput, unknown>({ ...params, run: () => new Promise(() => {}) });
+        await runJobInBackground(jobId, params);
+
+        const record = readJobResult(jobId);
+        expect(record?.status).toBe('failed');
+        expect(record?.failureDetail).toEqual({
+          adapter: 'codex',
+          transport: 'subprocess',
+          category: 'execution_error',
+        });
+      });
+    });
+  });
+});
+
+describe('runAsJob — cancellation aborts in-flight work (#4086)', () => {
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-runasjob-abort-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+  });
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('a signal-respecting job stops when cancelled, and the cancellation is preserved', async () => {
+    const jobId = 'job-abort-1';
+    writeJobPending(jobId, 'orchestrate');
+    let sawAbort = false;
+    const bg = runJobInBackground<DummyInput, { ok: true }, never>(jobId, {
+      toolName: 'orchestrate',
+      input: { task: 'x' },
+      freshJobId: () => jobId,
+      // Respects the signal: never resolves on its own, rejects when aborted.
+      run: (_id, _input, signal) =>
+        new Promise<{ ok: true }>((_resolve, reject) => {
+          signal.addEventListener('abort', () => {
+            sawAbort = true;
+            reject(new Error('aborted by signal'));
+          });
+        }),
+    });
+
+    // Simulate cancel_job: write the durable cancelled record FIRST, then abort.
+    writeJobCancelled(jobId, 'orchestrate', 'user cancel');
+    expect(abortJob(jobId, 'user cancel')).toBe(true);
+    await bg;
+
+    expect(sawAbort).toBe(true); // the work actually observed the abort
+    // The terminal writer (writeJobFailed on the abort rejection) must NOT have
+    // overwritten the cancellation (#4022 guard).
+    expect(readJobResult(jobId)?.status).toBe('cancelled');
+    // Slot released.
+    expect(getInFlight('orchestrate')).toBe(0);
+  });
+
+  it('a job that IGNORES the signal still completes, but its cancelled record wins', async () => {
+    const jobId = 'job-abort-2';
+    writeJobPending(jobId, 'orchestrate');
+    const bg = runJobInBackground<DummyInput, { ok: true }, never>(jobId, {
+      toolName: 'orchestrate',
+      input: { task: 'x' },
+      freshJobId: () => jobId,
+      run: () => Promise.resolve({ ok: true }), // ignores the signal, resolves immediately
+    });
+
+    writeJobCancelled(jobId, 'orchestrate', 'user cancel');
+    await bg;
+
+    // writeJobComplete ran but no-ops against the cancelled record (#4022).
+    expect(readJobResult(jobId)?.status).toBe('cancelled');
+  });
+});
+
+describe('runAsJob — producerVersion stamps the record at write time (#5008)', () => {
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+  // NOT `VERSION`: a same-literal round trip cannot tell "stamped from the
+  // injected seam" from "stamped from the ambient constant" or "not stamped".
+  const FIXTURE_VERSION = '9.9.9-fixture';
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-runasjob-version-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+  });
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('stamps the pending record on dispatch', () => {
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'x' },
+      freshJobId: () => 'job-pv-pending',
+      run: () => new Promise(() => {}),
+      producerVersion: FIXTURE_VERSION,
+    });
+    expect(readJobResult('job-pv-pending')?.producerVersion).toBe(FIXTURE_VERSION);
+  });
+
+  it('stamps the complete record with the injected version, which round-trips', async () => {
+    const params = {
+      toolName: 'orchestrate',
+      input: { task: 'ok' } as DummyInput,
+      freshJobId: () => 'job-pv-complete',
+      run: () => Promise.resolve({ value: 42 }),
+      producerVersion: FIXTURE_VERSION,
+    };
+    runAsJob<DummyInput, { value: number }>({ ...params, run: () => new Promise(() => {}) });
+    await runJobInBackground('job-pv-complete', params);
+    const record = readJobResult('job-pv-complete');
+    expect(record?.status).toBe('complete');
+    expect(record?.producerVersion).toBe(FIXTURE_VERSION);
+    expect(record?.producerVersion).not.toBe(VERSION);
+  });
+
+  it('stamps the failed record too — a rejection is still a write', async () => {
+    const params = {
+      toolName: 'orchestrate',
+      input: { task: 'boom' } as DummyInput,
+      freshJobId: () => 'job-pv-failed',
+      run: () => Promise.reject(new Error('kaboom')),
+      producerVersion: FIXTURE_VERSION,
+    };
+    runAsJob<DummyInput, never>({ ...params, run: () => new Promise(() => {}) });
+    await runJobInBackground('job-pv-failed', params);
+    const record = readJobResult('job-pv-failed');
+    expect(record?.status).toBe('failed');
+    expect(record?.producerVersion).toBe(FIXTURE_VERSION);
+  });
+
+  it('stamps a failure-shaped result recorded as failed (#4363 path)', async () => {
+    const params = {
+      toolName: 'orchestrate',
+      input: { task: 'shape' } as DummyInput,
+      freshJobId: () => 'job-pv-shape',
+      run: () => Promise.resolve({ ok: false, error: 'nope' }),
+      producerVersion: FIXTURE_VERSION,
+    };
+    runAsJob<DummyInput, { ok: boolean; error: string }>({
+      ...params,
+      run: () => new Promise(() => {}),
+    });
+    await runJobInBackground('job-pv-shape', params);
+    const record = readJobResult('job-pv-shape');
+    expect(record?.status).toBe('failed');
+    expect(record?.producerVersion).toBe(FIXTURE_VERSION);
+  });
+
+  it('defaults to the running server VERSION when the caller supplies none', async () => {
+    const params = {
+      toolName: 'orchestrate',
+      input: { task: 'ok' } as DummyInput,
+      freshJobId: () => 'job-pv-default',
+      run: () => Promise.resolve({ value: 1 }),
+    };
+    runAsJob<DummyInput, { value: number }>({ ...params, run: () => new Promise(() => {}) });
+    await runJobInBackground('job-pv-default', params);
+    expect(readJobResult('job-pv-default')?.producerVersion).toBe(VERSION);
+  });
+});
+
+describe('runAsJob — retention sweep before the pending write (#6224, #4976 gap 2)', () => {
+  let tmpDir: string;
+  let clock: FixedTimeProvider;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-runasjob-prune-test-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+    clock = new FixedTimeProvider(Date.parse('2026-09-14T12:00:00.000Z'));
+    setTimeProvider(clock);
+  });
+
+  afterEach(() => {
+    resetTimeProvider();
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** A `complete` record settled `msAgo` before the fixed clock. */
+  function seedSettled(jobId: string, msAgo: number): string {
+    const nowMs = clock.now();
+    const path = nexusDataPath('jobs', `result-${jobId}.json`);
+    mkdirSync(nexusDataPath('jobs'), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        v: 1,
+        jobId,
+        toolName: 'orchestrate',
+        status: 'complete',
+        createdAt: new Date(nowMs - msAgo - 1_000).toISOString(),
+        completedAt: new Date(nowMs - msAgo).toISOString(),
+        result: { ok: true },
+      })
+    );
+    return path;
+  }
+
+  function dispatch(jobId: string): void {
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: jobId },
+      freshJobId: () => jobId,
+      run: () => new Promise(() => {}),
+    });
+  }
+
+  it('sweeps expired records on the first dispatch of the process', () => {
+    const expired = seedSettled('expired', JOB_RECORD_RETENTION_MS + 1);
+    const fresh = seedSettled('fresh', JOB_RECORD_RETENTION_MS - 1);
+
+    dispatch('job-sweep-1');
+
+    expect(existsSync(expired)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(readJobResult('job-sweep-1')?.status).toBe('pending');
+  });
+
+  it('is bounded to one sweep per process per hour', () => {
+    dispatch('job-sweep-first');
+    const expiredAfterFirstSweep = seedSettled('expired-later', JOB_RECORD_RETENTION_MS + 1);
+
+    // 59 minutes later: not due, the expired record survives the dispatch.
+    // `JOB_PRUNE_SWEEP_INTERVAL_MS` in the store, pinned as a literal here.
+    clock.advance(3_600_000 - 60_000);
+    dispatch('job-sweep-second');
+    expect(existsSync(expiredAfterFirstSweep)).toBe(true);
+
+    // At the hour: due again.
+    clock.advance(60_000);
+    dispatch('job-sweep-third');
+    expect(existsSync(expiredAfterFirstSweep)).toBe(false);
+  });
+});
+
+describe('runAsJob — the runaway guard aborts the job body (#6725)', () => {
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+  /** Short guard, at or under the standard ceiling: no wedged watchdog. */
+  const GUARD_MS = 1_000;
+  /** Above the 3.6M MCP ceiling, so the wedged watchdog is armed at 3/8. */
+  const LONG_GUARD_MS = 4_000_000;
+  const WEDGED_AT_MS = (LONG_GUARD_MS / 8) * 3;
+
+  /** What the body observed at the moment its signal fired. */
+  interface AbortObservation {
+    readonly reason: unknown;
+    readonly recordStatusAtAbort: string | undefined;
+    readonly inFlightAtAbort: number;
+  }
+
+  /** A body that never settles on its own and records what it saw on abort. */
+  function hangingBody(
+    jobId: string,
+    seen: AbortObservation[]
+  ): (id: string, input: DummyInput, signal: AbortSignal) => Promise<{ ok: true }> {
+    return (_id, _input, signal) =>
+      new Promise<{ ok: true }>(() => {
+        signal.addEventListener('abort', () => {
+          seen.push({
+            reason: signal.reason,
+            recordStatusAtAbort: readJobResult(jobId)?.status,
+            inFlightAtAbort: getInFlight('orchestrate'),
+          });
+        });
+      });
+  }
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-runasjob-guard-abort-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'];
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    resetConcurrency();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('aborts the signal with a TimeoutError BEFORE recording failed and releasing the slot', async () => {
+    process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(GUARD_MS);
+    const jobId = 'job-guard-abort-1';
+    const seen: AbortObservation[] = [];
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'wedged' },
+      freshJobId: () => jobId,
+      run: hangingBody(jobId, seen),
+    });
+
+    await vi.advanceTimersByTimeAsync(GUARD_MS);
+    await vi.waitFor(() => {
+      expect(readJobResult(jobId)?.status).toBe('failed');
+    });
+
+    expect(seen).toHaveLength(1);
+    const reason = seen[0]!.reason;
+    expect(reason).toBeInstanceOf(DOMException);
+    expect((reason as DOMException).name).toBe('TimeoutError');
+    expect((reason as DOMException).message).toBe('runaway guard exceeded');
+    // Ordering: when the body heard the abort, nothing had yet said it was over.
+    expect(seen[0]!.recordStatusAtAbort).toBe('pending');
+    expect(seen[0]!.inFlightAtAbort).toBe(1);
+    expect(readJobResult(jobId)?.error).toBe('runaway guard exceeded');
+    expect(getInFlight('orchestrate')).toBe(0);
+  });
+
+  it('the wedged watchdog aborts the body the same way', async () => {
+    process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(LONG_GUARD_MS);
+    const jobId = 'job-wedged-abort-1';
+    const seen: AbortObservation[] = [];
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'silent' },
+      freshJobId: () => jobId,
+      run: hangingBody(jobId, seen),
+    });
+
+    await vi.advanceTimersByTimeAsync(WEDGED_AT_MS);
+    await vi.waitFor(() => {
+      expect(readJobResult(jobId)?.status).toBe('failed');
+    });
+
+    expect(seen).toHaveLength(1);
+    expect((seen[0]!.reason as DOMException).name).toBe('TimeoutError');
+    expect((seen[0]!.reason as DOMException).message).toBe(
+      `wedged (no progress for ${String(WEDGED_AT_MS)} ms)`
+    );
+    expect(seen[0]!.recordStatusAtAbort).toBe('pending');
+  });
+
+  it('the abort reason classifies as a real TIMEOUT on the CLI breaker, not a caller cancel', async () => {
+    process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(GUARD_MS);
+    const jobId = 'job-guard-abort-breaker';
+    const seen: AbortObservation[] = [];
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'wedged' },
+      freshJobId: () => jobId,
+      run: hangingBody(jobId, seen),
+    });
+    await vi.advanceTimersByTimeAsync(GUARD_MS);
+    await vi.waitFor(() => {
+      expect(seen).toHaveLength(1);
+    });
+
+    // The seam a CLI adapter uses when the job's signal ends its call (#6691).
+    const cliError = createCallerAbortCliError(seen[0]!.reason, 'aborted', 'claude');
+    expect(cliError.code).toBe('TIMEOUT');
+    expect(isCallerCancelled(cliError)).toBe(false);
+  });
+
+  it('does not abort when the BODY rejects, even with the guard message text', async () => {
+    // The body has already settled — there is nothing left to stop. The guard
+    // is identified by its error class, never by message text.
+    const jobId = 'job-body-rejects-1';
+    let captured: AbortSignal | undefined;
+    await runJobInBackground<DummyInput, { ok: true }, never>(jobId, {
+      toolName: 'orchestrate',
+      input: { task: 'x' },
+      freshJobId: () => jobId,
+      run: (_id, _input, signal) => {
+        captured = signal;
+        return Promise.reject(new Error('runaway guard exceeded'));
+      },
+    });
+
+    expect(readJobResult(jobId)?.status).toBe('failed');
+    expect(captured).toBeDefined();
+    expect(captured?.aborted).toBe(false);
+  });
+
+  it('end to end: a body that respects the signal stops doing work when the guard fires', async () => {
+    process.env['NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS'] = String(GUARD_MS);
+    const jobId = 'job-guard-e2e-1';
+    const UNIT_MS = 100;
+    let unitsDone = 0;
+    let stoppedWith: unknown;
+    runAsJob<DummyInput, { ok: true }>({
+      toolName: 'orchestrate',
+      input: { task: 'loop' },
+      freshJobId: () => jobId,
+      // One unit of work per UNIT_MS until the signal fires.
+      run: async (_id, _input, signal) => {
+        while (!signal.aborted) {
+          await new Promise((resolve) => setTimeout(resolve, UNIT_MS));
+          if (signal.aborted) break;
+          unitsDone += 1;
+        }
+        stoppedWith = signal.reason;
+        throw new Error('stopped by signal');
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(GUARD_MS);
+    await vi.waitFor(() => {
+      expect(readJobResult(jobId)?.status).toBe('failed');
+    });
+    const unitsAtGuard = unitsDone;
+    // Ten more guard windows: a body that was not aborted would keep counting.
+    await vi.advanceTimersByTimeAsync(GUARD_MS * 10);
+
+    expect(unitsAtGuard).toBeGreaterThan(0);
+    expect(unitsDone).toBe(unitsAtGuard);
+    expect((stoppedWith as DOMException).name).toBe('TimeoutError');
+    expect(readJobResult(jobId)?.error).toBe('runaway guard exceeded');
+  });
+});

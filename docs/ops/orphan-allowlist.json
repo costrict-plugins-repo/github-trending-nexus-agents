@@ -1,0 +1,41 @@
+{
+  "version": "1.0.0",
+  "description": "Allowlist for the orphan-detection check (#2410, blocking since #4583). Files matching these patterns or paths are exempted from orphan flagging — typically because they're invoked by name (CLI scripts, migrations) or intentionally not imported (examples, illustrative code). `patterns` are permanent structural facts about the repo layout. Each `specific_files` entry must declare exactly one of `expires` (YYYY-MM-DD, dated debt — the file flags once the date passes) or `permanent: true` (the file can never be imported); an entry declaring neither fails the check by name.",
+  "patterns": [
+    {
+      "glob": "scripts/**/*.ts",
+      "rationale": "CLI scripts invoked by name from package.json or directly via tsx; not imported by other code."
+    },
+    {
+      "glob": "examples/**",
+      "rationale": "Illustrative code, intentionally not imported."
+    },
+    {
+      "glob": "**/migrations/**",
+      "rationale": "Data migrations invoked by name."
+    },
+    {
+      "glob": "**/*.test.ts",
+      "rationale": "Test files are entry points, not imports."
+    },
+    {
+      "glob": "**/*.config.ts",
+      "rationale": "Tooling config files (tsup, vitest, eslint) loaded by tools, not imported."
+    },
+    {
+      "glob": "**/vitest.config.*.ts",
+      "rationale": "Variant vitest configs (e.g. opencode-e2e) referenced by CI workflows via `--config` flag, not imported."
+    },
+    {
+      "glob": "**/index.ts",
+      "rationale": "Barrel re-export files that ARE consumed (directly via explicit `./foo/index.js` NodeNext imports, or via directory imports that knip resolves). The exemption exists for genuinely-consumed barrels only — knip resolves directory imports, so it does NOT flag a consumed barrel; a barrel flagged as orphaned despite this glob would be genuinely dead and should be deleted (see #4177, which removed five such dead barrels)."
+    }
+  ],
+  "specific_files": [
+    {
+      "path": "packages/nexus-agents/scripts/typedoc-astro-title.mjs",
+      "rationale": "TypeDoc markdown-hooks plugin, named in the `plugin` array of typedoc.markdown.json and loaded by TypeDoc itself. Nothing can import it: it exports only a `load(app)` hook that TypeDoc calls, and its only caller is the docs build invoking TypeDoc by config. Permanent, not debt.",
+      "permanent": true
+    }
+  ]
+}

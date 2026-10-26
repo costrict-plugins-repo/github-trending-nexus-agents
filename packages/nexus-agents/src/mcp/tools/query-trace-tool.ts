@@ -1,0 +1,440 @@
+/**
+ * nexus-agents/mcp - Query Trace MCP Tool (Epic #952, Phase 5)
+ *
+ * Read-only MCP tool that queries execution traces from disk
+ * (runs/{runId}/trace.jsonl, with a legacy traces/ fallback) written by TraceWriter.
+ *
+ * @module mcp/tools/query-trace-tool
+ */
+
+import { readFile, stat } from 'node:fs/promises';
+import { join } from 'node:path';
+import { z } from 'zod';
+import {
+  readTraceSnapshot,
+  decodeTraceBytes,
+  relationCounts,
+  type TraceSnapshotReading,
+} from '../../pipeline/trace-attribution.js';
+import type { TraceRelationCounts } from '../../pipeline/trace-schema.js';
+import type { McpServer } from '../sdk-types.js';
+import { createLogger, formatZodError } from '../../core/index.js';
+import { nexusDataPath } from '../../config/nexus-data-dir.js';
+import { getDefaultRunsDir } from '../../pipeline/pipeline-runner.js';
+import { resolveInsideRoot } from '../../security/safe-path.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import {
+  toolStructuredError,
+  toolSuccess,
+  type BaseMcpToolDeps,
+  type ToolResult,
+} from './tool-result.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+
+// ============================================================================
+// Input Schema
+// ============================================================================
+
+export const QueryTraceInputSchema = z.object({
+  runId: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[a-zA-Z0-9_-]+$/, 'runId must be alphanumeric, hyphens, or underscores')
+    .describe('Run ID to query traces for'),
+  eventType: z
+    .string()
+    .max(100)
+    .regex(/^[a-zA-Z0-9._-]+$/, 'eventType must be alphanumeric with dots, hyphens, or underscores')
+    .optional()
+    .describe('Filter by event type'),
+  limit: z.number().min(1).max(500).optional().describe('Max events to return (default: 100)'),
+});
+
+export type QueryTraceInput = z.infer<typeof QueryTraceInputSchema>;
+
+// ============================================================================
+// Response Types
+// ============================================================================
+
+/** Error categories for trace query failures. */
+export type TraceErrorCategory =
+  'not_found' | 'permission_error' | 'parse_error' | 'too_large' | 'unknown';
+
+interface TraceAttributionReport {
+  readonly status: 'measured' | 'unmeasured';
+  readonly reason?: string;
+  readonly writerObserved: {
+    readonly observed: number;
+    readonly foreignDropped: number;
+    readonly evicted: number;
+    /** Null for historical snapshots that did not measure invalid losses. */
+    readonly invalidDropped: number | null;
+  } | null;
+  readonly retained: TraceRelationCounts | null;
+  readonly filtered: TraceRelationCounts | null;
+  readonly returned: TraceRelationCounts | null;
+}
+export interface QueryTraceResponse {
+  /** Run-level participation cannot distinguish reused/concurrent sessions or prove settlement. */
+  readonly attribution?: TraceAttributionReport;
+  readonly runId: string;
+  readonly events: readonly Record<string, unknown>[];
+  readonly totalEvents: number;
+  readonly truncated: boolean;
+  readonly source: 'disk' | 'not_found';
+  /** Data subdirectory read; omitted for missing traces and explicit directory overrides. */
+  readonly sourceDirectory?: 'runs' | 'traces';
+  /**
+   * Lines the reader could not parse, omitted when none.
+   *
+   * `totalEvents` counts what SURVIVED `JSON.parse`, not what the file
+   * contained. A partially-flushed JSONL trace — the normal failure mode for an
+   * append-only file written by a process that died mid-write — used to be
+   * byte-identical to a run that simply emitted fewer events. Same fix the
+   * audit-chain reader got under #4787.
+   */
+  readonly skippedLines?: number;
+  readonly errorCategory?: TraceErrorCategory;
+  readonly errorMessage?: string;
+}
+
+// ============================================================================
+// Dependencies
+// ============================================================================
+
+export type QueryTraceDeps = BaseMcpToolDeps;
+
+// ============================================================================
+// Trace Query Logic
+// ============================================================================
+
+/** Maximum trace file size to read (100 MB). */
+const MAX_TRACE_FILE_BYTES = 100 * 1024 * 1024;
+
+const traceLogger = createLogger({ component: 'query-trace' });
+
+/** Classify a trace query error into a category for structured responses. */
+export function classifyTraceError(err: unknown): TraceErrorCategory {
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return 'not_found';
+    if (code === 'EACCES' || code === 'EPERM') return 'permission_error';
+    if (err.message.includes('JSON') || err instanceof SyntaxError) return 'parse_error';
+  }
+  return 'unknown';
+}
+
+/**
+ * Build a clean, deterministic user-facing error message for a trace-query
+ * failure (#2721). The previous `sanitizeErrorMessage` regex stripped paths
+ * starting with `/` but left their relative-root segment exposed, producing
+ * artifacts like `stat 'runs<path>'` that told the user nothing about what
+ * actually went wrong. Synthesize the message from the classified category
+ * instead — same approach as `query_task_state` ("No state log for task: X").
+ */
+function userFacingTraceError(err: unknown, runId: string): string {
+  const category = classifyTraceError(err);
+  switch (category) {
+    case 'not_found':
+      return `No trace file for runId '${runId}'`;
+    case 'permission_error':
+      return `Permission denied reading trace for runId '${runId}'`;
+    case 'parse_error':
+      return `Trace file for runId '${runId}' is malformed (invalid JSONL)`;
+    default:
+      return 'Failed to read trace';
+  }
+}
+
+/**
+ * Parse JSONL content, COUNTING the lines that could not be read.
+ *
+ * The count is the point. Swallowing every `SyntaxError` silently made
+ * `totalEvents` a count of survivors reported as a count of events, and left
+ * `parse_error` — a category this module declares and renders a message for —
+ * unreachable from the disk path, because no `SyntaxError` ever escaped to
+ * `classifyTraceError`.
+ */
+function parseJsonlLines(content: string): {
+  events: Record<string, unknown>[];
+  skippedLines: number;
+} {
+  const events: Record<string, unknown>[] = [];
+  let skippedLines = 0;
+  for (const line of content.trim().split('\n').filter(Boolean)) {
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        skippedLines++;
+        continue;
+      }
+      events.push(parsed as Record<string, unknown>);
+    } catch {
+      skippedLines++;
+    }
+  }
+  return { events, skippedLines };
+}
+
+const EMPTY_RESPONSE: Omit<QueryTraceResponse, 'runId'> = {
+  events: [],
+  totalEvents: 0,
+  truncated: false,
+  source: 'not_found',
+};
+
+/**
+ * The response for a trace too large to read.
+ *
+ * NOT `EMPTY_RESPONSE`. That spreads `source: 'not_found'`, so the one case
+ * where the trace certainly exists and is certainly non-empty was reported as
+ * "there is no trace for this run" — with `totalEvents: 0`, a measurement never
+ * taken, beside a `truncated: true` that contradicts it. `source` is the
+ * existence oracle, and a consumer branching on `'not_found'` never reaches the
+ * contradiction.
+ */
+function overSizeResponse(runId: string, sizeBytes: number): QueryTraceResponse {
+  return {
+    runId,
+    events: [],
+    totalEvents: 0,
+    truncated: true,
+    source: 'disk',
+    errorCategory: 'too_large',
+    errorMessage:
+      `Trace for runId '${runId}' is ${String(sizeBytes)} bytes, over the ` +
+      `${String(MAX_TRACE_FILE_BYTES)}-byte read cap; no events were read`,
+  };
+}
+
+/**
+ * Build the success response, disclosing any lines the reader could not parse.
+ *
+ * The skip count is omitted when zero, so a clean read is byte-identical to
+ * what every existing consumer already saw.
+ */
+function readTraceResponse(
+  input: QueryTraceInput,
+  read: { events: Record<string, unknown>[]; skippedLines: number },
+  reading: TraceSnapshotReading
+): QueryTraceResponse {
+  const limit = input.limit ?? 100;
+  const events =
+    reading.status === 'measured'
+      ? reading.entries.map((entry) => ({ ...entry }))
+      : read.events.map(withoutCertifiedAttribution);
+  const parsed =
+    input.eventType !== undefined
+      ? events.filter((e) => e['eventType'] === input.eventType)
+      : events;
+
+  return {
+    runId: input.runId,
+    attribution: attributionReport(reading, input.eventType, limit),
+    events: parsed.slice(0, limit),
+    totalEvents: parsed.length,
+    truncated: parsed.length > limit,
+    source: 'disk',
+    ...(read.skippedLines > 0
+      ? {
+          skippedLines: read.skippedLines,
+          errorCategory: 'parse_error' as const,
+          errorMessage:
+            `${String(read.skippedLines)} line(s) in the trace for runId '${input.runId}' ` +
+            'could not be parsed; the events returned are what survived',
+        }
+      : {}),
+  };
+}
+
+/** Invalid/missing snapshot binding must not echo raw positive attribution as certified. */
+function withoutCertifiedAttribution(entry: Record<string, unknown>): Record<string, unknown> {
+  const {
+    attributionVersion: _version,
+    captureRelation: _relation,
+    captureOrigin: _capture,
+    origin: _origin,
+    ...legacy
+  } = entry;
+  return legacy;
+}
+
+function attributionReport(
+  reading: TraceSnapshotReading,
+  eventType: string | undefined,
+  limit: number
+): TraceAttributionReport {
+  if (reading.status === 'unmeasured')
+    return {
+      ...reading,
+      writerObserved: null,
+      retained: null,
+      filtered: null,
+      returned: null,
+    };
+  const filtered =
+    eventType === undefined
+      ? reading.entries
+      : reading.entries.filter((e) => e.eventType === eventType);
+  return {
+    status: 'measured',
+    writerObserved: {
+      ...reading.snapshot.writerObserved,
+      invalidDropped: reading.snapshot.writerObserved.invalidDropped ?? null,
+    },
+    retained: reading.snapshot.retained,
+    filtered: relationCounts(filtered),
+    returned: relationCounts(filtered.slice(0, limit)),
+  };
+}
+
+/** Read runs/ first, then legacy traces/ only when absent. Overrides use a single root. */
+export async function queryTraceFromDisk(
+  input: QueryTraceInput,
+  runsDir?: string
+): Promise<QueryTraceResponse> {
+  if (runsDir !== undefined) return readTraceFromDirectory(input, runsDir);
+
+  const primary = await readTraceFromDirectory(input, getDefaultRunsDir());
+  if (primary.errorCategory !== 'not_found') {
+    return primary.source === 'disk' ? { ...primary, sourceDirectory: 'runs' } : primary;
+  }
+
+  const legacy = await readTraceFromDirectory(input, nexusDataPath('traces'));
+  return legacy.source === 'disk' ? { ...legacy, sourceDirectory: 'traces' } : legacy;
+}
+
+/** Read a trace within one directory, preserving the path guard and read limits. */
+async function readTraceFromDirectory(
+  input: QueryTraceInput,
+  dir: string
+): Promise<QueryTraceResponse> {
+  // Path traversal guard: the trace must stay within its directory after
+  // following symlinks, and the canonical path is what gets read.
+  const tracePath = resolveInsideRoot(join(dir, input.runId, 'trace.jsonl'), dir);
+  if (tracePath === null) {
+    return { runId: input.runId, ...EMPTY_RESPONSE };
+  }
+
+  try {
+    const fileStat = await stat(tracePath);
+    if (fileStat.size > MAX_TRACE_FILE_BYTES) {
+      return overSizeResponse(input.runId, fileStat.size);
+    }
+
+    const content = await readFile(tracePath);
+    const decoded = decodeTraceBytes(content);
+    if (decoded === null) {
+      return {
+        ...readTraceResponse(
+          input,
+          { events: [], skippedLines: 0 },
+          {
+            status: 'unmeasured',
+            reason: 'invalid_encoding',
+          }
+        ),
+        errorCategory: 'parse_error',
+        errorMessage: 'Trace is not valid UTF-8; no events were read',
+      };
+    }
+    return readTraceResponse(
+      input,
+      parseJsonlLines(decoded),
+      readTraceSnapshot(tracePath, dir, content, input.runId)
+    );
+  } catch (err: unknown) {
+    const category = classifyTraceError(err);
+    const message = userFacingTraceError(err, input.runId);
+
+    if (category === 'not_found') {
+      traceLogger.debug('Trace file not found', { runId: input.runId });
+    } else {
+      traceLogger.warn('Trace query error', { runId: input.runId, category, message });
+    }
+
+    return {
+      runId: input.runId,
+      ...EMPTY_RESPONSE,
+      errorCategory: category,
+      errorMessage: message,
+    };
+  }
+}
+
+// ============================================================================
+// Handler
+// ============================================================================
+
+function queryTraceHandler(args: unknown, ctx: HandlerContext): Promise<ToolResult> {
+  const parsed = QueryTraceInputSchema.safeParse(args);
+  if (!parsed.success) {
+    return Promise.resolve(
+      toolStructuredError({
+        errorCategory: 'validation',
+        message: `Validation error: ${formatZodError(parsed.error)}`,
+      })
+    );
+  }
+
+  return queryTraceFromDisk(parsed.data)
+    .then((result) => toolSuccess(JSON.stringify(result, null, 2)))
+    .catch((caught: unknown) => {
+      const e = caught instanceof Error ? caught : new Error(String(caught));
+      ctx.logger.error('Trace query failed', e);
+      return toolStructuredError({
+        errorCategory: 'internal',
+        message: `Trace query failed: ${e.message}`,
+      });
+    });
+}
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+/** @category MCP */
+export function registerQueryTraceTool(server: McpServer, deps: QueryTraceDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'query_trace' });
+  const toolSchema = {
+    runId: z
+      .string()
+      .min(1)
+      .max(128)
+      .regex(/^[a-zA-Z0-9_-]+$/, 'runId must be alphanumeric, hyphens, or underscores')
+      .describe('Run ID to query traces for'),
+    eventType: z
+      .string()
+      .max(100)
+      .regex(/^[a-zA-Z0-9._-]+$/)
+      .optional()
+      .describe('Filter by event type (e.g., model.called)'),
+    limit: z.number().min(1).max(500).optional().describe('Max events to return (default: 100)'),
+  };
+
+  const description =
+    'Query execution traces by run ID. Returns agent and model ' +
+    'attribution for pipeline runs including decision paths, ' +
+    'error taxonomy, timing and snapshot-bound attribution counts. writerObserved.invalidDropped ' +
+    'counts rejected conversions or rows, and is null for historical snapshots without that measurement. ' +
+    'Counted or unknown loss does not certify complete capture. run_related is logical ' +
+    'session participation only: reused/concurrent invocations are indistinguishable; no attempt, worker or settlement proof.';
+
+  const secureHandler = createSecureHandler(queryTraceHandler, {
+    toolName: 'query_trace',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const timeoutMs = getToolTimeout('query_trace', deps.security);
+  const wrappedHandler = wrapToolWithTimeout('query_trace', secureHandler, { timeoutMs, logger });
+
+  server.registerTool(
+    'query_trace',
+    { description, inputSchema: toolSchema, annotations: getToolAnnotations('query_trace') },
+    toSdkCallback(wrappedHandler)
+  );
+  logger.info('Registered query_trace tool');
+}

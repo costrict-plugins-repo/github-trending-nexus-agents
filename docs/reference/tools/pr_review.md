@@ -1,0 +1,34 @@
+---
+title: 'MCP Tool: pr_review'
+description: 'Multi-voter PR review with verification gate (experimental)'
+diataxis: reference
+audience: user
+tier: 2
+keywords: [mcp, tool, reference, pr_review]
+---
+
+# `pr_review`
+
+> Auto-generated from the registered MCP tool descriptions and input
+> schemas. Do not edit by hand — run `pnpm docs:tools` to regenerate.
+
+Run multi-voter consensus review on a PR diff (#2233). 5 voters (architect, security, devex, catfish, scope_steward) each emit approve/request_changes/abstain with reasoning and citations. Reuses consensus_vote infra; experimental.
+
+## Parameters
+
+| Parameter | Type | Required | Constraints | Description |
+| --------- | ---- | -------- | ----------- | ----------- |
+| `prTitle` | string | yes | minLength 1; maxLength 500 | PR title |
+| `prDescription` | string | no | maxLength 10000 | PR body / description |
+| `prDiff` | string | yes | minLength 1; maxLength 2000000 | Unified diff text (max 2000000 chars). REQUIRED SHAPE (#4451): must contain a `diff --git` header, an `@@ … @@` hunk header backed by +/- lines, or a `---`/`+++` header pair — a prose summary of the change is REJECTED, because reviewing a summary is not reviewing the code and would be recorded as though it were. (Stated here because Zod refinements do not survive JSON-schema generation, so this constraint is otherwise invisible to clients.) No need to truncate before calling: the panel reads the whole diff whenever it fits the voters' context windows (#6003); a diff larger than that is security-prioritized and PARTIALLY reviewed (lowest-priority whole files dropped; a partial panel read can block but never verified-approve). Separately, the audit record's hash binds only the first 50000 UTF-8 bytes; the response `coverage` and the record summary state both what the panel read and what the hash binds. |
+| `repoContext` | string | no | maxLength 2000 | Optional one-paragraph repo context (architecture, conventions; max 2000 chars; trim before calling) |
+| `baseRef` | string | no | maxLength 200 | Base branch ref (e.g. main) |
+| `headRef` | string | no | maxLength 200 | Head branch ref |
+| `prNumber` | integer | no | max 1000000; > 0 | PR number — with baseSha, enables Option-C audit-record persistence (#4031) |
+| `baseSha` | string | no | pattern `^[0-9a-f]{40}$` | 40-hex base commit sha the reviewed diff was computed from — pass `git merge-base origin/<base> <head>`, the base the gate recomputes (Option-C binding, #4031, #5692) |
+| `repoPath` | string | no | maxLength 1024 | Repo root path for persisting the governance pr-review record (overrides cwd auto-detection). Must contain a .git ancestor — relative paths are resolved against cwd; ignored (falls back to cwd auto-detection) if it is not a real repo root. Env NEXUS_PR_REVIEW_RECORDS_PATH still takes precedence and is unrestricted. |
+| `simulate` | boolean | no | default false | Use simulated voters (testing only; never ship live with this true) |
+| `errorPolicy` | enum | no | one of: standard \| absolute_quorum; default standard | Error policy (#4132). 'standard' (default): absent voters excluded; approval requires a majority of the requested panel. 'absolute_quorum': any errored voter — esp. the contrarian — degrades a would-be approve to a recoverable abstain (verified:false); never manufactures a verified approve from an induced error. |
+| `project` | string | no | pattern `^[A-Za-z0-9._/@-]{1,200}$` | The project the panel is judging (#6110), e.g. `acme/widgets` — it replaces `nexus-agents` in every voter's system prompt, so a consuming repository is not judged against this one's mission and governance files. When omitted the name is DERIVED from the server's working directory (the `origin` remote as `owner/repo`, else the nearest `package.json` name) and falls back to `nexus-agents`; the response discloses which on `project.source`. Letters, digits and `._/@-` only, at most 200 characters. |
+| `dispatch` | enum | no | one of: sync \| async; default sync | Async dispatch (#4968). 'sync' (default): run inline and return the result. 'async': return { status: 'pending', jobId } immediately and run in the background; poll get_job_result({ jobId }). |
+| `mode` | never | no | — | Not an input of this tool. The async switch is `dispatch`; `mode: 'async'` is rejected (#4968). |

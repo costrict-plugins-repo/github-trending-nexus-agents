@@ -1,0 +1,558 @@
+/**
+ * Tests for the authentic-vote-record persistence OUTCOME (#3991).
+ *
+ * `recordAuthenticVote` returns a structured {@link VoteRecordPersistOutcome} so
+ * a skipped/failed persist is observable to the MCP caller instead of being a
+ * server-only WARN. Covered: all-simulated skip, no-committable-root skip (with
+ * an actionable `NEXUS_VOTE_RECORDS_PATH` detail), env-override write, and
+ * repo-root write. The persistence/cwd-resolution logic itself is unchanged —
+ * these assert only the classification of the outcome.
+ *
+ * @module mcp/tools/consensus-vote-recording.test
+ */
+
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { getNexusDataDir, nexusDataPath } from '../../config/nexus-data-dir.js';
+import { VOTE_RECORDS_PATH_ENV } from '../../audit/vote-record-store.js';
+import type { ConsensusResult, Vote } from '../../consensus/types.js';
+import type { AgentVoteResult, VoterRole } from '../../cli/vote-types.js';
+import { executeAgentVote } from '../../cli/voter-agents.js';
+import type { ILogger, IModelAdapter } from '../../core/index.js';
+import {
+  getOutcomeStore,
+  OutcomeStore,
+  setOutcomeStore,
+} from '../../orchestration/outcomes/index.js';
+
+const memoryMocks = vi.hoisted(() => ({
+  recordTask: vi.fn(),
+  recordLearning: vi.fn(),
+  runPromotionPipeline: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock('./tool-memory.js', () => ({
+  getToolMemory: () => memoryMocks,
+}));
+
+import {
+  recordAuthenticVote,
+  recordVoteOutcomes,
+  recordVoteSuccess,
+} from './consensus-vote-recording.js';
+
+/** Differs from any default, so a dropped decisionId cannot pass by accident. */
+const TEST_DECISION_ID = 'consensus-test-decision-7f3a';
+
+// #3991: the runtime ledger resolves via nexusDataPath (governance category)
+// instead of findRepoRoot. Mock the resolver so each test pins the data root.
+vi.mock('../../config/nexus-data-dir.js', () => ({
+  getNexusDataDir: vi.fn(() => '/data-root/.nexus-agents'),
+  nexusDataPath: vi.fn((...segments: string[]) =>
+    ['/data-root/.nexus-agents', ...segments].join('/')
+  ),
+  previewNexusDataPath: vi.fn((...segments: string[]) =>
+    ['/data-root/.nexus-agents', ...segments].join('/')
+  ),
+}));
+
+function vote(decision: Vote['decision'], confidence: number): Vote {
+  return { decision, confidence, reasoning: 'because' };
+}
+
+function agentVote(
+  role: VoterRole,
+  decision: Vote['decision'],
+  source: AgentVoteResult['source'] = 'llm'
+): AgentVoteResult {
+  return { role, vote: vote(decision, 0.8), processingTimeMs: 10, source };
+}
+
+function consensusResult(overrides: Partial<ConsensusResult> = {}): ConsensusResult {
+  const now = '2026-06-15T00:00:00.000Z';
+  return {
+    proposalId: 'p-1',
+    proposal: { title: 'T', description: 'D', algorithm: 'higher_order' },
+    outcome: 'approved',
+    votes: new Map(),
+    voteCounts: { approve: 2, reject: 1, abstain: 0, total: 3 },
+    approvalPercentage: 66.7,
+    quorumReached: true,
+    startedAt: now,
+    closedAt: now,
+    durationMs: 5,
+    ...overrides,
+  };
+}
+
+const realVotes: readonly AgentVoteResult[] = [
+  agentVote('architect', 'approve'),
+  agentVote('security', 'approve'),
+  agentVote('catfish', 'reject'),
+];
+
+describe('recordVoteSuccess decision fidelity (#5544)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setOutcomeStore(new OutcomeStore());
+  });
+
+  it('records the task but no learning or outcome sample for no_quorum', () => {
+    const votes = [
+      agentVote('architect', 'approve'),
+      { ...agentVote('security', 'abstain', 'error'), error: 'timeout' },
+    ];
+
+    recordVoteSuccess({
+      decisionId: TEST_DECISION_ID,
+      proposal: 'Require every voter',
+      strategy: 'unanimous',
+      decision: 'no_quorum',
+      durationMs: 10,
+      approvalPercentage: 50,
+      votes,
+    });
+
+    expect(memoryMocks.recordTask).toHaveBeenCalledOnce();
+    expect(memoryMocks.recordLearning).not.toHaveBeenCalled();
+    expect(memoryMocks.runPromotionPipeline).not.toHaveBeenCalled();
+    expect(getOutcomeStore().size).toBe(0);
+  });
+
+  it('continues recording learning and outcomes for an approved decision', () => {
+    const votes = [agentVote('architect', 'approve')];
+
+    recordVoteSuccess({
+      decisionId: TEST_DECISION_ID,
+      proposal: 'Ship it',
+      strategy: 'simple_majority',
+      decision: 'approved',
+      durationMs: 10,
+      approvalPercentage: 90,
+      votes,
+    });
+
+    expect(memoryMocks.recordTask).toHaveBeenCalledOnce();
+    expect(memoryMocks.recordLearning).toHaveBeenCalledWith(
+      expect.objectContaining({ pattern: 'simple_majority vote → approved', confidence: 0.9 })
+    );
+    expect(memoryMocks.runPromotionPipeline).toHaveBeenCalledOnce();
+    expect(getOutcomeStore().size).toBe(1);
+  });
+});
+
+describe('recordVoteOutcomes CLI attribution (#5529)', () => {
+  beforeEach(() => {
+    setOutcomeStore(new OutcomeStore());
+  });
+
+  it('attributes a failed codex voter without changing a successful LLM voter', () => {
+    recordVoteOutcomes(
+      [
+        { ...agentVote('architect', 'approve'), cli: 'gemini' },
+        {
+          ...agentVote('security', 'abstain', 'error'),
+          cli: 'codex',
+          error: 'Codex failed',
+        },
+      ],
+      TEST_DECISION_ID
+    );
+
+    const outcomes = getOutcomeStore().query();
+    expect(outcomes).toHaveLength(2);
+    expect(outcomes[0]).toMatchObject({ cli: 'gemini', success: true });
+    expect(outcomes[1]).toMatchObject({ cli: 'codex', success: false });
+  });
+
+  it('attributes an error vote with no CLI to unknown, never claude', () => {
+    recordVoteOutcomes(
+      [
+        {
+          ...agentVote('security', 'abstain', 'error'),
+          error: 'Unattributed failure',
+        },
+      ],
+      TEST_DECISION_ID
+    );
+
+    const outcome = getOutcomeStore().query()[0];
+    expect(outcome?.cli).toBe('unknown');
+    expect(outcome?.cli).not.toBe('claude');
+  });
+});
+
+describe('consensus outcome decision correlation (#6857)', () => {
+  beforeEach(() => {
+    setOutcomeStore(new OutcomeStore());
+  });
+
+  it('threads the supplied decision ID through recordVoteSuccess to every recorded seat', () => {
+    const decisionId = 'consensus-supplied-6857';
+    recordVoteSuccess({
+      decisionId,
+      proposal: 'Reject the proposal',
+      strategy: 'simple_majority',
+      decision: 'rejected',
+      durationMs: 10,
+      votes: [
+        agentVote('architect', 'reject'),
+        { ...agentVote('security', 'abstain', 'error'), error: 'timeout' },
+        agentVote('catfish', 'approve', 'simulation'),
+      ],
+    });
+
+    const rows = getOutcomeStore().query();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.traceId)).toEqual([decisionId, decisionId]);
+    // Answering is measured here; a rejection is still an LLM answer.
+    expect(rows.map((row) => row.success)).toEqual([true, false]);
+    expect(rows.map((row) => row.id)).not.toContain(decisionId);
+  });
+
+  it('uses the decision ID supplied directly to recordVoteOutcomes', () => {
+    recordVoteOutcomes([agentVote('pm', 'approve')], 'consensus-direct-6857');
+    expect(getOutcomeStore().query()[0]?.traceId).toBe('consensus-direct-6857');
+  });
+});
+
+describe('recordVoteOutcomes served model and cost (#6624)', () => {
+  beforeEach(() => {
+    setOutcomeStore(new OutcomeStore());
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('records one row per seat, each with the model that sat it and its cost', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced:1,2');
+    recordVoteOutcomes(
+      [
+        // claude-sonnet is $3 / $15 per 1M: 1000 in + 2000 out = 0.033.
+        {
+          ...agentVote('architect', 'approve'),
+          cli: 'claude',
+          model: 'claude-sonnet',
+          servedModel: 'claude-sonnet',
+          inputTokens: 1_000,
+          outputTokens: 2_000,
+        },
+        // The same model through a declared gateway: $1 / $2 per 1M = 0.005.
+        {
+          ...agentVote('security', 'approve'),
+          cli: 'claude',
+          model: 'claude-sonnet',
+          servedModel: 'claude-sonnet',
+          gatewayArm: 'api:custom-openai',
+          inputTokens: 1_000,
+          outputTokens: 2_000,
+        },
+        {
+          ...agentVote('devex', 'reject'),
+          cli: 'opencode',
+          model: 'acme-unpriced-model-xyz',
+          servedModel: 'acme-unpriced-model-xyz',
+          inputTokens: 1_000,
+          outputTokens: 2_000,
+        },
+      ],
+      TEST_DECISION_ID
+    );
+
+    const [architect, security, devex] = getOutcomeStore().query();
+    expect(architect).toMatchObject({
+      model: 'consensus',
+      voterRole: 'architect',
+      servedModel: 'claude-sonnet',
+      costUsd: 0.033,
+      priceBasis: 'list',
+    });
+    expect(security).toMatchObject({ servedModel: 'claude-sonnet', costUsd: 0.005 });
+    expect(devex).toMatchObject({ servedModel: 'acme-unpriced-model-xyz', priceBasis: 'unknown' });
+    expect(devex !== undefined && 'costUsd' in devex).toBe(false);
+  });
+
+  it('records no served fields for a seat that never reached a model', () => {
+    recordVoteOutcomes(
+      [{ ...agentVote('pm', 'abstain', 'error'), error: 'spawn failed' }],
+      TEST_DECISION_ID
+    );
+    const row = getOutcomeStore().query()[0] as unknown as Record<string, unknown>;
+    expect(row['model']).toBe('consensus');
+    for (const key of ['servedModel', 'costUsd', 'priceBasis']) {
+      expect(key in row).toBe(false);
+    }
+  });
+});
+
+describe('recordVoteOutcomes records the model that answered, not the one requested (#6660)', () => {
+  beforeEach(() => {
+    setOutcomeStore(new OutcomeStore());
+  });
+
+  it.each([true, false])(
+    'records serving identity only with an explicit report: %s',
+    async (reported) => {
+      // Operational alias substitution alone is not transport evidence. The same
+      // successful completion with an explicit report can be named and priced.
+      const approve = JSON.stringify({
+        decision: 'approve',
+        reasoning: 'Approve: the change is small and tested.',
+        confidence: 0.9,
+      });
+      const adapter: IModelAdapter = {
+        providerId: 'cli-claude',
+        modelId: 'claude-fable-5',
+        capabilities: [],
+        complete: vi.fn().mockResolvedValue({
+          ok: true,
+          value: {
+            content: approve,
+            stopReason: 'end_turn',
+            model: 'claude-sonnet',
+            ...(reported ? { reportedModel: 'claude-sonnet' } : {}),
+            fallbackFrom: 'claude-fable-5',
+            usage: { inputTokens: 1_000, outputTokens: 2_000 },
+          },
+        }),
+        stream: vi.fn(),
+        countTokens: vi.fn().mockResolvedValue(10),
+        validateConfig: vi.fn().mockReturnValue({ ok: true }),
+      };
+      const logger: ILogger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        child: vi.fn(),
+        setLevel: vi.fn(),
+      };
+      const seat = await executeAgentVote('architect', 'Ratify', adapter, logger, {
+        timeoutMs: 5000,
+        maxRetries: 0,
+      });
+      expect(seat.source).toBe('llm');
+      expect(seat.operationalModel).toBe('claude-sonnet');
+      expect(seat.inputTokens).toBe(1000);
+      expect(seat.outputTokens).toBe(2000);
+      expect(seat.servedModel).toBe(reported ? 'claude-sonnet' : undefined);
+
+      recordVoteOutcomes([seat], TEST_DECISION_ID);
+
+      const rows = getOutcomeStore().query();
+      expect(rows).toHaveLength(1);
+      const [row] = rows;
+      if (!reported) {
+        expect(row?.model).toBe('consensus');
+        expect(row).not.toHaveProperty('servedModel');
+        expect(row).not.toHaveProperty('costUsd');
+        expect(row).not.toHaveProperty('priceBasis');
+        return;
+      }
+      // claude-sonnet is $3 / $15 per 1M: 1000 in + 2000 out = 0.033.
+      expect(row).toMatchObject({
+        model: 'consensus',
+        servedModel: 'claude-sonnet',
+        costUsd: 0.033,
+        priceBasis: 'list',
+      });
+    }
+  );
+});
+
+describe('recordAuthenticVote persistence outcome (#3991)', () => {
+  let dir: string;
+  let dataRoot: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'vote-outcome-'));
+    dataRoot = join(dir, 'data-root', '.nexus-agents');
+    // Default: nexusDataPath roots under a real temp data dir so persists write.
+    vi.mocked(getNexusDataDir).mockReturnValue(dataRoot);
+    vi.mocked(nexusDataPath).mockImplementation((...segments: string[]) =>
+      join(dataRoot, ...segments)
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reports all-simulated when every vote is simulated', async () => {
+    const outcome = await recordAuthenticVote({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      errorPolicy: undefined,
+      proposal: 'p',
+      strategy: 'simple_majority',
+      result: consensusResult(),
+      votes: [
+        agentVote('architect', 'approve', 'simulation'),
+        agentVote('security', 'reject', 'simulation'),
+      ],
+    });
+    expect(outcome.persisted).toBe(false);
+    if (!outcome.persisted) {
+      expect(outcome.reason).toBe('all-simulated');
+      expect(outcome.detail).toContain('simulated');
+    }
+  });
+
+  it('reports write-failed with an actionable note when the data dir is unwritable', async () => {
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, undefined); // no override → nexusDataPath
+    // Make the resolved path unwritable: put a regular FILE where a directory
+    // component must be, so persistVoteRecord's mkdirSync throws ENOTDIR and the
+    // outcome is classified write-failed. The path still passes the resolver's
+    // defense-in-depth check because it sits under getNexusDataDir.
+    const fileAsDir = join(dir, 'not-a-dir');
+    writeFileSync(fileAsDir, 'x', 'utf-8');
+    const unwritable = join(fileAsDir, 'governance', 'vote-records.jsonl');
+    vi.mocked(getNexusDataDir).mockReturnValue(fileAsDir);
+    vi.mocked(nexusDataPath).mockReturnValue(unwritable);
+
+    const outcome = await recordAuthenticVote({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      errorPolicy: undefined,
+      proposal: 'Promote loop X to enforce',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes: realVotes,
+    });
+    expect(outcome.persisted).toBe(false);
+    if (!outcome.persisted) {
+      expect(outcome.reason).toBe('write-failed');
+      expect(outcome.detail).toContain(VOTE_RECORDS_PATH_ENV);
+    }
+  });
+
+  it('persists and returns the record when the env override path is set', async () => {
+    const filePath = join(dir, 'env', 'vote-records.jsonl');
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, filePath);
+
+    const outcome = await recordAuthenticVote({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      errorPolicy: undefined,
+      proposal: 'Promote loop X to enforce',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes: realVotes,
+      correlationId: 'corr-1',
+    });
+    expect(outcome.persisted).toBe(true);
+    if (outcome.persisted) {
+      expect(outcome.record.decision).toBe('approved');
+      expect(outcome.record.correlationId).toBe('corr-1');
+    }
+    // The record actually landed on disk at the override path.
+    const written = readFileSync(filePath, 'utf-8').trim();
+    expect(written.length).toBeGreaterThan(0);
+  });
+
+  it('#4004: binds the ratifies subject into the persisted record', async () => {
+    const filePath = join(dir, 'ratify', 'vote-records.jsonl');
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, filePath);
+
+    const outcome = await recordAuthenticVote({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      errorPolicy: undefined,
+      proposal: 'Promote auto-remediation to enforce',
+      strategy: 'higher_order',
+      result: consensusResult(),
+      votes: realVotes,
+      correlationId: 'corr-ratify',
+      ratifies: 'auto-remediation',
+    });
+    expect(outcome.persisted).toBe(true);
+    if (outcome.persisted) {
+      expect(outcome.record.ratifies).toBe('auto-remediation');
+      // ratifies is covered by the self-hash, so the on-disk line carries it.
+      const written = readFileSync(filePath, 'utf-8').trim();
+      expect(JSON.parse(written).ratifies).toBe('auto-remediation');
+    }
+  });
+
+  it('#3991: persists to the .nexus-agents/governance/ data-dir path when no override is set', async () => {
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, undefined);
+
+    const outcome = await recordAuthenticVote({
+      declaredOptions: undefined,
+      resolvedDecision: undefined,
+      errorPolicy: undefined,
+      proposal: 'p',
+      strategy: 'simple_majority',
+      result: consensusResult(),
+      votes: realVotes,
+    });
+    expect(outcome.persisted).toBe(true);
+    // Landed under the canonical nexusDataPath governance location — the global-
+    // install / sandbox-robust path, NOT a repo-root committed ledger.
+    const written = readFileSync(
+      join(dataRoot, 'governance', 'vote-records.jsonl'),
+      'utf-8'
+    ).trim();
+    expect(written.length).toBeGreaterThan(0);
+  });
+});
+
+describe('declared options reach the persisted record (#6049, the seam)', () => {
+  // buildVoteRecord's own tests inject `declaredOptions` directly, so passing
+  // `undefined` from either production path broke NOTHING. This drives the
+  // recording layer for real and reads back what landed on disk.
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'vote-options-'));
+    vi.stubEnv('NEXUS_DATA_DIR', dir);
+    vi.stubEnv(VOTE_RECORDS_PATH_ENV, undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('persists coverage when options were declared and no selection was parseable', async () => {
+    const outcome = await recordAuthenticVote({
+      declaredOptions: ['A - do it', 'B - do not'],
+      resolvedDecision: 'rejected',
+      errorPolicy: undefined,
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: [agentVote('architect', 'approve'), agentVote('security', 'approve')],
+    });
+
+    expect(outcome.persisted).toBe(true);
+    if (!outcome.persisted) return;
+    expect(outcome.record.optionCoverage).toEqual({
+      approverCount: 2,
+      selectedCount: 0,
+      unattributedApprovals: 2,
+    });
+    expect(outcome.record.optionTally).toEqual([]);
+  });
+
+  it('persists NEITHER field for an ordinary yes/no vote — the pair', async () => {
+    const outcome = await recordAuthenticVote({
+      declaredOptions: undefined,
+      resolvedDecision: 'approved',
+      errorPolicy: undefined,
+      proposal: 'p',
+      strategy: 'supermajority',
+      result: consensusResult(),
+      votes: [agentVote('architect', 'approve'), agentVote('security', 'approve')],
+    });
+
+    expect(outcome.persisted).toBe(true);
+    if (!outcome.persisted) return;
+    expect(outcome.record.optionCoverage).toBeUndefined();
+    expect(outcome.record.optionTally).toBeUndefined();
+  });
+});

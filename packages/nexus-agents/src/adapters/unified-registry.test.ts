@@ -1,0 +1,691 @@
+/**
+ * Tests for UnifiedAdapterRegistry
+ *
+ * Verifies centralized adapter creation and task routing:
+ * - Task category → CLI routing is deterministic
+ * - Adapters are cached per CLI (no duplicate creation)
+ * - Role-based routing uses task specialization matrix
+ * - Model preference resolution via canonical registry
+ * - Default adapter fallback behavior
+ *
+ * @module adapters/unified-registry.test
+ * (Source: Issue #1149, #1151)
+ */
+
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  UnifiedAdapterRegistry,
+  createUnifiedRegistry,
+  getGlobalRegistry,
+  resetGlobalRegistry,
+  claimGlobalRegistry,
+  RegistryAlreadyInitializedError,
+} from './unified-registry.js';
+import { ConfigError } from '../core/errors.js';
+import * as resilientAdapters from './resilient-adapter.js';
+import { getDefaultCliCircuitBreakerRegistry } from '../cli-adapters/cli-circuit-breaker.js';
+import { TASK_SPECIALIZATION_MATRIX } from '../config/task-specialization.js';
+import { DEFAULT_MODEL_CAPABILITIES } from '../config/in-tree-data.js';
+import * as modelConfigHelpers from '../config/model-config-helpers.js';
+import type { ModelId } from '../config/model-capabilities-types.js';
+import type { IResilientAdapter } from './resilient-adapter-types.js';
+
+// Silence logging in tests
+const mockLogger = {
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  child: vi.fn().mockReturnThis(),
+  setLevel: vi.fn(),
+};
+
+describe('UnifiedAdapterRegistry', () => {
+  let registry: UnifiedAdapterRegistry;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetGlobalRegistry();
+    registry = createUnifiedRegistry({ logger: mockLogger });
+  });
+
+  afterEach(() => {
+    registry.dispose();
+  });
+
+  // #4659: the ResilientAdapter's failover listener could never fire. Its
+  // `recordBreakerFailure` returns early unless a CircuitBreakerRegistry was
+  // attached, and NO production caller attached one — both construction sites
+  // here built the adapter and stopped. A shared registry already existed and
+  // already gated voter-panel availability (#4330); the adapter simply never
+  // saw it, so a CLI whose circuit opened kept being handed out.
+  describe('circuit-breaker arming (#4659)', () => {
+    it('arms the CLI-specific adapter with the shared registry', () => {
+      const adapter = registry.getAdapterForCli('claude');
+
+      expect(adapter.getCircuitBreakerRegistry?.()).toBe(getDefaultCliCircuitBreakerRegistry());
+    });
+
+    it('arms the default adapter with the SAME shared registry', () => {
+      // Same instance, not merely a registry: a per-adapter registry would let
+      // one adapter keep routing to a CLI another already saw fail.
+      const viaDefault = registry.getDefault();
+      const viaCli = registry.getAdapterForCli('codex');
+
+      expect(viaDefault.getCircuitBreakerRegistry?.()).toBe(viaCli.getCircuitBreakerRegistry?.());
+      expect(viaDefault.getCircuitBreakerRegistry?.()).toBe(getDefaultCliCircuitBreakerRegistry());
+    });
+  });
+
+  describe('constructor', () => {
+    it('should initialize with pre-computed routing', () => {
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.taskRouting).toHaveLength(10);
+      expect(snapshot.availableModels).toBeGreaterThan(0);
+    });
+
+    it('should log initialization', () => {
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        'UnifiedAdapterRegistry initialized',
+        expect.objectContaining({ categories: 10 })
+      );
+    });
+  });
+
+  describe('task routing', () => {
+    it('should route all 10 categories', () => {
+      const snapshot = registry.getSnapshot();
+      const categories = snapshot.taskRouting.map((r) => r.category);
+      expect(categories).toContain('architecture');
+      expect(categories).toContain('code_generation');
+      expect(categories).toContain('research');
+      expect(categories).toContain('security_review');
+      expect(categories).toContain('documentation');
+      expect(categories).toContain('testing');
+      expect(categories).toContain('devops');
+      expect(categories).toContain('exploration');
+      expect(categories).toContain('planning');
+      expect(categories).toContain('code_review');
+    });
+
+    it('should match task specialization matrix', () => {
+      for (const spec of TASK_SPECIALIZATION_MATRIX) {
+        const routing = registry.getRouting(spec.category);
+        expect(routing).toBeDefined();
+        expect(routing?.primaryCli).toBe(spec.primaryCli);
+        expect(routing?.secondaryCli).toBe(spec.secondaryCli);
+      }
+    });
+
+    it('should route architecture to gemini', () => {
+      const routing = registry.getRouting('architecture');
+      expect(routing?.primaryCli).toBe('gemini');
+    });
+
+    it('should route code_generation to codex', () => {
+      const routing = registry.getRouting('code_generation');
+      expect(routing?.primaryCli).toBe('codex');
+    });
+
+    it('should route research to gemini', () => {
+      const routing = registry.getRouting('research');
+      expect(routing?.primaryCli).toBe('gemini');
+    });
+  });
+
+  describe('getAdapter(category)', () => {
+    it('should return adapter for known category', () => {
+      const adapter = registry.getAdapter('code_generation');
+      expect(adapter).toBeDefined();
+      expect(adapter.providerId).toBeDefined();
+    });
+
+    it('should cache adapters per CLI', () => {
+      // code_generation and testing both route to codex
+      const adapter1 = registry.getAdapter('code_generation');
+      const adapter2 = registry.getAdapter('testing');
+      expect(adapter1).toBe(adapter2);
+    });
+
+    it('should return different adapters for different CLIs', () => {
+      const codeAdapter = registry.getAdapter('code_generation'); // codex
+      const archAdapter = registry.getAdapter('architecture'); // gemini
+      expect(codeAdapter).not.toBe(archAdapter);
+    });
+  });
+
+  describe('getAdapterForTask(text)', () => {
+    it('should detect code generation task', () => {
+      registry.getAdapterForTask('implement a new feature');
+      // "implement" → code_generation → codex
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('codex');
+    });
+
+    it('should detect research task', () => {
+      registry.getAdapterForTask('research state of the art');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('gemini');
+    });
+
+    it('should fall back to default for unrecognized task', () => {
+      const result = registry.getAdapterForTask('something completely unrelated xyz123');
+      // Should return default adapter
+      expect(result).toBeDefined();
+    });
+  });
+
+  describe('getAdapterForCli(cli)', () => {
+    it('should create adapter for claude', () => {
+      const adapter = registry.getAdapterForCli('claude');
+      expect(adapter).toBeDefined();
+    });
+
+    it('should cache adapter for same CLI', () => {
+      const a1 = registry.getAdapterForCli('gemini');
+      const a2 = registry.getAdapterForCli('gemini');
+      expect(a1).toBe(a2);
+    });
+
+    it('should track cached adapters in snapshot', () => {
+      registry.getAdapterForCli('claude');
+      registry.getAdapterForCli('codex');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('claude');
+      expect(snapshot.cachedArms).toContain('codex');
+    });
+  });
+
+  describe('getAdapterForModel(modelPreference)', () => {
+    it('should resolve claude-opus to claude CLI', () => {
+      registry.getAdapterForModel('claude-opus');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('claude');
+    });
+
+    it('should resolve codex-5.3 to codex CLI', () => {
+      registry.getAdapterForModel('codex-5.3');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('codex');
+    });
+
+    it('should resolve gemini-pro to gemini CLI', () => {
+      registry.getAdapterForModel('gemini-pro');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('gemini');
+    });
+
+    // #6599: the model used to be dropped here — the CLI slot adapter was
+    // returned bare, so execute_expert ran the CLI's default model.
+    it('binds the resolved registry id onto requests sent through the slot adapter', async () => {
+      const complete = vi.fn().mockResolvedValue({ ok: true, value: {} });
+      const slot = { complete } as unknown as IResilientAdapter;
+      const spy = vi.spyOn(registry, 'getAdapterForCli').mockReturnValue(slot);
+      // cliAlias in, canonical id out: the bound model is the registry id.
+      const adapter = registry.getAdapterForModel('custom-sonnet');
+      await adapter.complete({ messages: [{ role: 'user', content: 'hi' }] });
+      expect(spy).toHaveBeenCalledWith('opencode');
+      expect(complete.mock.calls[0]?.[0]).toMatchObject({ model: 'opencode-custom-sonnet' });
+    });
+
+    it('a request that names its own model keeps it', async () => {
+      const complete = vi.fn().mockResolvedValue({ ok: true, value: {} });
+      const slot = { complete } as unknown as IResilientAdapter;
+      vi.spyOn(registry, 'getAdapterForCli').mockReturnValue(slot);
+      const adapter = registry.getAdapterForModel('custom-sonnet');
+      await adapter.complete({ messages: [], model: 'opencode-custom-opus' });
+      expect(complete.mock.calls[0]?.[0]).toMatchObject({ model: 'opencode-custom-opus' });
+    });
+
+    it('should fall back to default for unknown model', () => {
+      const adapter = registry.getAdapterForModel('unknown-model-xyz');
+      expect(adapter).toBeDefined();
+    });
+
+    // #2192 defense-in-depth: prefix fallback uses longest-prefix-wins so a
+    // future registry with both 'gemini-pro' and 'gemini-pro-experimental'
+    // would resolve a 'gemini-pro-experimental-foo' input to the longer one.
+    // No current registry entries have this overlap, but verify the policy.
+    it('routes prefix matches via longest-prefix-wins (defense-in-depth)', () => {
+      // 'gemini-pro-bespoke-deployment' starts with both 'gemini-pro' (10 chars)
+      // and no longer entry — so it routes to gemini via the gemini-pro entry.
+      registry.getAdapterForModel('gemini-pro-bespoke-deployment');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('gemini');
+    });
+  });
+
+  describe('getAdapterForRole(role)', () => {
+    it('should route code_expert to codex', () => {
+      registry.getAdapterForRole('code_expert');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('codex');
+    });
+
+    it('should route architecture_expert to gemini', () => {
+      registry.getAdapterForRole('architecture_expert');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('gemini');
+    });
+
+    it('should route research_expert to gemini', () => {
+      registry.getAdapterForRole('research_expert');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('gemini');
+    });
+
+    it('should route documentation_expert to gemini', () => {
+      registry.getAdapterForRole('documentation_expert');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('gemini');
+    });
+
+    it('should route infrastructure_expert to claude (devops)', () => {
+      registry.getAdapterForRole('infrastructure_expert');
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toContain('claude');
+    });
+
+    it('should fall back to default for unknown role', () => {
+      const adapter = registry.getAdapterForRole('nonexistent_expert');
+      expect(adapter).toBeDefined();
+    });
+  });
+
+  describe('getDefault()', () => {
+    it('should return an adapter', () => {
+      const adapter = registry.getDefault();
+      expect(adapter).toBeDefined();
+    });
+
+    it('should return same instance on repeated calls', () => {
+      const a1 = registry.getDefault();
+      const a2 = registry.getDefault();
+      expect(a1).toBe(a2);
+    });
+  });
+
+  describe('dispose()', () => {
+    it('should clear cached adapters', () => {
+      registry.getAdapterForCli('claude');
+      registry.getAdapterForCli('gemini');
+      registry.dispose();
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.cachedArms).toHaveLength(0);
+    });
+
+    it('should log disposal', () => {
+      registry.dispose();
+      expect(mockLogger.info).toHaveBeenCalledWith('UnifiedAdapterRegistry disposed');
+    });
+  });
+
+  describe('getSnapshot()', () => {
+    it('should include routing for all categories', () => {
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.taskRouting).toHaveLength(10);
+    });
+
+    it('should report model count matching canonical registry', () => {
+      const snapshot = registry.getSnapshot();
+      expect(snapshot.availableModels).toBe(DEFAULT_MODEL_CAPABILITIES.models.length);
+    });
+  });
+});
+
+describe('global registry singleton', () => {
+  afterEach(() => {
+    resetGlobalRegistry();
+  });
+
+  it('should create on first access', () => {
+    const reg = getGlobalRegistry({ logger: mockLogger });
+    expect(reg).toBeInstanceOf(UnifiedAdapterRegistry);
+  });
+
+  it('should return same instance', () => {
+    const r1 = getGlobalRegistry({ logger: mockLogger });
+    const r2 = getGlobalRegistry();
+    expect(r1).toBe(r2);
+  });
+
+  it('should reset properly', () => {
+    const r1 = getGlobalRegistry({ logger: mockLogger });
+    resetGlobalRegistry();
+    const r2 = getGlobalRegistry({ logger: mockLogger });
+    expect(r1).not.toBe(r2);
+  });
+
+  // #5211 (cheap half): a config the singleton cannot apply is refused, not
+  // logged and dropped. Before, the second call below warned and handed back
+  // the registry built by the first, so `defaultCliTimeoutMs: 9_999` was
+  // silently 5_000 wherever the caller went on to use it.
+  it('throws RegistryAlreadyInitializedError when config is supplied to an already-initialized singleton', () => {
+    const first = getGlobalRegistry({ logger: mockLogger });
+    mockLogger.warn.mockClear();
+
+    const call = (): UnifiedAdapterRegistry =>
+      getGlobalRegistry({ logger: mockLogger, defaultCliTimeoutMs: 9_999 });
+
+    expect(call).toThrow(RegistryAlreadyInitializedError);
+    expect(call).toThrow(/defaultCliTimeoutMs/);
+    expect(call).toThrow(/resetGlobalRegistry\(\)/);
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+    // The refusal leaves the singleton as it was.
+    expect(getGlobalRegistry()).toBe(first);
+  });
+
+  it('the conflict error is a ConfigError carrying the refused keys', () => {
+    getGlobalRegistry({ logger: mockLogger });
+    let caught: unknown;
+    try {
+      getGlobalRegistry({ defaultCliTimeoutMs: 9_999 });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ConfigError);
+    expect(caught).toBeInstanceOf(RegistryAlreadyInitializedError);
+    expect((caught as RegistryAlreadyInitializedError).name).toBe(
+      'RegistryAlreadyInitializedError'
+    );
+    expect((caught as RegistryAlreadyInitializedError).context).toEqual({
+      providedKeys: ['defaultCliTimeoutMs'],
+    });
+  });
+
+  it('an empty config object on a later call is not a conflict', () => {
+    const first = getGlobalRegistry({ logger: mockLogger });
+    expect(getGlobalRegistry({})).toBe(first);
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
+  it('should not warn when config is omitted on subsequent calls', () => {
+    getGlobalRegistry({ logger: mockLogger });
+    mockLogger.warn.mockClear();
+    getGlobalRegistry();
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// #3185 — routing is re-resolved on read; no construction-time freeze.
+// ============================================================================
+
+describe('UnifiedAdapterRegistry — routing re-resolves on read (#3185)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetGlobalRegistry();
+  });
+
+  it('getRouting reflects a post-construction default-model change (no stale cache)', () => {
+    const spy = vi
+      .spyOn(modelConfigHelpers, 'getDefaultModelForCli')
+      .mockReturnValue('claude-opus');
+    const registry = createUnifiedRegistry({ logger: mockLogger });
+
+    // 'planning' routes to claude → primaryModel resolved via the helper.
+    const before = registry.getRouting('planning');
+    expect(before?.primaryModel).toBe('claude-opus');
+
+    // Simulate a registry/overlay update that changes the resolved default.
+    spy.mockReturnValue('claude-opus-overlay' as ModelId);
+
+    // The SAME instance must reflect the change — proving no construction-time
+    // freeze of the routing table.
+    const after = registry.getRouting('planning');
+    expect(after?.primaryModel).toBe('claude-opus-overlay');
+    registry.dispose();
+  });
+
+  it('getSnapshot re-reads routing on each call', () => {
+    const spy = vi
+      .spyOn(modelConfigHelpers, 'getDefaultModelForCli')
+      .mockReturnValue('claude-opus');
+    const registry = createUnifiedRegistry({ logger: mockLogger });
+
+    const planningBefore = registry
+      .getSnapshot()
+      .taskRouting.find((r) => r.category === 'planning');
+    expect(planningBefore?.primaryModel).toBe('claude-opus');
+
+    spy.mockReturnValue('claude-opus-overlay' as ModelId);
+
+    const planningAfter = registry.getSnapshot().taskRouting.find((r) => r.category === 'planning');
+    expect(planningAfter?.primaryModel).toBe('claude-opus-overlay');
+    registry.dispose();
+  });
+});
+
+describe('the registry singleton has a designated composition root (#6012)', () => {
+  /** Files allowed to CLAIM the singleton (choose its logger), relative to src/. */
+  const COMPOSITION_ROOTS = ['cli.ts', 'mcp/server.ts'];
+
+  function sourceFiles(dir: string, acc: string[] = []): string[] {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) sourceFiles(full, acc);
+      else if (entry.name.endsWith('.ts') && !entry.name.includes('.test.')) acc.push(full);
+    }
+    return acc;
+  }
+
+  const srcRoot = (): string => join(dirname(fileURLToPath(import.meta.url)), '..');
+
+  it('nothing configures the singleton through getGlobalRegistry', () => {
+    // `getGlobalRegistry(config)` applies the config only on the FIRST call and
+    // warns on every later one. Nine sites passed `{ logger }`, so the logger on
+    // every adapter and circuit-breaker log line was set by whichever ran first,
+    // and the other eight warned on the SUCCESS path of `nexus-agents vote`.
+    // Claiming goes through `claimGlobalRegistry`, which is idempotent; this
+    // ratchet keeps the warning-producing form out of the tree entirely.
+    const offenders = sourceFiles(srcRoot())
+      .filter((f) => /getGlobalRegistry\(\s*\{/.test(readFileSync(f, 'utf-8')))
+      .map((f) => relative(srcRoot(), f));
+    expect(offenders).toEqual([]);
+  });
+
+  it('only the designated roots claim it', () => {
+    const claimers = sourceFiles(srcRoot())
+      .filter((f) => /\bclaimGlobalRegistry\(/.test(readFileSync(f, 'utf-8')))
+      .map((f) => relative(srcRoot(), f))
+      .filter((rel) => rel !== 'adapters/unified-registry.ts'); // the definition
+    expect(claimers.sort()).toEqual([...COMPOSITION_ROOTS].sort());
+  });
+
+  it('claiming twice is silent and keeps the first logger', () => {
+    // The two roots BOTH run in `nexus-agents --mode=server` (cli main, then the
+    // MCP transport). With a warning-on-second-claim helper that combination
+    // reintroduced the exact noise this change removes — measured on the built
+    // binary before this was made idempotent.
+    resetGlobalRegistry();
+    const first = { ...mockLogger } as unknown as Parameters<typeof claimGlobalRegistry>[0];
+    const second = { ...mockLogger } as unknown as Parameters<typeof claimGlobalRegistry>[0];
+    const created = vi.spyOn(resilientAdapters, 'createResilientAdapter');
+    const a = claimGlobalRegistry(first, { defaultCliTimeoutMs: 30_000 });
+    const b = claimGlobalRegistry(second);
+    expect(b).toBe(a);
+    expect(a.getLogger()).toBe(first);
+    a.getAdapterForCli('claude');
+    expect(created).toHaveBeenCalledWith(
+      expect.objectContaining({
+        defaultCliTimeoutMs: 30_000,
+        circuitBreakerRegistry: getDefaultCliCircuitBreakerRegistry(),
+      })
+    );
+    created.mockRestore();
+  });
+
+  it('warns when a later claim supplies configuration that cannot be applied', () => {
+    resetGlobalRegistry();
+    vi.clearAllMocks();
+    const first = claimGlobalRegistry(mockLogger);
+
+    const later = claimGlobalRegistry(mockLogger, { defaultCliTimeoutMs: 1_800_000 });
+
+    expect(later).toBe(first);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      'UnifiedAdapterRegistry claim ignored configuration: singleton already initialized',
+      { providedKeys: ['defaultCliTimeoutMs'] }
+    );
+    const created = vi.spyOn(resilientAdapters, 'createResilientAdapter');
+    later.getAdapterForCli('codex');
+    expect(created.mock.calls[0]?.[0]).not.toHaveProperty('defaultCliTimeoutMs');
+    created.mockRestore();
+  });
+});
+
+// #4392 increment 1: the registry keyed strictly by `CliName`, so an `api:*`
+// routing arm had no place in it at all. It now accepts an explicitly
+// registered API arm alongside the CLI slots. CLI-name behaviour is unchanged:
+// a slot is still created lazily and cached; an API arm is never synthesised.
+describe('UnifiedAdapterRegistry — api:* arms (#4392)', () => {
+  let registry: UnifiedAdapterRegistry;
+
+  function stubResilientAdapter(id: string): IResilientAdapter {
+    return {
+      providerId: 'stub',
+      modelId: id,
+      capabilities: [],
+      complete: vi.fn(),
+      stream: vi.fn(),
+      getHealth: vi.fn(() => undefined),
+      refresh: vi.fn(() => Promise.resolve()),
+      setPreferredCli: vi.fn(),
+      onFailover: vi.fn(() => () => undefined),
+      dispose: vi.fn(),
+    } as unknown as IResilientAdapter;
+  }
+
+  beforeEach(() => {
+    resetGlobalRegistry();
+    registry = createUnifiedRegistry({ logger: mockLogger });
+  });
+
+  afterEach(() => {
+    registry.dispose();
+  });
+
+  it('getAdapterForArm on a CLI slot is the SAME instance getAdapterForCli returns', () => {
+    const viaCli = registry.getAdapterForCli('claude');
+
+    expect(registry.getAdapterForArm('claude')).toBe(viaCli);
+    expect(registry.getSnapshot().cachedArms).toEqual(['claude']);
+  });
+
+  it('getAdapterForArm on an unregistered api arm is undefined, not a CLI fallback', () => {
+    expect(registry.getAdapterForArm('api:gw-prod')).toBeUndefined();
+    // Asking did not create anything.
+    expect(registry.getSnapshot().cachedArms).toEqual([]);
+  });
+
+  it('a registered api arm is returned by id and listed in cachedArms', () => {
+    const stub = stubResilientAdapter('gw-prod');
+
+    registry.registerApiArm('api:gw-prod', stub);
+
+    expect(registry.getAdapterForArm('api:gw-prod')).toBe(stub);
+    expect(registry.getSnapshot().cachedArms).toEqual(['api:gw-prod']);
+    expect('cachedAdapters' in registry.getSnapshot()).toBe(false);
+  });
+
+  it('registering an api arm leaves CLI-slot behaviour untouched', () => {
+    const stub = stubResilientAdapter('gw-prod');
+    registry.registerApiArm('api:gw-prod', stub);
+
+    const opencode = registry.getAdapterForCli('opencode');
+
+    expect(opencode).not.toBe(stub);
+    expect(opencode.getCircuitBreakerRegistry?.()).toBe(getDefaultCliCircuitBreakerRegistry());
+    expect(registry.getSnapshot().cachedArms).toEqual(['api:gw-prod', 'opencode']);
+  });
+
+  it('rejects an id that fails the endpoint validator, even through a cast', () => {
+    const stub = stubResilientAdapter('bad');
+
+    // No cast needed: `EndpointArmId` admits any `api:` string, which is
+    // exactly why the registry re-validates at runtime.
+    expect(() => {
+      registry.registerApiArm('api:https://user:secret@gw', stub);
+    }).toThrow(/api arm id/i);
+    expect(registry.getAdapterForArm('api:https://user:secret@gw')).toBeUndefined();
+  });
+
+  it.each(['api:openai', 'api:anthropic', 'api:google', 'api:gemini'] as const)(
+    'refuses to register or overwrite built-in vendor arm %s',
+    (arm) => {
+      const stub = stubResilientAdapter('vendor-override');
+      expect(() => {
+        registry.registerApiArm(arm, stub);
+      }).toThrow(/built-in vendor arm/i);
+      expect(registry.getAdapterForArm(arm)).toBeUndefined();
+    }
+  );
+
+  it('dispose() disposes a registered api arm along with the CLI slots', () => {
+    const stub = stubResilientAdapter('gw-prod');
+    registry.registerApiArm('api:gw-prod', stub);
+
+    registry.dispose();
+
+    expect(stub.dispose).toHaveBeenCalledTimes(1);
+    expect(registry.getSnapshot().cachedArms).toEqual([]);
+  });
+});
+
+describe('UnifiedAdapterRegistry — gateway cost declaration at registration (#4392 inc 2)', () => {
+  let registry: UnifiedAdapterRegistry;
+  const stub = {
+    providerId: 'stub',
+    modelId: 'gw',
+    capabilities: [],
+    complete: vi.fn(),
+    stream: vi.fn(),
+    getHealth: vi.fn(() => undefined),
+    refresh: vi.fn(() => Promise.resolve()),
+    setPreferredCli: vi.fn(),
+    onFailover: vi.fn(() => () => undefined),
+    dispose: vi.fn(),
+  } as unknown as IResilientAdapter;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    resetGlobalRegistry();
+    registry = createUnifiedRegistry({ logger: mockLogger });
+  });
+
+  afterEach(() => {
+    registry.dispose();
+    vi.unstubAllEnvs();
+  });
+
+  it('warns at the registration, naming NEXUS_GATEWAY_COST, when a gateway arm is registered with it unset', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', undefined);
+
+    registry.registerApiArm('api:gw-prod', stub);
+
+    expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+    expect(String(mockLogger.warn.mock.calls[0]?.[0])).toContain('NEXUS_GATEWAY_COST');
+  });
+
+  it('is silent when the gateway arm is declared', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'gw-prod=free');
+
+    registry.registerApiArm('api:gw-prod', stub);
+
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
+  it('refuses vendor arm registration before gateway cost warning can run', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', undefined);
+
+    expect(() => {
+      registry.registerApiArm('api:anthropic', stub);
+    }).toThrow(/built-in vendor arm/i);
+
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+});

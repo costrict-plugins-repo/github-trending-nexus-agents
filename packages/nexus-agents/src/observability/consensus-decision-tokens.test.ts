@@ -1,0 +1,395 @@
+import { describe, expect, it } from 'vitest';
+
+import { summarizeConsensusDecisionTokens } from './consensus-decision-tokens.js';
+import type { DecisionCostRecord } from './decision-cost-store.js';
+import type { VoteRecord } from '../audit/vote-record.js';
+import { TaskOutcomeSchema, type TaskOutcome } from '../orchestration/outcomes/outcome-types.js';
+import type { VoterAttemptEvent } from './attempt-usage.js';
+
+type LinkedVote = Pick<VoteRecord, 'correlationId' | 'decision'>;
+
+function cost(
+  id: string,
+  tokens: number,
+  measured: boolean | null = true,
+  gate: DecisionCostRecord['gate'] = 'consensus_vote'
+): DecisionCostRecord {
+  const perVoter = [
+    {
+      role: 'architect',
+      model: 'test-model',
+      inputTokens: tokens,
+      outputTokens: 0,
+      totalTokens: tokens,
+      costUsd: 0,
+      unmeasured: false,
+      ...(measured !== null ? { tokenUsageMeasured: measured } : {}),
+    },
+  ];
+  return {
+    decisionId: id,
+    gate,
+    timestamp: '2026-09-28T00:00:00.000Z',
+    summary: {
+      billingMode: 'plan',
+      voterCount: 1,
+      measuredVoters: 1,
+      unmeasuredVoters: 0,
+      totalInputTokens: tokens,
+      totalOutputTokens: 0,
+      totalTokens: tokens,
+      totalCostUsd: 0,
+      perVoter,
+      perModel: [],
+      ...(measured !== null
+        ? {
+            tokenMeasuredVoters: measured ? 1 : 0,
+            tokenUnmeasuredVoters: measured ? 0 : 1,
+          }
+        : {}),
+    },
+  };
+}
+
+function vote(id: string | undefined, decision: VoteRecord['decision']): LinkedVote {
+  return { ...(id !== undefined ? { correlationId: id } : {}), decision };
+}
+
+function outcome(
+  traceId?: string,
+  success = true,
+  source: TaskOutcome['source'] = 'consensus'
+): TaskOutcome {
+  return TaskOutcomeSchema.parse({
+    id: 'seat-row',
+    cli: 'claude',
+    category: 'planning',
+    model: 'consensus',
+    success,
+    durationMs: 10,
+    timestamp: '2026-09-28T00:00:00.000Z',
+    source,
+    ...(traceId !== undefined ? { traceId } : {}),
+  });
+}
+
+describe('consensus outcome join coverage (#6857)', () => {
+  it('counts decisions once and separates answered seats from failed seats and unmatched rows', () => {
+    const report = summarizeConsensusDecisionTokens(
+      [cost('supplied-a', 4), cost('supplied-b', 6), cost('missing-seats', 2)],
+      [
+        vote('supplied-a', 'rejected'),
+        vote('supplied-b', 'no_quorum'),
+        vote('missing-seats', 'approved'),
+      ],
+      [
+        outcome('supplied-a'),
+        outcome('supplied-a', false),
+        outcome('supplied-b', false),
+        outcome('orphan'),
+      ]
+    );
+    expect(report).toMatchObject({
+      matchedDecisionsWithOutcomes: 2,
+      matchedOutcomeRows: 3,
+      matchedLlmAnsweredOutcomeRows: 1,
+      unmatchedOutcomeRows: 1,
+    });
+    expect(report.outcomeJoinCoverage).toBeCloseTo(2 / 3);
+  });
+
+  it('keeps legacy, ambiguous, invalid and unjoined outcome rows unmatched', () => {
+    const damaged = { ...cost('bad', 9), summary: { ...cost('bad', 9).summary, totalTokens: -9 } };
+    const legacy = outcome();
+    expect(legacy.traceId).toBeUndefined();
+    const report = summarizeConsensusDecisionTokens(
+      [
+        cost('cost-dup', 4),
+        cost('cost-dup', 4),
+        cost('vote-dup', 2),
+        damaged,
+        cost('cost-only', 1),
+        cost('good', 3),
+      ],
+      [
+        vote('cost-dup', 'approved'),
+        vote('vote-dup', 'approved'),
+        vote('vote-dup', 'rejected'),
+        vote('bad', 'approved'),
+        vote('vote-only', 'approved'),
+        vote('good', 'approved'),
+      ],
+      [
+        legacy,
+        outcome('cost-dup'),
+        outcome('vote-dup'),
+        outcome('bad'),
+        outcome('cost-only'),
+        outcome('vote-only'),
+      ]
+    );
+    expect(report).toMatchObject({
+      matchedDecisionsWithOutcomes: 0,
+      matchedOutcomeRows: 0,
+      matchedLlmAnsweredOutcomeRows: 0,
+      unmatchedOutcomeRows: 6,
+      outcomeJoinCoverage: 0,
+    });
+  });
+
+  it('reports zero outcomes as unmeasured even with matched decisions', () => {
+    for (const rows of [[], [outcome('joined', true, 'delegate')]]) {
+      const report = summarizeConsensusDecisionTokens(
+        [cost('joined', 4)],
+        [vote('joined', 'approved')],
+        rows
+      );
+      expect(report).toMatchObject({
+        matchedDecisionsWithOutcomes: 0,
+        matchedOutcomeRows: 0,
+        unmatchedOutcomeRows: 0,
+        outcomeJoinCoverage: null,
+      });
+    }
+    expect(summarizeConsensusDecisionTokens([], []).outcomeJoinCoverage).toBeNull();
+  });
+
+  it('reports rows without matched decisions as unmatched with an unmeasured decision ratio', () => {
+    const report = summarizeConsensusDecisionTokens([], [], [outcome('unknown')]);
+    expect(report.unmatchedOutcomeRows).toBe(1);
+    expect(report.outcomeJoinCoverage).toBeNull();
+  });
+});
+
+describe('summarizeConsensusDecisionTokens', () => {
+  it('includes failed no-quorum final-seat tokens in the numerator but not the success denominator', () => {
+    const report = summarizeConsensusDecisionTokens(
+      [
+        cost('approved', 40),
+        cost('rejected', 60),
+        cost('failed', 20),
+        cost('unmatched', 100),
+        cost('review', 900, true, 'pr_review'),
+      ],
+      [
+        vote('approved', 'approved'),
+        vote('rejected', 'rejected'),
+        vote('failed', 'no_quorum'),
+        vote('missing', 'approved'),
+        vote('missing-failure', 'no_quorum'),
+      ]
+    );
+
+    expect(report).toMatchObject({
+      matchedQuorumDecisions: 2,
+      matchedNoQuorumDecisions: 1,
+      unmatchedQuorumVoteRecords: 1,
+      unmatchedNoQuorumVoteRecords: 1,
+      unmatchedCostRecords: 1,
+      totalReportedFinalSeatTokens: 120,
+      noQuorumReportedFinalSeatTokens: 20,
+      reportedTokensPerMatchedQuorumDecision: 60,
+      tokenMeasuredVoters: 3,
+      tokenUnmeasuredVoters: 0,
+      tokenCoverage: 1,
+      measurement: 'lower-bound-final-seats',
+    });
+  });
+
+  it('keeps explicit zero usage measured but legacy and partial usage unmeasured', () => {
+    const report = summarizeConsensusDecisionTokens(
+      [cost('zero', 0), cost('legacy', 8, null), cost('partial', 5, false)],
+      [vote('zero', 'approved'), vote('legacy', 'approved'), vote('partial', 'no_quorum')]
+    );
+
+    expect(report.totalReportedFinalSeatTokens).toBe(13);
+    expect(report.tokenMeasuredVoters).toBe(1);
+    expect(report.tokenUnmeasuredVoters).toBe(2);
+    expect(report.tokenCoverage).toBeCloseTo(1 / 3);
+  });
+
+  it('excludes duplicate IDs and invalid cost rows instead of multiplying tokens', () => {
+    const invalid = { ...cost('bad', 9), summary: { ...cost('bad', 9).summary, totalTokens: -9 } };
+    const report = summarizeConsensusDecisionTokens(
+      [cost('dup', 7), cost('dup', 7), invalid, cost('good', 4)],
+      [
+        vote('dup', 'approved'),
+        vote('bad', 'approved'),
+        vote('good', 'approved'),
+        vote('vote-dup', 'approved'),
+        vote('vote-dup', 'rejected'),
+      ]
+    );
+
+    expect(report.totalReportedFinalSeatTokens).toBe(4);
+    expect(report.matchedQuorumDecisions).toBe(1);
+    expect(report.ambiguousDecisionIds).toBe(2);
+    expect(report.invalidCostRecords).toBe(1);
+    expect(report.unmatchedQuorumVoteRecords).toBe(1);
+  });
+
+  it('does not accept a valid row when a second damaged row reuses its decision ID', () => {
+    const damaged = {
+      ...cost('shared', 9),
+      summary: { ...cost('shared', 9).summary, totalTokens: -9 },
+    };
+    const report = summarizeConsensusDecisionTokens(
+      [cost('shared', 9), damaged],
+      [vote('shared', 'approved')]
+    );
+    expect(report.totalReportedFinalSeatTokens).toBe(0);
+    expect(report.ambiguousDecisionIds).toBe(1);
+    expect(report.invalidCostRecords).toBe(1);
+  });
+
+  it('reports an unmeasured ratio and coverage with no quorum-backed decisions or seats', () => {
+    const noSuccess = summarizeConsensusDecisionTokens(
+      [cost('failed', 6)],
+      [vote('failed', 'no_quorum')]
+    );
+    expect(noSuccess.reportedTokensPerMatchedQuorumDecision).toBeNull();
+    expect(noSuccess.noQuorumReportedFinalSeatTokens).toBe(6);
+
+    const empty = summarizeConsensusDecisionTokens([], []);
+    expect(empty.reportedTokensPerMatchedQuorumDecision).toBeNull();
+    expect(empty.tokenCoverage).toBeNull();
+    expect(empty.totalReportedFinalSeatTokens).toBe(0);
+    expect(empty.matchedQuorumDecisions).toBe(0);
+  });
+
+  it('does not turn an approved zero-seat cost row into a free measured decision', () => {
+    const zeroSeat = cost('empty', 0);
+    const emptySummary = {
+      ...zeroSeat.summary,
+      voterCount: 0,
+      measuredVoters: 0,
+      tokenMeasuredVoters: 0,
+      tokenUnmeasuredVoters: 0,
+      perVoter: [],
+    };
+    const report = summarizeConsensusDecisionTokens(
+      [{ ...zeroSeat, summary: emptySummary }],
+      [vote('empty', 'approved')]
+    );
+    expect(report.reportedTokensPerMatchedQuorumDecision).toBeNull();
+    expect(report.matchedQuorumDecisions).toBe(0);
+    expect(report.invalidCostRecords).toBe(1);
+  });
+
+  it('rejects a schema-valid summary that invents tokens absent from its voter lines', () => {
+    const honest = cost('inflated', 2);
+    const report = summarizeConsensusDecisionTokens(
+      [{ ...honest, summary: { ...honest.summary, totalInputTokens: 20, totalTokens: 20 } }],
+      [vote('inflated', 'approved')]
+    );
+    expect(report.totalReportedFinalSeatTokens).toBe(0);
+    expect(report.invalidCostRecords).toBe(1);
+  });
+});
+
+// #6821: observed outer-attempt usage is reported beside the final-seat totals.
+describe('observed attempt usage in the decision-token report (#6821)', () => {
+  function withAttempts(
+    record: DecisionCostRecord,
+    observed: NonNullable<DecisionCostRecord['summary']['observedAttemptUsage']>
+  ): DecisionCostRecord {
+    return { ...record, summary: { ...record.summary, observedAttemptUsage: observed } };
+  }
+  const observed = {
+    seats: 1,
+    incompleteSeats: 1,
+    completions: 3,
+    reportedCompletions: 2,
+    inputTokens: 90,
+    outputTokens: 10,
+    totalTokens: 100,
+  };
+
+  it('is null when no matched decision observed attempt usage', () => {
+    const report = summarizeConsensusDecisionTokens([cost('a', 4)], [vote('a', 'approved')]);
+    expect(report.observedAttemptUsage).toBeNull();
+  });
+
+  it('totals matched decisions that observed attempts, separately from final seats', () => {
+    const report = summarizeConsensusDecisionTokens(
+      [withAttempts(cost('a', 40), observed), withAttempts(cost('b', 9), observed), cost('c', 1)],
+      [vote('a', 'approved'), vote('c', 'rejected')]
+    );
+    // `b` is unmatched and `c` is legacy: only `a` contributes.
+    expect(report.observedAttemptUsage).toEqual({ decisions: 1, ...observed });
+    expect(report.totalReportedFinalSeatTokens).toBe(41);
+  });
+});
+
+describe('duplicate response telemetry preserves final-seat accounting', () => {
+  function withResponse(record: DecisionCostRecord, eventId: string): DecisionCostRecord {
+    const event: VoterAttemptEvent = {
+      id: eventId,
+      role: 'architect',
+      cli: 'claude',
+      adapter: 'claude',
+      attemptKind: 'initial',
+      outcome: 'final',
+      usage: { kind: 'reported', input: 3, output: 2 },
+    };
+    return { ...record, attemptTelemetry: { events: [event], observableAttempts: 1 } };
+  }
+
+  it('keeps every final-seat result identical when response IDs collide across decisions', () => {
+    const costs = [cost('approved', 4), cost('failed', 6), cost('legacy', 1), cost('good', 9)];
+    const votes = [
+      vote('approved', 'approved'),
+      vote('failed', 'no_quorum'),
+      vote('legacy', 'rejected'),
+      vote('good', 'approved'),
+    ];
+    const outcomes = [outcome('approved'), outcome('failed', false)];
+    const baseline = summarizeConsensusDecisionTokens(costs, votes, outcomes);
+    const result = summarizeConsensusDecisionTokens(
+      costs.map((row) =>
+        row.decisionId === 'legacy'
+          ? row
+          : withResponse(row, row.decisionId === 'good' ? 'unique-response' : 'shared-response')
+      ),
+      votes,
+      outcomes
+    );
+    const { attemptTelemetry: baselineTelemetry, ...baselineFinalSeats } = baseline;
+    const { attemptTelemetry: resultTelemetry, ...resultFinalSeats } = result;
+    expect(baselineTelemetry?.decisionsLackingTelemetry).toBe(4);
+    expect(resultFinalSeats).toEqual(baselineFinalSeats);
+    expect(resultTelemetry).toMatchObject({
+      invalidTelemetry: 2,
+      decisionsWithTelemetry: 1,
+      decisionsLackingTelemetry: 1,
+      observableAttempts: 1,
+      observedAttempts: 1,
+      reportedAttempts: 1,
+      totalTokens: 5,
+      coverage: 1,
+    });
+  });
+
+  it('reports duplicate-only telemetry as invalid and unmeasured while retaining both decisions', () => {
+    const result = summarizeConsensusDecisionTokens(
+      [withResponse(cost('a', 4), 'shared'), withResponse(cost('b', 6), 'shared')],
+      [vote('a', 'approved'), vote('b', 'no_quorum')]
+    );
+    expect(result).toMatchObject({
+      matchedQuorumDecisions: 1,
+      matchedNoQuorumDecisions: 1,
+      invalidCostRecords: 0,
+      totalReportedFinalSeatTokens: 10,
+      noQuorumReportedFinalSeatTokens: 6,
+      attemptTelemetry: {
+        invalidTelemetry: 2,
+        decisionsWithTelemetry: 0,
+        decisionsLackingTelemetry: 0,
+        measurement: 'unmeasured',
+        observableAttempts: null,
+        observedAttempts: null,
+        totalTokens: null,
+      },
+    });
+  });
+});

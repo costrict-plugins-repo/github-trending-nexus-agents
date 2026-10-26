@@ -1,0 +1,253 @@
+/**
+ * Tests for learning persistence health check in doctor command (Issue #1017).
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { writeFileSync, rmSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { mkdtempOutsideRepo } from '../testing/non-repo-temp-dir.js';
+
+// Mock CLI adapter factory to avoid real subprocess spawns (perf: saves ~23s)
+vi.mock('../cli-adapters/factory.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../cli-adapters/factory.js')>();
+  return { ...actual, createAllAdapters: vi.fn(() => new Map()) };
+});
+
+// The pinned-model probe (#6120) would spawn the real claude CLI.
+vi.mock('./doctor-claude-model.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./doctor-claude-model.js')>();
+  return {
+    ...actual,
+    probeClaudePinnedModel: vi.fn(() =>
+      Promise.resolve({ alias: 'fable', status: 'not-probed' as const, reason: 'stubbed' })
+    ),
+  };
+});
+
+// We test the behavior indirectly through runDoctor since checkLearningPersistence is private.
+// For unit tests, we verify the DoctorResult shape includes learningPersistence.
+
+describe('Doctor learning persistence check (Issue #1017)', () => {
+  let originalEnv: string | undefined;
+
+  beforeEach(() => {
+    originalEnv = process.env['NEXUS_PERSIST_LEARNING'];
+  });
+
+  afterEach(() => {
+    if (originalEnv !== undefined) {
+      process.env['NEXUS_PERSIST_LEARNING'] = originalEnv;
+    } else {
+      delete process.env['NEXUS_PERSIST_LEARNING'];
+    }
+  });
+
+  it('reports disabled when NEXUS_PERSIST_LEARNING is explicitly false', async () => {
+    process.env['NEXUS_PERSIST_LEARNING'] = 'false';
+    // Dynamic import to get fresh module state
+    const { runDoctor } = await import('./doctor.js');
+    const result = await runDoctor();
+
+    expect(result.learningPersistence).toBeDefined();
+    expect(result.learningPersistence.enabled).toBe(false);
+    expect(result.learningPersistence.outcomeCount).toBe(0);
+    expect(result.learningPersistence.ruleCount).toBe(0);
+    expect(result.learningPersistence.error).toBeNull();
+  });
+
+  it('reports enabled with counts when flag is on and data exists', async () => {
+    process.env['NEXUS_PERSIST_LEARNING'] = 'true';
+
+    // Create temp dir with test data
+    const tmpDir = mkdtempOutsideRepo('nexus-doctor-test-');
+
+    const outcomesFile = join(tmpDir, 'outcomes.jsonl');
+    const rulesFile = join(tmpDir, 'rules.json');
+
+    // Write fake outcomes (3 lines)
+    const outcome = {
+      id: 'o1',
+      cli: 'claude',
+      category: 'code_generation',
+      model: 'test',
+      success: true,
+      durationMs: 100,
+      timestamp: '2026-01-01',
+      source: 'delegate',
+    };
+    writeFileSync(
+      outcomesFile,
+      [
+        JSON.stringify(outcome),
+        JSON.stringify({ ...outcome, id: 'o2' }),
+        JSON.stringify({ ...outcome, id: 'o3' }),
+      ].join('\n') + '\n'
+    );
+
+    // Write fake rules
+    writeFileSync(
+      rulesFile,
+      JSON.stringify({
+        version: 1,
+        savedAt: '2026-02-13T10:00:00Z',
+        rules: [{ id: 'r1' }, { id: 'r2' }],
+      })
+    );
+
+    // We can't easily swap the LEARNING_DIR constant, so test the shape.
+    // The integration behavior is tested via the real doctor command.
+    const { runDoctor } = await import('./doctor.js');
+    const result = await runDoctor();
+
+    expect(result.learningPersistence).toBeDefined();
+    expect(result.learningPersistence.enabled).toBe(true);
+
+    // Clean up
+    if (existsSync(tmpDir)) {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports the named empty case: 0 eligible, 0 rules, and a last-distill time (#6512)', async () => {
+    process.env['NEXUS_PERSIST_LEARNING'] = 'true';
+    const originalDataDir = process.env['NEXUS_DATA_DIR'];
+    const dataDir = mkdtempOutsideRepo('nexus-doctor-6512-');
+    process.env['NEXUS_DATA_DIR'] = dataDir;
+    try {
+      const { getOutcomesFile, getRulesFile, ensureLearningDir } =
+        await import('../config/learning-persistence.js');
+      ensureLearningDir();
+      const { TaskOutcomeSchema } = await import('../orchestration/outcomes/outcome-types.js');
+      const seat = TaskOutcomeSchema.parse({
+        id: 's1',
+        cli: 'claude',
+        category: 'code_generation',
+        model: 'test',
+        success: true,
+        durationMs: 100,
+        timestamp: '2026-09-01T00:00:00.000Z',
+        source: 'consensus',
+      });
+      writeFileSync(getOutcomesFile(), JSON.stringify(seat) + '\n');
+
+      const { OutcomeStore } = await import('../orchestration/outcomes/outcome-store.js');
+      const { PersistentStrategyDistiller } =
+        await import('../learning/strategy-distiller-persistence.js');
+      const store = new OutcomeStore();
+      store.append(seat);
+      const distiller = new PersistentStrategyDistiller(store, { filePath: getRulesFile() });
+      expect(distiller.checkPersistedTrigger()).toBe(true);
+
+      const { runDoctor } = await import('./doctor.js');
+      const check = (await runDoctor()).learningPersistence;
+      expect(check.ruleCount).toBe(0);
+      expect(check.activeRuleCount).toBe(0);
+      expect(check.trainedOnEligible).toBe(0);
+      expect(check.fileEligibleOutcomeCount).toBe(0);
+      expect(check.routedOutcomes).toEqual({ total: 0, last7Days: 0 });
+      expect(check.outcomeCount).toBe(1);
+      expect(check.rulesLastSaved).not.toBeNull();
+    } finally {
+      if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+      else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('counts routed outcomes and the ones from the last 7 days (#6521)', async () => {
+    process.env['NEXUS_PERSIST_LEARNING'] = 'true';
+    const originalDataDir = process.env['NEXUS_DATA_DIR'];
+    const dataDir = mkdtempOutsideRepo('nexus-doctor-6521-');
+    process.env['NEXUS_DATA_DIR'] = dataDir;
+    try {
+      const { getOutcomesFile, ensureLearningDir } =
+        await import('../config/learning-persistence.js');
+      ensureLearningDir();
+      const dayMs = 24 * 60 * 60 * 1000;
+      const row = (id: string, ageDays: number, routed: boolean): string =>
+        JSON.stringify({
+          id,
+          cli: 'claude',
+          category: 'code_generation',
+          model: 'pipeline',
+          success: true,
+          durationMs: 100,
+          timestamp: new Date(Date.now() - ageDays * dayMs).toISOString(),
+          source: 'delegate',
+          ...(routed && { routedBy: 'composite-router' }),
+        });
+      writeFileSync(
+        getOutcomesFile(),
+        [row('r1', 1, true), row('r2', 30, true), row('n1', 1, false)].join('\n') + '\n'
+      );
+
+      const { runDoctor } = await import('./doctor.js');
+      const check = (await runDoctor()).learningPersistence;
+      expect(check.outcomeCount).toBe(3);
+      expect(check.routedOutcomes).toEqual({ total: 2, last7Days: 1 });
+      expect(check.fileEligibleOutcomeCount).toBe(2);
+    } finally {
+      if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+      else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('DoctorResult includes learningPersistence field', async () => {
+    const { runDoctor } = await import('./doctor.js');
+    const result = await runDoctor();
+    expect(result).toHaveProperty('learningPersistence');
+    expect(result.learningPersistence).toHaveProperty('enabled');
+    expect(result.learningPersistence).toHaveProperty('dirExists');
+    expect(result.learningPersistence).toHaveProperty('dirWritable');
+    expect(result.learningPersistence).toHaveProperty('outcomeCount');
+    expect(result.learningPersistence).toHaveProperty('ruleCount');
+    expect(result.learningPersistence).toHaveProperty('rulesLastSaved');
+    expect(result.learningPersistence).toHaveProperty('error');
+  });
+
+  it('DoctorResult includes sqliteCheck field (#1249)', async () => {
+    const { runDoctor } = await import('./doctor.js');
+    const result = await runDoctor();
+    expect(result).toHaveProperty('sqliteCheck');
+    expect(result.sqliteCheck).toHaveProperty('available');
+    expect(result.sqliteCheck).toHaveProperty('error');
+    expect(typeof result.sqliteCheck.available).toBe('boolean');
+  });
+
+  it('DoctorResult includes dataDirectory field (#1249)', async () => {
+    const { runDoctor } = await import('./doctor.js');
+    const result = await runDoctor();
+    expect(result).toHaveProperty('dataDirectory');
+    expect(result.dataDirectory).toHaveProperty('rootExists');
+    expect(result.dataDirectory).toHaveProperty('rootPath');
+    expect(result.dataDirectory).toHaveProperty('subdirectories');
+    expect(typeof result.dataDirectory.rootExists).toBe('boolean');
+    expect(typeof result.dataDirectory.rootPath).toBe('string');
+    expect(Array.isArray(result.dataDirectory.subdirectories)).toBe(true);
+  });
+
+  // Issue #2892: checkDataDirectory() tags each subdir with its
+  // per-repo / cross-repo scope and resolves the real path.
+  it('checkDataDirectory tags subdir scope and exposes repoRoot (#2892)', async () => {
+    const { checkDataDirectory } = await import('./doctor.js');
+    const check = checkDataDirectory();
+
+    expect(check).toHaveProperty('repoRoot');
+    // repoRoot is either a string (repo-preferred active) or null.
+    expect(check.repoRoot === null || typeof check.repoRoot === 'string').toBe(true);
+
+    // Every subdir is tagged with a valid scope.
+    for (const sub of check.subdirectories) {
+      expect(['per-repo', 'cross-repo']).toContain(sub.scope);
+    }
+
+    // Known per-repo subdirs (sessions, audit) are tagged per-repo;
+    // known cross-repo subdirs (learning, auth) are tagged cross-repo.
+    const byName = new Map(check.subdirectories.map((s) => [s.name, s.scope]));
+    expect(byName.get('sessions')).toBe('per-repo');
+    expect(byName.get('audit')).toBe('per-repo');
+    expect(byName.get('learning')).toBe('cross-repo');
+    expect(byName.get('auth')).toBe('cross-repo');
+  });
+});
