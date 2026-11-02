@@ -1,0 +1,241 @@
+/**
+ * ArtifactStore tests (Issue #912, Phase 4-3)
+ *
+ * Tests put, get, query, provenance, bounds, and FIFO eviction.
+ */
+import { describe, it, expect } from 'vitest';
+
+import {
+  ArtifactStore,
+  getPipelineArtifactStore,
+  resetPipelineArtifactStore,
+} from './artifact-store.js';
+import type { Artifact, IArtifactStore } from './artifact-store.js';
+
+// ============================================================================
+// Fixtures
+// ============================================================================
+
+function makeArtifact(overrides: Partial<Artifact> = {}): Artifact {
+  return {
+    id: `art-${String(Date.now())}`,
+    type: 'code',
+    content: 'function hello() {}',
+    metadata: {},
+    createdBy: 'nexus:test-plugin',
+    createdAt: Date.now(),
+    inputRefs: [],
+    ...overrides,
+  };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+describe('ArtifactStore', () => {
+  describe('put', () => {
+    it('stores an artifact and returns ref', () => {
+      const store = new ArtifactStore();
+      const ref = store.put(makeArtifact({ id: 'a1' }));
+      expect(ref.id).toBe('a1');
+      expect(ref.type).toBe('code');
+    });
+
+    it('rejects oversized content', () => {
+      const store = new ArtifactStore({ maxContentSize: 10 });
+      const big = makeArtifact({
+        id: 'big',
+        content: 'x'.repeat(100),
+      });
+      expect(() => store.put(big)).toThrow('exceeds');
+    });
+  });
+
+  describe('get', () => {
+    it('retrieves stored artifact', () => {
+      const store = new ArtifactStore();
+      const artifact = makeArtifact({ id: 'g1' });
+      store.put(artifact);
+      const result = store.get({ id: 'g1', type: 'code' });
+      expect(result).toBeDefined();
+      expect(result?.id).toBe('g1');
+    });
+
+    it('returns undefined for missing artifact', () => {
+      const store = new ArtifactStore();
+      expect(store.get({ id: 'missing', type: 'code' })).toBeUndefined();
+    });
+  });
+
+  describe('query', () => {
+    it('filters by artifact type', () => {
+      const store = new ArtifactStore();
+      store.put(makeArtifact({ id: 'c1', type: 'code' }));
+      store.put(makeArtifact({ id: 'r1', type: 'review' }));
+      store.put(makeArtifact({ id: 'c2', type: 'code' }));
+      const refs = store.query({ type: 'code' });
+      expect(refs).toHaveLength(2);
+    });
+
+    it('filters by creator', () => {
+      const store = new ArtifactStore();
+      store.put(makeArtifact({ id: 'a1', createdBy: 'plugin-a' }));
+      store.put(makeArtifact({ id: 'a2', createdBy: 'plugin-b' }));
+      const refs = store.query({ createdBy: 'plugin-a' });
+      expect(refs).toHaveLength(1);
+    });
+
+    it('returns all with empty filter', () => {
+      const store = new ArtifactStore();
+      store.put(makeArtifact({ id: 'x1' }));
+      store.put(makeArtifact({ id: 'x2' }));
+      expect(store.query({})).toHaveLength(2);
+    });
+  });
+
+  describe('provenance', () => {
+    it('returns provenance entry for artifact', () => {
+      const store = new ArtifactStore();
+      store.put(
+        makeArtifact({
+          id: 'p1',
+          createdBy: 'nexus:analyzer',
+          inputRefs: [{ id: 'input-1', type: 'spec' }],
+        })
+      );
+      const chain = store.provenance({ id: 'p1', type: 'code' });
+      expect(chain).toHaveLength(1);
+      expect(chain[0]?.plugin).toBe('nexus:analyzer');
+      expect(chain[0]?.inputArtifacts).toContain('input-1');
+    });
+
+    it('returns empty for missing artifact', () => {
+      const store = new ArtifactStore();
+      expect(store.provenance({ id: 'nope', type: 'code' })).toHaveLength(0);
+    });
+
+    it('walks inputRefs transitively (#2867)', () => {
+      const store = new ArtifactStore();
+      store.put(makeArtifact({ id: 'a', inputRefs: [] }));
+      store.put(makeArtifact({ id: 'b', inputRefs: [{ id: 'a', type: 'code' }] }));
+      store.put(makeArtifact({ id: 'c', inputRefs: [{ id: 'b', type: 'code' }] }));
+
+      const chain = store.provenance({ id: 'c', type: 'code' });
+      expect(chain.map((e) => e.artifactId)).toEqual(['c', 'b', 'a']);
+    });
+
+    it('terminates on a cycle without infinite-looping (#2867)', () => {
+      const store = new ArtifactStore();
+      store.put(makeArtifact({ id: 'a', inputRefs: [{ id: 'b', type: 'code' }] }));
+      store.put(makeArtifact({ id: 'b', inputRefs: [{ id: 'a', type: 'code' }] }));
+
+      const chain = store.provenance({ id: 'a', type: 'code' });
+      expect(chain).toHaveLength(2);
+    });
+
+    it('visits a multi-parent diamond DAG node once (#2867)', () => {
+      const store = new ArtifactStore();
+      store.put(makeArtifact({ id: 'a', inputRefs: [] }));
+      store.put(makeArtifact({ id: 'b', inputRefs: [{ id: 'a', type: 'code' }] }));
+      store.put(makeArtifact({ id: 'c', inputRefs: [{ id: 'a', type: 'code' }] }));
+      store.put(
+        makeArtifact({
+          id: 'd',
+          inputRefs: [
+            { id: 'b', type: 'code' },
+            { id: 'c', type: 'code' },
+          ],
+        })
+      );
+
+      const chain = store.provenance({ id: 'd', type: 'code' });
+      // a, b, c, d — `a` exactly once despite two paths to it.
+      expect(chain).toHaveLength(4);
+      expect(chain.filter((e) => e.artifactId === 'a')).toHaveLength(1);
+    });
+
+    it('truncates the chain at a FIFO-evicted ancestor (#2867)', () => {
+      const store = new ArtifactStore({ maxArtifacts: 2 });
+      store.put(makeArtifact({ id: 'a', inputRefs: [] }));
+      store.put(makeArtifact({ id: 'b', inputRefs: [{ id: 'a', type: 'code' }] }));
+      // Putting 'c' evicts 'a' (oldest).
+      store.put(makeArtifact({ id: 'c', inputRefs: [{ id: 'b', type: 'code' }] }));
+
+      const chain = store.provenance({ id: 'c', type: 'code' });
+      expect(chain.map((e) => e.artifactId)).toEqual(['c', 'b']);
+    });
+  });
+
+  describe('bounds and eviction', () => {
+    it('evicts oldest when max artifacts exceeded', () => {
+      const store = new ArtifactStore({ maxArtifacts: 3 });
+      store.put(makeArtifact({ id: 'e1' }));
+      store.put(makeArtifact({ id: 'e2' }));
+      store.put(makeArtifact({ id: 'e3' }));
+      store.put(makeArtifact({ id: 'e4' }));
+      expect(store.get({ id: 'e1', type: 'code' })).toBeUndefined();
+      expect(store.get({ id: 'e4', type: 'code' })).toBeDefined();
+    });
+
+    it('respects size property', () => {
+      const store = new ArtifactStore();
+      store.put(makeArtifact({ id: 's1' }));
+      store.put(makeArtifact({ id: 's2' }));
+      expect(store.size).toBe(2);
+    });
+
+    it('re-putting the same id keeps store.size stable', () => {
+      const store = new ArtifactStore({ maxArtifacts: 3 });
+      store.put(makeArtifact({ id: 'same' }));
+      store.put(makeArtifact({ id: 'same' }));
+      store.put(makeArtifact({ id: 'same' }));
+      expect(store.size).toBe(1);
+    });
+
+    it('re-putting an existing id does not evict other live artifacts', () => {
+      // Before the fix, put() always ran evictIfNeeded — even when the id
+      // already existed. At capacity, the first entry in insertOrder was
+      // shifted and its artifact deleted, even though the caller was
+      // merely replacing an existing entry. Result: every re-put at
+      // capacity silently lost an unrelated live artifact.
+      const store = new ArtifactStore({ maxArtifacts: 2 });
+      store.put(makeArtifact({ id: 'a' }));
+      store.put(makeArtifact({ id: 'b' }));
+      // Re-put 'b' (the newest) — this must NOT evict 'a'. With the bug,
+      // evictIfNeeded runs even though size is not growing, shifts 'a'
+      // off the front of insertOrder and deletes it.
+      store.put(makeArtifact({ id: 'b' }));
+
+      expect(store.size).toBe(2);
+      expect(store.get({ id: 'a', type: 'code' })).toBeDefined();
+      expect(store.get({ id: 'b', type: 'code' })).toBeDefined();
+    });
+  });
+
+  describe('interface conformance', () => {
+    it('implements IArtifactStore', () => {
+      const store: IArtifactStore = new ArtifactStore();
+      expect(typeof store.put).toBe('function');
+      expect(typeof store.get).toBe('function');
+      expect(typeof store.query).toBe('function');
+      expect(typeof store.provenance).toBe('function');
+    });
+  });
+
+  describe('getPipelineArtifactStore (#1179)', () => {
+    it('returns the same instance on repeated calls', () => {
+      resetPipelineArtifactStore();
+      const a = getPipelineArtifactStore();
+      const b = getPipelineArtifactStore();
+      expect(a).toBe(b);
+    });
+
+    it('returns a new instance after reset', () => {
+      const a = getPipelineArtifactStore();
+      resetPipelineArtifactStore();
+      const b = getPipelineArtifactStore();
+      expect(a).not.toBe(b);
+    });
+  });
+});

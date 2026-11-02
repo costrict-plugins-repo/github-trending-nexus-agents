@@ -1,0 +1,1046 @@
+schema_version: '1.0'
+sources:
+  claude-code-docs:
+    name: Claude Code Documentation
+    type: product_docs
+    url: https://docs.anthropic.com/en/docs/claude-code
+    vendor: Anthropic
+    topics:
+      - cli-tools
+    tags:
+      - claude
+      - mcp
+      - cli
+    reviewed_date: 2026-01-04
+    reviewed_in: claude-code-research.md
+    key_info:
+      - 'Models: Claude family (Opus, Sonnet, Haiku)'
+      - Full MCP client support
+      - Session resume via --continue/--resume
+      - Hooks system for customization
+      - OAuth 2.0 authentication
+    version_checked: 2.0.76
+  claude-agent-sdk:
+    name: Claude Agent SDK
+    type: product_docs
+    url: https://github.com/anthropics/claude-code/tree/main/packages/agent
+    vendor: Anthropic
+    topics:
+      - cli-tools
+      - orchestration
+    tags:
+      - sdk
+      - agent
+      - development
+    reviewed_date: 2026-01-04
+    reviewed_in: claude-code-research.md
+    key_info:
+      - Build custom agentic applications
+      - Programmatic API for Claude Code
+      - Tool management and orchestration
+    version_checked: 2.0.76
+  claude-skills-standard:
+    name: Claude Code Agent Skills (SKILL.md)
+    type: product_docs
+    url: https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/skills
+    vendor: Anthropic
+    topics:
+      - cli-tools
+      - orchestration
+    tags:
+      - skills
+      - claude-code
+      - customization
+      - automation
+    reviewed_date: 2026-01-09
+    reviewed_in: null
+    key_info:
+      - SKILL.md format with YAML frontmatter
+      - 'Required fields: name (64 chars max), description (1024 chars max)'
+      - 'Optional fields: allowed-tools, model, context, agent, hooks,
+        user-invocable'
+      - Model-invoked discovery based on description matching
+      - Progressive disclosure pattern for token efficiency
+      - 'Storage: ~/.claude/skills/ (personal), .claude/skills/ (project)'
+      - 'context: fork runs skill in isolated sub-agent'
+      - allowed-tools restricts tool access during skill execution
+    best_practices:
+      - Descriptions must include WHAT skill does AND WHEN to use it
+      - Write descriptions in third person (not "I can help")
+      - Keep SKILL.md under 500 lines
+      - 'Use gerund naming: processing-pdfs, analyzing-spreadsheets'
+      - Link to supporting files (one level deep only)
+      - Scripts execute without loading contents (token efficient)
+    version_checked: 2026-01
+  gemini-cli-docs:
+    name: Gemini CLI Documentation
+    type: product_docs
+    url: https://github.com/google-gemini/gemini-cli
+    vendor: Google
+    topics:
+      - cli-tools
+    tags:
+      - gemini
+      - cli
+      - google
+    reviewed_date: 2026-01-04
+    reviewed_in: gemini-cli-research.md
+    key_info:
+      - Model router with automatic selection
+      - OAuth / ADC authentication
+      - 1M+ token context window
+      - Multimodal support
+      - MCP support (experimental)
+    version_checked: 0.22.5
+  codex-cli-docs:
+    name: OpenAI Codex CLI Documentation
+    type: product_docs
+    url: https://github.com/openai/codex
+    vendor: OpenAI
+    topics:
+      - cli-tools
+    tags:
+      - codex
+      - openai
+      - cli
+    reviewed_date: 2026-01-04
+    reviewed_in: openai-codex-cli-research.md
+    key_info:
+      - codex-mini-latest model
+      - GPT-5 family access
+      - ChatGPT OAuth authentication
+      - MCP server mode
+      - Fast code generation
+    version_checked: 0.77.0
+  mcp-protocol-spec:
+    name: Model Context Protocol Specification
+    type: specification
+    url: https://modelcontextprotocol.io
+    vendor: Anthropic
+    topics:
+      - cli-tools
+      - orchestration
+    tags:
+      - protocol
+      - mcp
+      - standard
+    reviewed_date: 2026-01-04
+    reviewed_in: cli-integration-architecture.md
+    key_info:
+      - Version 2025-11-25
+      - 'Transports: stdio, HTTP, SSE'
+      - Tool, Resource, Prompt support
+      - JSON-RPC 2.0 based
+    version_checked: 2025-11-25
+  mcp-sdk-typescript:
+    name: MCP TypeScript SDK
+    type: product_docs
+    url: https://github.com/modelcontextprotocol/typescript-sdk
+    vendor: Anthropic
+    topics:
+      - cli-tools
+    tags:
+      - sdk
+      - typescript
+      - mcp
+    reviewed_date: 2026-01-04
+    reviewed_in: cli-integration-architecture.md
+    key_info:
+      - '@modelcontextprotocol/sdk package'
+      - Server and Client implementations
+      - InMemory transport for testing
+      - Zod integration for schemas
+    version_checked: 1.25.2
+  claude-flow-project:
+    name: Claude-Flow Project Analysis
+    type: code_analysis
+    url: https://github.com/ruvnet/claude-flow
+    vendor: Community
+    topics:
+      - consensus
+      - memory
+      - orchestration
+    tags:
+      - reference
+      - patterns
+      - multi-agent
+    reviewed_date: 2026-01-04
+    reviewed_in: claude-flow-analysis.md
+    key_info:
+      - Multi-agent swarm architecture
+      - Consensus voting patterns
+      - Memory coordination
+      - Raft consensus implementation
+      - Byzantine fault tolerance patterns
+    version_checked: main branch 2026-01
+  anthropic-reward-hacking:
+    name: 'Anthropic: Emergent Misalignment from Reward Hacking'
+    type: research_blog
+    url: https://www.anthropic.com/research/emergent-misalignment-reward-hacking
+    vendor: Anthropic
+    topics:
+      - code-generation
+    tags:
+      - safety
+      - reward-hacking
+      - misalignment
+    reviewed_date: 2026-01-06
+    reviewed_in: self-improvement-feedback-loops.md
+    key_info:
+      - Training on gameable environments amplifies gaming
+      - Models can generalize to rewriting own reward function
+      - SFT on first environments with non-gaming data mitigates
+      - Context-dependent alignment detection recommended
+    version_checked: '2025'
+  lilian-weng-reward-hacking:
+    name: 'Lilian Weng: Reward Hacking in Reinforcement Learning'
+    type: research_blog
+    url: https://lilianweng.github.io/posts/2024-11-28-reward-hacking/
+    vendor: Independent
+    topics:
+      - code-generation
+    tags:
+      - safety
+      - reward-hacking
+      - rl
+    reviewed_date: 2026-01-06
+    reviewed_in: self-improvement-feedback-loops.md
+    key_info:
+      - Inoculation prompting mitigation
+      - Reward shaping with clipping
+      - Reward ensembles
+      - Sandboxing evaluation suite
+      - Rich observability logging
+    version_checked: 2024-11-28
+  augment-code-auggie:
+    name: Augment Code (Auggie CLI)
+    type: open_source_repo
+    url: https://github.com/augmentcode/auggie
+    vendor: Augment Code
+    topics:
+      - orchestration
+      - code-generation
+    tags:
+      - context-engine
+      - pr-review
+      - subagent
+      - skills
+    reviewed_date: 2026-03-17
+    reviewed_in: memory/augment_code_research.md
+    quality_signals:
+      stars_at_review: 161
+      language: TypeScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - context-engine-mcp
+      - subagent-tool-restrictions
+      - pr-review-action
+      - skill-relevance-matching
+    verdict: adopted
+    verdict_notes: Context Engine MCP pattern, tool restrictions, PR actions all implemented
+    quality_score: 5
+    evidence_tier: medium
+  autoresearchclaw:
+    name: AutoResearchClaw
+    type: open_source_repo
+    url: https://github.com/aiming-lab/AutoResearchClaw
+    vendor: Aiming Lab
+    topics:
+      - orchestration
+      - multi-agent-systems
+    tags:
+      - metaclaw
+      - self-learning
+      - multi-agent-debate
+      - paper-generation
+    reviewed_date: 2026-03-17
+    reviewed_in: memory/autoresearchclaw_research.md
+    quality_signals:
+      stars_at_review: 3536
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - failure-lesson-injection
+      - pivot-refine-loop
+      - multi-agent-debate
+    verdict: partially_adopted
+    verdict_notes: Failure lessons implemented (#1568). PIVOT/REFINE rejected (scope
+      creep). Multi-agent debate already exists as consensus voting.
+    quality_score: 7
+    evidence_tier: medium
+  metaclaw:
+    name: MetaClaw
+    type: open_source_repo
+    url: https://github.com/aiming-lab/MetaClaw
+    vendor: Aiming Lab
+    topics:
+      - memory
+      - multi-agent-systems
+    tags:
+      - meta-learning
+      - skill-evolution
+      - rl-training
+      - lora
+    reviewed_date: 2026-03-17
+    reviewed_in: memory/metaclaw_research.md
+    quality_signals:
+      stars_at_review: 1579
+      language: Python
+      has_tests: false
+      has_docs: true
+    techniques_extracted:
+      - skill-relevance-injection
+      - generation-aware-invalidation
+    verdict: partially_adopted
+    verdict_notes: Skill relevance matching implemented (#1569). RL training
+      rejected (different product direction). Auto-skill extraction rejected
+      (security risk).
+    quality_score: 5
+    evidence_tier: medium
+  simplemem:
+    name: SimpleMem
+    type: open_source_repo
+    url: https://github.com/aiming-lab/SimpleMem
+    vendor: Aiming Lab
+    topics:
+      - memory
+    tags:
+      - semantic-compression
+      - lifelong-memory
+      - mcp
+      - cross-session
+    reviewed_date: 2026-03-17
+    reviewed_in: memory/simplemem_research.md
+    quality_signals:
+      stars_at_review: 3216
+      language: Python
+      has_tests: true
+      has_docs: true
+      has_paper: true
+      arxiv_id: '2601.02553'
+    techniques_extracted:
+      - write-time-deduplication
+      - multi-view-retrieval
+      - intent-aware-retrieval
+    verdict: partially_adopted
+    verdict_notes: Write-time dedup implemented (#1570). Multi-view indexing
+      deferred. Intent-aware retrieval rejected (over-engineering for
+      orchestration memory).
+    quality_score: 8
+    evidence_tier: high
+  composio-agent-orchestrator:
+    name: Composio Agent Orchestrator
+    type: open_source_repo
+    url: https://github.com/ComposioHQ/agent-orchestrator
+    vendor: Composio
+    topics:
+      - orchestration
+      - code-generation
+    tags:
+      - parallel-agents
+      - git-worktrees
+      - ci-fixes
+      - multi-agent
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (in-conversation analysis)
+    quality_signals:
+      stars_at_review: 4628
+      language: TypeScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - git-worktree-parallelism
+      - agent-agnostic-orchestration
+    verdict: monitoring
+    verdict_notes: Git worktree-based parallel agent execution. Interesting but our
+      per-instance directory approach works. Revisit if parallelism becomes a
+      bottleneck.
+    quality_score: 6
+    evidence_tier: medium
+  microsoft-agent-framework:
+    name: Microsoft Agent Framework
+    type: open_source_repo
+    url: https://github.com/microsoft/agent-framework
+    vendor: Microsoft
+    topics:
+      - orchestration
+      - multi-agent-systems
+    tags:
+      - graph-orchestration
+      - multi-agent
+      - dotnet
+      - python
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (in-conversation analysis)
+    quality_signals:
+      stars_at_review: 8027
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - graph-based-workflow-orchestration
+      - multi-agent-conversation-patterns
+    verdict: monitoring
+    verdict_notes: Graph-based orchestration similar to our GraphBuilder.
+      Multi-language support (Python + .NET). Monitor for novel patterns we
+      lack.
+    quality_score: 7
+    evidence_tier: medium
+  swe-agent:
+    name: SWE-agent
+    type: open_source_repo
+    url: https://github.com/SWE-agent/SWE-agent
+    vendor: Princeton NLP
+    topics:
+      - code-generation
+      - multi-agent-systems
+    tags:
+      - swe-bench
+      - github-issues
+      - automated-repair
+      - neurips-2024
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (competitive analysis)
+    quality_signals:
+      stars_at_review: 18769
+      language: Python
+      has_tests: true
+      has_docs: true
+      has_paper: true
+    techniques_extracted:
+      - agent-computer-interface
+      - file-viewer-tool
+      - search-replace-editing
+    verdict: monitoring
+    verdict_notes: Primary open-source SWE-bench competitor. SoTA on full.
+      Live-SWE-agent 79.2% on Verified.
+    quality_score: 9
+    evidence_tier: high
+  openai-agents-sdk:
+    name: OpenAI Agents SDK
+    type: open_source_repo
+    url: https://github.com/openai/openai-agents-python
+    vendor: OpenAI
+    topics:
+      - orchestration
+      - tool-use
+    tags:
+      - multi-agent
+      - handoffs
+      - guardrails
+      - tracing
+      - mcp
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 19000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - agent-handoff-protocol
+      - guardrail-middleware
+      - structured-output-agents
+    verdict: monitoring
+    verdict_notes: Direct competitor. Lightweight handoff protocol and guardrail
+      patterns worth studying. MCP-native.
+    quality_score: 8
+    evidence_tier: high
+  openhands:
+    name: OpenHands (formerly OpenDevin)
+    type: open_source_repo
+    url: https://github.com/All-Hands-AI/OpenHands
+    vendor: All-Hands AI
+    topics:
+      - code-generation
+      - orchestration
+    tags:
+      - swe-bench
+      - sandboxed-execution
+      - browser-agent
+      - agent-sdk
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 68000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - sandboxed-code-execution
+      - agent-runtime-abstraction
+      - event-stream-architecture
+    verdict: monitoring
+    verdict_notes: 72% SWE-Bench Verified with Claude Sonnet. Sandbox execution
+      model and event-stream architecture are strong reference patterns.
+    quality_score: 9
+    evidence_tier: high
+  crewai:
+    name: CrewAI
+    type: open_source_repo
+    url: https://github.com/crewAIInc/crewAI
+    vendor: CrewAI Inc
+    topics:
+      - orchestration
+    tags:
+      - role-based-agents
+      - crew-pipelines
+      - task-delegation
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 44000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - role-based-agent-specialization
+      - sequential-crew-pipeline
+    verdict: monitoring
+    verdict_notes: Role specialization model mirrors nexus-agents create_expert.
+      Crew pipeline concept similar to our graph workflows.
+    quality_score: 7
+    evidence_tier: medium
+  pydantic-ai:
+    name: PydanticAI
+    type: open_source_repo
+    url: https://github.com/pydantic/pydantic-ai
+    vendor: Pydantic
+    topics:
+      - orchestration
+      - tool-use
+    tags:
+      - type-safe
+      - structured-output
+      - dependency-injection
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 15000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - typed-tool-definitions
+      - structured-result-validation
+    verdict: monitoring
+    verdict_notes: Validates our zero-any/type-safety approach. Structured output
+      patterns for tool responses worth studying.
+    quality_score: 7
+    evidence_tier: medium
+  gsd-get-shit-done:
+    name: GSD (Get Shit Done) — updated entry
+    type: open_source_repo
+    url: https://github.com/gsd-build/get-shit-done
+    vendor: TÂCHES
+    topics:
+      - orchestration
+      - code-generation
+    tags:
+      - spec-driven-development
+      - context-engineering
+      - meta-prompting
+      - wave-execution
+      - claude-code
+      - opencode
+      - gemini-cli
+      - codex
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (in-conversation analysis)
+    quality_signals:
+      stars_at_review: 34062
+      language: JavaScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - context-rot-prevention
+      - wave-based-parallel-execution
+      - spec-driven-verification-loop
+      - xml-structured-task-specs
+      - atomic-commit-per-task
+    verdict: partially_adopted
+    verdict_notes: Context management + verification patterns adopted for SWE-bench
+      (#1574). 34K stars, multi-CLI support. Context rot prevention is the core
+      innovation.
+    quality_score: 9
+    evidence_tier: high
+  ai-researcher:
+    name: AI-Researcher
+    type: open_source_repo
+    url: https://github.com/HKUDS/AI-Researcher
+    vendor: HKUDS (HKU Data Science)
+    topics:
+      - orchestration
+      - reasoning
+    tags:
+      - research-automation
+      - paper-generation
+      - multi-agent-debate
+      - neurips-2025
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 3000
+      language: Python
+      has_tests: true
+      has_docs: true
+      has_paper: true
+    techniques_extracted:
+      - writer-reviewer-critic-loop
+      - automated-literature-review
+    verdict: monitoring
+    verdict_notes: NeurIPS 2025 Spotlight. Research synthesis architecture directly
+      applicable to research_synthesize tool. Writer/Reviewer/Critic loop
+      parallels our consensus voting.
+    quality_score: 8
+    evidence_tier: high
+  awesome-ai-agent-papers:
+    name: awesome-ai-agent-papers
+    type: open_source_repo
+    url: https://github.com/VoltAgent/awesome-ai-agent-papers
+    vendor: VoltAgent
+    topics:
+      - evaluation
+    tags:
+      - paper-registry
+      - curated-list
+      - agent-research
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 2000
+      language: Markdown
+      has_tests: false
+      has_docs: true
+    techniques_extracted:
+      - curated-paper-feed
+    verdict: monitoring
+    verdict_notes: Potential input feed for research_discover tool. Curated agent
+      paper list maintained by community.
+    quality_score: 4
+    evidence_tier: low
+  mcp-registry:
+    name: MCP Server Registry
+    type: open_source_repo
+    url: https://github.com/modelcontextprotocol/registry
+    vendor: Anthropic
+    topics:
+      - cli-tools
+      - tool-use
+    tags:
+      - mcp
+      - registry
+      - discoverability
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 1000
+      language: TypeScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - mcp-server-discovery
+      - tool-registry-pattern
+    verdict: planned
+    verdict_notes: nexus-agents should register here for discoverability.
+      registry_import tool alignment opportunity.
+    quality_score: 6
+    evidence_tier: medium
+  mcp-agent-lastmile:
+    name: mcp-agent (LastMile AI)
+    type: open_source_repo
+    url: https://github.com/lastmile-ai/mcp-agent
+    vendor: LastMile AI
+    topics:
+      - orchestration
+      - tool-use
+    tags:
+      - mcp
+      - workflow-patterns
+      - map-reduce
+      - evaluator-optimizer
+      - durable-execution
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 5000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - mcp-workflow-patterns
+      - evaluator-optimizer-loop
+      - durable-agent-execution
+    verdict: monitoring
+    verdict_notes: Composable MCP workflow patterns (map-reduce, router, evaluator).
+      Durable execution via Temporal. Direct MCP-native competitor.
+    quality_score: 7
+    evidence_tier: medium
+  agentscope:
+    name: AgentScope
+    type: open_source_repo
+    url: https://github.com/agentscope-ai/agentscope
+    vendor: AgentScope AI
+    topics:
+      - orchestration
+      - memory
+    tags:
+      - multi-agent
+      - finetuning
+      - message-hub
+      - a2a-protocol
+      - human-in-the-loop
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 8000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - message-hub-orchestration
+      - agent-finetuning-loop
+      - a2a-protocol-support
+    verdict: monitoring
+    verdict_notes: Production-ready with built-in finetuning, A2A + MCP support,
+      message hub for flexible multi-agent orchestration. Strong reference for
+      memory + orchestration patterns.
+    quality_score: 8
+    evidence_tier: high
+  agent-mcp:
+    name: Agent-MCP
+    type: open_source_repo
+    url: https://github.com/rinadelph/Agent-MCP
+    vendor: Community
+    topics:
+      - orchestration
+      - cli-tools
+    tags:
+      - mcp
+      - parallel-agents
+      - specialized-coordination
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 2000
+      language: TypeScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - mcp-based-agent-coordination
+      - parallel-specialized-agents
+    verdict: monitoring
+    verdict_notes: MCP-native multi-agent coordination. Parallel specialized agents
+      pattern mirrors our worker dispatch.
+    quality_score: 5
+    evidence_tier: medium
+  mcp-gateway-registry:
+    name: MCP Gateway Registry
+    type: open_source_repo
+    url: https://github.com/agentic-community/mcp-gateway-registry
+    vendor: Agentic Community
+    topics:
+      - security
+      - cli-tools
+    tags:
+      - mcp
+      - oauth
+      - keycloak
+      - tool-governance
+      - enterprise
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 1500
+      language: TypeScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - mcp-tool-governance
+      - oauth-tool-access
+      - dynamic-tool-discovery
+    verdict: monitoring
+    verdict_notes: Enterprise MCP gateway with OAuth, tool governance, and audit
+      trails. Relevant for nexus-agents security hardening (#818).
+    quality_score: 6
+    evidence_tier: medium
+  owl-camel-ai:
+    name: OWL (CAMEL-AI)
+    type: open_source_repo
+    url: https://github.com/camel-ai/owl
+    vendor: CAMEL-AI
+    topics:
+      - orchestration
+      - tool-use
+    tags:
+      - multi-agent
+      - browser-agents
+      - mcp
+      - function-calling
+      - github-blog-top10
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (GitHub Blog Top 10 Open Source AI Projects)
+    quality_signals:
+      stars_at_review: 12000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - multi-agent-cooperation-via-mcp
+      - browser-terminal-tool-integration
+    verdict: monitoring
+    verdict_notes: GitHub Blog Top 10. Multi-agent cooperation through browsers,
+      terminals, function calls, and MCP tools. Architecture mirrors our worker
+      dispatch + tool-use patterns.
+    quality_score: 8
+    evidence_tier: high
+  ruflo:
+    name: Ruflo
+    type: open_source_repo
+    url: https://github.com/ruvnet/ruflo
+    vendor: Community
+    topics:
+      - orchestration
+      - memory
+    tags:
+      - claude-code
+      - swarm-intelligence
+      - rag
+      - distributed-agents
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 3000
+      language: TypeScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - swarm-agent-orchestration
+      - conversational-ai-system
+    verdict: monitoring
+    verdict_notes: Claude-native agent orchestration with swarm intelligence and
+      RAG. TypeScript stack aligns with nexus-agents.
+    quality_score: 7
+    evidence_tier: medium
+  letta-agent-file:
+    name: Letta Agent File (.af)
+    type: open_source_repo
+    url: https://github.com/letta-ai/agent-file
+    vendor: Letta AI
+    topics:
+      - orchestration
+      - memory
+    tags:
+      - agent-format
+      - portable-agents
+      - memory-persistence
+      - interoperability
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (GitHub Blog Top 10 Open Source AI Projects)
+    quality_signals:
+      stars_at_review: 5000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - portable-agent-file-format
+      - memory-behavior-packaging
+    verdict: monitoring
+    verdict_notes: Open file format (.af) for packaging AI agents with memory and
+      behavior. Interoperability concept relevant to nexus-agents expert
+      serialization.
+    quality_score: 7
+    evidence_tier: medium
+  praisonai:
+    name: PraisonAI
+    type: open_source_repo
+    url: https://github.com/MervinPraison/PraisonAI
+    vendor: PraisonAI
+    topics:
+      - orchestration
+    tags:
+      - multi-agent
+      - self-reflection
+      - mcp
+      - workflows
+      - memory
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 8000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - agent-self-reflection
+      - multi-agent-workflows-with-memory
+    verdict: monitoring
+    verdict_notes: Production-ready multi-AI agents with self-reflection, 100+ LLM
+      support, MCP integration. Python + JS SDKs.
+    quality_score: 8
+    evidence_tier: high
+  unbody:
+    name: Unbody
+    type: open_source_repo
+    url: https://github.com/unbody-io/unbody
+    vendor: Unbody
+    topics:
+      - orchestration
+      - memory
+    tags:
+      - ai-native-backend
+      - perception
+      - reasoning
+      - action-layers
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (GitHub Blog Top 10 Open Source AI Projects)
+    quality_signals:
+      stars_at_review: 4000
+      language: TypeScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - layered-ai-backend-architecture
+      - perception-memory-reasoning-action
+    verdict: monitoring
+    verdict_notes: Modular AI-native backend with perception/memory/reasoning/action
+      layers. Architecture pattern relevant to nexus-agents pipeline design.
+    quality_score: 7
+    evidence_tier: medium
+  aider:
+    name: Aider
+    type: open_source_repo
+    url: https://github.com/Aider-AI/aider
+    vendor: Aider AI
+    topics:
+      - code-generation
+    tags:
+      - git-native
+      - pair-programming
+      - terminal
+      - multi-model
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 35000
+      language: Python
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - git-native-code-editing
+      - conversational-code-modification
+    verdict: monitoring
+    verdict_notes: Terminal-native AI pair programming. Git-native workflows with
+      conversational editing. Reference for CLI code generation patterns.
+    quality_score: 8
+    evidence_tier: high
+  cline:
+    name: Cline
+    type: open_source_repo
+    url: https://github.com/cline/cline
+    vendor: Cline
+    topics:
+      - code-generation
+      - tool-use
+    tags:
+      - ide-extension
+      - mcp
+      - plan-mode
+      - terminal-controls
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 40000
+      language: TypeScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - plan-mode-execution
+      - mcp-tool-integration
+    verdict: monitoring
+    verdict_notes: 5M installs. IDE-native with Plan Mode, MCP integration, and
+      terminal-first controls. Zero markup pricing model. TypeScript stack
+      aligns with nexus-agents.
+    quality_score: 9
+    evidence_tier: high
+  antigravity:
+    name: Antigravity
+    type: open_source_repo
+    url: https://github.com/google/anthropic-antigravity
+    vendor: Google
+    topics:
+      - code-generation
+      - orchestration
+    tags:
+      - gemini
+      - swe-bench
+      - free-tier
+      - skills
+    reviewed_date: 2026-03-18
+    reviewed_in: N/A (automated discovery)
+    quality_signals:
+      stars_at_review: 15000
+      language: TypeScript
+      has_tests: true
+      has_docs: true
+    techniques_extracted:
+      - skill-based-agent-architecture
+      - gemini-native-orchestration
+    verdict: monitoring
+    verdict_notes: 76.2% SWE-bench, free. Gemini-native with skills-first
+      architecture. Relevant as Gemini CLI alternative for nexus-agents routing.
+    quality_score: 8
+    evidence_tier: high
+  www-anthropic-com-glasswing:
+    name: Project Glasswing — Anthropic Defensive Cybersecurity Initiative
+    type: research_blog
+    url: https://www.anthropic.com/glasswing
+    reviewed_date: 2026-04-08
+    reviewed_in: N/A (added via research_add_source tool)
+    vendor: Anthropic
+    topics:
+      - security
+      - code-generation
+      - evaluation
+    tags:
+      - cybersecurity
+      - vulnerability-detection
+      - zero-day
+      - defensive-security
+      - claude-mythos
+    verdict: monitoring
+    verdict_notes: Mythos Preview restricted to Glasswing partners. Key patterns
+      (agentic bug-finding scaffold, SARIF-based findings) are adoptable with
+      Opus 4.6. Watch for Cyber Verification Program and future safeguarded Opus
+      releases.
+  utkusen-sast-skills:
+    name: sast-skills — Agent skills for AI-powered SAST scanning
+    type: open_source_repo
+    url: https://github.com/utkusen/sast-skills
+    reviewed_date: 2026-04-08
+    reviewed_in: N/A (added via research_add_source tool)
+    topics:
+      - security
+      - code-generation
+      - tool-use
+    tags:
+      - sast
+      - vulnerability-detection
+      - claude-code
+      - agent-skills
+      - owasp
+    quality_signals:
+      stars_at_review: 500
+      language: markdown
+      has_tests: false
+      has_docs: true
+    techniques_extracted:
+      - agent-sast-scanning
+      - parallel-vulnerability-detection
+    verdict: partially_adopted
+    verdict_notes: Architecture pattern (13 parallel skills + report consolidation)
+      informs nexus-agents security_scan design (#1681). Not directly adopted —
+      nexus-agents uses MCP tools + SARIF normalization instead of CLAUDE.md
+      skills.

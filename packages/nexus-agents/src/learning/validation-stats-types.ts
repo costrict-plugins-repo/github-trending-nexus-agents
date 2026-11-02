@@ -1,0 +1,233 @@
+/**
+ * Validation Statistics Types
+ *
+ * Type definitions for statistical analysis in the learning validation dashboard.
+ * Supports confidence intervals, hypothesis testing, and A/B test comparisons.
+ *
+ * @module learning/validation-stats-types
+ * (Source: Issue #273 - Learning Validation Dashboard)
+ */
+
+/**
+ * Confidence interval result with bounds and metadata.
+ */
+export interface ConfidenceInterval {
+  /** Lower bound of the interval */
+  readonly lower: number;
+  /** Upper bound of the interval */
+  readonly upper: number;
+  /** Point estimate (center of interval) */
+  readonly estimate: number;
+  /** Confidence level (e.g., 0.95 for 95% CI) */
+  readonly confidence: number;
+  /** Sample size used */
+  readonly n: number;
+  /** Standard error */
+  readonly standardError: number;
+  /**
+   * Whether the interval was computed from data (#5760 item 3).
+   *
+   * `false` means the sample was empty and `lower`/`upper`/`estimate` carry no
+   * information — they are whatever the empty branch happened to return, not a
+   * result. Read this before reading the bounds.
+   *
+   * The bounds alone cannot say it. `meanConfidenceInterval([])` returned
+   * `lower === upper === 0` — the strongest possible precision claim, over no
+   * data. `proportionConfidenceInterval(0, 0)` returned `[0, 1]`, which is
+   * honest by luck rather than by construction: a proportion's domain happens
+   * to be bounded, so its uninformative interval is expressible, and a mean's
+   * is not. `calculateDifferenceCI` divided by `(total1 || 1)` and produced a
+   * finite interval from nothing at all.
+   *
+   * Named for the vocabulary this repo already uses for exactly this —
+   * `tokensMeasured`, `policyEvaluated`, `gapsMeasured`, `routerTypeMeasured`.
+   * REQUIRED rather than optional so the compiler names every producer;
+   * optional would let a new one stay silent, which is the state this removes.
+   *
+   * Ratified 5 of 6 approvers at supermajority (#5760). Infinity and NaN
+   * bounds were both rejected for the same reason: each serialises to `null`
+   * in JSON, turning a loud in-process signal into a silent persisted one.
+   */
+  readonly measured: boolean;
+}
+
+/**
+ * Result of a two-sample comparison test.
+ */
+export interface ComparisonResult {
+  /** P-value from the test */
+  readonly pValue: number;
+  /** Whether result is significant at alpha level */
+  readonly significant: boolean;
+  /** Alpha level used for significance */
+  readonly alpha: number;
+  /** Difference in success rates (group1 - group2) */
+  readonly difference: number;
+  /** Confidence interval for the difference */
+  readonly differenceCI: ConfidenceInterval;
+  /** Effect size (Cohen's h for proportions) */
+  readonly effectSize: number;
+  /** Sample sizes */
+  readonly n1: number;
+  readonly n2: number;
+}
+
+/**
+ * Descriptive statistics for a distribution.
+ */
+export interface DistributionStats {
+  readonly mean: number;
+  readonly median: number;
+  readonly stdDev: number;
+  readonly variance: number;
+  readonly min: number;
+  readonly max: number;
+  readonly n: number;
+  /** Percentiles: p5, p25, p50, p75, p95 */
+  readonly percentiles: {
+    readonly p5: number;
+    readonly p25: number;
+    readonly p50: number;
+    readonly p75: number;
+    readonly p95: number;
+  };
+}
+
+/**
+ * Regret analysis result comparing actual vs optimal decisions.
+ */
+export interface RegretAnalysis {
+  /**
+   * Total cumulative regret, or `null` when no decision was comparable (#5255).
+   *
+   * These three were plain `number` and returned `0`/`0`/`1` for an empty
+   * decision set — which the dashboard rendered as "Cumulative Regret: 0.00"
+   * and "Optimal Decision Rate: 100.0%" with a full progress bar. A perfect
+   * routing record asserted over nothing is an absent measurement wearing a
+   * good score, and the primary consumer of these numbers is the learning loop
+   * itself, which has no way to consult a sibling flag.
+   *
+   * `null` means UNMEASURED — no comparable decision existed. It does not mean
+   * zero regret; that is `0`, and the two are now distinguishable.
+   */
+  readonly cumulativeRegret: number | null;
+  /** Average regret per decision, or `null` when unmeasured — see above. */
+  readonly avgRegret: number | null;
+  /** Number of decisions analyzed. Stays numeric: 0 is the true count. */
+  readonly totalDecisions: number;
+  /** Number of suboptimal decisions. Stays numeric: 0 is the true count. */
+  readonly suboptimalDecisions: number;
+  /** Share of optimal decisions, or `null` when unmeasured — see above. */
+  readonly optimalRate: number | null;
+  /** Regret per model (how much worse each model performed vs best) */
+  readonly regretPerModel: Record<string, number>;
+}
+
+/**
+ * Win/loss analysis comparing routing choices.
+ */
+export interface WinLossAnalysis {
+  /** Model name */
+  readonly model: string;
+  /** Number of times this model won (best outcome) */
+  readonly wins: number;
+  /** Number of times this model lost (not best outcome) */
+  readonly losses: number;
+  /** Number of ties */
+  readonly ties: number;
+  /** Win rate */
+  readonly winRate: number;
+  /** Confidence interval for win rate */
+  readonly winRateCI: ConfidenceInterval;
+}
+
+/**
+ * Variant result summary for experiment results.
+ */
+export interface VariantResultSummary {
+  readonly name: string;
+  readonly n: number;
+  readonly successRate: number;
+  readonly avgReward: number;
+  readonly successRateCI: ConfidenceInterval;
+}
+
+/**
+ * A/B test experiment result.
+ */
+export interface ExperimentResult {
+  /** Experiment identifier */
+  readonly experimentId: string;
+  /** Control group statistics */
+  readonly control: VariantResultSummary;
+  /** Treatment group statistics */
+  readonly treatment: VariantResultSummary;
+  /** Comparison between groups */
+  readonly comparison: ComparisonResult;
+  /**
+   * Relative improvement (treatment vs control), or null when control has no
+   * samples or its measured success rate is zero (the ratio is undefined).
+   * Inspect `control.n`: zero means no samples; a positive count with null
+   * lift means a measured zero baseline, including unbounded lift when the
+   * treatment rate is positive. A measured zero lift remains numeric 0.
+   * Render null as '-' rather than as 0% improvement.
+   */
+  readonly relativeImprovement: number | null;
+  /** Whether experiment has enough data for valid conclusions */
+  readonly hasMinimumSampleSize: boolean;
+  /** Minimum recommended sample size per group */
+  readonly recommendedSampleSize: number;
+  /**
+   * Whether {@link recommendedSampleSize} was computed from a baseline the
+   * control actually measured.
+   *
+   * `false` means the control has **no observations**, so the `0` baseline
+   * `calculateMinSampleSize` was handed is a default, not a rate. The number it
+   * returns is real arithmetic over a fabricated input and comes out several
+   * times too small — in the direction that tells an operator to stop
+   * collecting early, which is exactly the reader this field exists to warn.
+   *
+   * Note the gate is `control.n > 0`, NOT `control.successRate > 0`: a control
+   * of 0/50 is a measured baseline of 0.0 and a legitimate input here. That is
+   * a different question from whether {@link relativeImprovement} is non-null:
+   * the ratio over a zero control rate is undefined (#5857).
+   */
+  readonly recommendedSampleSizeMeasured: boolean;
+}
+
+/**
+ * Model performance matrix entry (model × task type).
+ */
+export interface PerformanceMatrixEntry {
+  readonly model: string;
+  readonly taskType: string;
+  readonly n: number;
+  readonly successRate: number;
+  readonly avgReward: number;
+  readonly avgLatencyMs: number;
+  readonly successRateCI: ConfidenceInterval;
+}
+
+/**
+ * Options for statistical calculations.
+ */
+export interface StatisticalOptions {
+  /** Confidence level for intervals (default: 0.95) */
+  readonly confidence?: number;
+  /** Alpha level for significance testing (default: 0.05) */
+  readonly alpha?: number;
+  /** Minimum sample size for valid inference (default: 30) */
+  readonly minSampleSize?: number;
+  /** Use continuity correction for proportions (default: true) */
+  readonly useContinuityCorrection?: boolean;
+}
+
+/**
+ * Default statistical options.
+ */
+export const DEFAULT_STATISTICAL_OPTIONS: Required<StatisticalOptions> = {
+  confidence: 0.95,
+  alpha: 0.05,
+  minSampleSize: 30,
+  useContinuityCorrection: true,
+};

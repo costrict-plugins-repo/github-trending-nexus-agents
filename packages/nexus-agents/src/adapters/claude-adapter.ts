@@ -1,0 +1,514 @@
+import type { ExecutionAccessMode } from '../core/types/model.js';
+import { validatedModelIdentity } from '../cli-adapters/model-identity.js';
+
+/**
+ * nexus-agents/adapters - Claude/Anthropic Model Adapter
+ *
+ * Adapter for Anthropic's Claude models (claude-opus-4, claude-sonnet-4, claude-haiku-3).
+ * Implements the IModelAdapter interface with streaming support, rate limiting,
+ * and proper error handling.
+ *
+ * Verified 2026-01-03: @anthropic-ai/sdk@0.71.2 is current stable
+ * (Source: npm registry)
+ */
+
+import Anthropic from '@anthropic-ai/sdk';
+import type { MessageStreamEvent } from '@anthropic-ai/sdk/resources/messages';
+import type {
+  Result,
+  CompletionRequest,
+  CompletionResponse,
+  ModelMetadata,
+  StreamChunk,
+  ContentBlock,
+  TokenUsage,
+} from '../core/index.js';
+import { ok, err, ModelError, ConfigError, getTokenEstimator } from '../core/index.js';
+import {
+  BaseAdapter,
+  type BaseAdapterConfig,
+  requireApiKey,
+  validateApiKeyPresence,
+} from './base-adapter.js';
+import { createStream } from './streaming.js';
+import type { ClaudeAdapterConfig } from './claude-adapter-types.js';
+import { DEFAULT_MAX_TOKENS } from './claude-adapter-types.js';
+import {
+  mapStopReason,
+  mapContentBlock,
+  mapMessage,
+  mapTool,
+  resolveModelId,
+  getModelCapabilities,
+  forcesResponseTool,
+  buildRespondTool,
+  mapResponseWithRespondTool,
+  RESPOND_TOOL_NAME,
+} from './claude-adapter-helpers.js';
+import { extractRequestSystemPrompt } from './prompt-utils.js';
+import { planOptionalParams, type DroppedParam } from './optional-params.js';
+
+// Re-export types and constants for backward compatibility
+export type { ClaudeAdapterConfig } from './claude-adapter-types.js';
+export { CLAUDE_MODELS, CLAUDE_MODEL_ALIASES } from './claude-adapter-types.js';
+
+/**
+ * Claude/Anthropic model adapter.
+ *
+ * Provides a unified interface for interacting with Anthropic's Claude models.
+ * Supports completion, streaming, tool use, and vision capabilities.
+ *
+ * @example
+ * ```typescript
+ * const adapter = new ClaudeAdapter({
+ *   modelId: 'claude-sonnet-4',
+ *   apiKey: process.env.ANTHROPIC_API_KEY,
+ * });
+ *
+ * const result = await adapter.complete({
+ *   messages: [{ role: 'user', content: 'Hello!' }],
+ *   maxTokens: 1024,
+ * });
+ *
+ * if (result.ok) {
+ *   console.log(result.value.content);
+ * }
+ * ```
+ */
+export class ClaudeAdapter extends BaseAdapter {
+  /** This concrete API only returns content/tool descriptions; it executes no host tools. */
+  supportsAccessMode(
+    _mode: ExecutionAccessMode,
+    _signal?: AbortSignal
+  ): Promise<boolean | undefined> {
+    return Promise.resolve(this.constructor === ClaudeAdapter ? true : undefined);
+  }
+
+  private readonly client: Anthropic;
+  private readonly resolvedModelId: string;
+
+  /**
+   * Creates a new ClaudeAdapter instance.
+   *
+   * @param config - Claude adapter configuration
+   * @throws {ConfigError} If API key is missing
+   */
+  constructor(config: ClaudeAdapterConfig) {
+    const resolvedModelId = resolveModelId(config.modelId);
+
+    // Build baseConfig conditionally to satisfy exactOptionalPropertyTypes
+    const baseConfig: BaseAdapterConfig = {
+      providerId: 'anthropic',
+      modelId: resolvedModelId,
+      capabilities: getModelCapabilities(config.modelId),
+      apiKey: config.apiKey,
+    };
+
+    // Only set optional properties if defined
+    if (config.baseUrl !== undefined) {
+      baseConfig.baseUrl = config.baseUrl;
+    }
+    if (config.timeout !== undefined) {
+      baseConfig.timeout = config.timeout;
+    }
+    if (config.maxRetries !== undefined) {
+      baseConfig.maxRetries = config.maxRetries;
+    }
+
+    super(baseConfig);
+
+    this.resolvedModelId = resolvedModelId;
+
+    // Validate API key presence
+    requireApiKey(config.apiKey, 'Anthropic', config.modelId);
+
+    // Create Anthropic client
+    this.client = new Anthropic({
+      apiKey: config.apiKey,
+      baseURL: config.baseUrl,
+      timeout: config.timeout,
+      maxRetries: config.maxRetries ?? 2,
+    });
+  }
+
+  /**
+   * Validates adapter configuration.
+   * Extends base validation with Claude-specific checks.
+   */
+  override validateConfig(): Result<void, ConfigError> {
+    const baseResult = super.validateConfig();
+    if (!baseResult.ok) {
+      return baseResult;
+    }
+
+    // Validate API key is present
+    const keyResult = validateApiKeyPresence(this.config.apiKey, this.providerId, this.modelId);
+    if (!keyResult.ok) return keyResult;
+
+    return ok(undefined);
+  }
+
+  /**
+   * Send a completion request to Claude.
+   *
+   * @param request - The completion request
+   * @returns Result with response or ModelError
+   */
+  async complete(request: CompletionRequest): Promise<Result<CompletionResponse, ModelError>> {
+    this.logRequest(request);
+
+    try {
+      const response = await this.executeCompletion(request);
+      this.logResponse(response);
+      return ok(response);
+    } catch (error) {
+      return err(this.transformError(error));
+    }
+  }
+
+  /**
+   * Stream a completion request from Claude.
+   *
+   * @param request - The completion request
+   * @yields StreamChunk objects as they arrive
+   */
+  async *stream(request: CompletionRequest): AsyncIterable<StreamChunk> {
+    this.logRequest(request);
+
+    const [controller, iterable] = createStream<StreamChunk>();
+
+    // Start streaming in the background
+    this.executeStream(request, controller).catch((error: unknown) => {
+      const modelError = this.transformError(error);
+      controller.error(modelError);
+    });
+
+    yield* iterable;
+  }
+
+  /**
+   * Count tokens in text using Claude-specific estimation.
+   *
+   * Claude uses a custom tokenizer. This provides a more accurate estimate
+   * than the base adapter's generic calculation.
+   *
+   * @param text - Text to count tokens for
+   * @returns Approximate token count
+   */
+  override countTokens(text: string): Promise<number> {
+    // Use unified TokenEstimator with Claude-specific ratio (~3.5 chars/token)
+    return Promise.resolve(getTokenEstimator().estimateText(text, 'claude'));
+  }
+
+  /**
+   * Executes the completion request against the Anthropic API.
+   */
+  private async executeCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+    const { params, dropped } = this.buildRequestParams(request);
+    // #3036: forward AbortSignal into the SDK so withWatchdog timeouts
+    // actually cancel the in-flight HTTP request instead of leaking it
+    // past the Promise.race boundary. Branch on signal presence — vitest
+    // 4 `toHaveBeenCalledWith(params)` treats `(params, undefined)` as
+    // a distinct call shape from `(params)`, so passing the second arg
+    // unconditionally would break every callsite-shape assertion.
+    const response =
+      request.signal !== undefined
+        ? await this.client.messages.create(params, { signal: request.signal })
+        : await this.client.messages.create(params);
+
+    // #3433: when we forced a `respond` tool to satisfy a non-text
+    // responseFormat, surface its structured input as a text block so the
+    // caller's JSON parser keeps working unchanged.
+    // #4069: surface params dropped by the seam (e.g. temperature) as warnings.
+    return this.mapResponse(response, forcesResponseTool(request), dropped);
+  }
+
+  /**
+   * Executes streaming completion and pushes chunks to the controller.
+   */
+  private async executeStream(
+    request: CompletionRequest,
+    controller: {
+      push: (chunk: StreamChunk) => Result<void, Error>;
+      complete: () => void;
+      error: (error: Error) => void;
+    }
+  ): Promise<void> {
+    try {
+      const { params } = this.buildRequestParams(request);
+      const stream = this.client.messages.stream(params);
+
+      for await (const event of stream) {
+        const chunk = this.mapStreamEvent(event);
+        if (chunk) {
+          controller.push(chunk);
+        }
+      }
+
+      controller.complete();
+    } catch (error) {
+      const modelError = this.transformError(error);
+      controller.error(modelError);
+    }
+  }
+
+  /**
+   * Builds Anthropic API request parameters from our CompletionRequest.
+   */
+  private buildRequestParams(request: CompletionRequest): {
+    params: Anthropic.MessageCreateParamsNonStreaming;
+    dropped: readonly DroppedParam[];
+  } {
+    // Filter out system messages and map the rest
+    const messages = request.messages.filter((m) => m.role !== 'system').map(mapMessage);
+
+    const params: Anthropic.MessageCreateParamsNonStreaming = {
+      model: this.resolvedModelId,
+      messages,
+      max_tokens: request.maxTokens ?? DEFAULT_MAX_TOKENS,
+    };
+
+    // Add system prompt if provided
+    const systemPrompt = extractRequestSystemPrompt(request);
+    if (systemPrompt !== undefined) {
+      params.system = systemPrompt;
+    }
+
+    // Apply optional parameters; the seam reports any params it dropped (#4069).
+    const dropped = this.applyOptionalParams(params, request);
+
+    return { params, dropped };
+  }
+
+  /**
+   * Applies optional parameters to the request params.
+   *
+   * @returns the params the seam dropped (#4069) — surfaced as response warnings.
+   */
+  private applyOptionalParams(
+    params: Anthropic.MessageCreateParamsNonStreaming,
+    request: CompletionRequest
+  ): readonly DroppedParam[] {
+    // #4068: the temperature drop-decision (#4061: Claude after Opus 4.6 rejects
+    // any non-1.0 temperature with a 400; omit it — 1.0 is the API default, so
+    // omitting is equivalent) is centralized in the shared planOptionalParams seam.
+    const plan = planOptionalParams(request, this.resolvedModelId);
+    if (plan.temperature !== undefined) {
+      // eslint-disable-next-line @typescript-eslint/no-deprecated -- still valid for older Anthropic models (≤ Opus 4.6) and value 1.0; the seam gates on temperatureUnsupportedForModel
+      params.temperature = plan.temperature;
+    }
+
+    if (request.stop !== undefined && request.stop.length > 0) {
+      params.stop_sequences = request.stop;
+    }
+
+    if (request.tools !== undefined && request.tools.length > 0) {
+      params.tools = request.tools.map(mapTool);
+    }
+
+    // #3433: honor responseFormat via a forced `respond` tool_use. Anthropic
+    // has no native JSON mode, so we register a synthetic tool whose
+    // input_schema is the requested schema and force the model to call it.
+    // The caller-supplied tools (above) are preserved — `respond` is merged
+    // in, never clobbered. We only set tool_choice when the caller didn't
+    // already specify their own tool usage intent.
+    if (forcesResponseTool(request)) {
+      const respondTool = buildRespondTool(request.responseFormat);
+      params.tools = [...(params.tools ?? []), respondTool];
+      params.tool_choice = { type: 'tool', name: RESPOND_TOOL_NAME };
+    }
+
+    return plan.dropped;
+  }
+
+  /**
+   * Maps Anthropic API response to our CompletionResponse format.
+   */
+  private mapResponse(
+    response: Anthropic.Message,
+    surfaceRespondTool = false,
+    dropped: readonly DroppedParam[] = []
+  ): CompletionResponse {
+    const reportedModel = validatedModelIdentity(response.model);
+    const content: ContentBlock[] = surfaceRespondTool
+      ? mapResponseWithRespondTool(response.content)
+      : response.content.map(mapContentBlock);
+
+    // Cache figures come through in full (#4440). The CLI-side
+    // `parsers/claude-parser.ts` has extracted these since #4435 — a panel's
+    // FIRST call is the one that writes the cache, so dropping them loses its
+    // largest input measurement — but this direct-API path was never updated,
+    // the same one-arm-fixed shape as #4602.
+    //
+    // The SDK types both as `number | null` — never undefined, which is why a
+    // null check alone suffices here. Null stays absent rather than
+    // becoming 0: a fabricated 0 reads as "no cache write happened", which is
+    // a claim the API did not make. `totalTokens` deliberately remains
+    // uncached input + output, matching the CLI parser — folding the cache
+    // figures in would change semantics for every existing consumer.
+    const cachedInputTokens = response.usage.cache_read_input_tokens;
+    const cacheCreationInputTokens = response.usage.cache_creation_input_tokens;
+    const usage: TokenUsage = {
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+      totalTokens: response.usage.input_tokens + response.usage.output_tokens,
+      ...(cachedInputTokens !== null && { cachedInputTokens }),
+      ...(cacheCreationInputTokens !== null && { cacheCreationInputTokens }),
+    };
+
+    return {
+      content,
+      usage,
+      stopReason: mapStopReason(response.stop_reason),
+      model: response.model,
+      ...(reportedModel !== undefined ? { reportedModel } : {}),
+      // #4069: surface dropped params (e.g. an omitted temperature) so the caller
+      // can see a behavioral param had no effect. Omitted entirely when nothing
+      // was dropped (exactOptionalPropertyTypes).
+      ...(dropped.length > 0 ? { warnings: dropped } : {}),
+    };
+  }
+
+  /** Usage for a `message_start` chunk, omitted when the vendor sent none (#4835). */
+  private static usageFrom(raw: { input_tokens?: number; output_tokens?: number } | undefined): {
+    usage?: TokenUsage;
+  } {
+    const inputTokens = raw?.input_tokens;
+    if (typeof inputTokens !== 'number') return {};
+    const outputTokens = typeof raw?.output_tokens === 'number' ? raw.output_tokens : 0;
+    return {
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+    };
+  }
+
+  /**
+   * Maps Anthropic stream events to our StreamChunk format.
+   */
+  private mapStreamEvent(event: MessageStreamEvent): StreamChunk | null {
+    switch (event.type) {
+      case 'message_start':
+        // #4835: the prompt count arrives HERE, not on message_delta — the
+        // Anthropic protocol puts it on `message.usage`. The delta comment
+        // ("Not available in delta") was correct about the wrong event, and
+        // the value was being dropped rather than being unavailable.
+        //
+        // Read defensively and OMIT when absent rather than zero-fill: the
+        // SDK types it as required, but an Anthropic-compatible proxy may not
+        // send it, and crashing a stream over a telemetry field would be a
+        // worse failure than the one being fixed.
+        return {
+          type: 'message_start',
+          message: { model: event.message.model },
+          ...ClaudeAdapter.usageFrom(event.message.usage),
+        };
+
+      case 'content_block_start':
+        return {
+          type: 'content_block_start',
+          index: event.index,
+          contentBlock: mapContentBlock(event.content_block),
+        };
+
+      case 'content_block_delta':
+        if (event.delta.type === 'text_delta') {
+          return {
+            type: 'content_block_delta',
+            index: event.index,
+            delta: { type: 'text_delta', text: event.delta.text },
+          };
+        }
+        return null;
+
+      case 'content_block_stop':
+        return {
+          type: 'content_block_stop',
+          index: event.index,
+        };
+
+      case 'message_delta':
+        return {
+          type: 'message_delta',
+          delta: { stop_reason: mapStopReason(event.delta.stop_reason ?? null) },
+          usage: {
+            // Genuinely absent on this event; the real count was emitted on
+            // message_start above. Flagged so `totalTokens` reads as the
+            // lower bound it is rather than as a total (#4835).
+            inputTokens: 0,
+            inputTokensMeasured: false,
+            outputTokens: event.usage.output_tokens,
+            totalTokens: event.usage.output_tokens,
+          },
+        };
+
+      case 'message_stop':
+        return { type: 'message_stop' };
+
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * (#2540) List models the Anthropic API currently exposes.
+   * Wraps `client.models.list()`. Cached for 5 min, in-flight promise
+   * shared across concurrent callers, throws on non-2xx so the
+   * harness-side identity resolver knows to fall back.
+   */
+  async listModels(): Promise<readonly ModelMetadata[]> {
+    const now = Date.now();
+    if (this.modelsCache !== null && now - this.modelsCache.fetchedAt < CLAUDE_LIST_MODELS_TTL_MS) {
+      return this.modelsCache.value;
+    }
+    if (this.modelsInFlight !== null) return this.modelsInFlight;
+    const inFlight = this.fetchModels();
+    this.modelsInFlight = inFlight;
+    try {
+      const value = await inFlight;
+      this.modelsCache = { value, fetchedAt: Date.now() };
+      return value;
+    } finally {
+      this.modelsInFlight = null;
+    }
+  }
+
+  private modelsCache: { value: readonly ModelMetadata[]; fetchedAt: number } | null = null;
+  private modelsInFlight: Promise<readonly ModelMetadata[]> | null = null;
+
+  private async fetchModels(): Promise<readonly ModelMetadata[]> {
+    const list = await this.client.models.list();
+    const out: ModelMetadata[] = [];
+    for (const m of list.data) {
+      const entry: ModelMetadata = { id: m.id };
+      if (typeof m.created_at === 'string') {
+        const ts = Date.parse(m.created_at);
+        if (!Number.isNaN(ts)) {
+          out.push({ ...entry, ownedBy: 'anthropic', createdAt: Math.floor(ts / 1000) });
+          continue;
+        }
+      }
+      out.push({ ...entry, ownedBy: 'anthropic' });
+    }
+    return out;
+  }
+}
+
+const CLAUDE_LIST_MODELS_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Creates a ClaudeAdapter with the specified configuration.
+ * Factory function for cleaner API.
+ *
+ * @param config - Claude adapter configuration
+ * @returns A configured ClaudeAdapter instance
+ *
+ * @example
+ * ```typescript
+ * const adapter = createClaudeAdapter({
+ *   modelId: 'claude-sonnet-4',
+ *   apiKey: process.env.ANTHROPIC_API_KEY!,
+ * });
+ * ```
+ */
+export function createClaudeAdapter(config: ClaudeAdapterConfig): ClaudeAdapter {
+  return new ClaudeAdapter(config);
+}

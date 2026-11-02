@@ -1,0 +1,339 @@
+/**
+ * Tests for research quality scoring.
+ *
+ * @module cli/research-helpers-scoring.test
+ * (Source: Research System Enhancement - Phase 4)
+ */
+
+import { describe, it, expect } from 'vitest';
+import { scoreDiscoveredItem, rankDiscoveredItems } from './research-helpers-scoring.js';
+import type { DiscoveredSource } from './research-helpers-sources.js';
+
+/** Create a test discovered source. */
+function createItem(overrides: Partial<DiscoveredSource> = {}): DiscoveredSource {
+  return {
+    source: 'arxiv',
+    title: 'Multi-Agent Orchestration Framework',
+    url: 'https://arxiv.org/abs/2401.12345',
+    description: 'A framework for multi-agent orchestration.',
+    relevance: 'medium',
+    discoveredAt: new Date().toISOString().split('T')[0] ?? '',
+    publishedAt: '2026-08-01',
+    ...overrides,
+  };
+}
+
+/** ISO date `n` days before now; negative `n` yields a future date. */
+function daysAgo(n: number): string {
+  return new Date(Date.now() - n * 86_400_000).toISOString().split('T')[0] ?? '';
+}
+
+describe('scoreDiscoveredItem', () => {
+  it('should return scores between 0 and 1', () => {
+    const item = createItem();
+    const score = scoreDiscoveredItem(item, 'multi agent orchestration');
+    expect(score.relevance).toBeGreaterThanOrEqual(0);
+    expect(score.relevance).toBeLessThanOrEqual(1);
+    expect(score.impact).toBeGreaterThanOrEqual(0);
+    expect(score.impact).toBeLessThanOrEqual(1);
+    expect(score.recency).toBeGreaterThanOrEqual(0);
+    expect(score.recency).toBeLessThanOrEqual(1);
+    expect(score.reproducibility).toBeGreaterThanOrEqual(0);
+    expect(score.reproducibility).toBeLessThanOrEqual(1);
+    expect(score.composite).toBeGreaterThanOrEqual(0);
+    expect(score.composite).toBeLessThanOrEqual(1);
+  });
+
+  it('should score high relevance for matching title', () => {
+    const item = createItem({ title: 'Multi-Agent Orchestration Framework' });
+    const score = scoreDiscoveredItem(item, 'multi agent orchestration');
+    expect(score.relevance).toBeGreaterThan(0.5);
+  });
+
+  it('should score low relevance for unrelated title', () => {
+    const item = createItem({ title: 'Quantum Computing Basics' });
+    const score = scoreDiscoveredItem(item, 'multi agent orchestration');
+    expect(score.relevance).toBeLessThan(0.3);
+  });
+
+  it('should score github items high on reproducibility', () => {
+    const item = createItem({ source: 'github' });
+    const score = scoreDiscoveredItem(item, 'test');
+    expect(score.reproducibility).toBe(1.0);
+  });
+
+  it('should score papers_with_code items high on reproducibility', () => {
+    const item = createItem({ source: 'papers_with_code' });
+    const score = scoreDiscoveredItem(item, 'test');
+    expect(score.reproducibility).toBe(0.8);
+  });
+
+  it('should score arxiv items low on reproducibility', () => {
+    const item = createItem({ source: 'arxiv' });
+    const score = scoreDiscoveredItem(item, 'test');
+    expect(score.reproducibility).toBe(0.3);
+  });
+
+  it('should score high impact for high relevance items', () => {
+    const item = createItem({ relevance: 'high' });
+    const score = scoreDiscoveredItem(item, 'test');
+    expect(score.impact).toBe(0.9);
+  });
+
+  it('should score low impact for low relevance items', () => {
+    const item = createItem({ relevance: 'low' });
+    const score = scoreDiscoveredItem(item, 'test');
+    expect(score.impact).toBe(0.2);
+  });
+
+  it('scores a recently PUBLISHED item higher than an old one (#4841)', () => {
+    // This replaces a test whose name promised a comparison and whose body
+    // scored a single item stamped today, asserting > 0.9. Every producer
+    // stamps `discoveredAt` with today's date, so it passed no matter what —
+    // including with the 730-day decay deleted entirely.
+    const fresh = scoreDiscoveredItem(createItem({ publishedAt: '2026-08-01' }), 'test');
+    const old = scoreDiscoveredItem(createItem({ publishedAt: '2019-03-01' }), 'test');
+
+    expect(fresh.recency).toBeGreaterThan(old.recency);
+  });
+
+  it('should handle empty topic gracefully', () => {
+    const item = createItem();
+    const score = scoreDiscoveredItem(item, '');
+    expect(score.relevance).toBe(0.5); // falls back to label
+  });
+
+  it('should handle invalid date gracefully', () => {
+    const item = createItem({ publishedAt: 'invalid' });
+    const score = scoreDiscoveredItem(item, 'test');
+    expect(score.recency).toBe(0.5);
+    expect(score.recencyMeasured).toBe(false);
+  });
+});
+
+// =============================================================================
+// Recency is scored on publication, not discovery (#4841)
+// =============================================================================
+
+describe('recency uses the publication date (#4841)', () => {
+  it('does not score recency from discoveredAt', () => {
+    // `discoveredAt` records when WE found the source, which every producer
+    // stamps as today. Scoring it made the 730-day decay unreachable and put
+    // a flat +0.2 on every composite: a 2019 paper and a 2026 preprint
+    // scored identically.
+    const old = createItem({ publishedAt: '2019-03-01', discoveredAt: '2026-08-25' });
+
+    expect(scoreDiscoveredItem(old, 'test').recency).toBeLessThan(0.5);
+  });
+
+  it('reports recency as unmeasured when no publication date is available', () => {
+    // Not every producer can supply one. Neutral rather than fresh, and said
+    // out loud — 1.0 would keep claiming the source is new.
+    const item = createItem();
+    delete (item as { publishedAt?: string }).publishedAt;
+
+    const score = scoreDiscoveredItem(item, 'test');
+
+    expect(score.recency).toBe(0.5);
+    expect(score.recencyMeasured).toBe(false);
+  });
+
+  it('marks recency measured when a publication date is present', () => {
+    // The pair: always-false would satisfy the test above.
+    expect(
+      scoreDiscoveredItem(createItem({ publishedAt: '2026-08-01' }), 'test').recencyMeasured
+    ).toBe(true);
+  });
+
+  it('still decays a genuinely old publication toward zero', () => {
+    // The decay the original code documented and could never reach. A bound
+    // here, not `=== 0`, because this test is about the direction of decay;
+    // the exact reported value at this age is pinned in the #4956 block
+    // below, since `< 0.05` on its own passes on a hard zero.
+    expect(
+      scoreDiscoveredItem(createItem({ publishedAt: daysAgo(11 * 365) }), 'test').recency
+    ).toBeLessThan(0.05);
+  });
+});
+
+// =============================================================================
+// The REPORTED recency floors at zero past ~7.7 years (#4956)
+// =============================================================================
+
+describe('the reported recency floors at zero past ~7.7 years (#4956)', () => {
+  it('reports exactly 0 for a 10-year-old publication', () => {
+    // 0.5 ** 10 is 0.00098, which the 2dp rounding in `scoreDiscoveredItem`
+    // renders as 0. The curve never reaches zero; the reported value does, at
+    // the age where 0.5 ** (days / 365) drops below 0.005 (~7.7 years). #4908
+    // claimed the reported value "approaches zero without reaching it", and the
+    // `< 0.05` bound above could not tell. Pinned as the honest limit rather
+    // than hidden behind a bound.
+    const tenYears = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(10 * 365) }), 'test');
+
+    expect(tenYears.recencyMeasured).toBe(true);
+    expect(tenYears.recency).toBe(0);
+  });
+
+  it('reports a non-zero recency just inside the floor', () => {
+    // 0.5 ** 7 is 0.0078, which rounds to 0.01: the floor is a property of
+    // the 2dp rounding, not of the curve, and it sits between 7 and 8 years.
+    const sevenYears = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(7 * 365) }), 'test');
+
+    expect(sevenYears.recency).toBe(0.01);
+  });
+
+  it('cannot separate an 8-year-old from a 20-year-old publication by composite', () => {
+    // The raw gap is 0.2 * (0.5 ** 8 - 0.5 ** 20) ~= 0.0008 of composite,
+    // below composite's own 2dp resolution. Reporting `recency` at higher
+    // precision would therefore change no ranking — `rankDiscoveredItems` and
+    // `executeReview` read only `composite` — which is why the limit is
+    // documented rather than chased (#4956 finding 1).
+    const eight = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(8 * 365) }), 'test');
+    const twenty = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(20 * 365) }), 'test');
+
+    expect(eight.recency).toBe(0);
+    expect(twenty.recency).toBe(0);
+    expect(eight.composite).toBe(twenty.composite);
+  });
+});
+
+// =============================================================================
+// The decay must not saturate (#4882)
+// =============================================================================
+
+describe('recency decay does not saturate (#4882)', () => {
+  it('ranks a 3-year-old publication above an 11-year-old one', () => {
+    // The linear `max(0, 1 - days/730)` floored both at exactly 0.0, so a 2024
+    // paper and a 2015 paper were indistinguishable. `rankDiscoveredItems`
+    // sorts on composite alone with no age tie-break, so which of the two
+    // entered the top-5 issue-filing slice was decided by sort order.
+    const old = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(3 * 365) }), 'test');
+    const ancient = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(11 * 365) }), 'test');
+
+    expect(old.recency).toBeGreaterThan(ancient.recency);
+  });
+
+  it('separates two publications that are both past the old 730-day floor', () => {
+    // The boundary case specifically: both of these scored 0.0 before.
+    const justPast = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(800) }), 'test');
+    const wellPast = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(2000) }), 'test');
+
+    expect(justPast.recency).toBeGreaterThan(wellPast.recency);
+    expect(wellPast.recency).toBeGreaterThan(0);
+  });
+
+  it('holds the one-year half-life the previous curve was calibrated on', () => {
+    // The 0.6 review gate and the 0.8 P1 boundary in `executeReview` were tuned
+    // against the old curve, which passed through 0.5 at one year. Keeping that
+    // point fixed is what makes this a tail fix rather than a recalibration.
+    const oneYear = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(365) }), 'test');
+
+    expect(oneYear.recency).toBeCloseTo(0.5, 2);
+  });
+
+  it('never scores above 1.0 for a future publication date', () => {
+    // `Math.max(0, 1 - days/730)` clamped the floor and left the ceiling open:
+    // a date one year ahead scored 1.5. Semantic Scholar stamps year-only dates
+    // as `${year}-01-01`, so a paper carrying next year's volume year produces
+    // exactly this.
+    const future = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(-365) }), 'test');
+
+    expect(future.recency).toBeLessThanOrEqual(1);
+  });
+});
+
+describe('rankDiscoveredItems', () => {
+  it('should sort items by composite score descending', () => {
+    const items: DiscoveredSource[] = [
+      createItem({ title: 'Unrelated Topic', relevance: 'low', source: 'arxiv' }),
+      createItem({ title: 'Multi-Agent Orchestration', relevance: 'high', source: 'github' }),
+      createItem({ title: 'Agent Systems', relevance: 'medium', source: 'arxiv' }),
+    ];
+
+    const ranked = rankDiscoveredItems(items, 'multi agent orchestration');
+    expect(ranked.length).toBe(3);
+    // First item should have highest composite score
+    expect(ranked[0]?.score.composite).toBeGreaterThanOrEqual(ranked[1]?.score.composite ?? 0);
+    expect(ranked[1]?.score.composite).toBeGreaterThanOrEqual(ranked[2]?.score.composite ?? 0);
+  });
+
+  it('should return empty array for empty input', () => {
+    const ranked = rankDiscoveredItems([], 'test');
+    expect(ranked).toHaveLength(0);
+  });
+
+  it('should attach scores to each item', () => {
+    const items = [createItem()];
+    const ranked = rankDiscoveredItems(items, 'test');
+    expect(ranked[0]?.score).toBeDefined();
+    expect(ranked[0]?.item).toBeDefined();
+    expect(ranked[0]?.score.composite).toBeGreaterThan(0);
+  });
+});
+
+// =============================================================================
+// An unmeasured recency is excluded, not defaulted (#4956)
+// =============================================================================
+
+describe('undated sources get no recency credit (#4956)', () => {
+  // `NEUTRAL_RECENCY` is 0.5. Under the old LINEAR curve that was the one-year
+  // point — mid-range. Under exponential decay it is the two-year point, so an
+  // undated source scored EXACTLY as well as a real one-year-old source: 0.28
+  // composite for both. Changing the curve should have moved the constant with
+  // it. Excluding the term instead means it cannot drift again.
+
+  function undated(): DiscoveredSource {
+    const item = createItem();
+    delete (item as { publishedAt?: string }).publishedAt;
+    return item;
+  }
+
+  it('no longer ties a genuinely fresh source', () => {
+    // The concrete regression: before this, both scored 0.28.
+    const fresh = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(365) }), 'test');
+    const unknown = scoreDiscoveredItem(undated(), 'test');
+
+    expect(unknown.composite).toBeLessThan(fresh.composite);
+  });
+
+  it('is scored purely on its measured dimensions', () => {
+    // Recency excluded and the remaining weights renormalised, so the missing
+    // term contributes nothing in either direction.
+    const unknown = scoreDiscoveredItem(undated(), 'test');
+    const measuredOnly =
+      (0.35 * unknown.relevance + 0.25 * unknown.impact + 0.2 * unknown.reproducibility) / 0.8;
+
+    expect(Math.abs(unknown.composite - measuredOnly)).toBeLessThan(0.02);
+  });
+
+  it('is not punished for the missing date either', () => {
+    // The pair. Absence of a date is not evidence of freshness, and it is not
+    // evidence of staleness — an undated source must still outrank one known
+    // to be twenty years old.
+    const ancient = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(20 * 365) }), 'test');
+    const unknown = scoreDiscoveredItem(undated(), 'test');
+
+    expect(unknown.composite).toBeGreaterThan(ancient.composite);
+  });
+
+  it('leaves a dated source scored over all four dimensions', () => {
+    // The other pair: renormalising unconditionally would inflate every score.
+    const dated = scoreDiscoveredItem(createItem({ publishedAt: daysAgo(365) }), 'test');
+    const allFour =
+      0.35 * dated.relevance +
+      0.25 * dated.impact +
+      0.2 * dated.recency +
+      0.2 * dated.reproducibility;
+
+    expect(Math.abs(dated.composite - allFour)).toBeLessThan(0.02);
+  });
+
+  it('reports recencyMeasured so a consumer can tell the two apart', () => {
+    // The flag existed since #4841 with no reader anywhere. The composite is
+    // now its first consumer; this pins that it still says which case it was.
+    expect(scoreDiscoveredItem(undated(), 'test').recencyMeasured).toBe(false);
+    expect(
+      scoreDiscoveredItem(createItem({ publishedAt: daysAgo(365) }), 'test').recencyMeasured
+    ).toBe(true);
+  });
+});

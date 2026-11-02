@@ -1,0 +1,64 @@
+---
+// Copy buttons and Mermaid rendering, shared by BaseLayout and DocsLayout.
+import CodeCopy from './CodeCopy.svelte';
+---
+
+<!-- Copy buttons (Svelte island #7320) -->
+<CodeCopy client:load />
+
+<!-- Mermaid: ink-on-paper theme, dynamically derived from Remarque tokens (#7231) -->
+<script>
+  import { buildMermaidTheme } from '../lib/mermaid-theme.ts';
+
+  let mermaidPromise: Promise<typeof import('mermaid').default> | null = null;
+  // An explicit choice from the docs theme toggle ([data-theme] on <html>)
+  // wins; otherwise follow the OS, as the landing page always has.
+  function currentIsDark(): boolean {
+    const chosen = document.documentElement.dataset.theme;
+    if (chosen === 'dark' || chosen === 'light') return chosen === 'dark';
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+  function loadMermaid(): Promise<typeof import('mermaid').default> {
+    mermaidPromise ??= import('mermaid').then((m) => {
+      m.default.initialize(buildMermaidTheme(document.documentElement, currentIsDark()));
+      return m.default;
+    });
+    return mermaidPromise;
+  }
+  async function renderMermaid(): Promise<void> {
+    const blocks = document.querySelectorAll<HTMLElement>('.mermaid:not([data-mermaid-rendered])');
+    if (blocks.length === 0) return;
+    const mermaid = await loadMermaid();
+    for (const block of blocks) {
+      const source = (block.dataset.source ?? block.textContent ?? '').trim();
+      if (!block.dataset.source) block.dataset.source = source;
+      try {
+        const id = `mermaid-${Math.random().toString(36).slice(2, 11)}`;
+        const { svg } = await mermaid.render(id, source);
+        block.innerHTML = svg;
+        block.dataset.mermaidRendered = '1';
+      } catch (err) {
+        block.innerHTML = `<pre class="code-block" style="color: var(--color-error);">Diagram render failed: ${String(err)}</pre>`;
+      }
+    }
+  }
+  function resetAndRender(): void {
+    document.querySelectorAll<HTMLElement>('.mermaid[data-mermaid-rendered]').forEach((el) => {
+      const source = el.dataset.source;
+      if (source !== undefined) {
+        el.textContent = source;
+        delete el.dataset.mermaidRendered;
+      }
+    });
+    void renderMermaid();
+  }
+  renderMermaid();
+  document.addEventListener('astro:page-load', resetAndRender);
+  function rethemeMermaid(): void {
+    mermaidPromise = null;
+    resetAndRender();
+  }
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', rethemeMermaid);
+  // Dispatched by ThemeToggle.svelte after [data-theme] changes.
+  document.addEventListener('nexus:themechange', rethemeMermaid);
+</script>

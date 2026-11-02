@@ -1,0 +1,205 @@
+# Strategy Manifest Registry
+#
+# Single source of truth for the 8 routable execution strategies the
+# MetaOrchestrator can select. Validated by the Zod schema in
+# packages/nexus-agents/src/orchestration/strategy-manifest.ts and embedded as a
+# typed constant in strategy-manifest-registry.ts (the two are asserted equal by
+# strategy-manifest-registry.test.ts so they cannot drift; #3837 gates this under
+# governance:check).
+#
+# Each manifest:
+#   id                stable kebab-case id (never reused; == strategy for the initial 8)
+#   schemaVersion     per-entry SHAPE version; must equal STRATEGY_MANIFEST_SCHEMA_VERSION
+#   strategy          the router ExecutionStrategy this manifest describes
+#   entrypointTool    the concrete MCP tool / engine that fronts this strategy
+#                     (generalizes the former STRATEGY_ENTRYPOINT_TOOL map)
+#   executorAvailable whether a wired inline executor exists (run-tool buildDefaultExecutors).
+#                     FAIL-CLOSED routing key: only 4/8 are true today
+#                     (dev-pipeline, pipeline, research, consensus). The rest declare
+#                     false so execute:true returns the structured no_executor error.
+#   description       one-line human description of what the strategy is for
+#   whenToForce       operator guidance for run({ forceStrategy }) (#3838)
+#   maturityTier      experimental | beta | stable
+#   latencyClass      expected latency class (#3734 operation-class taxonomy)
+#   selectionRules    declarative routing rules the manifest-driven router matches
+#                     over (#3836): each rule has a priority + pattern/pipelineType/
+#                     complexity predicates; highest-priority matching rule wins.
+#
+# authorityTier (Epic D, #3841 — semantics in ADR-0017) is now DECLARED for every
+# strategy and MACHINE-ENFORCED: the router refuses an action above a strategy's
+# declared tier (authority-tier-guard.ts), and the CI gate
+# (check-authority-tier-drift.ts, under governance:check) fails on an undeclared
+# tier or an `enforce` declared without the ADR-0017 evidence record. The initial
+# eight are CONSERVATIVELY declared (ADR-0017 §"The Four Tiers"): the work-producing
+# strategies are `suggest` (output is inert until a human/governor acts on it —
+# routed through the dev gate / review, never auto-applied), and `consensus` is
+# `advisory` (casts non-blocking votes, exactly the ADR pr_review example). NONE are
+# `enforce` — reaching `enforce` requires an earned evidence record + ratification
+# (the absorbed promotion cases #3552/#3769/#2077), never a default flip.
+#
+# costProfile (Epic G, #3856) is now DECLARED for every strategy as a COARSE cost
+# hint, scaled by the strategy's fan-out:
+#   low       a single model call (single-shot)
+#   medium    a templated multi-stage gate with bounded fan-out (dev-pipeline, pipeline)
+#   high      an N-voter panel / multi-agent orchestration / greenfield build
+#             (consensus, orchestrate, spec)
+#   variable  spend scales with input size — graph topology or research breadth
+#             (graph-workflow, research)
+# These are authored hints, surfaced in the weather_report cost section alongside
+# the MEASURED per-decision cost aggregates the DecisionCostStore records (#3855).
+#
+# Refresh path: as real decision-cost data accumulates (DecisionCostStore →
+# weather_report `decisionCosts` section), re-grade a strategy's costProfile against
+# its measured per-decision average and reconcile the hint here + the embedded TS
+# registry IN LOCKSTEP (the #3837 drift gate fails otherwise), then re-run
+# `pnpm strategy-manifest:check`.
+#
+# Adding a strategy = register a manifest here (and mirror it in the TS module),
+# NOT editing the router (Epic C, #3833). The router routes PURELY over the
+# selectionRules below (#3836) — no strategy names are hardcoded in the router.
+# Source: Issue #3833, #3835 (M2). Schema landed via #3834. Tiers declared #3841.
+
+version: 1
+
+manifests:
+  - id: single-shot
+    schemaVersion: 1
+    strategy: single-shot
+    entrypointTool: delegate_to_model
+    executorAvailable: false
+    description: Trivial single-step task delegated to one model.
+    whenToForce: Force when the goal is a one-shot ask that needs no pipeline, gate, or multi-step plan.
+    maturityTier: stable
+    latencyClass: single-llm
+    authorityTier: suggest
+    costProfile: low
+    selectionRules:
+      - priority: 40
+        patterns: [sequential]
+        complexities: [simple]
+
+  - id: dev-pipeline
+    schemaVersion: 1
+    strategy: dev-pipeline
+    entrypointTool: run_dev_pipeline
+    executorAvailable: true
+    description: Code change run through the dev gate (test / lint / typecheck).
+    whenToForce: Force when the goal is a code change that must pass the dev quality gate before it counts as done.
+    maturityTier: stable
+    latencyClass: pipeline
+    authorityTier: suggest
+    executeEnvelope:
+      filesystem: repo
+      spawn: dev-tooling
+      network: [llm-provider, web]
+      vcs: none
+    costProfile: medium
+    selectionRules:
+      - priority: 30
+        patterns: [sequential]
+
+  - id: pipeline
+    schemaVersion: 1
+    strategy: pipeline
+    entrypointTool: run_pipeline
+    executorAvailable: true
+    description: Multi-stage templated work (audit / general) via the pipeline engine.
+    whenToForce: Force when the work fits a templated multi-stage pipeline rather than a single model call.
+    maturityTier: stable
+    latencyClass: pipeline
+    authorityTier: suggest
+    executeEnvelope:
+      filesystem: repo
+      spawn: dev-tooling
+      network: [llm-provider, web]
+      vcs: none
+    costProfile: medium
+    selectionRules:
+      - priority: 80
+        pipelineTypes: [audit]
+        patterns: [sequential]
+
+  - id: graph-workflow
+    schemaVersion: 1
+    strategy: graph-workflow
+    entrypointTool: run_graph_workflow
+    executorAvailable: false
+    description: DAG / conditional-edge workflow execution.
+    whenToForce: Force when the work is an explicit dependency graph with conditional edges (a predefined workflow template).
+    maturityTier: beta
+    latencyClass: pipeline
+    authorityTier: suggest
+    costProfile: variable
+    selectionRules:
+      - priority: 50
+        patterns: [graph]
+
+  - id: orchestrate
+    schemaVersion: 1
+    strategy: orchestrate
+    entrypointTool: orchestrate
+    executorAvailable: false
+    description: Pattern-based multi-agent orchestration (wave / aflow / puppeteer).
+    whenToForce: Force when the work needs multi-agent orchestration patterns rather than a single linear pipeline.
+    maturityTier: beta
+    latencyClass: async-job-body
+    authorityTier: suggest
+    costProfile: high
+    selectionRules:
+      - priority: 50
+        patterns: [wave, aflow, puppeteer]
+
+  - id: consensus
+    schemaVersion: 1
+    strategy: consensus
+    entrypointTool: consensus_vote
+    executorAvailable: true
+    description: Multi-perspective decision routed to a consensus vote.
+    whenToForce: Force when a decision needs N independent voters rather than one model.
+    maturityTier: stable
+    latencyClass: multi-llm-panel
+    authorityTier: advisory
+    executeEnvelope:
+      filesystem: nexus-data-dir
+      spawn: agent-cli
+      network: [llm-provider]
+      vcs: none
+    costProfile: high
+    selectionRules:
+      - priority: 100
+        patterns: [consensus]
+
+  - id: spec
+    schemaVersion: 1
+    strategy: spec
+    entrypointTool: execute_spec
+    executorAvailable: false
+    description: Greenfield project built from a markdown spec document.
+    whenToForce: Force when building a greenfield project from a written spec, not a plain goal string.
+    maturityTier: beta
+    latencyClass: async-job-body
+    authorityTier: suggest
+    costProfile: high
+    selectionRules:
+      - priority: 90
+        pipelineTypes: [greenfield]
+
+  - id: research
+    schemaVersion: 1
+    strategy: research
+    entrypointTool: run_pipeline
+    executorAvailable: true
+    description: Research-heavy work routed through the research pipeline.
+    whenToForce: Force when the goal is research-led (gather, synthesize, compare) rather than a code change or decision.
+    maturityTier: stable
+    latencyClass: pipeline
+    authorityTier: suggest
+    executeEnvelope:
+      filesystem: repo
+      spawn: dev-tooling
+      network: [llm-provider, web]
+      vcs: none
+    costProfile: variable
+    selectionRules:
+      - priority: 90
+        pipelineTypes: [research]

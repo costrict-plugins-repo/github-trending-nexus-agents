@@ -1,0 +1,528 @@
+/**
+ * Tests for the governor-path ratification gate (#4635).
+ *
+ * @module scripts/check-governor-ratification.test
+ */
+
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+import { describe, expect, it, vi } from 'vitest';
+
+import {
+  governorPathsFromCodeowners,
+  GOVERNOR_SECTION_START_DIRECTIVE,
+  GOVERNOR_SECTION_END_DIRECTIVE,
+} from './governor-section.js';
+import {
+  evaluateRatification,
+  governorOwnersFromCodeowners,
+  RATIFICATION_LABEL,
+  formatVerdict,
+  runRatificationGate,
+} from './check-governor-ratification.js';
+
+const OWNERS = ['williamzujkowski'];
+const GOVERNOR_PATTERNS = governorPathsFromCodeowners(
+  [
+    GOVERNOR_SECTION_START_DIRECTIVE,
+    '/packages/nexus-agents/src/audit/ @owner',
+    '/packages/nexus-agents/src/security/audit-bridge.ts @owner',
+    '/CODEOWNERS @owner',
+    GOVERNOR_SECTION_END_DIRECTIVE,
+  ].join('\n')
+);
+
+describe('governorOwnersFromCodeowners', () => {
+  const CODEOWNERS = [
+    '# Security modules',
+    '/packages/nexus-agents/src/security/ @someone-else',
+    '',
+    GOVERNOR_SECTION_START_DIRECTIVE,
+    "# Governor's own core — never auto-merged",
+    '/packages/nexus-agents/src/audit/ @williamzujkowski',
+    '/packages/nexus-agents/src/security/audit-bridge.ts @williamzujkowski',
+    '/CODEOWNERS @williamzujkowski @second-owner',
+    GOVERNOR_SECTION_END_DIRECTIVE,
+  ].join('\n');
+
+  it('reads ratifiers from the governor section only', () => {
+    const owners = governorOwnersFromCodeowners(CODEOWNERS);
+    expect(owners).toContain('williamzujkowski');
+    expect(owners).toContain('second-owner');
+    // Owners of non-governor paths cannot ratify a governor change.
+    expect(owners).not.toContain('someone-else');
+  });
+
+  it('deduplicates a ratifier listed on several paths', () => {
+    expect(
+      governorOwnersFromCodeowners(CODEOWNERS).filter((o) => o === 'williamzujkowski')
+    ).toHaveLength(1);
+  });
+});
+
+describe('evaluateRatification', () => {
+  it('reports not-applicable when no governor path is touched — not "ratified"', () => {
+    // The distinction is the whole point: "nothing to ratify" and "ratified"
+    // are different measurements, and collapsing them is how a gate starts
+    // reporting a pass it never made.
+    const verdict = evaluateRatification({
+      touchedGovernorFiles: [],
+      approvals: [],
+      labels: [],
+      owners: OWNERS,
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+    });
+    expect(verdict.kind).toBe('not-applicable');
+  });
+
+  it('is indeterminate, not not-applicable, when no governor pattern could be parsed (#5576)', () => {
+    // "nothing was touched" and "we could not tell what counts as touched" are
+    // different measurements. A missing CODEOWNERS start marker yields zero
+    // patterns, so every PR looked like the former.
+    const verdict = evaluateRatification({
+      touchedGovernorFiles: [],
+      approvals: [],
+      labels: [],
+      owners: OWNERS,
+      governorPatternCount: 0,
+    });
+    expect(verdict.kind).toBe('indeterminate');
+  });
+
+  it('ratifies on an approving review from a governor-path owner', () => {
+    const verdict = evaluateRatification({
+      touchedGovernorFiles: ['packages/nexus-agents/src/audit/pr-review-record.ts'],
+      approvals: ['williamzujkowski'],
+      labels: [],
+      owners: OWNERS,
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+    });
+    expect(verdict.kind).toBe('ratified');
+    if (verdict.kind === 'ratified') expect(verdict.via).toBe('owner-approval');
+  });
+
+  it.each([
+    ['Alice', 'bob'],
+    ['bob', 'Alice'],
+  ])('approval ordering only chooses the diagnostic owner (#5731): %s, %s', (first, second) => {
+    // jq unique uses codepoint order; sort -u used the runner's locale.
+    // Even with multiple owners this cannot change the ratification decision.
+    const verdict = evaluateRatification({
+      touchedGovernorFiles: ['CODEOWNERS'],
+      approvals: [first, second],
+      labels: [],
+      owners: ['alice', 'bob'],
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+    });
+    expect(verdict).toEqual({
+      kind: 'ratified',
+      via: 'owner-approval',
+      detail: `approved by @${first}`,
+    });
+  });
+
+  it('ratifies on the explicit ratification label, applied by an owner', () => {
+    // #4690 added `labelAppliedBy`. Before that this case passed with no
+    // applier at all, which is the gap that change closes — see the
+    // attribution suite below.
+    const verdict = evaluateRatification({
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+      touchedGovernorFiles: ['CLAUDE.md'],
+      approvals: [],
+      labels: ['owner-ratified'],
+      owners: OWNERS,
+      labelAppliedBy: 'williamzujkowski',
+      // Applied after the head it ratifies. Undated is now `indeterminate` —
+      // see the staleness suite below.
+      labelAppliedAt: '2026-09-06T12:00:00Z',
+      headObservedAt: '2026-09-06T11:00:00Z',
+    });
+    expect(verdict.kind).toBe('ratified');
+    if (verdict.kind === 'ratified') expect(verdict.via).toBe('ratification-label');
+  });
+
+  it('does NOT ratify on an approval from a non-owner', () => {
+    const verdict = evaluateRatification({
+      touchedGovernorFiles: ['packages/nexus-agents/src/audit/x.ts'],
+      approvals: ['a-bot', 'some-contributor'],
+      labels: [],
+      owners: OWNERS,
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+    });
+    expect(verdict.kind).toBe('unratified');
+  });
+
+  it('does NOT ratify on an unrelated label', () => {
+    const verdict = evaluateRatification({
+      touchedGovernorFiles: ['CODEOWNERS'],
+      approvals: [],
+      labels: ['bug', 'ready-to-merge'],
+      owners: OWNERS,
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+    });
+    expect(verdict.kind).toBe('unratified');
+  });
+
+  it('is indeterminate — never "unratified" — when no ratifier can be resolved', () => {
+    // An empty owner list means CODEOWNERS could not be read or parsed. That is
+    // an absence of measurement, and reporting it as a normal unratified verdict
+    // would blame the PR for a broken gate.
+    const verdict = evaluateRatification({
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+      touchedGovernorFiles: ['packages/nexus-agents/src/audit/x.ts'],
+      approvals: ['williamzujkowski'],
+      labels: [],
+      owners: [],
+    });
+    expect(verdict.kind).toBe('indeterminate');
+  });
+
+  it('carries the touched files on an unratified verdict so the message can name them', () => {
+    const verdict = evaluateRatification({
+      touchedGovernorFiles: ['CLAUDE.md', 'packages/nexus-agents/src/audit/x.ts'],
+      approvals: [],
+      labels: [],
+      owners: OWNERS,
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+    });
+    expect(verdict.kind).toBe('unratified');
+    if (verdict.kind === 'unratified') expect(verdict.touched).toHaveLength(2);
+  });
+});
+
+describe('governor section is bounded (#4683)', () => {
+  // The section ran from its heading to EOF, and `#` lines are skipped as
+  // comments, so a section heading below it could not end it either. Any
+  // CODEOWNERS entry appended after the governor section therefore became a
+  // governor path AND its owners became ratifiers. Latent only because the
+  // governor section happens to be last today.
+  const WITH_TRAILING_SECTION = [
+    GOVERNOR_SECTION_START_DIRECTIVE,
+    "# Governor's own core — the governance-of-the-governor paths.",
+    '/packages/nexus-agents/src/audit/ @owner',
+    '/packages/nexus-agents/src/security/audit-bridge.ts @owner',
+    '/CODEOWNERS @owner',
+    GOVERNOR_SECTION_END_DIRECTIVE,
+    '',
+    '# Docs — added later by someone with no governor authority',
+    '/docs/ @docs-maintainer',
+  ].join('\n');
+
+  it('does not let a later section grant ratification rights', () => {
+    const owners = governorOwnersFromCodeowners(WITH_TRAILING_SECTION);
+    expect(owners).toEqual(['owner']);
+    expect(owners).not.toContain('docs-maintainer');
+  });
+
+  it('does not absorb a later section into the governor paths', () => {
+    const paths = governorPathsFromCodeowners(WITH_TRAILING_SECTION);
+    expect(paths).toContain('/packages/nexus-agents/src/audit/');
+    expect(paths).toContain('/packages/nexus-agents/src/security/audit-bridge.ts');
+    expect(paths).not.toContain('/docs/');
+  });
+
+  it('refuses to name ratifiers when the end directive is missing — the parser throws (#6048)', () => {
+    const unterminated = [
+      GOVERNOR_SECTION_START_DIRECTIVE,
+      "# Governor's own core — the governance-of-the-governor paths.",
+      '/packages/nexus-agents/src/audit/ @owner',
+      '/packages/nexus-agents/src/security/audit-bridge.ts @owner',
+    ].join('\n');
+    // Before #6048 this returned [] and relied on `evaluateRatification` to
+    // turn the empty owner set into `indeterminate`. The parser now refuses
+    // outright with a named error; `runRatificationGate` renders it as the
+    // same `indeterminate` verdict via parseGovernorPatternsOrReport.
+    expect(() => governorOwnersFromCodeowners(unterminated)).toThrow(
+      "CODEOWNERS: governor section end directive '# @governor-section-end' not found — " +
+        'the governor path set cannot be derived'
+    );
+  });
+
+  it('refuses to name governor paths when the end directive is missing — same error', () => {
+    const unterminated = [
+      GOVERNOR_SECTION_START_DIRECTIVE,
+      "# Governor's own core — the governance-of-the-governor paths.",
+      '/packages/nexus-agents/src/audit/ @owner',
+      '/packages/nexus-agents/src/security/audit-bridge.ts @owner',
+    ].join('\n');
+    // #4683 ran an unterminated section to end-of-file (MORE paths). #6048
+    // trades that for a loud refusal on BOTH sides, so the two gates cannot
+    // disagree about a file neither can bound.
+    expect(() => governorPathsFromCodeowners(unterminated)).toThrow(/end directive .* not found/);
+  });
+
+  it('the real CODEOWNERS carries both directives', () => {
+    const real = readFileSync(resolve(import.meta.dirname, '../CODEOWNERS'), 'utf8');
+    expect(real).toContain(GOVERNOR_SECTION_START_DIRECTIVE);
+    expect(real).toContain(GOVERNOR_SECTION_END_DIRECTIVE);
+    expect(governorOwnersFromCodeowners(real).length).toBeGreaterThan(0);
+  });
+});
+
+describe('the ratification label must be attributed to an owner (#4690)', () => {
+  // The label branch checked only that the label was PRESENT — never who
+  // applied it — and recorded no attribution, while the sibling approval
+  // branch records `approved by @login`. Applying a label is a weaker
+  // permission than submitting an owner review, so the weaker route was also
+  // the one with no provenance.
+  //
+  // This was latent for a different reason: the `owner-ratified` label did not
+  // exist in the repository at all until 2026-08-24, so the route was dead and
+  // owner approval was the only working one. Creating the label to record a
+  // real ratification activated it. That is what surfaced this.
+
+  const base = {
+    touchedGovernorFiles: ['CODEOWNERS'],
+    approvals: [] as string[],
+    labels: [RATIFICATION_LABEL],
+    owners: OWNERS,
+    labelAppliedAt: '2026-09-06T12:00:00Z',
+    headObservedAt: '2026-09-06T11:00:00Z',
+  };
+
+  it('ratifies when a governor-path owner applied the label, and names them', () => {
+    const v = evaluateRatification({
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+      ...base,
+      labelAppliedBy: 'williamzujkowski',
+    });
+    expect(v.kind).toBe('ratified');
+    if (v.kind === 'ratified') {
+      expect(v.via).toBe('ratification-label');
+      // The record must name a person, not just report a label.
+      expect(v.detail).toContain('williamzujkowski');
+    }
+  });
+
+  it('does NOT ratify when a non-owner applied the label', () => {
+    const v = evaluateRatification({
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+      ...base,
+      labelAppliedBy: 'drive-by-contributor',
+    });
+    expect(v.kind).toBe('unratified');
+  });
+
+  it('is INDETERMINATE when the label cannot be attributed — never ratified', () => {
+    // Timeline unavailable, or a label present with no corresponding event.
+    // An unattributable ratification recorded as `ratified` launders an
+    // unreviewed governance change as reviewed.
+    const v = evaluateRatification({
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+      ...base,
+      labelAppliedBy: undefined,
+    });
+    expect(v.kind).toBe('indeterminate');
+    if (v.kind === 'indeterminate') {
+      expect(v.reason).toMatch(/who applied/i);
+    }
+  });
+
+  it('owner approval still wins without any label attribution', () => {
+    const v = evaluateRatification({
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+      ...base,
+      labels: [],
+      approvals: ['williamzujkowski'],
+      labelAppliedBy: undefined,
+    });
+    expect(v.kind).toBe('ratified');
+    if (v.kind === 'ratified') expect(v.via).toBe('owner-approval');
+  });
+
+  it('the applier check is case-insensitive, like the approver check', () => {
+    const v = evaluateRatification({
+      governorPatternCount: GOVERNOR_PATTERNS.length,
+      ...base,
+      labelAppliedBy: 'WilliamZujkowski',
+    });
+    expect(v.kind).toBe('ratified');
+  });
+});
+
+describe('runRatificationGate with no inputs (#5444)', () => {
+  const capture = (): { lines: string[]; restore: () => void } => {
+    const lines: string[] = [];
+    const push = (...a: unknown[]): void => void lines.push(a.map(String).join(' '));
+    const log = vi.spyOn(console, 'log').mockImplementation(push);
+    const err = vi.spyOn(console, 'error').mockImplementation(push);
+    return {
+      lines,
+      restore: (): void => {
+        log.mockRestore();
+        err.mockRestore();
+      },
+    };
+  };
+
+  it('does not claim "not required" when CHANGED_FILES was never supplied', () => {
+    // The local invocation. Absent input is not an empty diff; it is an
+    // unmeasured state, and the sentence must not read as a verdict. A
+    // developer running this before pushing governor files was told, twice in
+    // one day, that no ratification was needed.
+    const c = capture();
+    try {
+      const code = runRatificationGate({}, resolve(import.meta.dirname, '..'));
+      const out = c.lines.join('\n');
+      expect(code).toBe(0);
+      expect(out).not.toContain('not required');
+      expect(out).toContain('nothing was measured');
+    } finally {
+      c.restore();
+    }
+  });
+
+  it('still reports not-applicable when CHANGED_FILES is present but empty', () => {
+    // CI semantics unchanged: a PR that touched nothing governor-owned is
+    // genuinely not applicable, and the workflow always sets the variable.
+    const c = capture();
+    try {
+      const code = runRatificationGate({ CHANGED_FILES: '' }, resolve(import.meta.dirname, '..'));
+      expect(code).toBe(0);
+      expect(c.lines.join('\n')).toContain('not required');
+    } finally {
+      c.restore();
+    }
+  });
+});
+
+// ============================================================================
+// The ratification label must not outlive the diff it ratified
+// ============================================================================
+
+describe('a ratification label predating the head is not a ratification', () => {
+  // The asymmetry this closes. `dismiss_stale_reviews` is enabled on `main`, so
+  // GitHub flips a stale APPROVED review to DISMISSED and the workflow's
+  // `state == "APPROVED"` filter stops matching it. Nothing retires a LABEL, so
+  // the two routes were unequal in the direction that matters: an
+  // `owner-ratified` label applied while the PR touched only docs stayed valid
+  // after a later commit added `packages/nexus-agents/src/audit/`, and the
+  // post-merge backstop reproduced the same verdict — nothing went red.
+  const base = {
+    governorPatternCount: GOVERNOR_PATTERNS.length,
+    touchedGovernorFiles: ['packages/nexus-agents/src/audit/audit-logger.ts'],
+    approvals: [] as string[],
+    labels: [RATIFICATION_LABEL],
+    owners: OWNERS,
+    labelAppliedBy: 'williamzujkowski',
+  };
+
+  it('refuses a label applied before the current head', () => {
+    const v = evaluateRatification({
+      ...base,
+      labelAppliedAt: '2026-09-06T10:00:00Z',
+      headObservedAt: '2026-09-06T11:00:00Z',
+    });
+
+    expect(v.kind).toBe('unratified');
+    if (v.kind === 'unratified') {
+      // The refusal must say WHY, or the owner cannot tell it from a PR that
+      // was never ratified at all.
+      expect(v.staleLabel?.labelAppliedAt).toBe('2026-09-06T10:00:00Z');
+      expect(v.staleLabel?.headObservedAt).toBe('2026-09-06T11:00:00Z');
+      expect(v.touched).toContain('packages/nexus-agents/src/audit/audit-logger.ts');
+    }
+  });
+
+  it('accepts a label applied after the current head', () => {
+    // The pair that keeps the refusal from applying to everything — without it
+    // the gate would reject every label-ratified PR, which is the benign
+    // population this route exists to serve.
+    const v = evaluateRatification({
+      ...base,
+      labelAppliedAt: '2026-09-06T11:00:01Z',
+      headObservedAt: '2026-09-06T11:00:00Z',
+    });
+
+    expect(v.kind).toBe('ratified');
+    if (v.kind === 'ratified') expect(v.via).toBe('ratification-label');
+  });
+
+  it('accepts a label applied at exactly the head commit time', () => {
+    // Equality is not staleness. A strict `<=` here would fail a ratification
+    // applied in the same second as the push.
+    const v = evaluateRatification({
+      ...base,
+      labelAppliedAt: '2026-09-06T11:00:00Z',
+      headObservedAt: '2026-09-06T11:00:00Z',
+    });
+
+    expect(v.kind).toBe('ratified');
+  });
+
+  it('is INDETERMINATE when the label has no timestamp', () => {
+    // Absence of measurement, not absence of staleness. A ratification whose
+    // age cannot be established is exactly what a later spot-check trusts.
+    const v = evaluateRatification({ ...base, headObservedAt: '2026-09-06T11:00:00Z' });
+
+    expect(v.kind).toBe('indeterminate');
+    if (v.kind === 'indeterminate') expect(v.reason).toContain('predates');
+  });
+
+  it('does not trust a commit date: the head time is server-observed', () => {
+    // The dissent that this design absorbed. Commit author/committer dates live
+    // in the commit object and are client-set, so `GIT_COMMITTER_DATE` backdates
+    // them freely — an attacker with a ratified PR could push a commit stamped
+    // BEFORE the label and have the check read it as current. The field is the
+    // earliest workflow-run `created_at` for the sha, which GitHub assigns.
+    // This test pins the field's meaning; the producer is the workflow.
+    const v = evaluateRatification({
+      ...base,
+      labelAppliedAt: '2026-09-06T12:00:00Z',
+      // A forged commit date would say 2026-09-05; the server saw the push at
+      // 13:00, after the label, so the label is stale regardless.
+      headObservedAt: '2026-09-06T13:00:00Z',
+    });
+
+    expect(v.kind).toBe('unratified');
+  });
+
+  it('is INDETERMINATE when the head has no timestamp', () => {
+    const v = evaluateRatification({ ...base, labelAppliedAt: '2026-09-06T12:00:00Z' });
+
+    expect(v.kind).toBe('indeterminate');
+  });
+
+  it('is INDETERMINATE when either timestamp is unparseable', () => {
+    // A garbage value must not silently compare as NaN and fall through to
+    // ratified — `NaN < x` is false, which would have read as "not stale".
+    const v = evaluateRatification({
+      ...base,
+      labelAppliedAt: 'not-a-date',
+      headObservedAt: '2026-09-06T11:00:00Z',
+    });
+
+    expect(v.kind).toBe('indeterminate');
+  });
+
+  it('does not apply the staleness rule to the approval route', () => {
+    // Approvals are retired by GitHub itself; re-checking them here would be a
+    // second, weaker implementation of a control that already works.
+    const v = evaluateRatification({
+      ...base,
+      labels: [],
+      approvals: ['williamzujkowski'],
+      labelAppliedAt: '2026-09-06T10:00:00Z',
+      headObservedAt: '2026-09-06T11:00:00Z',
+    });
+
+    expect(v.kind).toBe('ratified');
+    if (v.kind === 'ratified') expect(v.via).toBe('owner-approval');
+  });
+
+  it('renders the stale refusal with both timestamps and the remedy', () => {
+    const message = formatVerdict({
+      kind: 'unratified',
+      touched: ['CODEOWNERS'],
+      staleLabel: {
+        labelAppliedAt: '2026-09-06T10:00:00Z',
+        headObservedAt: '2026-09-06T11:00:00Z',
+      },
+    });
+
+    expect(message).toContain('2026-09-06T10:00:00Z');
+    expect(message).toContain('2026-09-06T11:00:00Z');
+    expect(message).toContain('re-apply');
+  });
+});

@@ -1,0 +1,33 @@
+---
+// No-flash theme restore for the docs pages (#7199). Rendered in <head>, so
+// it runs before first paint. Adapted from oklch-terminal-themes'
+// site/src/components/ThemeToggle.astro (MIT, William Zujkowski).
+//
+// With no stored choice it sets nothing: remarque's palette is authored with
+// light-dark() under `color-scheme: light dark`, so the page already follows
+// prefers-color-scheme. A stored 'light' or 'dark' sets [data-theme], which
+// remarque keys on. Storage can throw (private mode, blocked site data); the
+// page then simply follows the OS.
+//
+// It also marks the page as having JS ([data-menu-drawer], #7308) for the
+// narrow header layout in docs.css, which shows the Menu button and moves the
+// navs into the MenuDrawer island; set here, before the header is parsed, so
+// that layout never flashes the no-JS fallback.
+//
+// Inline because it must run before first paint, before any island hydrates.
+// Interactive widgets are Svelte islands, not inline scripts (#7313,
+// website/README.md).
+import { THEME_STORAGE_KEY as STORAGE_KEY } from '../lib/theme.ts';
+---
+
+<script is:inline define:vars={{ STORAGE_KEY }}>
+  document.documentElement.setAttribute('data-menu-drawer', '');
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored === 'light' || stored === 'dark') {
+      document.documentElement.dataset.theme = stored;
+    }
+  } catch {
+    // Storage unavailable: follow prefers-color-scheme.
+  }
+</script>

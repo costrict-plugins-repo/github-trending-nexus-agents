@@ -1,0 +1,259 @@
+/**
+ * nexus-agents CLI Server Audit & Security Config Integration
+ *
+ * Initializes structured audit logging and security configuration helpers.
+ *
+ * @module cli-server-audit
+ * (Source: Issue #740 Phase 2 - audit logging and security config)
+ */
+
+import { resolveAuthEnabled, resolveAuthMethod } from './cli-server-auth.js';
+import type { ILogger } from './core/index.js';
+import { createAuditLogger, type AuditLogger } from './audit/index.js';
+import type { SecurityConfig, AppConfig } from './config/index.js';
+import { DEFAULT_EXECUTION_MODE } from './config/schemas-security.js';
+import { nexusDataPath } from './config/nexus-data-dir.js';
+import { createDefaultPolicyFirewall } from './mcp/middleware/index.js';
+import { VERSION } from './version.js';
+import {
+  resolvePolicyRolloutMode,
+  formatPolicyRolloutMode,
+} from './mcp/middleware/policy-registry.js';
+
+/**
+ * Default file prefix for audit log files (#5120).
+ *
+ * Exported so producers and consumers (`verify-audit-chain-tool`) share a single
+ * source of truth for the filename convention (`${DEFAULT_AUDIT_FILE_PREFIX}-*.jsonl`).
+ */
+export const DEFAULT_AUDIT_FILE_PREFIX = 'audit';
+
+/**
+ * Initializes the audit logger from security configuration.
+ * Returns null if audit logging is not enabled.
+ *
+ * (Source: Issue #740 Phase 2 - wire audit to pipeline)
+ */
+export function initializeAuditLogger(
+  securityConfig: SecurityConfig | undefined,
+  logger: ILogger
+): AuditLogger | null {
+  if (securityConfig?.audit?.enabled !== true) {
+    logger.debug('Audit logging disabled (set security.audit.enabled: true to enable)');
+    return null;
+  }
+
+  const auditConfig = securityConfig.audit;
+  const logDir = auditConfig.logDir ?? nexusDataPath('audit');
+  const auditLogger = createAuditLogger(
+    {
+      logDir,
+      minSeverity: auditConfig.minSeverity,
+      enableHashChain: auditConfig.enableHashChain,
+      maxFileSizeBytes: auditConfig.maxFileSizeBytes,
+      maxFiles: auditConfig.maxFiles,
+      filePrefix: DEFAULT_AUDIT_FILE_PREFIX,
+      enableCompression: false,
+      flushIntervalMs: 1000,
+      maxQueueDepth: 10_000,
+    },
+    undefined,
+    logger
+  );
+
+  // Startup has BEGUN here — authentication, tool registration and transport
+  // connect have not run yet. `startServer` writes the completion record
+  // once the server reaches "waiting for requests" (#5577).
+  auditLogger.logSystemStartupBegin({ auditLogDir: logDir, packageVersion: VERSION });
+  logger.info('Audit logging enabled', { logDir });
+  return auditLogger;
+}
+
+/**
+ * Gracefully shuts down the audit logger, flushing pending events.
+ */
+export async function shutdownAuditLogger(
+  auditLogger: AuditLogger | null,
+  logger: ILogger,
+  metadata?: Record<string, unknown>
+): Promise<void> {
+  if (auditLogger === null) return;
+
+  try {
+    // Begin only: this logger is closed on the next line, and nothing can be
+    // recorded after that, so a completion record is not writable (#5577).
+    auditLogger.logSystemShutdownBegin(metadata);
+    await auditLogger.close();
+    logger.info('Audit logger shutdown complete');
+  } catch (error) {
+    logger.error(
+      'Error shutting down audit logger',
+      error instanceof Error ? error : new Error(String(error))
+    );
+  }
+}
+
+/**
+ * Writes the startup COMPLETION record (#5577).
+ *
+ * Every startup record carries `packageVersion` (#6509): the global install is
+ * replaced in place while a running server keeps old code, so a window of
+ * audit records is only attributable to a build through its startup record.
+ *
+ * Call only once the server has actually reached "waiting for requests".
+ * `initializeAuditLogger` writes the matching `system.startup.begin`.
+ */
+export function recordStartupComplete(auditLogger: AuditLogger | null, mode: string): void {
+  auditLogger?.logSystemStartup({ mode, packageVersion: VERSION });
+}
+
+/**
+ * Runs a startup step and records a FAILED startup if it throws, then
+ * rethrows (#5577).
+ *
+ * Without this the begin record has no answer: the process dies and the log
+ * shows a startup that neither succeeded nor failed.
+ */
+export async function recordStartupFailure<T>(
+  auditLogger: AuditLogger | null,
+  step: string,
+  run: () => Promise<T>
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    auditLogger?.logSystemStartup(
+      {
+        failedAt: step,
+        error: error instanceof Error ? error.message : String(error),
+        packageVersion: VERSION,
+      },
+      'failure'
+    );
+    throw error;
+  }
+}
+
+/**
+ * Gets policy values from config. The fallback for a missing config is the
+ * schema's own default, not a second literal (#6431): the two used to disagree
+ * (`'read-only'` here, and the schema's default on a parsed config).
+ */
+export function getPolicyValues(config?: AppConfig): {
+  mode: 'enforce' | 'warn';
+  defaultExec: 'read-only' | 'read-write';
+} {
+  const policy = config?.security?.policy;
+  return {
+    mode: policy?.policyMode ?? 'enforce',
+    defaultExec: policy?.defaultMode ?? DEFAULT_EXECUTION_MODE,
+  };
+}
+
+/** Gets rate limit values from config. */
+function getRateLimitValues(config?: AppConfig): { enabled: boolean; rpm: number } {
+  const rl = config?.security?.rateLimit;
+  return { enabled: rl?.enabled ?? true, rpm: rl?.requestsPerMinute ?? 60 };
+}
+
+/**
+ * Creates and configures policy firewall from config.
+ * (Source: Issue #477 - Wire policy firewall to config)
+ */
+function createConfiguredPolicyFirewall(
+  logger: ILogger,
+  config?: AppConfig
+): ReturnType<typeof createDefaultPolicyFirewall> {
+  const policyVals = getPolicyValues(config);
+  const blockedPatterns = config?.security?.blockedPatterns;
+  return createDefaultPolicyFirewall({
+    mode: policyVals.mode,
+    logger,
+    ...(blockedPatterns !== undefined && blockedPatterns.length > 0 && { blockedPatterns }),
+  });
+}
+
+/**
+ * Resolves auth state the same way `initializeAuth` will (#739, #5663). This
+ * used to default to `enabled: false` / `'none'` while the enforcement side
+ * defaulted to `true` / `'token'`, so the startup line reported the default
+ * server as unprotected and warned about it, five lines before a token was
+ * loaded and enforced.
+ */
+function getAuthValues(config?: AppConfig): { enabled: boolean; method: string } {
+  return { enabled: resolveAuthEnabled(config), method: resolveAuthMethod(config) };
+}
+
+/**
+ * Warns when no tamper-evident event chain is being written (#4990).
+ *
+ * The same treatment authentication already gets. A boolean on the info line is
+ * easy to scroll past; a security control that is absent deserves to be as
+ * visible as auth being absent.
+ */
+function warnIfAuditDisabled(auditEnabled: boolean, logger: ILogger): void {
+  if (auditEnabled) return;
+  logger.warn(
+    'Audit logging is disabled — no tamper-evident event chain is being written. ' +
+      'Set security.audit.enabled: true to enable it.'
+  );
+}
+
+/** Assembles the metadata payload logged for startup security configuration. */
+function buildSecurityLogContext(
+  config: AppConfig | undefined,
+  policyFirewall: ReturnType<typeof createDefaultPolicyFirewall>,
+  policyVals: ReturnType<typeof getPolicyValues>,
+  authVals: { enabled: boolean; method: string },
+  rateLimitVals: { enabled: boolean; rpm: number }
+): Record<string, unknown> {
+  const security = config?.security;
+  return {
+    policyMode: formatPolicyRolloutMode(resolvePolicyRolloutMode()),
+    defaultExecutionMode: policyVals.defaultExec,
+    policyRuleCount: policyFirewall.getRules().length,
+    authEnabled: authVals.enabled,
+    authMethod: authVals.method,
+    rateLimitEnabled: rateLimitVals.enabled,
+    rateLimitRequestsPerMinute: rateLimitVals.rpm,
+    auditEnabled: security?.audit?.enabled === true,
+    allowedPaths: security?.allowedPaths ?? ['./'],
+    blockedPatterns: security?.blockedPatterns ?? [],
+  };
+}
+
+/**
+ * Logs security configuration at startup.
+ * Returns the configured policy firewall for use in tool registration.
+ * (Source: Issue #185 Phase 1 - Startup security logging)
+ * (Source: Issue #477 - Wire policy firewall to config)
+ */
+export function logSecurityConfig(
+  logger: ILogger,
+  config?: AppConfig
+): ReturnType<typeof createDefaultPolicyFirewall> {
+  const policyFirewall = createConfiguredPolicyFirewall(logger, config);
+  const authVals = getAuthValues(config);
+  const policyVals = getPolicyValues(config);
+  const rateLimitVals = getRateLimitValues(config);
+  const auditEnabled = config?.security?.audit?.enabled === true;
+
+  logger.info(
+    'Security configuration',
+    buildSecurityLogContext(config, policyFirewall, policyVals, authVals, rateLimitVals)
+  );
+
+  warnIfAuditDisabled(auditEnabled, logger);
+
+  if (!authVals.enabled) {
+    logger.warn(
+      'Authentication explicitly disabled — network-exposed endpoints are unprotected. Remove NEXUS_AUTH_ENABLED=false to re-enable.'
+    );
+  }
+
+  logger.debug('Policy firewall rules', {
+    rules: policyFirewall.getRules().map((r) => ({ name: r.name, description: r.description })),
+  });
+
+  return policyFirewall;
+}

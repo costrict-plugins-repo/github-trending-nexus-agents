@@ -1,0 +1,119 @@
+/**
+ * nexus-agents sprint command types
+ *
+ * Type definitions for the sprint planning CLI command.
+ *
+ * (Source: Issue #230, Epic #225)
+ * (Source: Issue #584 - CommandResult consolidation)
+ */
+
+import type { CommandResult } from '../core/index.js';
+
+/**
+ * Priority levels for sprint items.
+ */
+export type Priority = 'P1' | 'P2' | 'P3' | 'P4';
+
+/**
+ * GitHub issue summary for sprint planning.
+ */
+export interface SprintIssue {
+  readonly number: number;
+  readonly title: string;
+  readonly labels: readonly string[];
+  readonly priority: Priority | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  /** Issue type derived from title prefix */
+  readonly type: 'feat' | 'bug' | 'task' | 'refactor' | 'docs' | 'other';
+  /** Estimated effort if found in body */
+  readonly estimatedEffort?: string;
+}
+
+/**
+ * Sprint proposal generated from open issues.
+ */
+export interface SprintProposal {
+  /** Sprint title */
+  readonly title: string;
+  /** Sprint goals summary */
+  readonly goals: readonly string[];
+  /** Issues grouped by priority */
+  readonly p1Issues: readonly SprintIssue[];
+  readonly p2Issues: readonly SprintIssue[];
+  readonly p3Issues: readonly SprintIssue[];
+  readonly p4Issues: readonly SprintIssue[];
+  /** Total estimated effort */
+  readonly totalEffort?: string;
+  /** Generated proposal body for GitHub issue */
+  readonly body: string;
+}
+
+/**
+ * Why `gh issue create` produced no issue number.
+ *
+ * - `gh_failed` — `safeExecSandboxed` returned null: `gh` is absent,
+ *   unauthenticated, rate-limited, or the sandbox denied the command.
+ * - `no_issue_number` — `gh` ran but printed no `/issues/<n>` URL.
+ *
+ * Kept distinct because they send an operator to different checks (#5848).
+ */
+export type SprintIssueFailureReason = 'gh_failed' | 'no_issue_number';
+
+/** Outcome of filing the sprint epic. */
+export type SprintIssueCreation =
+  | { readonly ok: true; readonly issueNumber: number }
+  | { readonly ok: false; readonly reason: SprintIssueFailureReason };
+
+/**
+ * Sprint planning result.
+ * Extends CommandResult with sprint-specific fields.
+ */
+export interface SprintPlanResult extends CommandResult {
+  /** Generated proposal */
+  readonly proposal?: SprintProposal;
+  /**
+   * Vote result if a vote was requested.
+   *
+   * `no_quorum` (#4135, wired here in #5344) is DISTINCT from `rejected`: the
+   * panel could not reach a valid quorum, which says nothing about the sprint
+   * plan. Collapsing it into `rejected` recorded a verdict on the plan when the
+   * panel had not delivered one.
+   */
+  readonly voteOutcome?: 'approved' | 'rejected' | 'no_quorum' | 'pending' | 'skipped';
+  /** Created issue number if issue was created */
+  readonly createdIssueNumber?: number;
+}
+
+/**
+ * Options for the sprint command.
+ */
+export interface SprintCommandOptions {
+  /** Subcommand: 'plan' or 'list' */
+  readonly subcommand: 'plan' | 'list';
+  /** Run consensus vote on the proposal */
+  readonly vote?: boolean;
+  /** Create GitHub issue if approved */
+  readonly createIssue?: boolean;
+  /** Output format */
+  readonly format?: 'text' | 'json';
+  /** Dry run mode */
+  readonly dryRun?: boolean;
+  /** Maximum issues to include per priority */
+  readonly maxPerPriority?: number;
+  /** Sprint duration hint (e.g., "1 week", "2 weeks") */
+  readonly duration?: string;
+}
+
+/**
+ * Raw GitHub issue from API.
+ */
+export interface GitHubIssueRaw {
+  readonly number: number;
+  readonly title: string;
+  readonly body: string;
+  readonly state: string;
+  readonly labels: Array<{ name: string }>;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}

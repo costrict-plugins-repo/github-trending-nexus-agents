@@ -1,0 +1,693 @@
+/**
+ * Centralized Zod schema for NEXUS_* environment variables (Issue #1016)
+ *
+ * Validates all known NEXUS_* env vars at startup (warn-only, never blocks).
+ * Detects typos via Levenshtein distance and suggests corrections.
+ *
+ * Does NOT replace per-module parsing (parseIntEnv, resolveV2Config, etc.).
+ * This is an additional safety net run once at startup.
+ *
+ * @module config/env-schema
+ */
+
+import { z } from 'zod';
+import type { ILogger } from '../core/index.js';
+import { levenshtein } from '../string-distance.js';
+import { VOTER_ROLES } from '../cli/vote-types.js';
+import { gatewayEndpointRejection, parseGatewayCostEnv } from '../adapters/sdk/gateway-cost.js';
+import { parseGatewayExtraHeaders } from '../adapters/gateway-http.js';
+import {
+  describeClassGuard,
+  MCP_TIMEOUTS,
+  OPERATION_CLASSES,
+  TIMEOUT_MULTIPLIER_ENV_VAR,
+  type ClassGuardResolution,
+  type OperationClassName,
+} from './timeouts.js';
+
+// ============================================================================
+// Helper Zod types for string-encoded values
+// ============================================================================
+
+/** String that parses to a positive integer. */
+const positiveIntStr = z.string().regex(/^\d+$/, 'Must be a positive integer string');
+
+/** String "true" or "false". */
+const boolStr = z.enum(['true', 'false']);
+
+/** String that parses to a non-negative float. */
+const floatStr = z.string().regex(/^\d+(\.\d+)?$/, 'Must be a non-negative number string');
+
+/**
+ * The exact accept-set of `parseBoolEnv` (config/defaults-env.ts): `true`, `1`,
+ * `false`, `0`, case-insensitively. Deliberately narrower than a general
+ * boolean: `yes`/`no`/`on`/`off` are silently discarded by that helper, so
+ * accepting them here would report a working setting for one that does nothing.
+ */
+const boolLooseStr = z
+  .string()
+  .refine((v) => ['true', '1', 'false', '0'].includes(v.toLowerCase()), {
+    message: 'Must be one of: true, false, 1, 0',
+  });
+
+/**
+ * Console renderer setting (core/step-notifications.ts): `0|false|off` disables,
+ * `1|true|on` enables, case-insensitively.
+ */
+const consoleRendererStr = z
+  .string()
+  .refine((v) => ['true', '1', 'false', '0', 'on', 'off'].includes(v.toLowerCase()), {
+    message: 'Must be one of: true, false, 1, 0, on, off',
+  });
+
+// ============================================================================
+// Known NEXUS_* environment variables schema
+// ============================================================================
+
+/**
+ * Schema for all known NEXUS_* environment variables.
+ * Each field is optional (env vars may not be set).
+ * Values are validated as strings matching expected patterns.
+ */
+const NexusEnvSchema = z.object({
+  // --- Timeouts ---
+  // NEXUS_TIMEOUT_CLISIMPLE + NEXUS_TIMEOUT_CLICOMPLEX removed in #4180 — silent
+  // no-ops (#2977 class). Their only possible reader, getTimeout('cliSimpleMs' /
+  // 'cliComplexMs'), had zero production call sites; per-complexity CLI timeouts
+  // flow through getTimeoutForCli/TIMEOUT_PROFILES instead.
+  // NEXUS_TIMEOUT_CLI / _API / _WORKFLOW / _MCP removed in #4939 — the rest of
+  // that getter's family. getTimeout() itself had zero production callers, and
+  // config-manager echoed the four back as `Source: (env)` for values nothing
+  // consumed. The real knobs are NEXUS_TIMEOUT_CLASS_*_MS and the *_TIMEOUT_MS
+  // names below.
+  NEXUS_VOTE_TIMEOUT_MS: positiveIntStr.optional(),
+  NEXUS_MCP_TIMEOUT_MS: positiveIntStr.optional(),
+  NEXUS_WORKFLOW_TIMEOUT_MS: positiveIntStr.optional(),
+  NEXUS_GRAPH_TIMEOUT_MS: positiveIntStr.optional(),
+  // NEXUS_TEST_TIMEOUT_MS removed in #4180 — silent no-op (#2977 class). No
+  // production reader ever constructed this name; TEST_TIMEOUTS takes no env
+  // override. Re-register only alongside a real consumer.
+  NEXUS_EXPERT_TIMEOUT_MS: positiveIntStr.optional(),
+  NEXUS_WORKER_TIMEOUT_MS: positiveIntStr.optional(),
+
+  // --- Central timeout authority (#3734) ---
+  // Global scale applied to every operation-class runaway-guard (clamped 0.25–10).
+  NEXUS_TIMEOUT_MULTIPLIER: floatStr.optional(),
+  // Per-operation-class guard overrides (ms). One per OperationClassName; env-schema
+  // can't match dynamic names, so the six are registered explicitly.
+  NEXUS_TIMEOUT_CLASS_INTERACTIVE_MS: positiveIntStr.optional(),
+  NEXUS_TIMEOUT_CLASS_SINGLE_LLM_MS: positiveIntStr.optional(),
+  NEXUS_TIMEOUT_CLASS_MULTI_LLM_PANEL_MS: positiveIntStr.optional(),
+  NEXUS_TIMEOUT_CLASS_PIPELINE_MS: positiveIntStr.optional(),
+  NEXUS_TIMEOUT_CLASS_NETWORK_FETCH_MS: positiveIntStr.optional(),
+  NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS: positiveIntStr.optional(),
+
+  // --- Retry ---
+
+  // --- Rate Limit ---
+  // Read via parseBoolEnv (config/defaults-env.ts), so `1`/`0` work at runtime;
+  // the strict `boolStr` shape reported them invalid. Caught by the #5155 ratchet.
+
+  // --- Workers & Concurrency ---
+  NEXUS_MAX_CONCURRENT_EXPERTS: positiveIntStr.optional(),
+  // NEXUS_WORKERS_* + NEXUS_WORKFLOW_MAX_PARALLEL + NEXUS_TEST_PARALLELISM +
+  // NEXUS_EVALUATION_MAX_WORKERS + NEXUS_SWARM_OBSERVER_MAX_EVENTS removed in
+  // #2977 — these had zero production consumers (silent no-ops).
+
+  // --- Circuit Breaker ---
+
+  // --- V2 Pipeline ---
+  // @deprecated Legacy umbrella mode for V2 pipeline (#925 Phase F). V2 is standard ('full'); slated for removal.
+  NEXUS_V2_MODE: z.enum(['off', 'partial', 'full']).optional(),
+
+  // @deprecated Legacy override for V2 delegate_to_model pipeline (#925 Phase F). V2 is standard. Slated for removal.
+  NEXUS_V2_DELEGATE: boolStr.optional(),
+
+  // @deprecated Legacy override for V2 orchestrate pipeline (#925 Phase F). V2 is standard. Slated for removal.
+  NEXUS_V2_ORCHESTRATE: boolStr.optional(),
+
+  // Policy enforcement mode ('off' | 'warn' | 'block') for V2 orchestrate execute check (#925).
+  NEXUS_V2_POLICY_MODE: z.enum(['off', 'warn', 'block']).optional(),
+
+  NEXUS_AORCHESTRA: boolStr.optional(),
+  NEXUS_AORCHESTRA_DISPATCH: boolStr.optional(),
+  NEXUS_WORKER_MAX_CALLS: positiveIntStr.optional(),
+
+  // --- Server ---
+  NEXUS_AUTH_ENABLED: boolStr.optional(),
+
+  // --- Logging ---
+  NEXUS_LOG_LEVEL: z
+    .enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'])
+    .optional(),
+
+  // --- Features ---
+  NEXUS_PERSIST_LEARNING: boolLooseStr.optional(),
+  // #6512: off switch for strategy distillation only (read by isStrategyDistillationEnabled).
+  NEXUS_STRATEGY_DISTILLATION: boolLooseStr.optional(),
+  NEXUS_REFLECTIVE_MEMORY: z.enum(['true', 'false', 'shadow']).optional(),
+  NEXUS_EVENTBUS_ENABLED: boolStr.optional(),
+  // NEXUS_EVENTBUS_MAX_HISTORY removed in #2977 — silent no-op (no production reader).
+  NEXUS_BILLING_MODE: z.enum(['plan', 'api']).optional(),
+  NEXUS_CONFIG_PATH: z.string().optional(),
+  // Explicit runtime data root; overrides the per-repo/cross-repo split. In
+  // CLAUDE.md's most-used table since it shipped, and absent from this schema
+  // until #4722 — so setting the documented variable made `validateNexusEnv`
+  // report it as an UNKNOWN NEXUS_* var, typo suggestion and all.
+  NEXUS_DATA_DIR: z.string().optional(),
+  // Explicit workspace project directory override (#5166; replaces deprecated MCP roots).
+  NEXUS_PROJECT_DIR: z.string().optional(),
+  // `0` opts out of the per-repo data dir (epic #2872; default ON).
+  NEXUS_REPO_PREFERRED: boolLooseStr.optional(),
+  // Scratch root for short-lived working files (#4412, getNexusTmpDir). Unset
+  // resolves to `<dataDir>/tmp`; set it to relocate scratch off the repo.
+  NEXUS_TMPDIR: z.string().optional(),
+  // Sandbox FLAVOR string (`docker-opencode`, `codex`, …), set by the host
+  // image so sandbox-detection knows it is inside one (epic #2500, #5026). It
+  // was registered as a boolean while every producer and reader used a flavor
+  // string, so the documented value warned as invalid at startup (#5695).
+  // Empty is the POSIX idiom for "override the image's export and turn it off";
+  // sandbox-detection reads empty as unset, so the validator accepts it too.
+  NEXUS_SANDBOX: z.string().optional(),
+  NEXUS_SANDBOX_ROOT: z.string().optional(),
+  NEXUS_ALLOW_MOCK_ORCHESTRATION: boolStr.optional(),
+  // Explicit opt-in for simulateVotes outside test runners (#4170) — read by
+  // checkSimulationAllowed (mcp/tools/simulation-guard.ts). Unset = fail closed.
+  NEXUS_ALLOW_SIMULATE: z.enum(['0', '1']).optional(),
+
+  // --- Autonomous remediation & policy (#3540 / #3653) ---
+  // Drives the auto-remediation cycle (resolveAutoRemediateMode); default audit
+  // (zero-write soak, #3769) when unset, explicit `off` disables.
+  NEXUS_AUTO_REMEDIATE: z.enum(['off', 'audit', 'enforce']).optional(),
+  // Run-layer consensus verdict enforcement (#4464); default audit.
+  NEXUS_CONSENSUS_ENFORCE: z.enum(['off', 'audit', 'enforce']).optional(),
+  // Stage-boundary policy gate enforcement mode (getGateEnforcementMode); warn by
+  // default. Read by dev-pipeline's consensus→execute gate, and by any compiled
+  // gate node whose caller supplies a `policyEnforcement` bundle without a mode
+  // (no in-tree caller supplies a bundle today). The V2 delegate graph declares
+  // no gate (#4657); v2-orchestrate's execute check reads the V2 policy-mode variable instead (its own entry below; see CONFIGURATION.md).
+  NEXUS_POLICY_GATE_MODE: z.enum(['off', 'warn', 'block']).optional(),
+  // Path to a model-registry overlay manifest (buildDefaultRegistry / #3185 hot-reload).
+  NEXUS_MODELS_OVERLAY_PATH: z.string().optional(),
+  // Render the unified cross-ranked memory prefix instead of per-backend sections (#3236); default on, set 0 to opt out.
+  NEXUS_CONTEXT_RANKED: boolLooseStr.optional(),
+  // Attach a ranked, budgeted repo-map (module import graph, PageRank-centrality)
+  // to context for structural tasks (#4254, getRepoMapForTask); pull-shaped +
+  // rank-gated, off by default.
+  NEXUS_REPO_MAP: z.enum(['0', '1']).optional(),
+  // Allow LLM-based pipeline classification when keyword scoring finds no
+  // evidence (#4677). Off by default: fixing the confidence floor made the
+  // enrichment gate reachable for the first time, and measurement put that at
+  // ~60% of realistic goals — one LLM call each. Opt in deliberately.
+  NEXUS_LLM_CLASSIFICATION: boolLooseStr.optional(),
+  // Feed live dispatch outcomes into the MetaOrchestrator shadow selector + persist them (#3593); off by default.
+  NEXUS_META_SHADOW_TRAIN: boolLooseStr.optional(),
+  // Resolve a concrete model from the difficulty tier at route time (#3394,
+  // isRouteModelSelectionEnabled); off by default. Registered here in #4197 —
+  // the reader predates this schema entry.
+  NEXUS_ROUTE_MODEL_SELECTION: boolLooseStr.optional(),
+  // Record would-be tier model selections (shadow) + join them with outcomes for
+  // the offline flip eval (#4197, isRouteModelShadowEnabled); off by default.
+  NEXUS_ROUTE_MODEL_SHADOW: boolLooseStr.optional(),
+  // Record would-be Route=(model,gateway) selections (shadow) + join with outcomes
+  // to compare factored selection against flat-arms baseline (#7071); off by default.
+  NEXUS_ROUTE_GATEWAY_SHADOW: boolLooseStr.optional(),
+  // Async job-result reader source (#3090/#3693): `task_state` prefers/unions the
+  // Stage-2 task-state log (default); set to `sidecar` for legacy fallback.
+  // Reader half of the sidecar→Stage-2 migration (epic #2631).
+  NEXUS_JOB_RESULT_SOURCE: z.enum(['sidecar', 'task_state']).optional(),
+
+  // --- Hooks & Sessions ---
+  // All three are read via parseBoolEnv in cli/hooks/handlers/handler-utils.ts
+  // (`1`/`0` work at runtime); strict boolStr reported them invalid (#5155).
+  NEXUS_HOOK_VERBOSE: boolLooseStr.optional(),
+  NEXUS_SESSIONS_DB: z.string().optional(),
+  NEXUS_DISABLE_SESSIONS: boolLooseStr.optional(),
+  NEXUS_DISABLE_METRICS: boolLooseStr.optional(),
+  /** Backfill missing research paper quality scores and evidence tiers on load (#4288). */
+  NEXUS_BACKFILL_RESEARCH_QUALITY: boolLooseStr.optional(),
+
+  // --- Read by production code but previously unregistered (#5142) ---
+  // Each type below was verified against the consuming call site, not inferred
+  // from the name. Registering with a wrong type would replace "unknown
+  // variable" with "invalid value" on a value that actually works — trading one
+  // misreport for a worse one. Variables whose accepted set needed a judgement
+  // call are tracked in docs/ops/env-schema-coverage-baseline.json instead.
+
+  // Paths, URLs, tokens and term lists: any non-empty string is legal, so
+  // z.string() is the accurate type rather than a permissive stand-in.
+  NEXUS_CODEPR_TOKEN: z.string().optional(),
+  NEXUS_CUSTOM_MODEL: z.string().optional(),
+  // #6645: the OpenAI API surface the single-model custom-openai adapter calls.
+  // Default `chat` (/chat/completions); `responses` opts into /responses. The
+  // reader (adapters/sdk/gateway-env.ts) trims and lower-cases, then refuses
+  // anything else at construction.
+  NEXUS_CUSTOM_API_SURFACE: z
+    .string()
+    .refine((v) => ['', 'chat', 'responses'].includes(v.trim().toLowerCase()), {
+      message: 'Must be one of: responses, chat',
+    })
+    .optional(),
+  // #7151 OPTION B: endpoint router arms are opt-in in every billing mode.
+  NEXUS_ROUTE_GATEWAY_ARMS: boolLooseStr.optional(),
+  // #6604: pin the gateway model a family slot (claude/codex/gemini) uses.
+  // Any model id is legal here; the one reader (adapters/gateway-family-slots.ts)
+  // validates it against the discovered catalogue and warns on a miss.
+  NEXUS_GATEWAY_MODEL_ANTHROPIC: z.string().optional(),
+  NEXUS_GATEWAY_MODEL_OPENAI: z.string().optional(),
+  NEXUS_GATEWAY_MODEL_GOOGLE: z.string().optional(),
+  // #4392 increment 2: what a gateway arm costs (GATEWAY_COST_ENV; spelled
+  // out because scripts/check-env-schema-coverage.ts reads keys by regex).
+  // Validated by the same parser every runtime reader uses, so "invalid" here
+  // means UNDECLARED there — the task-class cost ceiling and the per-task
+  // budget exclude the gateway (#6393) and `doctor` warns.
+  // The parser's own reason is forwarded (superRefine, not a fixed message):
+  // "duplicate endpoint key" and "more than one bare declaration" are different
+  // fixes, and a grammar reminder names neither.
+  NEXUS_GATEWAY_COST: z
+    .string()
+    .superRefine((v, ctx) => {
+      const parsed = parseGatewayCostEnv(v);
+      if (!parsed.ok) ctx.addIssue({ code: 'custom', message: parsed.error.message });
+    })
+    .optional(),
+  NEXUS_MODEL_REGISTRY_OVERLAY: z.string().optional(),
+  // #6608: the header carrying the gateway key instead of `Authorization:
+  // Bearer` (OPENAI_COMPAT_AUTH_HEADER_ENV), e.g. `api-key`. The runtime
+  // reader warns on an illegal header name and keeps the bearer default.
+  NEXUS_OPENAI_COMPAT_AUTH_HEADER: z.string().optional(),
+  // #6608: extra static gateway headers, `Name=value,Name2=value2`
+  // (OPENAI_COMPAT_EXTRA_HEADERS_ENV). Validated by the runtime parser; a
+  // value can be a credential, so an invalid one is logged redacted.
+  NEXUS_OPENAI_COMPAT_EXTRA_HEADERS: z
+    .string()
+    .superRefine((v, ctx) => {
+      const parsed = parseGatewayExtraHeaders(v);
+      if (!parsed.ok) ctx.addIssue({ code: 'custom', message: parsed.reason });
+    })
+    .optional(),
+  // #4392 increment 2 step 2: the `<endpoint>` of the `api:<endpoint>` arm the
+  // voter gateway registers as (OPENAI_COMPAT_ENDPOINT_ENV; spelled out for
+  // the coverage script). Same shape rule as a scoped NEXUS_GATEWAY_COST key,
+  // so a URL — or a credential inside one — can never become an arm id, and
+  // never a built-in vendor segment, which would make the gateway a VENDOR
+  // arm (#6409). The rule is `gatewayEndpointRejection`, shared with the
+  // runtime reader; an invalid value is reported here and that reader falls
+  // back to the default endpoint (`openai-compat`).
+  NEXUS_OPENAI_COMPAT_ENDPOINT: z
+    .string()
+    .superRefine((v, ctx) => {
+      const reason = gatewayEndpointRejection(v.trim());
+      if (reason !== undefined) ctx.addIssue({ code: 'custom', message: reason });
+    })
+    .optional(),
+  NEXUS_OPENAI_COMPAT_KEY: z.string().optional(),
+  // #6600: gateway model-id allowlist (OPENAI_COMPAT_MODELS_ENV), applied
+  // before the per-gateway adapter cap. Comma-separated; `*` is a wildcard.
+  NEXUS_OPENAI_COMPAT_MODELS: z.string().optional(),
+  NEXUS_OPENAI_COMPAT_URL: z.string().optional(),
+  NEXUS_OPENCODE_CONFIG: z.string().optional(),
+  NEXUS_PR_REVIEW_RECORDS_PATH: z.string().optional(),
+  NEXUS_SENSITIVE_REFS: z.string().optional(),
+  NEXUS_SUBPROCESS_EXTRA_ENV: z.string().optional(),
+  NEXUS_VOTE_RECORDS_PATH: z.string().optional(),
+  // #3927 item 4: the SSH key `scripts/append-ratification-record.ts` signs a
+  // committed vote record's hash with (`--signing-key` overrides it). A path;
+  // unset ⇒ the agent key at `<dataDir>/auth/vote-record-signing.key` when it
+  // exists (#6257), else the record is appended unsigned and the script says so.
+  NEXUS_VOTE_SIGNING_KEY: z.string().optional(),
+
+  // parseIntEnv / parseInt consumers: a non-integer is discarded in favour of
+  // the default, so reporting it as invalid tells the user their setting was
+  // ignored rather than letting it fail silently.
+  NEXUS_CI_HEALTH_MAX_BYTES: positiveIntStr.optional(),
+  NEXUS_IMPROVEMENT_REVIEW_INTERVAL_MS: positiveIntStr.optional(),
+  NEXUS_MCP_DEPTH: positiveIntStr.optional(),
+  NEXUS_SUBPROCESS_DEPTH: positiveIntStr.optional(),
+  // `0` is meaningful here — it disables async job dispatch entirely — so this
+  // is non-negative, not positive (job-concurrency.ts:106 accepts `>= 0`).
+  NEXUS_JOB_MAX_CONCURRENT_TOTAL: z
+    .string()
+    .regex(/^\d+$/, 'Must be a non-negative integer string')
+    .optional(),
+
+  // parseBoolEnv consumers (config/defaults-env.ts:50). The helper accepts
+  // exactly true|1|false|0, case-insensitively — NOT yes/no/on/off, which fall
+  // through to the default. Accepting a wider set here would tell the user
+  // `yes` works when the code silently ignores it.
+  NEXUS_IMPROVEMENT_REVIEW_FILE_ISSUES: boolLooseStr.optional(),
+  NEXUS_NO_SCAFFOLD: boolLooseStr.optional(),
+  NEXUS_TUNE_ENFORCE: boolLooseStr.optional(),
+  NEXUS_VERSION_CHECK: boolLooseStr.optional(),
+  // #5155: these five each read a single private literal (`=== '1'`,
+  // `=== 'true'`, `=== '0'`) so the other spelling was a silent no-op. They
+  // now go through the same helper, so the schema tells the truth about them.
+  NEXUS_BUDGET_ENFORCE: boolLooseStr.optional(),
+  NEXUS_CONTEXT_RETRIEVER_INJECT: boolLooseStr.optional(),
+  // Exact opt-in: inferred gaps otherwise remain report-only (#6930).
+  NEXUS_CAPABILITY_GAP_INFERRED: z.enum(['0', '1']).optional(),
+  NEXUS_DYNAMIC_MODELS: boolLooseStr.optional(),
+  NEXUS_GITIGNORE_AUTO: boolLooseStr.optional(),
+  NEXUS_SUBPROCESS_ENV_ALLOWLIST: boolLooseStr.optional(),
+  // #6431: the per-operator opt-in that runs the MCP PolicyFirewall in
+  // enforce (mcp/middleware/policy-registry.ts). Default off = warn: rules
+  // evaluate and log would-be denials, none is applied. #4987/#4988 described
+  // this flag before it had a reader.
+  NEXUS_MCP_POLICY_ENFORCE: boolLooseStr.optional(),
+  // #6795: set by the generated child MCP config (cli-adapters/child-mcp-config.ts).
+  // A nexus-agents server spawned for an expert CLI serves model-driven calls,
+  // so `connectTransport` records its stdio caller as unmeasured, not tier 1.
+  NEXUS_MCP_CHILD: boolLooseStr.optional(),
+  // #6590: comma-separated CliNames to take out of service. A plain string on
+  // purpose: an unknown name is warned about and ignored by the one reader
+  // (cli-adapters/disabled-clis.ts), so a stricter schema would turn one typo
+  // into an invalid-value report for the whole variable.
+  NEXUS_DISABLED_CLIS: z.string().optional(),
+
+  // Lowercased before parsing, so mixed case is genuinely accepted.
+  NEXUS_REPUTATION_GATING: z
+    .string()
+    .refine((v) => ['off', 'audit', 'enforce'].includes(v.toLowerCase()), {
+      message: 'Must be one of: off, audit, enforce',
+    })
+    .optional(),
+
+  // #5382: rollout gate for HostileInputFirewall behaviour changes. Defaults to
+  // `off` — unlike NEXUS_REPUTATION_GATING, which defaults to `enforce` — because
+  // the firewall is a PUBLISHED API with external callers, so a stricter default
+  // would be a silent breaking change. Same tri-state and same coercion as its
+  // two sibling flags; see security/firewall/firewall-policy-mode.ts.
+  NEXUS_FIREWALL_POLICY: z
+    .string()
+    .refine((v) => ['off', 'audit', 'enforce'].includes(v.toLowerCase()), {
+      message: 'Must be one of: off, audit, enforce',
+    })
+    .optional(),
+
+  // Former debt variables registered to burn down coverage baseline (#6457)
+  NEXUS_BUDGET_TOLERANCE: floatStr.optional(),
+  NEXUS_CONSOLE: consoleRendererStr.optional(),
+  NEXUS_CONTEXT_WARN_THRESHOLD: floatStr.optional(),
+  NEXUS_CUSTOM_API_ALLOW_PRIVATE: boolLooseStr.optional(),
+  NEXUS_PORTABLE_MODE: boolLooseStr.optional(),
+  NEXUS_TASK_STATE_ENABLED: boolLooseStr.optional(),
+});
+
+// ============================================================================
+// Known variable names (derived from schema)
+// ============================================================================
+
+const KNOWN_NAMES: readonly string[] = Object.keys(NexusEnvSchema.shape);
+
+/**
+ * Variables whose grammar can carry a key or a URL, so an invalid value is
+ * recorded and logged as {@link REDACTED_VALUE} rather than verbatim. A
+ * `NEXUS_GATEWAY_COST` entry key is operator-typed free text before the
+ * parser rejects it — `ghp_TOKEN=free` or `https://user:pw@host=free` would
+ * otherwise land on the startup warn line, which is exactly what the parser's
+ * own "never echo the key" errors avoid. `NEXUS_OPENAI_COMPAT_ENDPOINT` is
+ * the same shape: the likely mistake is pasting the gateway URL into it.
+ */
+const REDACTED_VALUE_VARS: ReadonlySet<string> = new Set([
+  'NEXUS_GATEWAY_COST',
+  'NEXUS_OPENAI_COMPAT_ENDPOINT',
+  'NEXUS_OPENAI_COMPAT_EXTRA_HEADERS',
+]);
+const REDACTED_VALUE = '<redacted>';
+
+// ============================================================================
+// Dynamic variable families (#5142)
+// ============================================================================
+
+/**
+ * Variables whose NAME is built at runtime by string concatenation, so they can
+ * never appear as fixed schema keys.
+ *
+ * Verified live before this existed: `NEXUS_VOTER_MODEL_ARCHITECT=claude-opus`
+ * — a documented, working per-role routing override — was reported as an
+ * unknown variable, i.e. the typo detector accused the user of a typo they did
+ * not make.
+ *
+ * The voter-model suffixes are derived from `VOTER_ROLES`, the canonical role
+ * list, rather than re-listed here: a second hand-maintained copy would
+ * reintroduce exactly the schema-vs-code drift this is fixing, one level up.
+ */
+const DYNAMIC_FAMILIES: readonly {
+  readonly prefix: string;
+  readonly suffixes: readonly string[] | 'any-identifier';
+}[] = [
+  {
+    // cli/voter-model-overrides.ts:24 — `NEXUS_VOTER_MODEL_${role.toUpperCase()}`
+    prefix: 'NEXUS_VOTER_MODEL_',
+    suffixes: Object.keys(VOTER_ROLES).map((r) => r.toUpperCase()),
+  },
+  {
+    // mcp/jobs/job-concurrency.ts:85 — `NEXUS_JOB_MAX_CONCURRENT_${tool.toUpperCase()}`
+    // The suffix is an arbitrary MCP tool name. Importing the tool registry here
+    // would couple config to MCP and risk an import cycle, so the suffix is
+    // matched structurally. The cost is honest and bounded: a misspelt TOOL name
+    // in this one family is not flagged. The alternative — leaving the whole
+    // family unregistered — misreports every CORRECT use, which is worse.
+    prefix: 'NEXUS_JOB_MAX_CONCURRENT_',
+    suffixes: 'any-identifier',
+  },
+];
+
+/** True when `name` is a valid member of a runtime-constructed family. */
+function isDynamicFamilyMember(name: string): boolean {
+  return DYNAMIC_FAMILIES.some((family) => {
+    if (!name.startsWith(family.prefix)) return false;
+    const suffix = name.slice(family.prefix.length);
+    if (suffix === '') return false;
+    if (family.suffixes === 'any-identifier') return /^[A-Z][A-Z0-9_]*$/.test(suffix);
+    return family.suffixes.includes(suffix);
+  });
+}
+
+// ============================================================================
+// Levenshtein distance
+// ============================================================================
+
+/** Returns the closest known var name if edit distance <= 3, or null. */
+function suggestSimilar(name: string, known: readonly string[]): string | null {
+  let best: string | null = null;
+  let bestDist = 4; // threshold: must be strictly less than 4
+
+  for (const candidate of known) {
+    const dist = levenshtein(name, candidate);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = candidate;
+    }
+  }
+
+  return best;
+}
+
+// ============================================================================
+// Validation result types
+// ============================================================================
+
+/** An unknown NEXUS_* env var with optional typo suggestion. */
+export interface UnknownVar {
+  readonly name: string;
+  readonly suggestion: string | null;
+}
+
+/** An invalid NEXUS_* env var with error message. */
+export interface InvalidVar {
+  readonly name: string;
+  readonly value: string;
+  readonly error: string;
+}
+
+/**
+ * A variable that is spelled correctly, holds a valid value, and still changes
+ * nothing — the request was reduced by a downstream clamp.
+ *
+ * This is the category the report was missing. "Unknown" catches a typo and
+ * "invalid" catches a bad value; a correctly-set variable that is silently
+ * capped passes both and does nothing, which is the failure mode #5155 named
+ * for the boolean flags and which the timeout knobs still had.
+ */
+export interface IneffectiveVar {
+  readonly name: string;
+  readonly requestedMs: number;
+  readonly effectiveMs: number;
+  readonly reason: string;
+}
+
+/** Result of validating NEXUS_* environment variables. */
+export interface EnvValidationResult {
+  readonly unknownVars: readonly UnknownVar[];
+  readonly invalidVars: readonly InvalidVar[];
+  readonly ineffectiveVars: readonly IneffectiveVar[];
+}
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+/** Classifies NEXUS_* keys into known (with values) and unknown. */
+function classifyEnvKeys(
+  nexusKeys: readonly string[],
+  env: NodeJS.ProcessEnv
+): { knownRecord: Record<string, string>; unknownVars: UnknownVar[] } {
+  const knownRecord: Record<string, string> = {};
+  const unknownVars: UnknownVar[] = [];
+
+  for (const key of nexusKeys) {
+    if (isDynamicFamilyMember(key)) {
+      // Name is valid but has no fixed schema entry, so there is nothing to
+      // value-check against; recording it as known is what stops the false
+      // unknown-variable report.
+      continue;
+    }
+    if (KNOWN_NAMES.includes(key)) {
+      const value = env[key];
+      if (value !== undefined) {
+        knownRecord[key] = value;
+      }
+    } else {
+      unknownVars.push({
+        name: key,
+        suggestion: suggestSimilar(key, KNOWN_NAMES),
+      });
+    }
+  }
+
+  return { knownRecord, unknownVars };
+}
+
+/**
+ * Logs validation warnings via the provided logger.
+ *
+ * Unknown names, invalid values and ineffective settings are reported here.
+ * Warnings never include unknown values.
+ */
+function logValidationWarnings(
+  logger: ILogger,
+  unknownVars: readonly UnknownVar[],
+  invalidVars: readonly InvalidVar[],
+  ineffectiveVars: readonly IneffectiveVar[]
+): void {
+  for (const u of unknownVars) {
+    const hint = u.suggestion !== null ? ` (did you mean ${u.suggestion}?)` : '';
+    logger.warn(`Unknown environment variable: ${u.name}${hint}`);
+  }
+  for (const inv of invalidVars) {
+    const shown = inv.value === REDACTED_VALUE ? REDACTED_VALUE : `"${inv.value}"`;
+    logger.warn(`Invalid environment variable ${inv.name}=${shown}: ${inv.error}`);
+  }
+  for (const ineff of ineffectiveVars) {
+    logger.warn(
+      `Environment variable ${ineff.name} had no effect: requested ` +
+        `${String(ineff.requestedMs)}ms, using ${String(ineff.effectiveMs)}ms. ${ineff.reason}`
+    );
+  }
+}
+
+/**
+ * Timeout knobs that were set and then clamped away.
+ *
+ * Every class is asked, not only the configured ones: a class declared above
+ * the request ceiling would be capped with no operator involvement at all, and
+ * hiding that would be the same defect one level up. `clampCause` says who to
+ * blame, and a clamp attributable to no knob is reported to nobody rather than
+ * pinned on a variable the operator never set.
+ */
+function findIneffectiveVars(): IneffectiveVar[] {
+  const classNames = Object.keys(OPERATION_CLASSES) as OperationClassName[];
+  const resolutions: ClassGuardResolution[] = classNames.map((cls) => describeClassGuard(cls));
+  return resolutions
+    .filter((r) => r.clampedByCeiling)
+    .flatMap((r) => {
+      // Name the knob that actually asked for more.
+      const name =
+        r.clampCause === 'override' && r.overrideEnvVar !== null
+          ? r.overrideEnvVar
+          : r.clampCause === 'multiplier'
+            ? TIMEOUT_MULTIPLIER_ENV_VAR
+            : null;
+      if (name === null) return [];
+      return [
+        {
+          name,
+          requestedMs: r.requestedMs,
+          effectiveMs: r.effectiveMs,
+          reason: ineffectiveReason(r),
+        },
+      ];
+    });
+}
+
+/**
+ * Names the ceiling that bit. `async-job-body` is the one class not bounded by
+ * the MCP request ceiling (#5995); its ceiling is the class override maximum,
+ * and the cost of sitting at it is stated because that is what the operator
+ * is trading for the extra hour.
+ */
+function ineffectiveReason(r: ClassGuardResolution): string {
+  if (r.ceilingMs !== MCP_TIMEOUTS.maxMs) {
+    return (
+      `The '${r.cls}' class guard is capped at the class override ceiling ` +
+      `(${String(r.ceilingMs)}ms), so values above it are discarded. A backgrounded ` +
+      `job holds its concurrency slot for as long as it runs; past the MCP ceiling a ` +
+      `body that stops heartbeating is failed as wedged at 3/8 of the guard (#6162).`
+    );
+  }
+  return (
+    `The '${r.cls}' class guard is capped at the MCP request ceiling ` +
+    `(${String(r.ceilingMs)}ms), so values above it are discarded.`
+  );
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/**
+ * Validates all NEXUS_* environment variables.
+ *
+ * - Detects unknown vars (potential typos) with Levenshtein suggestions
+ * - Detects invalid values for known vars
+ * - Warn-only: never throws, never blocks startup
+ *
+ * @param logger - Optional logger for direct warning output
+ * @returns Validation result with unknown and invalid var lists
+ */
+export function validateNexusEnv(logger?: ILogger): EnvValidationResult {
+  const nexusKeys = Object.keys(process.env).filter((k) => k.startsWith('NEXUS_'));
+  const { knownRecord, unknownVars } = classifyEnvKeys(nexusKeys, process.env);
+
+  // Validate known vars against the schema
+  const invalidVars: InvalidVar[] = [];
+  const result = NexusEnvSchema.safeParse(knownRecord);
+  if (!result.success) {
+    for (const issue of result.error.issues) {
+      const varName = String(issue.path[0]);
+      invalidVars.push({
+        name: varName,
+        // Redacted at the record, not only at the log line: the record is
+        // returned to callers, and a copy is one more place a key can leak.
+        value: REDACTED_VALUE_VARS.has(varName) ? REDACTED_VALUE : (knownRecord[varName] ?? ''),
+        error: issue.message,
+      });
+    }
+  }
+
+  const ineffectiveVars = findIneffectiveVars();
+
+  if (logger !== undefined) {
+    logValidationWarnings(logger, unknownVars, invalidVars, ineffectiveVars);
+  }
+
+  return { unknownVars, invalidVars, ineffectiveVars };
+}
+
+/**
+ * Returns all known NEXUS_* variable names from the schema.
+ */
+export function getKnownNexusVarNames(): readonly string[] {
+  return KNOWN_NAMES;
+}

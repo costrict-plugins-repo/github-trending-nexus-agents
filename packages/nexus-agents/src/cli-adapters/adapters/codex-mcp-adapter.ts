@@ -1,0 +1,420 @@
+/**
+ * nexus-agents/cli-adapters - Codex MCP Adapter
+ *
+ * MCP-based adapter for Codex CLI. Preferred transport for Codex integration.
+ * Extends BaseCliAdapter to reuse retry logic, health checks, version
+ * detection, and capacity tracking.
+ *
+ * (Source: Issue #1140 — Migrated to BaseCliAdapter base class)
+ *
+ * SECURITY: All spawn() calls use array-based args without shell interpolation.
+ */
+
+import { Client, StdioClientTransport } from '../../mcp/sdk-facade/index.js';
+import type {
+  CliName,
+  CliTransport,
+  CliTask,
+  CliResponse,
+  CliError,
+  ModelInfo,
+  ResolvedExecutionOptions,
+} from '../types.js';
+import type { Result } from '../../core/index.js';
+import { getErrorMessage, ok, err, getTimeProvider, createLogger } from '../../core/index.js';
+import type { CliModelInfo } from '../types-capability.js';
+import { listModelsForCli } from '../../config/models-dev-by-vendor.js';
+import { BaseCliAdapter } from '../base-adapter.js';
+import { accessModeConflict, isReadOnlyAnalysis } from '../access-mode.js';
+import { MAX_RESPONSE_STDERR_CHARS, spawnCwd } from '../subprocess-adapter.js';
+import { createCallerInputCliError } from '../cli-error-helpers.js';
+import { codexSandboxPreflight, createCodexSandboxGuard } from '../codex-sandbox-preflight.js';
+import {
+  CODEX_SYSTEM_CONFIG_FILES,
+  codexMcpDisableConfig,
+  scanCodexMcpServers,
+} from '../codex-mcp-isolation.js';
+import { type McpScanContext, mcpScanRefusal, scanOrThrow } from '../mcp-config-scan.js';
+
+import { type CodexAdapterOptions, toCodexModelSlug } from './codex-adapter-helpers.js';
+import {
+  CODEX_LEGACY_DEFAULTS,
+  type McpToolResult,
+  extractTextFromContent,
+  createTimeout,
+  determineErrorCode,
+  NEXUS_MCP_DEPTH_ENV,
+  nextCodexMcpDepthOrThrow,
+} from './codex-mcp-adapter-helpers.js';
+import {
+  getDefaultModelForCli,
+  getCliModelName,
+  buildModelInfo,
+} from '../../config/model-config-helpers.js';
+
+/**
+ * Where the `codex mcp-server` child reads its config (#6970). The transport
+ * spawns it in this process's cwd with the SDK's default environment plus
+ * {@link NEXUS_MCP_DEPTH_ENV}; of that environment only `HOME` locates a
+ * codex config file (`CODEX_HOME` is not passed through).
+ */
+function mcpServerScanContext(): McpScanContext {
+  return { env: { HOME: process.env['HOME'] }, cwd: process.cwd() };
+}
+
+/**
+ * Codex CLI adapter using MCP transport.
+ *
+ * Extends BaseCliAdapter which provides:
+ * - Retry logic with exponential backoff
+ * - Health checks with version compatibility
+ * - Capacity tracking
+ * - Error creation helpers
+ */
+export class CodexMcpAdapter extends BaseCliAdapter {
+  readonly name: CliName = 'codex';
+  /**
+   * #6754: a new thread is started with `sandbox: 'read-only'` on every call.
+   * A `codex-reply` carries no sandbox argument, so a read-only task that
+   * continues a session is refused in {@link accessModeRefusal}.
+   */
+  override readonly enforcesReadOnlyAnalysis = true;
+  readonly transport: CliTransport = 'mcp';
+
+  private readonly model: string;
+  private sandboxArgs: readonly string[] = [];
+  private readonly sandboxRefusal: () => Promise<CliError | undefined>;
+  private client: Client | undefined;
+  private mcpTransport: StdioClientTransport | undefined;
+  private connected = false;
+  /**
+   * Stderr attribution state (#6094). The registry caches one adapter per CLI
+   * and voter roles run under `Promise.all`, so the mcp-server's stderr pipe is
+   * shared by every in-flight call. `inFlight` is the current overlap;
+   * `overlapEpoch` advances whenever a call starts while another is in flight,
+   * so a capture that began alone can still see that it was later overlapped.
+   */
+  private inFlight = 0;
+  private overlapEpoch = 0;
+
+  constructor(options?: CodexAdapterOptions) {
+    super(options?.logger ?? createLogger({ component: 'codex-mcp-adapter' }));
+    this.model = options?.model ?? getCliModelName(getDefaultModelForCli('codex'));
+    this.sandboxRefusal = createCodexSandboxGuard(
+      options?.sandboxProbe ?? codexSandboxPreflight,
+      this.logger,
+      (args) => {
+        this.sandboxArgs = args;
+      },
+      options?.platform
+    );
+  }
+
+  /**
+   * Key-free model enumeration via the models.dev snapshot (#3405), matching
+   * `CodexCliAdapter`.
+   *
+   * #4318: this was missing, and `buildDefaultModelSources` includes an adapter
+   * only when `hasListModels(adapter)` is true. Since `createAllAdapters`
+   * defaults codex to the mcp transport, codex was silently filtered out of
+   * `list_available_models` — the probe reported one fewer transport than it
+   * had, with no error anywhere. Model enumeration is transport-independent, so
+   * the two adapters must answer identically.
+   */
+  listModels(): Promise<readonly CliModelInfo[]> {
+    return Promise.resolve(listModelsForCli(this.name));
+  }
+
+  /**
+   * Gets Codex model information.
+   * Resolves from canonical registry when possible, falls back to legacy lookup.
+   */
+  getModelInfo(): ModelInfo {
+    const fromRegistry = buildModelInfo('codex', this.model);
+    if (fromRegistry !== undefined) return fromRegistry;
+    return {
+      id: this.model,
+      name: CODEX_LEGACY_DEFAULTS.displayNames[this.model] ?? this.model,
+      contextWindow: CODEX_LEGACY_DEFAULTS.contextWindow,
+      maxOutput: CODEX_LEGACY_DEFAULTS.maxOutput,
+      costPerMillionInput:
+        CODEX_LEGACY_DEFAULTS.inputCosts[this.model] ?? CODEX_LEGACY_DEFAULTS.inputCost,
+      costPerMillionOutput:
+        CODEX_LEGACY_DEFAULTS.outputCosts[this.model] ?? CODEX_LEGACY_DEFAULTS.outputCost,
+    };
+  }
+
+  /**
+   * Initializes the MCP connection to Codex.
+   */
+  async initialize(): Promise<void> {
+    if (this.connected) {
+      return;
+    }
+
+    this.initCapacityTracker();
+    this.logger.debug('Initializing Codex MCP connection');
+
+    // Recursion guard (#3350): refuse to spawn `codex mcp-server` if we're
+    // already nested inside a nexus-spawned codex MCP context, and stamp the
+    // child with the incremented depth so it (and anything it spawns) inherits
+    // the marker. Throws before any spawn when nested — breaking the loop.
+    const childDepth = nextCodexMcpDepthOrThrow();
+
+    // initialize() also has direct callers that do not pass through execute().
+    const refusal = await this.sandboxRefusal();
+    if (refusal !== undefined) throw new Error(refusal.message);
+
+    try {
+      // Use the same selected backend as the read-only preflight.
+      this.mcpTransport = new StdioClientTransport({
+        command: 'codex',
+        args: ['mcp-server', ...this.sandboxArgs],
+        stderr: 'pipe',
+        env: { [NEXUS_MCP_DEPTH_ENV]: childDepth },
+      });
+
+      this.client = new Client({ name: 'nexus-agents', version: '2.0.0' }, { capabilities: {} });
+      await this.client.connect(this.mcpTransport);
+      this.connected = true;
+      this.initialized = true;
+      this.logger.info('Codex MCP connection established');
+    } catch (error) {
+      this.connected = false;
+      const connectionError = error instanceof Error ? error : new Error('Connection failed');
+      this.logger.error('Failed to initialize Codex MCP connection', connectionError);
+      throw error;
+    }
+  }
+
+  /**
+   * Executes a task via MCP client.
+   * Called by BaseCliAdapter.execute() with retry handling.
+   */
+  async executeTask(
+    _task: CliTask,
+    options: ResolvedExecutionOptions
+  ): Promise<Result<CliResponse, CliError>> {
+    const startTime = getTimeProvider().now();
+
+    if (this.client === undefined) {
+      return err(this.createError('CONNECTION_ERROR', 'MCP client not initialized'));
+    }
+
+    // #6094: read the mcp-server's piped stderr for the duration of THIS call.
+    // A sandbox failure inside the codex tool loop (bwrap on a userns-
+    // restricted host) is written there while the tool result still carries
+    // the model's parsed answer; without this the pipe was never read.
+    const stderrCapture = this.captureTransportStderr();
+    try {
+      const result = await Promise.race([
+        this.callCodexTool(_task),
+        createTimeout(options.timeoutMs),
+      ]);
+
+      if (result === null) {
+        return err(this.createError('TIMEOUT', 'Execution timed out'));
+      }
+
+      return this.parseToolResult(result, startTime, stderrCapture.stop());
+    } catch (error) {
+      return this.handleExecutionError(error);
+    } finally {
+      stderrCapture.stop();
+    }
+  }
+
+  /**
+   * Attach a listener to the transport's stderr pipe; `stop()` detaches it
+   * and returns what was written meanwhile (capped like the subprocess path).
+   * A transport without a readable stderr (tests, or `stderr: 'inherit'`)
+   * yields an empty capture, which the caller records as absent.
+   *
+   * ATTRIBUTION (#6094 review): the pipe is process-wide, so a line written
+   * while two calls overlap cannot be assigned to either. If another call was
+   * in flight at ANY point during this capture, the capture is discarded
+   * (debug-logged) and the seat falls through to the reasoning fallback.
+   * Attributing it to both would classify a seat that read the artifact as
+   * unverifiable.
+   */
+  private captureTransportStderr(): { stop: () => string } {
+    this.inFlight++;
+    if (this.inFlight > 1) this.overlapEpoch++;
+    const epochAtStart = this.overlapEpoch;
+    const overlappedAtStart = this.inFlight > 1;
+    const stream = (this.mcpTransport as { stderr?: NodeJS.ReadableStream | null } | undefined)
+      ?.stderr;
+    let captured = '';
+    const onData = (chunk: Buffer | string): void => {
+      if (captured.length < MAX_RESPONSE_STDERR_CHARS) captured += chunk.toString();
+    };
+    stream?.on('data', onData);
+    let stopped = false;
+    return {
+      stop: (): string => {
+        if (stopped) return '';
+        stopped = true;
+        stream?.off('data', onData);
+        this.inFlight--;
+        const overlapped = overlappedAtStart || this.overlapEpoch !== epochAtStart;
+        if (overlapped && captured !== '') {
+          this.logger.debug('Codex MCP stderr not attributed: another call was in flight', {
+            capturedChars: captured.length,
+          });
+          return '';
+        }
+        return captured.slice(0, MAX_RESPONSE_STDERR_CHARS);
+      },
+    };
+  }
+
+  /**
+   * #7012: refuse directory-bound tasks; the MCP tool's cwd support is
+   * unverified, so neither new nor continued sessions can honour workDir.
+   * #6754: a continued session cannot be pinned to the read-only sandbox.
+   * #6970: nor can a read-only task run when codex's MCP config cannot be
+   * listed, since its servers run outside the sandbox.
+   */
+  protected override async accessModeRefusal(task: CliTask): Promise<CliError | undefined> {
+    const base = await super.accessModeRefusal(task);
+    if (base !== undefined) return base;
+    if (spawnCwd(task.options?.['workDir']) !== undefined) {
+      return createCallerInputCliError(
+        'Refusing Codex MCP task with workDir: cwd support is unverified for the MCP tools. ' +
+          'Use the subprocess transport to honour the working directory.',
+        this.name
+      );
+    }
+    if (isReadOnlyAnalysis(task)) {
+      if (task.sessionId !== undefined && task.sessionId !== '') {
+        return accessModeConflict(
+          this.name,
+          'read-only-analysis',
+          'a continued codex session carries no sandbox setting'
+        );
+      }
+      const scan = scanCodexMcpServers(mcpServerScanContext(), this.codexSystemConfigFiles());
+      if (!scan.ok) return mcpScanRefusal(this.name, scan.error);
+    }
+    return this.sandboxRefusal();
+  }
+
+  /**
+   * The system config files the MCP scan reads (#6970). A seam so tests can
+   * keep the host's real `/etc/codex` out of the scan.
+   */
+  protected codexSystemConfigFiles(): readonly string[] {
+    return CODEX_SYSTEM_CONFIG_FILES;
+  }
+
+  /**
+   * The `config` argument of a new `codex` thread for a read-only task: the
+   * same per-server disables `codex exec` gets as `-c` (#6970). The tool
+   * applies `config` as `-c` overrides. Throws when the config cannot be
+   * listed.
+   */
+  private readOnlyMcpConfig(task: CliTask): { config?: Readonly<Record<string, unknown>> } {
+    if (!isReadOnlyAnalysis(task)) return {};
+    const servers = scanOrThrow(
+      this.name,
+      scanCodexMcpServers(mcpServerScanContext(), this.codexSystemConfigFiles())
+    );
+    return servers.length === 0 ? {} : { config: codexMcpDisableConfig(servers) };
+  }
+
+  /**
+   * Calls the codex or codex-reply tool on Codex MCP server.
+   * @see https://developers.openai.com/codex/mcp/
+   */
+  private async callCodexTool(task: CliTask): Promise<McpToolResult> {
+    if (this.client === undefined) {
+      throw new Error('Client not initialized');
+    }
+
+    const isReply = task.sessionId !== undefined && task.sessionId !== '';
+    const toolName = isReply ? 'codex-reply' : 'codex';
+
+    // task.model is the canonical registry id, which codex rejects — translate
+    // it to the slug the MCP server's `model` argument accepts (#5091).
+    const baseArgs = {
+      prompt: task.content,
+      ...(task.model !== undefined && { model: toCodexModelSlug(task.model, this.logger) }),
+    };
+
+    const args = isReply
+      ? { ...baseArgs, threadId: task.sessionId }
+      : {
+          ...baseArgs,
+          sandbox: 'read-only' as const,
+          'approval-policy': 'never' as const,
+          ...this.readOnlyMcpConfig(task),
+        };
+
+    const result = await this.client.callTool({
+      name: toolName,
+      arguments: args,
+    });
+
+    return result as McpToolResult;
+  }
+
+  /**
+   * Parses MCP tool result to CLI response.
+   */
+  private parseToolResult(
+    result: McpToolResult,
+    startTime: number,
+    stderr: string
+  ): Result<CliResponse, CliError> {
+    if (result.isError === true) {
+      const errorText = extractTextFromContent(result.content);
+      // #4373: this hardcoded EXECUTION_ERROR and never looked at the message,
+      // so a quota-dead codex-mcp was indistinguishable from any other failure
+      // and never counted as a serving failure against the circuit breaker the
+      // voter gate reads (#4330). Classify the text the same way the error path
+      // below does.
+      const code = errorText === null ? 'EXECUTION_ERROR' : determineErrorCode(errorText);
+      return err(this.createError(code, errorText ?? 'Tool execution failed'));
+    }
+
+    const text = extractTextFromContent(result.content);
+    if (text === null) {
+      return err(this.createError('PARSE_ERROR', 'No text content in response'));
+    }
+
+    return ok({
+      text,
+      durationMs: getTimeProvider().now() - startTime,
+      raw: result,
+      ...(stderr !== '' ? { stderr } : {}),
+    });
+  }
+
+  /**
+   * Handles execution errors.
+   */
+  private handleExecutionError(error: unknown): Result<CliResponse, CliError> {
+    const message = getErrorMessage(error);
+    const errorCode = determineErrorCode(message);
+
+    if (errorCode === 'CONNECTION_ERROR') {
+      this.connected = false;
+    }
+
+    return err(this.createError(errorCode, message, error as Error));
+  }
+
+  /**
+   * Disposes the adapter and closes MCP connection.
+   */
+  async dispose(): Promise<void> {
+    if (this.mcpTransport !== undefined) {
+      this.logger.debug('Closing Codex MCP connection');
+      await this.mcpTransport.close();
+      this.mcpTransport = undefined;
+    }
+    this.client = undefined;
+    this.connected = false;
+    this.initialized = false;
+  }
+}

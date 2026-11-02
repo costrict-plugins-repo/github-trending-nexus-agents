@@ -1,0 +1,135 @@
+/**
+ * nexus-agents/workflows - AFlow Structure Evaluation
+ *
+ * Structure validation methods for workflow evaluation.
+ * Validates workflow DAG structure, dependencies, and agent roles.
+ *
+ * @module workflows/aflow/evaluation-structure
+ * (Source: Issue #329, arXiv:2410.10762)
+ */
+
+import type { WorkflowDefinition } from '../../core/index.js';
+import { VALID_AGENT_ROLES } from './evaluation-types.js';
+
+/**
+ * Evaluate workflow structural validity.
+ * Returns a score between 0 and 1 based on structural checks.
+ *
+ * A zero-step workflow scores 0: every check below names the empty case
+ * explicitly (#4585) rather than passing vacuously over an empty step list.
+ */
+export function evaluateStructure(workflow: WorkflowDefinition): number {
+  const checks = [
+    hasValidSteps(workflow),
+    hasNoCycles(workflow),
+    hasValidDependencies(workflow),
+    hasUniqueStepIds(workflow),
+    hasValidAgentRoles(workflow),
+  ];
+
+  const passed = checks.filter(Boolean).length;
+  return passed / checks.length;
+}
+
+/**
+ * Check if workflow has valid steps.
+ * Each step must have non-empty id, agent, and action.
+ */
+export function hasValidSteps(workflow: WorkflowDefinition): boolean {
+  return (
+    workflow.steps.length >= 1 &&
+    workflow.steps.every((s) => s.id.length > 0 && s.agent.length > 0 && s.action.length > 0)
+  );
+}
+
+/**
+ * Check if workflow has no dependency cycles.
+ * Uses DFS with recursion stack to detect cycles.
+ *
+ * A zero-step workflow is reported as NOT acyclic (#4585): `[].some()` is
+ * `false`, so `!steps.some(hasCycle)` used to certify an empty workflow as
+ * structurally sound purely because there was nothing to walk. That vacuous
+ * pass handed an empty workflow 4 of the 5 checks in `evaluateStructure`
+ * (0.8), even though `hasValidSteps` in this same module already declares a
+ * zero-step workflow invalid. Empty means "no DAG to verify", not "verified".
+ */
+export function hasNoCycles(workflow: WorkflowDefinition): boolean {
+  if (workflow.steps.length === 0) return false;
+
+  const visited = new Set<string>();
+  const recursionStack = new Set<string>();
+
+  const hasCycle = (stepId: string): boolean => {
+    if (recursionStack.has(stepId)) return true;
+    if (visited.has(stepId)) return false;
+
+    visited.add(stepId);
+    recursionStack.add(stepId);
+
+    const step = workflow.steps.find((s) => s.id === stepId);
+    for (const dep of step?.dependsOn ?? []) {
+      if (hasCycle(dep)) return true;
+    }
+
+    recursionStack.delete(stepId);
+    return false;
+  };
+
+  return !workflow.steps.some((s) => hasCycle(s.id));
+}
+
+/**
+ * Check if all dependencies reference valid steps.
+ *
+ * A zero-step workflow is reported as invalid for the same reason as
+ * `hasNoCycles` (#4585): `[].every()` is true, so an empty workflow used to
+ * certify that all of its dependencies resolve without a single reference
+ * being read. No steps means no dependencies were verified, not that they all
+ * check out.
+ */
+export function hasValidDependencies(workflow: WorkflowDefinition): boolean {
+  if (workflow.steps.length === 0) return false;
+
+  const stepIds = new Set(workflow.steps.map((s) => s.id));
+  return workflow.steps.every((s) => (s.dependsOn ?? []).every((dep) => stepIds.has(dep)));
+}
+
+/**
+ * Check if all step IDs are unique.
+ *
+ * A zero-step workflow is reported as invalid (#4585): `0 === new Set([]).size`
+ * holds, so an empty id list used to pass as "all ids unique". Uniqueness over
+ * nothing is not uniqueness observed.
+ */
+export function hasUniqueStepIds(workflow: WorkflowDefinition): boolean {
+  if (workflow.steps.length === 0) return false;
+
+  const ids = workflow.steps.map((s) => s.id);
+  return ids.length === new Set(ids).size;
+}
+
+/**
+ * Check if all agent roles are valid.
+ *
+ * A zero-step workflow is reported as invalid (#4585): `[].every()` is true,
+ * so an empty workflow used to certify every agent role as valid without ever
+ * consulting `VALID_AGENT_ROLES`.
+ */
+export function hasValidAgentRoles(workflow: WorkflowDefinition): boolean {
+  if (workflow.steps.length === 0) return false;
+
+  return workflow.steps.every((s) => VALID_AGENT_ROLES.has(s.agent));
+}
+
+/**
+ * Quick check if workflow is minimally viable.
+ */
+export function isViableWorkflow(workflow: WorkflowDefinition, minSteps: number): boolean {
+  return (
+    workflow.steps.length >= minSteps &&
+    hasValidSteps(workflow) &&
+    hasNoCycles(workflow) &&
+    hasValidDependencies(workflow) &&
+    hasUniqueStepIds(workflow)
+  );
+}

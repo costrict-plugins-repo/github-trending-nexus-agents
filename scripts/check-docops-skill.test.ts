@@ -1,0 +1,306 @@
+/**
+ * Unit tests for the DocOps skill-sync escape-hatch fix (#2411).
+ *
+ * The bug: `git log -1 --pretty=%B` reads only the latest commit message,
+ * which on GitHub Actions PR runs is the auto-generated merge-commit
+ * subject, NOT the developer's commit message. The fix walks the full
+ * PR commit range when GITHUB_BASE_REF is set so [skip-docops] in any
+ * commit on the branch is honored.
+ *
+ * Strategy: build a tiny throwaway git repo per test, set up a base ref
+ * and a feature branch, and assert getCommitMessagesForEscapeHatch returns
+ * the right text under each environment configuration.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+
+import {
+  type CheckResult,
+  getCommitMessagesForEscapeHatch,
+  isMechanicalActionBumpDiff,
+  performCheck,
+} from './check-docops-skill.js';
+
+interface RepoCtx {
+  dir: string;
+  origCwd: string;
+  origBaseRef: string | undefined;
+}
+
+function git(repoDir: string, cmd: string): string {
+  return execSync(`git -C "${repoDir}" ${cmd}`, { encoding: 'utf-8' });
+}
+
+function setupRepo(): RepoCtx {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'docops-test-'));
+  const origCwd = process.cwd();
+  const origBaseRef = process.env['GITHUB_BASE_REF'];
+
+  git(dir, 'init -q -b main');
+  git(dir, 'config user.email test@example.com');
+  git(dir, 'config user.name Test');
+  git(dir, 'commit --allow-empty -q -m "initial commit on main"');
+
+  process.chdir(dir);
+  return { dir, origCwd, origBaseRef };
+}
+
+function teardownRepo(ctx: RepoCtx): void {
+  process.chdir(ctx.origCwd);
+  if (ctx.origBaseRef === undefined) {
+    delete process.env['GITHUB_BASE_REF'];
+  } else {
+    process.env['GITHUB_BASE_REF'] = ctx.origBaseRef;
+  }
+  fs.rmSync(ctx.dir, { recursive: true, force: true });
+}
+
+describe('getCommitMessagesForEscapeHatch (#2411)', () => {
+  let ctx: RepoCtx;
+
+  beforeEach(() => {
+    ctx = setupRepo();
+  });
+
+  afterEach(() => {
+    teardownRepo(ctx);
+  });
+
+  it('finds [skip-docops] in the latest commit when no PR base ref is set', () => {
+    delete process.env['GITHUB_BASE_REF'];
+    git(ctx.dir, 'commit --allow-empty -q -m "feat: change [skip-docops]"');
+
+    const out = getCommitMessagesForEscapeHatch(ctx.dir);
+
+    expect(out).toContain('[skip-docops]');
+  });
+
+  it('walks the PR commit range when GITHUB_BASE_REF is set, honoring branch tokens', () => {
+    git(ctx.dir, 'checkout -q -b feature');
+    git(ctx.dir, 'commit --allow-empty -q -m "feat: real change [skip-docops]"');
+    git(ctx.dir, 'commit --allow-empty -q -m "chore: lint fix"');
+
+    git(ctx.dir, 'update-ref refs/remotes/origin/main main');
+    process.env['GITHUB_BASE_REF'] = 'main';
+
+    const out = getCommitMessagesForEscapeHatch(ctx.dir);
+
+    expect(out).toContain('[skip-docops]');
+    expect(out).toContain('chore: lint fix');
+  });
+
+  it('does NOT inherit [skip-docops] from a commit already on the base branch (#5028)', () => {
+    // The range was `origin/main...HEAD` — symmetric — so commits on the base
+    // branch but NOT on the PR branch were searched too. Six `[skip-docops]`
+    // commits are on main today, so any branch whose merge-base predates one
+    // of them skipped the whole gate regardless of what it changed.
+    git(ctx.dir, 'checkout -q -b feature');
+    git(ctx.dir, 'commit --allow-empty -q -m "feat: an honest change"');
+
+    // main moves ahead with a bypass commit the feature branch never contains.
+    git(ctx.dir, 'checkout -q main');
+    git(ctx.dir, 'commit --allow-empty -q -m "chore: unrelated [skip-docops]"');
+    git(ctx.dir, 'update-ref refs/remotes/origin/main main');
+    git(ctx.dir, 'checkout -q feature');
+    process.env['GITHUB_BASE_REF'] = 'main';
+
+    const out = getCommitMessagesForEscapeHatch(ctx.dir);
+
+    expect(out).not.toContain('[skip-docops]');
+    expect(out).toContain('feat: an honest change');
+  });
+
+  it('sees [skip-docops] in a branch commit that is not HEAD (#2411, the original bug)', () => {
+    // #5034: this test used to create a branch with no bypass token anywhere
+    // and assert the token was absent — which passes for any implementation
+    // that does not invent it, including the `git log -1` version #2411 fixed.
+    // It read as coverage of the merge-ref case and pinned nothing.
+    //
+    // The actual #2411 bug: under a PR merge ref, `git log -1` returns the
+    // generated merge-commit subject, so a token in the developer's own commit
+    // was never seen. That is what this now exercises — the token is in an
+    // EARLIER branch commit, with an unrelated commit on top.
+    git(ctx.dir, 'checkout -q -b feature');
+    git(ctx.dir, 'commit --allow-empty -q -m "docs: intentional bypass [skip-docops]"');
+    git(ctx.dir, 'commit --allow-empty -q -m "chore: follow-up with no token"');
+
+    git(ctx.dir, 'update-ref refs/remotes/origin/main main');
+    process.env['GITHUB_BASE_REF'] = 'main';
+
+    const out = getCommitMessagesForEscapeHatch(ctx.dir);
+
+    expect(out).toContain('[skip-docops]');
+    expect(out).toContain('chore: follow-up with no token');
+  });
+
+  it('falls back to HEAD-only when GITHUB_BASE_REF points at a non-existent ref', () => {
+    git(ctx.dir, 'commit --allow-empty -q -m "feat: head-only message [skip-docops]"');
+    process.env['GITHUB_BASE_REF'] = 'nonexistent-base-ref-xyz';
+
+    const out = getCommitMessagesForEscapeHatch(ctx.dir);
+
+    expect(out).toContain('[skip-docops]');
+  });
+});
+
+describe('isMechanicalActionBumpDiff (#3363)', () => {
+  it('treats a pure actions/checkout version bump as mechanical', () => {
+    const diff = [
+      'diff --git a/.github/workflows/docs-check.yml b/.github/workflows/docs-check.yml',
+      '--- a/.github/workflows/docs-check.yml',
+      '+++ b/.github/workflows/docs-check.yml',
+      '@@ -10,7 +10,7 @@ jobs:',
+      '       - uses: actions/checkout@aaaaaaa # v6.0.2',
+      '+      - uses: actions/checkout@bbbbbbb # v6.0.3',
+      '-      - uses: actions/checkout@aaaaaaa # v6.0.2',
+    ].join('\n');
+    // Reconstruct a realistic +/- pair (context line above is unchanged).
+    const realistic = [
+      '@@ -10,7 +10,7 @@',
+      '-      - uses: actions/checkout@aaaaaaa # v6.0.2',
+      '+      - uses: actions/checkout@bbbbbbb # v6.0.3',
+    ].join('\n');
+    expect(isMechanicalActionBumpDiff(diff)).toBe(true);
+    expect(isMechanicalActionBumpDiff(realistic)).toBe(true);
+  });
+
+  it('handles multiple action bumps in one file', () => {
+    const diff = [
+      '-      - uses: actions/checkout@aaa # v6.0.2',
+      '+      - uses: actions/checkout@bbb # v6.0.3',
+      '-      - uses: actions/setup-node@ccc # v5.0.0',
+      '+      - uses: actions/setup-node@ddd # v5.0.1',
+    ].join('\n');
+    expect(isMechanicalActionBumpDiff(diff)).toBe(true);
+  });
+
+  it('is NOT mechanical when a non-uses line changes (real pipeline edit)', () => {
+    const diff = [
+      '-      - uses: actions/checkout@aaa # v6.0.2',
+      '+      - uses: actions/checkout@bbb # v6.0.3',
+      '+        with:',
+      '+          fetch-depth: 0',
+    ].join('\n');
+    expect(isMechanicalActionBumpDiff(diff)).toBe(false);
+  });
+
+  it('is NOT mechanical when a run step changes', () => {
+    const diff = [
+      '-          npx tsx scripts/check-docops-skill.ts',
+      '+          npx tsx scripts/check-docops-skill.ts --verbose',
+    ].join('\n');
+    expect(isMechanicalActionBumpDiff(diff)).toBe(false);
+  });
+
+  it('returns false for an empty diff (no detectable change)', () => {
+    expect(isMechanicalActionBumpDiff('')).toBe(false);
+  });
+});
+
+describe('performCheck consumes the escape-hatch recogniser (#6026, the seam)', () => {
+  // The recogniser had 25 tests and the gate had 10, and NONE of the 35 broke
+  // when performCheck was reverted to bypassing on any occurrence. Both parts
+  // were covered; the wire between them was not. These drive the real decision
+  // path with a real manifest and only the world-reads faked.
+  const PIPELINE_FILE = 'scripts/inject-governance.ts';
+
+  function check(commitMessage: string, changed: string[]): CheckResult {
+    return performCheck(false, {
+      readCommitMessages: () => commitMessage,
+      readChangedFiles: () => changed,
+    });
+  }
+
+  it('a prose MENTION does not bypass — the violation still fires', () => {
+    const result = check('fix(ci): stop the gate inheriting [skip-docops] from the base branch', [
+      PIPELINE_FILE,
+    ]);
+    expect(result.escapeHatchUsed).toBe(false);
+    expect(result.success).toBe(false);
+    expect(result.changedPipelineFiles).toContain(PIPELINE_FILE);
+    expect(result.escapeHatchMentions).toHaveLength(1);
+  });
+
+  it('a trailing INVOCATION does bypass', () => {
+    const result = check('chore: regenerate artifacts [skip-docops]', [PIPELINE_FILE]);
+    expect(result.escapeHatchUsed).toBe(true);
+    expect(result.success).toBe(true);
+  });
+
+  it('a standalone INVOCATION on its own line does bypass', () => {
+    const result = check('chore: regenerate artifacts\n\n[skip-docops] generated output only', [
+      PIPELINE_FILE,
+    ]);
+    expect(result.escapeHatchUsed).toBe(true);
+  });
+
+  it('reports absence and mention-only differently', () => {
+    const absent = check('fix: unrelated', [PIPELINE_FILE]);
+    expect(absent.escapeHatchUsed).toBe(false);
+    expect(absent.escapeHatchMentions).toHaveLength(0);
+  });
+
+  it('no pipeline file changed is a pass, not a bypass', () => {
+    const result = check('fix: touch nothing relevant', ['README.md']);
+    expect(result.success).toBe(true);
+    expect(result.escapeHatchUsed).toBe(false);
+    expect(result.changedPipelineFiles).toHaveLength(0);
+  });
+});
+
+describe('performCheck accepts a per-PR note file under pipeline_notes_dir (#6334)', () => {
+  // Every PIPELINE NOTE used to land in one shared region of SKILL.md, so any
+  // two concurrent pipeline PRs conflicted on merge and a hand-resolved
+  // conflict voided the governor ratification binding. A note file under the
+  // manifest's `pipeline_notes_dir` now satisfies the gate as well.
+  const PIPELINE_FILE = 'scripts/inject-governance.ts';
+  const SKILL_FILE = 'skills/documentation-management/SKILL.md';
+  const NOTES_DIR = 'skills/documentation-management/pipeline-notes';
+
+  function check(changed: string[]): CheckResult {
+    return performCheck(false, {
+      readCommitMessages: () => 'fix: a real pipeline change',
+      readChangedFiles: () => changed,
+    });
+  }
+
+  it('the real manifest names the notes directory', () => {
+    const result = check(['README.md']);
+    expect(result.manifest?.pipeline_notes_dir).toBe(NOTES_DIR);
+  });
+
+  it('(a) a .md note file under the notes dir satisfies the gate', () => {
+    const result = check([PIPELINE_FILE, `${NOTES_DIR}/6334-notes-directory.md`]);
+    expect(result.skillUpdated).toBe(true);
+    expect(result.success).toBe(true);
+  });
+
+  it('(b) a non-.md file under the notes dir does NOT satisfy the gate', () => {
+    const result = check([PIPELINE_FILE, `${NOTES_DIR}/6334-notes-directory.txt`]);
+    expect(result.skillUpdated).toBe(false);
+    expect(result.success).toBe(false);
+  });
+
+  it('(c) a .md file in a sibling directory does NOT satisfy the gate', () => {
+    const sibling = 'skills/documentation-management/pipeline-notes-archive/6334.md';
+    const result = check([PIPELINE_FILE, sibling, 'skills/docs-review/SKILL.md']);
+    expect(result.skillUpdated).toBe(false);
+    expect(result.success).toBe(false);
+  });
+
+  it('(d) editing SKILL.md itself still satisfies the gate', () => {
+    const result = check([PIPELINE_FILE, SKILL_FILE]);
+    expect(result.skillUpdated).toBe(true);
+    expect(result.success).toBe(true);
+  });
+
+  it('names the empty case: a pipeline change with no note and no skill edit fails', () => {
+    const result = check([PIPELINE_FILE]);
+    expect(result.skillUpdated).toBe(false);
+    expect(result.success).toBe(false);
+  });
+});

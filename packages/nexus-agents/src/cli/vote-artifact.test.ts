@@ -1,0 +1,182 @@
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdtemp, open, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  extractBoundArtifact,
+  inlineVoteArtifact,
+  inlineVoteArtifactText,
+  MAX_VOTE_ARTIFACT_BYTES,
+} from './vote-artifact.js';
+import { parseCliArgs } from '../cli.js';
+
+const CAP = 256 * 1024;
+const hasMkfifo = ((): boolean => {
+  try {
+    execFileSync('mkfifo', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+describe('vote artifact file (#7092)', () => {
+  let dir: string;
+  let path: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vote-artifact-'));
+    path = join(dir, 'resolution.diff');
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('preserves the proposal when no artifact path is provided', async () => {
+    expect(await inlineVoteArtifact('Ratify', undefined)).toBe('Ratify');
+  });
+
+  it('parses --artifact-file and carries its path', () => {
+    const parsed = parseCliArgs(['vote', '-p', 'Ratify', '--artifact-file', path]);
+    expect(parsed.options.artifactFile).toBe(path);
+  });
+  it('omits artifactFile when absent', () => {
+    expect(parseCliArgs(['vote', '-p', 'Ratify']).options).not.toHaveProperty('artifactFile');
+  });
+  it('requires a flag value', () => {
+    expect(() => parseCliArgs(['vote', '-p', 'Ratify', '--artifact-file'])).toThrow();
+  });
+  it('inlines exact content with basename, UTF-8 bytes, SHA-256 and markers', async () => {
+    const content = '+ café 🌍\n';
+    await writeFile(path, content);
+    const digest = createHash('sha256').update(content).digest('hex');
+    expect(await inlineVoteArtifact('Ratify', path)).toBe(
+      `Ratify\n\nArtifact: resolution.diff sha256:${digest} ${String(Buffer.byteLength(content))} bytes\n` +
+        `===== BEGIN ARTIFACT =====\n${content}\n===== END ARTIFACT =====`
+    );
+  });
+  it('accepts exactly the byte cap without truncating', async () => {
+    const content = 'é'.repeat(CAP / 2);
+    await writeFile(path, content);
+    expect(MAX_VOTE_ARTIFACT_BYTES).toBe(CAP);
+    expect(await inlineVoteArtifact('Ratify', path)).toContain(content);
+  });
+  it('errors on a missing file', async () => {
+    await expect(inlineVoteArtifact('Ratify', path)).rejects.toThrow(/ENOENT/);
+  });
+  it('errors on an empty file', async () => {
+    await writeFile(path, '');
+    await expect(inlineVoteArtifact('Ratify', path)).rejects.toThrow(/empty/i);
+  });
+  it('errors on binary content containing NUL', async () => {
+    await writeFile(path, Buffer.from([65, 0, 66]));
+    await expect(inlineVoteArtifact('Ratify', path)).rejects.toThrow(/binary|NUL/i);
+  });
+  // #7092: POSIX fixture requires coreutils mkfifo, as in read-only-mcp-isolation.test.ts.
+  it.skipIf(!hasMkfifo)('rejects a named pipe promptly without waiting for a writer', async () => {
+    execFileSync('mkfifo', [path]);
+    const pending = inlineVoteArtifact('Ratify', path).catch((error: unknown) => error);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<string>((resolve) => {
+      timer = setTimeout(() => {
+        resolve('timed out');
+      }, 1000);
+    });
+    const result = await Promise.race([pending, timeout]);
+    try {
+      expect(result).toBeInstanceOf(Error);
+      expect(result).toHaveProperty('message', 'Vote artifact must be a regular file');
+    } finally {
+      clearTimeout(timer);
+      if (result === 'timed out') {
+        // Release the blocked reader before cleaning up the failed fixture.
+        const writer = await open(path, 'r+');
+        await pending;
+        await writer.close();
+      }
+    }
+  });
+
+  it('rejects invalid UTF-8 rather than replacing bytes in the reviewed artifact', async () => {
+    await writeFile(path, Buffer.from([0xc3, 0x28]));
+    await expect(inlineVoteArtifact('Ratify', path)).rejects.toThrow(/UTF-8/i);
+  });
+
+  it('reports actual byte size and cap when exceeded', async () => {
+    await writeFile(path, 'é'.repeat(CAP / 2 + 1));
+    await expect(inlineVoteArtifact('Ratify', path)).rejects.toThrow(`${String(CAP + 2)} bytes`);
+    await expect(inlineVoteArtifact('Ratify', path)).rejects.toThrow(`${String(CAP)} bytes`);
+  });
+});
+
+/** In-memory plans share exactly the file validator and framing. */
+describe('in-memory vote artifact (#7411)', () => {
+  it('preserves Unicode, BOM and framing byte-for-byte', () => {
+    const text = '\ufeffcafé 🌍\n';
+    const hash = createHash('sha256').update(text).digest('hex');
+    expect(inlineVoteArtifactText('Review', text, 'plan.txt')).toBe(
+      `Review\n\nArtifact: plan.txt sha256:${hash} ${String(Buffer.byteLength(text))} bytes\n===== BEGIN ARTIFACT =====\n${text}\n===== END ARTIFACT =====`
+    );
+  });
+  it.each(['', 'x\0y', '\ud800', '\udc00', 'x\ud800y', '🌍\ud800'])(
+    'refuses invalid text %j',
+    (text) => {
+      expect(() => inlineVoteArtifactText('Review', text, 'plan.txt')).toThrow();
+    }
+  );
+  it('refuses invalid UTF-8 bytes rather than hashing replacements', () => {
+    expect(() => inlineVoteArtifactText('Review', Buffer.from([0xc3, 0x28]), 'plan.txt')).toThrow(
+      /UTF-8/i
+    );
+  });
+  it('accepts the exact byte cap and refuses cap + 1 for Unicode', () => {
+    const text = 'é'.repeat(CAP / 2);
+    expect(inlineVoteArtifactText('Review', text, 'plan.txt')).toContain(text);
+    expect(() => inlineVoteArtifactText('Review', text + 'x', 'plan.txt')).toThrow(
+      /262145.*262144/
+    );
+  });
+
+  describe('extractBoundArtifact', () => {
+    it('extracts metadata from an inlined artifact proposal', () => {
+      const inlined = inlineVoteArtifactText('Review plan', 'sample content', 'plan.md');
+      const extracted = extractBoundArtifact(inlined);
+      expect(extracted).toBeDefined();
+      expect(extracted?.displayName).toBe('plan.md');
+      expect(extracted?.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(extracted?.bytes).toBe(14);
+    });
+
+    it('returns undefined when proposal does not contain an inlined artifact header', () => {
+      expect(extractBoundArtifact('Just an ordinary proposal')).toBeUndefined();
+    });
+
+    it('returns undefined when proposal merely mentions artifact in prose without framing block', () => {
+      const spoofed =
+        'Proposal text mentioning Artifact: plan.md sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 bytes in prose';
+      expect(extractBoundArtifact(spoofed)).toBeUndefined();
+    });
+
+    it('returns undefined when inlined artifact content does not match declared sha256 digest', () => {
+      const spoofed =
+        'Proposal\n\nArtifact: plan.md sha256:0000000000000000000000000000000000000000000000000000000000000000 14 bytes\n===== BEGIN ARTIFACT =====\nsample content\n===== END ARTIFACT =====';
+      expect(extractBoundArtifact(spoofed)).toBeUndefined();
+    });
+
+    it('returns undefined when inlined artifact content does not match declared byte length', () => {
+      const valid = inlineVoteArtifactText('Review plan', 'sample content', 'plan.md');
+      const tamperedLength = valid.replace(' 14 bytes', ' 99 bytes');
+      expect(extractBoundArtifact(tamperedLength)).toBeUndefined();
+    });
+
+    it('extracts artifact when proposal has trailing research context', () => {
+      const inlined = inlineVoteArtifactText('Review plan', 'sample content', 'plan.md');
+      const withResearch = `${inlined}\n\n---\n## Research context (informational):\nSome background research notes`;
+      const extracted = extractBoundArtifact(withResearch);
+      expect(extracted).toBeDefined();
+      expect(extracted?.displayName).toBe('plan.md');
+      expect(extracted?.bytes).toBe(14);
+    });
+  });
+});

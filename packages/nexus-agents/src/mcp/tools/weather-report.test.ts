@@ -1,0 +1,1154 @@
+/**
+ * Tests for weather report — multi-CLI performance dashboard and adaptive routing.
+ * (Source: Issue #865)
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { resetOutcomeStore, getOutcomeStore } from '../../orchestration/outcomes/index.js';
+import type { TaskOutcome } from '../../orchestration/outcomes/outcome-types.js';
+import {
+  generateWeatherReport,
+  getAdaptiveBonus,
+  shouldExplore,
+  queryWithLookback,
+} from './weather-report.js';
+import { createDefaultWeatherConfig } from './weather-report-types.js';
+import { CLI_NAMES } from '../../config/model-capabilities-types.js';
+
+// Disable persistence so getOutcomeStore() returns a fresh in-memory store
+vi.mock('../../config/learning-persistence.js', () => ({
+  isPersistenceEnabled: vi.fn(() => false),
+}));
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function makeOutcome(overrides: Partial<TaskOutcome> = {}): TaskOutcome {
+  return {
+    id: `test-${String(Date.now())}-${Math.random().toString(36).slice(2, 6)}`,
+    cli: 'claude',
+    category: 'code_generation',
+    model: 'claude-sonnet',
+    success: true,
+    durationMs: 1000,
+    timestamp: new Date().toISOString(),
+    source: 'delegate',
+    ...overrides,
+  };
+}
+
+function seedOutcomes(count: number, overrides: Partial<TaskOutcome> = {}): void {
+  const store = getOutcomeStore();
+  for (let i = 0; i < count; i++) {
+    store.append(makeOutcome(overrides));
+  }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+beforeEach(() => {
+  resetOutcomeStore();
+});
+
+describe('createDefaultWeatherConfig', () => {
+  it('returns expected defaults', () => {
+    const config = createDefaultWeatherConfig();
+    expect(config.coldStartThreshold).toBe(3);
+    expect(config.explorationRate).toBe(0.1);
+    expect(config.maxBonusAdjustment).toBe(10);
+  });
+});
+
+describe('generateWeatherReport', () => {
+  it('returns empty report when no outcomes', () => {
+    const report = generateWeatherReport({});
+
+    expect(report.overall.totalTasks).toBe(0);
+    expect(report.overall.successRate).toBe(0);
+    expect(report.cliWeather).toHaveLength(CLI_NAMES.length);
+    expect(report.collectedAt).toBeDefined();
+  });
+
+  it('reports per-CLI stats', () => {
+    seedOutcomes(5, { cli: 'claude', success: true, durationMs: 100 });
+    seedOutcomes(3, { cli: 'gemini', success: true, durationMs: 200 });
+    seedOutcomes(2, { cli: 'codex', success: false, durationMs: 300 });
+
+    const report = generateWeatherReport({});
+
+    expect(report.overall.totalTasks).toBe(10);
+    const claudeW = report.cliWeather.find((c) => c.cli === 'claude');
+    expect(claudeW?.totalTasks).toBe(5);
+    expect(claudeW?.successRate).toBe(1);
+
+    const codexW = report.cliWeather.find((c) => c.cli === 'codex');
+    expect(codexW?.totalTasks).toBe(2);
+    expect(codexW?.successRate).toBe(0);
+  });
+
+  it('filters by CLI when specified', () => {
+    seedOutcomes(5, { cli: 'claude' });
+    seedOutcomes(3, { cli: 'gemini' });
+
+    const report = generateWeatherReport({ cli: 'claude' });
+
+    expect(report.overall.totalTasks).toBe(5);
+    expect(report.cliWeather).toHaveLength(1);
+    expect(report.cliWeather[0]?.cli).toBe('claude');
+  });
+
+  it('filters by category when specified', () => {
+    seedOutcomes(5, { category: 'code_review' });
+    seedOutcomes(3, { category: 'testing' });
+
+    const report = generateWeatherReport({ category: 'code_review' });
+
+    expect(report.overall.totalTasks).toBe(5);
+  });
+
+  it('includes per-category breakdown in CLI weather', () => {
+    seedOutcomes(3, { cli: 'claude', category: 'code_review' });
+    seedOutcomes(2, { cli: 'claude', category: 'testing' });
+
+    const report = generateWeatherReport({});
+    const claudeW = report.cliWeather.find((c) => c.cli === 'claude');
+    expect(claudeW?.byCategory.get('code_review')?.count).toBe(3);
+    expect(claudeW?.byCategory.get('testing')?.count).toBe(2);
+  });
+
+  it('keeps defaulted-category rows out of the per-category breakdown (#6549)', () => {
+    seedOutcomes(2, { cli: 'claude', category: 'exploration', categorySource: 'detected' });
+    seedOutcomes(4, { cli: 'claude', category: 'exploration', categorySource: 'defaulted' });
+
+    const report = generateWeatherReport({});
+    const claudeW = report.cliWeather.find((c) => c.cli === 'claude');
+    expect(report.overall.totalTasks).toBe(6);
+    expect(claudeW?.byCategory.get('exploration')?.count).toBe(2);
+  });
+
+  it('a category filter does not count defaulted-category rows (#6549)', () => {
+    seedOutcomes(4, { category: 'exploration', categorySource: 'defaulted' });
+
+    const report = generateWeatherReport({ category: 'exploration' });
+
+    expect(report.overall.totalTasks).toBe(0);
+  });
+
+  it('includes adaptive bonuses when requested', () => {
+    seedOutcomes(15, { cli: 'claude', category: 'architecture', success: true });
+
+    const report = generateWeatherReport({ includeAdaptive: true });
+
+    expect(report.adaptiveBonuses.length).toBeGreaterThan(0);
+    const archBonus = report.adaptiveBonuses.find(
+      (b) => b.cli === 'claude' && b.category === 'architecture'
+    );
+    expect(archBonus?.sufficient).toBe(true);
+    expect(archBonus?.sampleCount).toBe(15);
+  });
+
+  it('excludes adaptive bonuses when not requested', () => {
+    seedOutcomes(5, { cli: 'claude' });
+
+    const report = generateWeatherReport({ includeAdaptive: false });
+
+    expect(report.adaptiveBonuses).toHaveLength(0);
+  });
+
+  it('includes failureBreakdown when failures have categories', () => {
+    getOutcomeStore().append(makeOutcome({ success: false, failureCategory: 'timeout' }));
+    getOutcomeStore().append(makeOutcome({ success: false, failureCategory: 'timeout' }));
+    getOutcomeStore().append(makeOutcome({ success: false, failureCategory: 'rate_limit' }));
+    seedOutcomes(3); // successes
+
+    const report = generateWeatherReport({});
+
+    expect(report.failureBreakdown).toBeDefined();
+    const breakdown = report.failureBreakdown ?? [];
+    expect(breakdown).toHaveLength(2);
+    const timeoutEntry = breakdown.find((e) => e.category === 'timeout');
+    expect(timeoutEntry?.count).toBe(2);
+    expect(timeoutEntry?.percentage).toBeCloseTo(66.7, 0);
+    const rateLimitEntry = breakdown.find((e) => e.category === 'rate_limit');
+    expect(rateLimitEntry?.count).toBe(1);
+  });
+
+  it('omits failureBreakdown when no failures', () => {
+    seedOutcomes(5);
+    const report = generateWeatherReport({});
+    expect(report.failureBreakdown).toBeUndefined();
+  });
+
+  it('auto-classifies failures without failureCategory as execution (#1441)', () => {
+    getOutcomeStore().append(makeOutcome({ success: false }));
+    const report = generateWeatherReport({});
+    const breakdown = report.failureBreakdown ?? [];
+    expect(breakdown).toHaveLength(1);
+    // OutcomeStore.append() auto-classifies unclassified failures as 'execution'
+    expect(breakdown[0]?.category).toBe('execution');
+  });
+
+  it('reports exploration rate and cold start threshold', () => {
+    const report = generateWeatherReport({});
+
+    expect(report.explorationRate).toBe(0.1);
+    expect(report.coldStartThreshold).toBe(3);
+  });
+});
+
+describe('adapter attempt stats (#1982)', () => {
+  it('reports zero stats on an empty store', () => {
+    const report = generateWeatherReport({});
+    expect(report.overall.adapterAttemptSuccessRate).toBe(0);
+    expect(report.overall.adapterUnavailableCount).toBe(0);
+    expect(report.overall.adapterUnavailableRate).toBe(0);
+  });
+
+  it('excludes adapter_unavailable from attempt success denominator', () => {
+    // 5 successes, 2 execution failures, 3 adapter_unavailable failures
+    seedOutcomes(5, { cli: 'claude', success: true });
+    seedOutcomes(2, { cli: 'claude', success: false, failureCategory: 'execution' });
+    seedOutcomes(3, {
+      cli: 'claude',
+      success: false,
+      failureCategory: 'adapter_unavailable',
+    });
+
+    const report = generateWeatherReport({});
+
+    // Headline: 5 / 10 = 0.50
+    expect(report.overall.successRate).toBeCloseTo(0.5, 2);
+    // Adapter-attempt: 5 successes / (10 - 3 infra) = 5/7 ≈ 0.714
+    expect(report.overall.adapterAttemptSuccessRate).toBeCloseTo(0.714, 2);
+    expect(report.overall.adapterUnavailableCount).toBe(3);
+    expect(report.overall.adapterUnavailableRate).toBeCloseTo(0.3, 2);
+  });
+
+  it('reports per-CLI adapter stats independently', () => {
+    seedOutcomes(4, { cli: 'claude', success: true });
+    seedOutcomes(1, { cli: 'claude', success: false, failureCategory: 'adapter_unavailable' });
+    seedOutcomes(5, { cli: 'gemini', success: true });
+
+    const report = generateWeatherReport({});
+    const claude = report.cliWeather.find((c) => c.cli === 'claude');
+    const gemini = report.cliWeather.find((c) => c.cli === 'gemini');
+
+    // claude: 4 / (5 - 1) = 1.0 attempt success; 1/5 unavailable
+    expect(claude?.adapterAttemptSuccessRate).toBe(1);
+    expect(claude?.adapterUnavailableCount).toBe(1);
+    expect(claude?.adapterUnavailableRate).toBeCloseTo(0.2, 2);
+    // gemini: no adapter_unavailable events
+    expect(gemini?.adapterAttemptSuccessRate).toBe(1);
+    expect(gemini?.adapterUnavailableCount).toBe(0);
+    expect(gemini?.adapterUnavailableRate).toBe(0);
+  });
+
+  it('falls back to message-based classification when failureCategory absent', () => {
+    seedOutcomes(2, { cli: 'claude', success: true });
+    // No failureCategory field; error message should be classified as adapter_unavailable
+    seedOutcomes(2, {
+      cli: 'claude',
+      success: false,
+      errorMessage: 'No model adapter configured',
+    });
+
+    const report = generateWeatherReport({});
+    const claude = report.cliWeather.find((c) => c.cli === 'claude');
+    // Note: outcome-store auto-classifies on append, so this may or may not be captured;
+    // the helper's fallback classifier is exercised only for pre-#1441 records. Assert
+    // the adapter-attempt rate is AT LEAST as high as the raw rate (the refinement
+    // should never penalize the attempt metric relative to raw).
+    expect(claude?.adapterAttemptSuccessRate ?? 0).toBeGreaterThanOrEqual(claude?.successRate ?? 0);
+  });
+});
+
+describe('getAdaptiveBonus', () => {
+  it('returns 0 below cold-start threshold', () => {
+    seedOutcomes(2, { cli: 'claude', category: 'code_generation', success: true });
+
+    const bonus = getAdaptiveBonus('claude', 'code_generation');
+    expect(bonus).toBe(0);
+  });
+
+  it('returns positive bonus for high success rate', () => {
+    seedOutcomes(15, { cli: 'claude', category: 'code_generation', success: true });
+
+    const bonus = getAdaptiveBonus('claude', 'code_generation');
+    expect(bonus).toBeGreaterThan(0);
+  });
+
+  it('returns negative bonus for low success rate', () => {
+    seedOutcomes(15, { cli: 'codex', category: 'research', success: false });
+
+    const bonus = getAdaptiveBonus('codex', 'research');
+    expect(bonus).toBeLessThan(0);
+  });
+
+  it('clamps to maxBonusAdjustment', () => {
+    seedOutcomes(20, { cli: 'claude', category: 'architecture', success: true });
+
+    const bonus = getAdaptiveBonus('claude', 'architecture', { maxBonusAdjustment: 3 });
+    expect(bonus).toBeLessThanOrEqual(3);
+    expect(bonus).toBeGreaterThanOrEqual(-3);
+  });
+
+  it('respects custom cold-start threshold', () => {
+    seedOutcomes(2, { cli: 'claude', category: 'testing', success: true });
+
+    // Default threshold is 3, so 2 samples = cold start
+    expect(getAdaptiveBonus('claude', 'testing')).toBe(0);
+
+    // With threshold of 2, 2 samples is sufficient
+    const bonus = getAdaptiveBonus('claude', 'testing', { coldStartThreshold: 2 });
+    expect(bonus).toBeGreaterThan(0);
+  });
+
+  it('scales with observed success rate', () => {
+    // Mixed success: 70% = baseline → ~0 adjustment
+    for (let i = 0; i < 7; i++) {
+      getOutcomeStore().append(
+        makeOutcome({ cli: 'gemini', category: 'documentation', success: true })
+      );
+    }
+    for (let i = 0; i < 3; i++) {
+      getOutcomeStore().append(
+        makeOutcome({ cli: 'gemini', category: 'documentation', success: false })
+      );
+    }
+
+    const bonus = getAdaptiveBonus('gemini', 'documentation');
+    // 70% success = baseline, should be near 0
+    expect(Math.abs(bonus)).toBeLessThan(1);
+  });
+});
+
+// ============================================================================
+// Per-model weather lens seam (#4194) — the lens itself is tested in
+// weather-report-model-lens.test.ts; these cases prove the report wires it.
+// ============================================================================
+
+describe('modelWeather section of the report (#4194)', () => {
+  it('rides the report payload without changing routing-visible bonuses', () => {
+    seedOutcomes(15, { model: 'claude-opus-4', cli: 'claude', category: 'code_generation' });
+
+    const report = generateWeatherReport({ includeModelWeather: true });
+
+    // Telemetry lens present…
+    expect(report.modelWeather?.some((e) => e.model === 'claude-opus-4')).toBe(true);
+    // …while the routing-visible bonus stays the CLI×category computation.
+    const bonus = report.adaptiveBonuses.find(
+      (b) => b.cli === 'claude' && b.category === 'code_generation'
+    );
+    expect(bonus?.sampleCount).toBe(15);
+    expect(bonus?.adaptiveBonus).toBe(
+      Math.round(getAdaptiveBonus('claude', 'code_generation') * 10) / 10
+    );
+  });
+
+  it('omits the modelWeather section when no model has sufficient samples', () => {
+    seedOutcomes(2, { model: 'gpt-5', cli: 'codex' });
+
+    const report = generateWeatherReport({ includeModelWeather: true });
+
+    expect(report.modelWeather).toBeUndefined();
+  });
+
+  it('omits the modelWeather lens entirely when not opted in (#4202 — routing path)', () => {
+    seedOutcomes(15, { model: 'claude-opus-4', cli: 'claude', category: 'code_generation' });
+
+    const report = generateWeatherReport({});
+
+    expect(report.modelWeather).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// queryWithLookback (#1401)
+// ============================================================================
+
+describe('queryWithLookback', () => {
+  it('returns only recent outcomes within lookback window', () => {
+    const store = getOutcomeStore();
+    const old = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString(); // 14 days ago
+    const recent = new Date(Date.now() - 1000).toISOString(); // 1 second ago
+
+    // Seed 5 old + 5 recent outcomes
+    for (let i = 0; i < 5; i++) {
+      store.append(makeOutcome({ cli: 'claude', category: 'testing', timestamp: old }));
+    }
+    for (let i = 0; i < 5; i++) {
+      store.append(makeOutcome({ cli: 'claude', category: 'testing', timestamp: recent }));
+    }
+
+    const cfg = { ...createDefaultWeatherConfig(), outcomeLookbackMs: 7 * 24 * 60 * 60 * 1000 };
+    const results = queryWithLookback(store, 'claude', 'testing', cfg);
+    // Should return only the 5 recent outcomes (within 7-day window)
+    expect(results).toHaveLength(5);
+  });
+
+  it('falls back to all history when lookback has insufficient samples', () => {
+    const store = getOutcomeStore();
+    const old = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    const recent = new Date(Date.now() - 1000).toISOString();
+
+    // Seed 10 old + 2 recent outcomes
+    for (let i = 0; i < 10; i++) {
+      store.append(makeOutcome({ cli: 'claude', category: 'testing', timestamp: old }));
+    }
+    for (let i = 0; i < 2; i++) {
+      store.append(makeOutcome({ cli: 'claude', category: 'testing', timestamp: recent }));
+    }
+
+    const cfg = {
+      ...createDefaultWeatherConfig(),
+      outcomeLookbackMs: 7 * 24 * 60 * 60 * 1000,
+      coldStartThreshold: 3, // Need 3 samples, only 2 recent
+    };
+    const results = queryWithLookback(store, 'claude', 'testing', cfg);
+    // Should fall back to all 12 outcomes
+    expect(results).toHaveLength(12);
+  });
+
+  it('returns all outcomes when lookbackMs is 0', () => {
+    const store = getOutcomeStore();
+    const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    for (let i = 0; i < 5; i++) {
+      store.append(makeOutcome({ cli: 'claude', category: 'testing', timestamp: old }));
+    }
+
+    const cfg = { ...createDefaultWeatherConfig(), outcomeLookbackMs: 0 };
+    const results = queryWithLookback(store, 'claude', 'testing', cfg);
+    expect(results).toHaveLength(5);
+  });
+
+  it('affects adaptive bonus calculation with lookback', () => {
+    const store = getOutcomeStore();
+    const old = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    const recent = new Date(Date.now() - 1000).toISOString();
+
+    // 10 old failures + 10 recent successes
+    for (let i = 0; i < 10; i++) {
+      store.append(
+        makeOutcome({ cli: 'gemini', category: 'architecture', success: false, timestamp: old })
+      );
+    }
+    for (let i = 0; i < 10; i++) {
+      store.append(
+        makeOutcome({ cli: 'gemini', category: 'architecture', success: true, timestamp: recent })
+      );
+    }
+
+    // Without lookback (0): 10/20 = 50% success → negative bonus
+    const noLookback = getAdaptiveBonus('gemini', 'architecture', { outcomeLookbackMs: 0 });
+    // With 7-day lookback: 10/10 = 100% success → positive bonus
+    const withLookback = getAdaptiveBonus('gemini', 'architecture', {
+      outcomeLookbackMs: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    expect(withLookback).toBeGreaterThan(noLookback);
+    expect(withLookback).toBeGreaterThan(0);
+    expect(noLookback).toBeLessThan(withLookback);
+  });
+});
+
+// ============================================================================
+// Recent Window (#1401)
+// ============================================================================
+
+describe('recentWindow in weather report', () => {
+  it('includes recentWindow with outcomes within lookback', () => {
+    const recent = new Date(Date.now() - 1000).toISOString();
+    for (let i = 0; i < 5; i++) {
+      getOutcomeStore().append(makeOutcome({ success: true, durationMs: 200, timestamp: recent }));
+    }
+    for (let i = 0; i < 3; i++) {
+      getOutcomeStore().append(makeOutcome({ success: false, durationMs: 400, timestamp: recent }));
+    }
+
+    const report = generateWeatherReport({});
+    expect(report.recentWindow).toBeDefined();
+    expect(report.recentWindow?.totalTasks).toBe(8);
+    expect(report.recentWindow?.successRate).toBeCloseTo(5 / 8, 2);
+    expect(report.recentWindow?.avgDurationMs).toBeCloseTo(275, 0);
+    expect(report.recentWindow?.windowMs).toBe(7 * 24 * 60 * 60 * 1000);
+  });
+
+  it('excludes old outcomes from recentWindow', () => {
+    const old = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    const recent = new Date(Date.now() - 1000).toISOString();
+
+    // 10 old failures
+    for (let i = 0; i < 10; i++) {
+      getOutcomeStore().append(makeOutcome({ success: false, durationMs: 500, timestamp: old }));
+    }
+    // 5 recent successes
+    for (let i = 0; i < 5; i++) {
+      getOutcomeStore().append(makeOutcome({ success: true, durationMs: 100, timestamp: recent }));
+    }
+
+    const report = generateWeatherReport({});
+    // Overall includes everything
+    expect(report.overall.totalTasks).toBe(15);
+    // Recent window only includes the 5 recent
+    expect(report.recentWindow?.totalTasks).toBe(5);
+    expect(report.recentWindow?.successRate).toBe(1);
+    expect(report.recentWindow?.avgDurationMs).toBe(100);
+  });
+
+  it('omits recentWindow when no outcomes in lookback', () => {
+    const old = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    for (let i = 0; i < 5; i++) {
+      getOutcomeStore().append(makeOutcome({ timestamp: old }));
+    }
+
+    const report = generateWeatherReport({});
+    expect(report.recentWindow).toBeUndefined();
+  });
+
+  it('omits recentWindow when no outcomes at all', () => {
+    const report = generateWeatherReport({});
+    expect(report.recentWindow).toBeUndefined();
+  });
+});
+
+describe('expert performance in weather report (Issue #1324)', () => {
+  it('includes expertPerformance when worker outcomes exist', () => {
+    // Seed worker-role outcomes (as produced by recordWorkerOutcomes)
+    getOutcomeStore().append(makeOutcome({ model: 'worker-code', success: true, durationMs: 100 }));
+    getOutcomeStore().append(makeOutcome({ model: 'worker-code', success: true, durationMs: 200 }));
+    getOutcomeStore().append(
+      makeOutcome({
+        model: 'worker-security',
+        success: false,
+        durationMs: 300,
+        failureCategory: 'timeout',
+      })
+    );
+
+    const report = generateWeatherReport({});
+    expect(report.expertPerformance).toBeDefined();
+    expect(report.expertPerformance?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('computes per-expert success rate and avg duration', () => {
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-testing', success: true, durationMs: 100 })
+    );
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-testing', success: true, durationMs: 300 })
+    );
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-testing', success: false, durationMs: 200 })
+    );
+
+    const report = generateWeatherReport({});
+    const testing = report.expertPerformance?.find((e) => e.role === 'testing');
+    expect(testing).toBeDefined();
+    expect(testing?.totalTasks).toBe(3);
+    expect(testing?.successRate).toBeCloseTo(2 / 3, 2);
+    expect(testing?.avgDurationMs).toBe(200);
+  });
+
+  it('omits expertPerformance when no worker outcomes', () => {
+    seedOutcomes(5, { model: 'orchestrator' }); // Non-worker outcomes
+    const report = generateWeatherReport({});
+    expect(report.expertPerformance).toBeUndefined();
+  });
+
+  it('extracts role name from worker-{role} model name', () => {
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-architecture', success: true, durationMs: 500 })
+    );
+
+    const report = generateWeatherReport({});
+    const arch = report.expertPerformance?.find((e) => e.role === 'architecture');
+    expect(arch).toBeDefined();
+    expect(arch?.role).toBe('architecture');
+  });
+
+  it('keys a worker row by its role marker, not its served model (#6624)', () => {
+    getOutcomeStore().append(
+      makeOutcome({
+        model: 'worker-security',
+        servedModel: 'claude-sonnet',
+        costUsd: 0.033,
+        priceBasis: 'list',
+        success: true,
+        durationMs: 500,
+      })
+    );
+
+    const report = generateWeatherReport({});
+    expect(report.expertPerformance?.map((e) => e.role)).toEqual(['security']);
+  });
+
+  it('includes consecutiveFailures from tail of outcome history (#1427)', () => {
+    getOutcomeStore().append(makeOutcome({ model: 'worker-code', success: true, durationMs: 100 }));
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-code', success: false, durationMs: 200 })
+    );
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-code', success: false, durationMs: 300 })
+    );
+
+    const report = generateWeatherReport({});
+    const code = report.expertPerformance?.find((e) => e.role === 'code');
+    expect(code?.consecutiveFailures).toBe(2);
+  });
+
+  it('flags degraded roles with successRate below 0.5 (#1427)', () => {
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-docs', success: false, durationMs: 100 })
+    );
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-docs', success: false, durationMs: 200 })
+    );
+    getOutcomeStore().append(makeOutcome({ model: 'worker-docs', success: true, durationMs: 300 }));
+
+    const report = generateWeatherReport({});
+    const docs = report.expertPerformance?.find((e) => e.role === 'docs');
+    expect(docs?.degraded).toBe(true);
+    expect(docs?.successRate).toBeCloseTo(1 / 3, 2);
+  });
+
+  it('sorts by reliability worst-first (#1427)', () => {
+    getOutcomeStore().append(makeOutcome({ model: 'worker-good', success: true, durationMs: 100 }));
+    getOutcomeStore().append(makeOutcome({ model: 'worker-bad', success: false, durationMs: 100 }));
+
+    const report = generateWeatherReport({});
+    const roles = report.expertPerformance?.map((e) => e.role);
+    expect(roles?.[0]).toBe('bad'); // 0% success rate = worst
+    expect(roles?.[1]).toBe('good'); // 100% success rate = best
+  });
+
+  it('includes lastSuccessAt timestamp (#1427)', () => {
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-infra', success: true, durationMs: 100 })
+    );
+    getOutcomeStore().append(
+      makeOutcome({ model: 'worker-infra', success: false, durationMs: 200 })
+    );
+
+    const report = generateWeatherReport({});
+    const infra = report.expertPerformance?.find((e) => e.role === 'infra');
+    expect(infra?.lastSuccessAt).toBeDefined();
+    // Should be a valid ISO timestamp
+    expect(new Date(infra!.lastSuccessAt!).getTime()).toBeGreaterThan(0);
+  });
+
+  it('includes dominant error pattern for failed experts', () => {
+    getOutcomeStore().append(
+      makeOutcome({
+        model: 'worker-security',
+        success: false,
+        failureCategory: 'timeout',
+        durationMs: 100,
+      })
+    );
+    getOutcomeStore().append(
+      makeOutcome({
+        model: 'worker-security',
+        success: false,
+        failureCategory: 'timeout',
+        durationMs: 200,
+      })
+    );
+    getOutcomeStore().append(
+      makeOutcome({
+        model: 'worker-security',
+        success: false,
+        failureCategory: 'rate_limit',
+        durationMs: 300,
+      })
+    );
+
+    const report = generateWeatherReport({});
+    const sec = report.expertPerformance?.find((e) => e.role === 'security');
+    expect(sec?.dominantErrorPattern).toBe('timeout');
+  });
+});
+
+describe('shouldExplore', () => {
+  it('returns boolean', () => {
+    const result = shouldExplore();
+    expect(typeof result).toBe('boolean');
+  });
+
+  it('always returns false with 0 exploration rate', () => {
+    // With rate 0, should never explore
+    let explored = false;
+    for (let i = 0; i < 100; i++) {
+      if (shouldExplore({ explorationRate: 0 })) explored = true;
+    }
+    expect(explored).toBe(false);
+  });
+
+  it('always returns true with 1.0 exploration rate', () => {
+    expect(shouldExplore({ explorationRate: 1 })).toBe(true);
+  });
+});
+
+// ============================================================================
+// Swarm Health Metrics (Issue #1403)
+// ============================================================================
+
+describe('swarmHealth in weather report', () => {
+  it('is absent when no outcomes exist', () => {
+    const report = generateWeatherReport({});
+    expect(report.swarmHealth).toBeUndefined();
+  });
+
+  it('computes agent utilization from expert roles', () => {
+    // 2 active expert roles, 1 failed
+    seedOutcomes(3, { model: 'worker-code_expert', success: true, source: 'delegate' });
+    seedOutcomes(2, { model: 'worker-security_expert', success: true, source: 'delegate' });
+    seedOutcomes(2, { model: 'worker-testing_expert', success: false, source: 'delegate' });
+
+    const report = generateWeatherReport({});
+    expect(report.swarmHealth).toBeDefined();
+    // 2 of 3 roles have successRate > 0
+    expect(report.swarmHealth?.agentUtilization).toBeCloseTo(2 / 3, 2);
+  });
+
+  it('computes collaboration efficiency from delegate outcomes', () => {
+    seedOutcomes(6, { source: 'delegate', success: true });
+    seedOutcomes(4, { source: 'delegate', success: false });
+    // Non-delegate outcomes should not affect collaboration efficiency
+    seedOutcomes(5, { source: 'direct' as 'delegate', success: true });
+
+    const report = generateWeatherReport({});
+    expect(report.swarmHealth).toBeDefined();
+    // 6 successes / 10 delegate = 0.6 (non-delegate 5 are excluded by source filter)
+    // Actually total is 15 outcomes, 11 delegate, but we seeded with source overrides
+    // The delegate filter: 6 success + 4 fail = 10 delegate outcomes → 6/10 = 0.6
+    // But wait, the 5 with 'direct' aren't 'delegate', so collaboration = 6/10 = 0.6
+    expect(report.swarmHealth?.collaborationEfficiency).toBeCloseTo(0.6, 2);
+  });
+
+  it('computes routing accuracy against best CLI per category', () => {
+    // Claude is best for code_generation (100% success)
+    seedOutcomes(5, { cli: 'claude', category: 'code_generation', success: true });
+    // Gemini routed to code_generation too (0% success — suboptimal routing)
+    seedOutcomes(5, { cli: 'gemini', category: 'code_generation', success: false });
+
+    const report = generateWeatherReport({});
+    expect(report.swarmHealth).toBeDefined();
+    // Best CLI for code_generation = claude (100%). 5/10 tasks went to claude.
+    expect(report.swarmHealth?.routingAccuracy).toBeCloseTo(0.5, 2);
+  });
+
+  it('does not score routing accuracy over defaulted-category rows (#6549)', () => {
+    seedOutcomes(5, { cli: 'claude', category: 'exploration', categorySource: 'defaulted' });
+    seedOutcomes(5, { cli: 'gemini', category: 'exploration', categorySource: 'defaulted' });
+
+    const report = generateWeatherReport({});
+    expect(report.swarmHealth).toBeDefined();
+    expect(report.swarmHealth?.observedCategories).toBe(0);
+    expect(report.swarmHealth?.analyzedCategories).toBe(0);
+  });
+
+  it('scores routing against API arms too, so an API arm row is not a free miss (#6552)', () => {
+    // api:anthropic is the best arm for code_generation (100%); gemini fails.
+    seedOutcomes(5, { cli: 'api:anthropic', category: 'code_generation', success: true });
+    seedOutcomes(5, { cli: 'gemini', category: 'code_generation', success: false });
+
+    const report = generateWeatherReport({});
+    // Scored over CLI names only, gemini (0%) was "best", every gemini row was
+    // "accurate" and regret was negative (-0.5).
+    expect(report.swarmHealth?.routingAccuracy).toBeCloseTo(0.5, 2);
+    expect(report.swarmHealth?.weeklyRegret).toBeCloseTo(0.5, 2);
+  });
+
+  it('computes weekly regret as gap from optimal', () => {
+    // Best possible: 100% for code_generation via claude
+    seedOutcomes(5, { cli: 'claude', category: 'code_generation', success: true });
+    // Actual includes gemini failures → overall rate = 50%, best = 100% → regret = 0.5
+    seedOutcomes(5, { cli: 'gemini', category: 'code_generation', success: false });
+
+    const report = generateWeatherReport({});
+    expect(report.swarmHealth).toBeDefined();
+    expect(report.swarmHealth?.weeklyRegret).toBeCloseTo(0.5, 2);
+  });
+
+  it('includes observedCategories and observedRoles', () => {
+    seedOutcomes(5, {
+      model: 'worker-code_expert',
+      category: 'code_generation',
+      source: 'delegate',
+    });
+    seedOutcomes(5, {
+      model: 'worker-security_expert',
+      category: 'security_review',
+      source: 'delegate',
+    });
+
+    const report = generateWeatherReport({});
+    expect(report.swarmHealth).toBeDefined();
+    expect(report.swarmHealth?.observedCategories).toBeGreaterThanOrEqual(2);
+    expect(report.swarmHealth?.observedRoles).toBe(2);
+  });
+});
+
+// ============================================================================
+// Cost section (Epic G, #3856)
+// ============================================================================
+
+function makeDecisionCostRecord(
+  gate: 'consensus_vote' | 'pr_review',
+  over: {
+    voterCount?: number;
+    measuredVoters?: number;
+    unmeasuredVoters?: number;
+    tokenMeasuredVoters?: number;
+    tokenUnmeasuredVoters?: number;
+    totalTokens?: number;
+    totalCostUsd?: number;
+  } = {}
+): import('../../observability/decision-cost-store.js').DecisionCostRecord {
+  const voterCount = over.voterCount ?? 0;
+  const measuredVoters = over.measuredVoters ?? voterCount;
+  return {
+    decisionId: `dc-${Math.random().toString(36).slice(2)}`,
+    gate,
+    timestamp: '2026-06-17T00:00:00.000Z',
+    summary: {
+      billingMode: 'api',
+      voterCount,
+      measuredVoters,
+      unmeasuredVoters: over.unmeasuredVoters ?? voterCount - measuredVoters,
+      ...(over.tokenMeasuredVoters !== undefined
+        ? { tokenMeasuredVoters: over.tokenMeasuredVoters }
+        : {}),
+      ...(over.tokenUnmeasuredVoters !== undefined
+        ? { tokenUnmeasuredVoters: over.tokenUnmeasuredVoters }
+        : {}),
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalTokens: over.totalTokens ?? 0,
+      totalCostUsd: over.totalCostUsd ?? 0,
+      perVoter: Array.from({ length: voterCount }, (_, i) => ({
+        role: `voter-${String(i)}`,
+        model: 'test-model',
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        costUsd: 0,
+        unmeasured: true,
+        ...(over.tokenMeasuredVoters !== undefined && over.tokenUnmeasuredVoters !== undefined
+          ? { tokenUsageMeasured: i < over.tokenMeasuredVoters }
+          : {}),
+      })),
+      perModel: [],
+    },
+  };
+}
+
+describe('weather report cost section (#3856)', () => {
+  it('joins consensus outcomes within the cost-section lookback without older-row fallback (#6857)', () => {
+    const record = {
+      ...makeDecisionCostRecord('consensus_vote', { voterCount: 1 }),
+      decisionId: 'windowed',
+    };
+    seedOutcomes(1, { source: 'consensus', traceId: 'windowed' });
+    seedOutcomes(1, { source: 'consensus', traceId: 'orphan' });
+    seedOutcomes(1, { source: 'delegate', traceId: 'windowed' });
+    seedOutcomes(1, { source: 'consensus', traceId: 'old', timestamp: '2020-01-01T00:00:00.000Z' });
+    const deps = {
+      decisionCostRecords: [record],
+      voteRecords: [{ correlationId: 'windowed', decision: 'approved' as const }],
+    };
+    const report = generateWeatherReport({}, undefined, deps);
+    expect(report.costSection?.consensusDecisionTokens).toMatchObject({
+      matchedDecisionsWithOutcomes: 1,
+      matchedOutcomeRows: 1,
+      unmatchedOutcomeRows: 1,
+      outcomeJoinCoverage: 1,
+    });
+    const allTime = generateWeatherReport(
+      {},
+      { ...createDefaultWeatherConfig(), outcomeLookbackMs: 0 },
+      deps
+    );
+    expect(allTime.costSection?.consensusDecisionTokens.unmatchedOutcomeRows).toBe(2);
+    resetOutcomeStore();
+    seedOutcomes(1, {
+      source: 'consensus',
+      traceId: 'windowed',
+      timestamp: '2020-01-01T00:00:00.000Z',
+    });
+    expect(
+      generateWeatherReport({}, undefined, deps).costSection?.consensusDecisionTokens
+        .outcomeJoinCoverage
+    ).toBeNull();
+  });
+
+  it('joins injected consensus costs to vote verdicts without treating no_quorum as success', () => {
+    const approved = makeDecisionCostRecord('consensus_vote', {
+      voterCount: 1,
+      tokenMeasuredVoters: 1,
+      tokenUnmeasuredVoters: 0,
+      totalTokens: 10,
+    });
+    const failed = makeDecisionCostRecord('consensus_vote', {
+      voterCount: 1,
+      tokenMeasuredVoters: 0,
+      tokenUnmeasuredVoters: 1,
+      totalTokens: 4,
+    });
+    const records = [
+      {
+        ...approved,
+        decisionId: 'ok',
+        summary: {
+          ...approved.summary,
+          totalInputTokens: 10,
+          perVoter: [{ ...approved.summary.perVoter[0]!, inputTokens: 10, totalTokens: 10 }],
+        },
+      },
+      {
+        ...failed,
+        decisionId: 'failed',
+        summary: {
+          ...failed.summary,
+          totalInputTokens: 4,
+          perVoter: [{ ...failed.summary.perVoter[0]!, inputTokens: 4, totalTokens: 4 }],
+        },
+      },
+    ];
+    const report = generateWeatherReport({}, undefined, {
+      decisionCostRecords: records,
+      voteRecords: [
+        { correlationId: 'ok', decision: 'approved' },
+        { correlationId: 'failed', decision: 'no_quorum' },
+      ],
+    });
+
+    expect(report.costSection?.consensusDecisionTokens).toMatchObject({
+      matchedQuorumDecisions: 1,
+      matchedNoQuorumDecisions: 1,
+      totalReportedFinalSeatTokens: 14,
+      noQuorumReportedFinalSeatTokens: 4,
+      reportedTokensPerMatchedQuorumDecision: 14,
+      tokenCoverage: 0.5,
+      measurement: 'lower-bound-final-seats',
+    });
+  });
+
+  it('always surfaces strategy cost profiles from the manifest registry', () => {
+    const report = generateWeatherReport({});
+    expect(report.costSection).toBeDefined();
+    const profiles = report.costSection?.strategyCostProfiles ?? [];
+    expect(profiles.length).toBe(8);
+    const consensus = profiles.find((p) => p.strategy === 'consensus');
+    expect(consensus?.costProfile).toBe('high');
+    const singleShot = profiles.find((p) => p.strategy === 'single-shot');
+    expect(singleShot?.costProfile).toBe('low');
+  });
+
+  it('has empty decisionCosts when no decision-cost records are available', () => {
+    const report = generateWeatherReport({});
+    expect(report.costSection?.decisionCosts.byGate).toEqual([]);
+    expect(report.costSection?.decisionCosts.totalDecisions).toBe(0);
+  });
+
+  it('aggregates injected decision-cost records per gate type', () => {
+    const records = [
+      makeDecisionCostRecord('consensus_vote', {
+        voterCount: 7,
+        tokenMeasuredVoters: 6,
+        tokenUnmeasuredVoters: 1,
+        totalTokens: 1000,
+        totalCostUsd: 0.06,
+      }),
+      makeDecisionCostRecord('consensus_vote', {
+        voterCount: 5,
+        totalTokens: 2000,
+        totalCostUsd: 0.12,
+      }),
+      makeDecisionCostRecord('pr_review', {
+        voterCount: 5,
+        totalTokens: 800,
+        totalCostUsd: 0.02,
+      }),
+    ];
+    const report = generateWeatherReport({}, undefined, { decisionCostRecords: records });
+    const byGate = report.costSection?.decisionCosts.byGate ?? [];
+    expect(byGate.map((g) => g.gate)).toEqual(['consensus_vote', 'pr_review']);
+    const consensus = byGate.find((g) => g.gate === 'consensus_vote');
+    expect(consensus?.decisionCount).toBe(2);
+    expect(consensus?.avgCostUsd).toBeCloseTo(0.09, 6);
+    expect(consensus?.avgVoters).toBe(6);
+    // The other consensus record is legacy: its five seats are unmeasured.
+    expect(consensus?.tokenMeasuredVoters).toBe(6);
+    expect(consensus?.tokenUnmeasuredVoters).toBe(6);
+    expect(consensus?.tokenCoverage).toBe(0.5);
+    expect(report.costSection?.decisionCosts.totalDecisions).toBe(3);
+  });
+});
+
+describe('the regret denominator counts only ANALYSABLE categories (#6036)', () => {
+  // observedCategories answers "how much data was there"; analyzedCategories
+  // answers "how much of it produced a routing verdict". They were one variable,
+  // so a category counted toward the regret denominator even when its routing
+  // could not be analysed — inflating the denominator and systematically
+  // UNDERSTATING regret against a metric whose target is "decreasing".
+  it('a category of only unattributed rows is observed but not analysed', () => {
+    // Reachable, not theoretical: OutcomeCliSchema admits `unknown`, which
+    // names no arm, so analyzeCategoryRouting finds no rates and returns null.
+    seedOutcomes(8, { cli: 'unknown', category: 'code_generation', success: true });
+
+    const health = generateWeatherReport({}).swarmHealth;
+    expect(health).toBeDefined();
+    expect(health?.observedCategories).toBeGreaterThan(0);
+    expect(health?.analyzedCategories).toBe(0);
+  });
+
+  it('a category routed entirely through api:* arms is analysed (#6552)', () => {
+    // Before #6552 this was the unanalysable case: API arm ids were not in the
+    // scored set. Routed rows now carry them, so they must be scored.
+    seedOutcomes(8, { cli: 'api:anthropic', category: 'code_generation', success: true });
+
+    const health = generateWeatherReport({}).swarmHealth;
+    expect(health?.observedCategories).toBeGreaterThan(0);
+    expect(health?.analyzedCategories).toBe(health?.observedCategories);
+  });
+
+  it('a CLI-routed category is both observed and analysed', () => {
+    seedOutcomes(8, { cli: 'claude', category: 'code_generation', success: true });
+
+    const health = generateWeatherReport({}).swarmHealth;
+    expect(health?.observedCategories).toBeGreaterThan(0);
+    expect(health?.analyzedCategories).toBe(health?.observedCategories);
+  });
+
+  it('the MIXED case is the one that silently understated regret', () => {
+    // One analysable category, one not. The denominator must be 1, not 2.
+    seedOutcomes(8, { cli: 'claude', category: 'code_generation', success: true });
+    seedOutcomes(8, { cli: 'unknown', category: 'code_review', success: true });
+
+    const health = generateWeatherReport({}).swarmHealth;
+    expect(health?.observedCategories).toBe(2);
+    expect(health?.analyzedCategories).toBe(1);
+  });
+
+  it('an unanalysable category does not dilute weeklyRegret', () => {
+    // The assertion that pins the DENOMINATOR rather than just the count.
+    // Reverting to `regretSum / observedCategories` halves the answer here,
+    // which is exactly the silent understatement this fixes.
+    const seedRegretfulCategory = (): void => {
+      // claude is best for code_generation; gemini routed there too and fails.
+      seedOutcomes(6, { cli: 'claude', category: 'code_generation', success: true });
+      seedOutcomes(6, { cli: 'gemini', category: 'code_generation', success: false });
+    };
+
+    seedRegretfulCategory();
+    const alone = generateWeatherReport({}).swarmHealth;
+    expect(alone?.weeklyRegret).toBeGreaterThan(0);
+
+    resetOutcomeStore();
+    seedRegretfulCategory();
+    seedOutcomes(8, { cli: 'unknown', category: 'code_review', success: true });
+    const withUnanalysable = generateWeatherReport({}).swarmHealth;
+
+    // One more OBSERVED category, no more ANALYSED ones -> regret unchanged.
+    expect(withUnanalysable?.observedCategories).toBe(2);
+    expect(withUnanalysable?.analyzedCategories).toBe(1);
+    expect(withUnanalysable?.weeklyRegret).toBe(alone?.weeklyRegret);
+  });
+
+  it('adaptationSpeedCategories is 0 when no category reached confidence', () => {
+    seedOutcomes(3, { cli: 'claude', category: 'code_generation', success: true });
+
+    const health = generateWeatherReport({}).swarmHealth;
+    expect(health).toBeDefined();
+    expect(health?.adaptationSpeedCategories).toBe(0);
+    // The value itself is still 0 — that is precisely why the count must exist.
+    expect(health?.adaptationSpeed).toBe(0);
+  });
+});
+
+// ============================================================================
+// API-arm rows (#6574): routed rows record `api:*` since #6554
+// ============================================================================
+
+describe('api:* outcome rows reach every weather reader (#6574)', () => {
+  it('recommendedMappings folds an api arm into its slot', () => {
+    // The issue's failing assertion: only api:anthropic rows for a category.
+    seedOutcomes(5, { cli: 'api:anthropic', category: 'testing', success: true });
+
+    const mappings = generateWeatherReport({}).recommendedMappings ?? [];
+    const testing = mappings.find((m) => m.category === 'testing');
+    expect(testing?.recommendedCli).toBe('claude');
+    expect(testing?.sampleCount).toBe(5);
+  });
+
+  it('recommendedMappings sums a slot with its api arm rather than picking one', () => {
+    // claude slot = 1 CLI success + 3 api:anthropic failures = 25%; gemini = 50%.
+    // Ignoring the api rows, or scoring them as a separate arm, makes claude 100%.
+    seedOutcomes(1, { cli: 'claude', category: 'testing', success: true });
+    seedOutcomes(3, { cli: 'api:anthropic', category: 'testing', success: false });
+    seedOutcomes(2, { cli: 'gemini', category: 'testing', success: true });
+    seedOutcomes(2, { cli: 'gemini', category: 'testing', success: false });
+
+    const testing = (generateWeatherReport({}).recommendedMappings ?? []).find(
+      (m) => m.category === 'testing'
+    );
+    expect(testing?.recommendedCli).toBe('gemini');
+    expect(testing?.successRate).toBe(0.5);
+  });
+
+  it('an empty store yields no mappings, insights or measured bonuses', () => {
+    const report = generateWeatherReport({});
+    expect(report.recommendedMappings).toEqual([]);
+    expect(report.learningInsights).toEqual([]);
+    expect(report.adaptiveBonuses.filter((b) => b.sampleCount > 0)).toEqual([]);
+    expect(report.swarmHealth).toBeUndefined();
+    expect(getAdaptiveBonus('claude', 'testing')).toBe(0);
+  });
+
+  it('getAdaptiveBonus credits api:anthropic rows to the claude slot, not another slot', () => {
+    seedOutcomes(5, { cli: 'api:anthropic', category: 'testing', success: true });
+
+    expect(getAdaptiveBonus('claude', 'testing')).toBeGreaterThan(0);
+    expect(getAdaptiveBonus('codex', 'testing')).toBe(0);
+  });
+
+  it('adaptiveBonuses count api:openai rows under the codex slot', () => {
+    seedOutcomes(4, { cli: 'api:openai', category: 'testing', success: true });
+
+    const bonus = generateWeatherReport({}).adaptiveBonuses.find(
+      (b) => b.cli === 'codex' && b.category === 'testing'
+    );
+    expect(bonus?.sampleCount).toBe(4);
+    expect(bonus?.sufficient).toBe(true);
+  });
+
+  it('learningInsights report the api arm under its own id, and no row-less arm', () => {
+    seedOutcomes(5, { cli: 'api:anthropic', category: 'testing', success: true });
+
+    const insights = generateWeatherReport({}).learningInsights ?? [];
+    expect(insights.map((i) => i.cli)).toEqual(['api:anthropic']);
+    expect(insights[0]?.sampleCount).toBe(5);
+  });
+
+  it('adaptation speed is measured from api-arm rows', () => {
+    // 40 samples → confidence 0.8, above the 0.7 adaptation threshold.
+    seedOutcomes(40, { cli: 'api:google', category: 'testing', success: true });
+
+    const health = generateWeatherReport({}).swarmHealth;
+    expect(health?.adaptationSpeedCategories).toBe(1);
+    expect(health?.adaptationSpeed).toBe(40);
+  });
+
+  it('cliWeather adds an api arm that has rows and omits the ones that do not', () => {
+    seedOutcomes(3, { cli: 'api:anthropic', category: 'testing', success: true });
+
+    const weather = generateWeatherReport({}).cliWeather;
+    expect(weather.map((c) => c.cli)).toEqual([...CLI_NAMES, 'api:anthropic']);
+    expect(weather.find((c) => c.cli === 'api:anthropic')?.totalTasks).toBe(3);
+  });
+});

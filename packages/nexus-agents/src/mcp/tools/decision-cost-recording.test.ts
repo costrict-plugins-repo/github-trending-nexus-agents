@@ -1,0 +1,714 @@
+/**
+ * Tests for the decision-cost recording bridge (#3855).
+ *
+ * Covers the vote-result → VoterCostInput mapping (model captured, missing
+ * usage left unmeasured) and the end-to-end record path against an injected
+ * store.
+ *
+ * @module mcp/tools/decision-cost-recording.test
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import type { ILogger } from '../../core/index.js';
+import type { AgentVoteResult } from '../../cli/vote-types.js';
+import { computeCostDetail } from '../../learning/usage-log.js';
+import {
+  ModelRegistry,
+  peekDefaultRegistry,
+  setDefaultRegistry,
+} from '../../config/model-registry.js';
+import { loadGeneratedRegistryEntries } from '../../config/models-generated-loader.js';
+import { DecisionCostStore } from '../../observability/decision-cost-store.js';
+import {
+  DecisionCostSummarySchema,
+  rollupDecisionCost,
+  UNKNOWN_MODEL,
+} from '../../observability/decision-cost.js';
+import {
+  votesToCostInputs,
+  recordDecisionCost,
+  recordVoteDecisionCost,
+  resolveBillingMode,
+  getDroppedCostRecordCount,
+  getDroppedCostWarnCount,
+  resetDroppedCostRecordCount,
+  _setWarnClockForTests,
+} from './decision-cost-recording.js';
+
+/**
+ * A seat whose adapter answered on the model it was built for, unless the test
+ * says otherwise: `servedModel` defaults to `model`. A test that needs the seat
+ * to report no served model passes `servedModel: undefined` explicitly.
+ */
+function vote(over: Partial<AgentVoteResult>): AgentVoteResult {
+  const base: AgentVoteResult = {
+    role: 'architect',
+    vote: { decision: 'approve', reasoning: 'ok', confidence: 0.8 },
+    processingTimeMs: 100,
+    source: 'llm',
+    cli: 'anthropic',
+    model: 'claude-sonnet',
+    ...over,
+  };
+  return 'servedModel' in over ? base : { ...base, servedModel: base.model };
+}
+
+describe('votesToCostInputs', () => {
+  it('captures the model and leaves usage unmeasured when the adapter reported none', () => {
+    const inputs = votesToCostInputs([vote({ role: 'architect', model: 'claude-sonnet' })]);
+    expect(inputs[0]?.role).toBe('architect');
+    expect(inputs[0]?.model).toBe('claude-sonnet');
+    expect(inputs[0]?.inputTokens).toBeUndefined();
+    expect(inputs[0]?.outputTokens).toBeUndefined();
+    expect(inputs[0]?.costUsd).toBeUndefined();
+  });
+
+  it('derives api-mode cost from adapter-reported tokens via the shared pricing table', () => {
+    // #3910: AgentVoteResult now carries the adapter's per-call token counts.
+    const withTokens = vote({
+      role: 'security',
+      model: 'claude-sonnet',
+      inputTokens: 1000,
+      outputTokens: 200,
+    });
+    const inputs = votesToCostInputs([withTokens]);
+    expect(inputs[0]?.inputTokens).toBe(1000);
+    expect(inputs[0]?.outputTokens).toBe(200);
+    // claude-sonnet is priced in the registry, so a real cost is attached
+    // (#4165: costUsd is only ever present when pricing actually resolved).
+    expect(inputs[0]?.costUsd).toBeGreaterThan(0);
+  });
+
+  it('OMITS costUsd for an unpriced model but keeps the tokens (#4165 — unmeasured, not $0)', () => {
+    // A model with no pricing anywhere in the registry chain must not record
+    // a measured $0 — the cost field is left off so the rollup counts the
+    // voter as UNMEASURED (#3855 semantics).
+    const inputs = votesToCostInputs([
+      vote({ role: 'devex', model: 'mystery-model-xyz', inputTokens: 500, outputTokens: 100 }),
+    ]);
+    expect(inputs[0]?.inputTokens).toBe(500);
+    expect(inputs[0]?.outputTokens).toBe(100);
+    expect(inputs[0]?.costUsd).toBeUndefined();
+    expect(Object.keys(inputs[0] ?? {})).not.toContain('costUsd');
+  });
+
+  it('states the price basis alongside the cost (#4406 — list, not contract-accurate)', () => {
+    const inputs = votesToCostInputs([
+      vote({ role: 'security', model: 'claude-sonnet', inputTokens: 1000, outputTokens: 200 }),
+    ]);
+    expect(inputs[0]?.costUsd).toBeGreaterThan(0);
+    expect(inputs[0]?.priceBasis).toBe('list');
+  });
+
+  it("states 'unknown' when the model resolved with no pricing anywhere in the chain", () => {
+    const inputs = votesToCostInputs([
+      vote({ role: 'devex', model: 'mystery-model-xyz', inputTokens: 500, outputTokens: 100 }),
+    ]);
+    expect(inputs[0]?.costUsd).toBeUndefined();
+    expect(inputs[0]?.priceBasis).toBe('unknown');
+  });
+
+  it('OMITS the basis when no price was ever looked up (no usage reported)', () => {
+    // We never consulted the registry for this voter, so we have nothing to
+    // say about its price basis — absent, not 'unknown'.
+    const inputs = votesToCostInputs([vote({ role: 'architect', model: 'claude-sonnet' })]);
+    expect(Object.keys(inputs[0] ?? {})).not.toContain('priceBasis');
+  });
+});
+
+// #6663: a seat is priced by the model that ANSWERED (`servedModel`), not the
+// alias it requested (`model`). The claude adapter's in-family substitution
+// after an out-of-credits envelope (#6120) is the known case where they differ.
+describe('votesToCostInputs carries attempt usage (#6821)', () => {
+  it('passes the seat’s attempt usage through unchanged', () => {
+    const attemptUsage = {
+      completions: 2,
+      reportedCompletions: 2,
+      inputTokens: 9,
+      outputTokens: 3,
+    };
+    const [input] = votesToCostInputs([vote({ inputTokens: 5, outputTokens: 1, attemptUsage })]);
+    expect(input?.attemptUsage).toEqual(attemptUsage);
+    expect(input?.inputTokens).toBe(5);
+  });
+
+  it('omits attempt usage on a seat that settled no completion', () => {
+    const [input] = votesToCostInputs([vote({})]);
+    expect(input).not.toHaveProperty('attemptUsage');
+  });
+});
+
+describe('votesToCostInputs prices the served model (#6663)', () => {
+  const REQUESTED = 'claude-fable-5';
+  const SERVED = 'claude-sonnet';
+
+  it('names and prices a seat that asked for A and was served by B at B', () => {
+    const served = computeCostDetail(SERVED, 1000, 200);
+    const requested = computeCostDetail(REQUESTED, 1000, 200);
+    // The premise: both price, and at different rates, so the test can tell them apart.
+    expect(served.priced && requested.priced).toBe(true);
+    expect(served.costUsd).not.toBe(requested.costUsd);
+
+    const inputs = votesToCostInputs([
+      vote({ model: REQUESTED, servedModel: SERVED, inputTokens: 1000, outputTokens: 200 }),
+    ]);
+    expect(inputs[0]?.model).toBe(SERVED);
+    expect(inputs[0]?.costUsd).toBe(served.costUsd);
+    expect(inputs[0]?.priceBasis).toBe('list');
+  });
+
+  it('rolls the decision total and per-model lines up at the served rates', () => {
+    const inputs = votesToCostInputs([
+      vote({
+        role: 'architect',
+        model: REQUESTED,
+        servedModel: SERVED,
+        inputTokens: 1000,
+        outputTokens: 200,
+      }),
+      vote({
+        role: 'security',
+        model: REQUESTED,
+        servedModel: 'claude-haiku',
+        inputTokens: 400,
+        outputTokens: 50,
+      }),
+    ]);
+    const summary = rollupDecisionCost(inputs, 'api');
+    const expected =
+      computeCostDetail(SERVED, 1000, 200).costUsd +
+      computeCostDetail('claude-haiku', 400, 50).costUsd;
+    expect(summary.totalCostUsd).toBeCloseTo(expected, 6);
+    expect(summary.measuredVoters).toBe(2);
+    expect(summary.perModel.map((m) => m.model).sort()).toEqual(['claude-haiku', SERVED]);
+  });
+
+  it('reports a seat with usage but no served model as UNKNOWN, never $0', () => {
+    const inputs = votesToCostInputs([
+      vote({ model: REQUESTED, servedModel: undefined, inputTokens: 1000, outputTokens: 200 }),
+    ]);
+    expect(inputs[0]?.model).toBeUndefined();
+    expect(Object.keys(inputs[0] ?? {})).not.toContain('costUsd');
+    expect(inputs[0]?.priceBasis).toBe('unknown');
+    expect(inputs[0]?.inputTokens).toBe(1000);
+
+    const summary = rollupDecisionCost(inputs, 'api');
+    expect(summary.perVoter[0]?.model).toBe(UNKNOWN_MODEL);
+    expect(summary.perVoter[0]?.unmeasured).toBe(true);
+    expect(summary.unmeasuredVoters).toBe(1);
+    expect(summary.priceBasis).toBe('unknown');
+  });
+});
+
+// #4392 increment 2, step 4: a seat that answered through a gateway carries the
+// arm it answered on, and its cost is what the arm's `NEXUS_GATEWAY_COST`
+// declaration says — never the model id's vendor list price. Before this a
+// `claude-*` id served by an undeclared gateway rolled up at Anthropic's rate
+// with `priceBasis: 'list'`: a measurement of nothing, and exactly the row a
+// billing spot-check would trust.
+describe('votesToCostInputs for a gateway seat (#4392 inc 2 step 4)', () => {
+  const gatewayVote = (over: Partial<AgentVoteResult> = {}): AgentVoteResult =>
+    vote({
+      role: 'ai_ml',
+      cli: 'openai',
+      model: 'claude-sonnet-4-6',
+      gatewayArm: 'api:openai-compat',
+      inputTokens: 1000,
+      outputTokens: 200,
+      ...over,
+    });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('records UNKNOWN (costUsd absent) for an undeclared gateway, keeping the tokens', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', undefined);
+    // The premise: the model id alone WOULD price.
+    expect(computeCostDetail('claude-sonnet-4-6', 1000, 200).priced).toBe(true);
+
+    const inputs = votesToCostInputs([gatewayVote()]);
+    expect(inputs[0]?.inputTokens).toBe(1000);
+    expect(inputs[0]?.outputTokens).toBe(200);
+    expect(Object.keys(inputs[0] ?? {})).not.toContain('costUsd');
+    expect(inputs[0]?.priceBasis).toBe('unknown');
+  });
+
+  it('records a MEASURED $0 when the gateway is declared free', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'openai-compat=free');
+    const inputs = votesToCostInputs([gatewayVote()]);
+    expect(inputs[0]?.costUsd).toBe(0);
+    expect(inputs[0]?.priceBasis).toBe('declared');
+  });
+
+  it('prices a flat-rate declaration, not the model id', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced:2,10');
+    const inputs = votesToCostInputs([gatewayVote()]);
+    // 1000 in @ $2/1M + 200 out @ $10/1M — not Sonnet's $0.006.
+    expect(inputs[0]?.costUsd).toBeCloseTo(0.004, 9);
+    expect(inputs[0]?.priceBasis).toBe('declared');
+  });
+
+  it('leaves a seat WITHOUT gatewayArm exactly as before (vendor list price)', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', undefined);
+    const inputs = votesToCostInputs([gatewayVote({ gatewayArm: undefined, cli: 'anthropic' })]);
+    expect(inputs[0]?.costUsd).toBe(computeCostDetail('claude-sonnet-4-6', 1000, 200).costUsd);
+    expect(inputs[0]?.costUsd).toBe(0.006);
+    expect(inputs[0]?.priceBasis).toBe('list');
+  });
+
+  it('stays unmeasured with no basis when the gateway seat reported no usage', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'free');
+    const inputs = votesToCostInputs([
+      gatewayVote({ inputTokens: undefined, outputTokens: undefined }),
+    ]);
+    expect(Object.keys(inputs[0] ?? {})).not.toContain('costUsd');
+    expect(Object.keys(inputs[0] ?? {})).not.toContain('priceBasis');
+  });
+});
+
+describe('catalog price scope persistence (#6830)', () => {
+  let dir: string;
+  let file: string;
+  let previousRegistry: ModelRegistry | undefined;
+  const mythos = 'anthropic/claude-mythos-preview';
+  const longModel = 'openrouter/' + 'm'.repeat(120);
+  const pricingProvenance = {
+    source: 'anthropic',
+    scope: 'project-glasswing-participants',
+    upstreamUrl: 'https://www.anthropic.com/project/glasswing',
+  } as const;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'decision-cost-scope-'));
+    file = join(dir, 'decision-costs.jsonl');
+    previousRegistry = peekDefaultRegistry();
+    const catalog = join(dir, 'catalog.json');
+    writeFileSync(
+      catalog,
+      JSON.stringify({
+        version: 1,
+        entries: [
+          { id: mythos, pricing: { inputPer1M: 25, outputPer1M: 125 }, pricingProvenance },
+          { id: 'claude-sonnet', pricing: { inputPer1M: 3, outputPer1M: 15 } },
+          { id: longModel, pricing: { inputPer1M: 2, outputPer1M: 10 } },
+        ],
+      })
+    );
+    setDefaultRegistry(
+      new ModelRegistry({
+        generatedEntries: loadGeneratedRegistryEntries({ path: catalog }).entries,
+      })
+    );
+  });
+
+  afterEach(() => {
+    setDefaultRegistry(previousRegistry);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('prices the full served model before persisting its truncated label (#7017)', () => {
+    const summary = recordDecisionCost({
+      decisionId: 'long-served-model',
+      gate: 'consensus_vote',
+      votes: [
+        vote({
+          model: 'claude-sonnet',
+          servedModel: longModel,
+          inputTokens: 1000,
+          outputTokens: 200,
+        }),
+      ],
+      store: new DecisionCostStore({ filePath: file, dataDir: dir }),
+      billingMode: 'api',
+    });
+
+    const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(reader.all()).toHaveLength(1);
+    expect(reader.all()[0]?.summary).toEqual(summary);
+    expect(summary).toMatchObject({
+      totalInputTokens: 1000,
+      totalOutputTokens: 200,
+      totalTokens: 1200,
+      totalCostUsd: 0.004,
+      measuredVoters: 1,
+      perVoter: [{ model: longModel.slice(0, 119) + '…', costUsd: 0.004 }],
+      perModel: [{ model: longModel.slice(0, 119) + '…', totalTokens: 1200 }],
+    });
+  });
+
+  it('retains Mythos Preview participant scope into an API-mode persisted record', () => {
+    const summary = recordDecisionCost({
+      decisionId: 'scoped-price',
+      gate: 'consensus_vote',
+      votes: [vote({ model: mythos, inputTokens: 1000, outputTokens: 500 })],
+      store: new DecisionCostStore({ filePath: file, dataDir: dir }),
+      billingMode: 'api',
+    });
+
+    expect(summary.totalCostUsd).toBe(0.0875);
+    expect(summary.perVoter[0]).toMatchObject({ priceBasis: 'list', pricingProvenance });
+    expect(DecisionCostSummarySchema.parse(summary).perVoter[0]).toHaveProperty(
+      'pricingProvenance',
+      pricingProvenance
+    );
+    const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(reader.hydrationComplete).toBe(true);
+    expect(reader.query()[0]?.summary.perVoter[0]).toMatchObject({
+      costUsd: 0.0875,
+      priceBasis: 'list',
+      pricingProvenance,
+    });
+  });
+
+  it('persists the same ordinary catalog cost without a pricing scope', () => {
+    recordDecisionCost({
+      decisionId: 'ordinary-price',
+      gate: 'consensus_vote',
+      votes: [vote({ model: 'claude-sonnet', inputTokens: 1000, outputTokens: 500 })],
+      store: new DecisionCostStore({ filePath: file, dataDir: dir }),
+      billingMode: 'api',
+    });
+
+    const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(reader.query()[0]?.summary.perVoter[0]).toMatchObject({
+      costUsd: 0.0105,
+      priceBasis: 'list',
+      unmeasured: false,
+    });
+    expect(reader.query()[0]?.summary.perVoter[0]).not.toHaveProperty('pricingProvenance');
+  });
+
+  it('omits catalog provenance from a plan-mode zero cost', () => {
+    const summary = recordDecisionCost({
+      decisionId: 'plan-price',
+      gate: 'consensus_vote',
+      votes: [vote({ model: mythos, inputTokens: 1000, outputTokens: 500 })],
+      store: new DecisionCostStore({ filePath: file, dataDir: dir }),
+      billingMode: 'plan',
+    });
+
+    expect(summary.totalCostUsd).toBe(0);
+    expect(summary.perVoter[0]).not.toHaveProperty('pricingProvenance');
+    const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(reader.query()[0]?.summary.perVoter[0]).not.toHaveProperty('pricingProvenance');
+  });
+});
+
+describe('resolveBillingMode', () => {
+  const original = process.env['NEXUS_BILLING_MODE'];
+  afterEach(() => {
+    if (original === undefined) delete process.env['NEXUS_BILLING_MODE'];
+    else process.env['NEXUS_BILLING_MODE'] = original;
+  });
+
+  it('defaults to plan', () => {
+    delete process.env['NEXUS_BILLING_MODE'];
+    expect(resolveBillingMode()).toBe('plan');
+  });
+
+  it('honors api', () => {
+    process.env['NEXUS_BILLING_MODE'] = 'api';
+    expect(resolveBillingMode()).toBe('api');
+  });
+});
+
+describe('recordDecisionCost', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'decision-cost-rec-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('passes the actual job id through the recording bridge (#6858)', () => {
+    const store = new DecisionCostStore({ filePath: join(dir, 'dc.jsonl'), dataDir: dir });
+    recordDecisionCost({
+      decisionId: 'decision-6858-bridge',
+      jobId: 'job-6858-bridge',
+      gate: 'consensus_vote',
+      votes: [vote({})],
+      store,
+    });
+    expect(store.all()[0]).toMatchObject({
+      decisionId: 'decision-6858-bridge',
+      jobId: 'job-6858-bridge',
+    });
+  });
+
+  it('rolls up + persists and returns the summary for the response', () => {
+    const store = new DecisionCostStore({ filePath: join(dir, 'dc.jsonl'), dataDir: dir });
+    const summary = recordDecisionCost({
+      decisionId: 'd1',
+      gate: 'consensus_vote',
+      votes: [vote({ role: 'architect' }), vote({ role: 'security' })],
+      store,
+      billingMode: 'api',
+    });
+
+    expect(summary.voterCount).toBe(2);
+    // No tokens reported ⇒ both unmeasured (honest floor, not measured $0).
+    expect(summary.unmeasuredVoters).toBe(2);
+    expect(summary.totalCostUsd).toBe(0);
+    expect(store.size).toBe(1);
+  });
+
+  it('passes the undeclared-options verdict through to the persisted record (#5422)', () => {
+    const store = new DecisionCostStore({ filePath: join(dir, 'dc.jsonl'), dataDir: dir });
+    recordDecisionCost({
+      decisionId: 'd-verdict',
+      gate: 'consensus_vote',
+      votes: [vote({ role: 'architect' })],
+      store,
+      billingMode: 'plan',
+      undeclaredOptionsDetector: { fired: false, declaredOptionCount: 0 },
+    });
+    expect(store.all()[0]?.undeclaredOptionsDetector).toEqual({
+      fired: false,
+      declaredOptionCount: 0,
+    });
+  });
+
+  it('skips an empty live panel instead of recording a detector measurement', () => {
+    const store = new DecisionCostStore({ filePath: join(dir, 'empty.jsonl'), dataDir: dir });
+    expect(
+      recordVoteDecisionCost({
+        decisionId: 'empty',
+        gate: 'consensus_vote',
+        votes: [],
+        store,
+        proposal: 'Option A',
+        declaredOptions: undefined,
+      })
+    ).toBeUndefined();
+    expect(store.all()).toHaveLength(0);
+  });
+
+  it('warns and preserves the vote when an unexpected cost-store error throws', () => {
+    const store = new DecisionCostStore({ filePath: join(dir, 'throw.jsonl'), dataDir: dir });
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    } as unknown as ILogger;
+    vi.spyOn(store, 'record').mockImplementationOnce(() => {
+      throw new Error('rollup failed');
+    });
+    expect(
+      recordVoteDecisionCost({
+        decisionId: 'throw',
+        gate: 'consensus_vote',
+        votes: [vote({})],
+        store,
+        logger,
+        proposal: 'Option A',
+        declaredOptions: undefined,
+      })
+    ).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith('Per-decision cost rollup failed (non-fatal)', {
+      error: 'rollup failed',
+    });
+  });
+
+  it('a voter with adapter-provided tokens yields a MEASURED rollup (#3910)', () => {
+    const store = new DecisionCostStore({ filePath: join(dir, 'dc.jsonl'), dataDir: dir });
+    const summary = recordDecisionCost({
+      decisionId: 'd-measured',
+      gate: 'consensus_vote',
+      // Tokens now ride on AgentVoteResult straight from the adapter usage layer.
+      votes: [
+        vote({ role: 'architect', model: 'claude-sonnet', inputTokens: 1200, outputTokens: 300 }),
+        vote({ role: 'security', model: 'claude-sonnet', inputTokens: 800, outputTokens: 150 }),
+      ],
+      store,
+      billingMode: 'api',
+    });
+
+    // Resolves from unmeasured → MEASURED: both voters reported usage.
+    expect(summary.measuredVoters).toBe(2);
+    expect(summary.unmeasuredVoters).toBe(0);
+    expect(summary.totalInputTokens).toBe(2000);
+    expect(summary.totalOutputTokens).toBe(450);
+    expect(summary.totalTokens).toBe(2450);
+  });
+
+  it('rolls up a token-reporting voter on an UNPRICED model as unmeasured end-to-end (#4165)', () => {
+    const store = new DecisionCostStore({ filePath: join(dir, 'dc.jsonl'), dataDir: dir });
+    const summary = recordDecisionCost({
+      decisionId: 'd-unpriced',
+      gate: 'consensus_vote',
+      votes: [
+        vote({ role: 'devex', model: 'mystery-model-xyz', inputTokens: 500, outputTokens: 100 }),
+        vote({ role: 'architect', model: 'claude-sonnet', inputTokens: 1000, outputTokens: 200 }),
+      ],
+      store,
+      billingMode: 'api',
+    });
+
+    // The unpriced voter's tokens are kept, but its unknown cost surfaces as
+    // UNMEASURED (total is a floor) — never a measured $0 (#3855).
+    expect(summary.measuredVoters).toBe(1);
+    expect(summary.unmeasuredVoters).toBe(1);
+    expect(summary.totalTokens).toBe(1800);
+    const unpriced = summary.perVoter.find((v) => v.role === 'devex');
+    expect(unpriced?.unmeasured).toBe(true);
+    expect(unpriced?.totalTokens).toBe(600);
+    expect(unpriced?.costUsd).toBe(0);
+    // Total cost reflects ONLY the priced voter.
+    const priced = summary.perVoter.find((v) => v.role === 'architect');
+    expect(summary.totalCostUsd).toBe(priced?.costUsd);
+    expect(summary.totalCostUsd).toBeGreaterThan(0);
+  });
+});
+
+describe('non-silent cost drops (#3910)', () => {
+  beforeEach(() => {
+    resetDroppedCostRecordCount();
+  });
+
+  /** A store whose persistence always reports a drop (fs/schema failure). */
+  function failingStore(): DecisionCostStore {
+    const store = new DecisionCostStore({ filePath: join(tmpdir(), 'unused.jsonl') });
+    // Simulate the JsonlStore reporting a failed persist without throwing.
+    (store as unknown as { record: (i: unknown) => unknown }).record = (input) => ({
+      record: {
+        decisionId: (input as { decisionId: string }).decisionId,
+        gate: (input as { gate: string }).gate,
+        timestamp: '2026-06-17T00:00:00.000Z',
+        summary: {
+          billingMode: 'api',
+          voterCount: 1,
+          measuredVoters: 1,
+          unmeasuredVoters: 0,
+          totalInputTokens: 100,
+          totalOutputTokens: 50,
+          totalTokens: 150,
+          totalCostUsd: 0.001,
+          perVoter: [],
+          perModel: [],
+        },
+      },
+      persisted: false,
+    });
+    return store;
+  }
+
+  it('logs AND counts a dropped rollup instead of silently swallowing it', () => {
+    const warnings: { message: string; context?: unknown }[] = [];
+    const logger: ILogger = {
+      debug: () => {},
+      info: () => {},
+      warn: (message, context) => {
+        warnings.push({ message, context });
+      },
+      error: () => {},
+      child: () => logger,
+      setLevel: () => {},
+    };
+
+    expect(getDroppedCostRecordCount()).toBe(0);
+
+    // Never throws into the caller — the decision still gets its summary.
+    const summary = recordDecisionCost({
+      decisionId: 'd-dropped',
+      gate: 'consensus_vote',
+      votes: [vote({ role: 'architect', model: 'claude-sonnet' })],
+      store: failingStore(),
+      billingMode: 'api',
+      logger,
+    });
+
+    expect(summary.totalCostUsd).toBe(0.001);
+    // Visible, not silent: counter incremented + warning logged.
+    expect(getDroppedCostRecordCount()).toBe(1);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.message).toContain('dropped');
+  });
+
+  it('rate-limits the warn under sustained drops while counting every drop (#3916)', () => {
+    // An unwritable store must not flood the log per-decision. Drive many
+    // consecutive drops and assert the warn count is BOUNDED (first-N burst,
+    // then suppressed) while the drop counter still reflects EVERY drop and the
+    // decision never fails.
+    let warnCount = 0;
+    const logger: ILogger = {
+      debug: () => {},
+      info: () => {},
+      warn: () => {
+        warnCount += 1;
+      },
+      error: () => {},
+      child: () => logger,
+      setLevel: () => {},
+    };
+    const store = failingStore();
+
+    const drops = 200;
+    for (let i = 0; i < drops; i++) {
+      const summary = recordDecisionCost({
+        decisionId: `d-${String(i)}`,
+        gate: 'consensus_vote',
+        votes: [vote({ role: 'architect', model: 'claude-sonnet' })],
+        store,
+        billingMode: 'api',
+        logger,
+      });
+      // Never-fail invariant holds on every iteration.
+      expect(summary.totalCostUsd).toBe(0.001);
+    }
+
+    // Counter is exact: every drop counted.
+    expect(getDroppedCostRecordCount()).toBe(drops);
+    // Warns are bounded, NOT one-per-drop (first-5 burst, then periodic).
+    expect(warnCount).toBe(getDroppedCostWarnCount());
+    expect(warnCount).toBeGreaterThanOrEqual(1);
+    expect(warnCount).toBeLessThanOrEqual(6);
+    expect(warnCount).toBeLessThan(drops);
+  });
+
+  it('still warns on a SLOW leak after the silence window despite count suppression (#3916)', () => {
+    // Pure count-based suppression would hide a 1/hr leak for ~999 drops. The
+    // time escape surfaces it once the silence window elapses.
+    let warnCount = 0;
+    const logger: ILogger = {
+      debug: () => {},
+      info: () => {},
+      warn: () => {
+        warnCount += 1;
+      },
+      error: () => {},
+      child: () => logger,
+      setLevel: () => {},
+    };
+    const store = failingStore();
+    const drop = (id: string): void => {
+      recordDecisionCost({
+        decisionId: id,
+        gate: 'consensus_vote',
+        votes: [vote({ role: 'architect', model: 'claude-sonnet' })],
+        store,
+        billingMode: 'api',
+        logger,
+      });
+    };
+
+    _setWarnClockForTests(1_000_000);
+    for (let i = 0; i < 5; i++) drop(`burst-${String(i)}`); // first-5 burst → 5 warns
+    expect(warnCount).toBe(5);
+    drop('same-time-1'); // post-burst, no time elapsed, not 1000th → suppressed
+    drop('same-time-2');
+    expect(warnCount).toBe(5);
+    _setWarnClockForTests(1_000_000 + 60_000); // advance past the silence window
+    drop('after-window'); // time escape → warns even though count would suppress
+    expect(warnCount).toBe(6);
+    expect(getDroppedCostRecordCount()).toBe(8); // every drop still counted
+    _setWarnClockForTests(null);
+  });
+});

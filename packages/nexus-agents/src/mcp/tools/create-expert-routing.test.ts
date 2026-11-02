@@ -1,0 +1,222 @@
+/**
+ * Tests for expert CLI routing helpers.
+ *
+ * (Source: Issue #858 — Multi-model task specialization Phase 3)
+ */
+
+import { describe, it, expect, vi } from 'vitest';
+import {
+  ROLE_TO_TASK_CATEGORY,
+  resolveAdapterForModelPreference,
+  resolveAdapterForRole,
+  getExpertFallbackChain,
+} from './create-expert-routing.js';
+import {
+  _resetGatewaySlotCatalog,
+  setGatewaySlotCatalog,
+} from '../../adapters/gateway-family-slots.js';
+import { fakeGatewayModel } from '../../testing/adapters/fake-gateway-model.js';
+
+const mockLogger = {
+  info: vi.fn(),
+  debug: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+};
+
+// ============================================================================
+// ROLE_TO_TASK_CATEGORY mapping
+// ============================================================================
+
+describe('ROLE_TO_TASK_CATEGORY', () => {
+  it('maps all 9 expert roles', () => {
+    expect(Object.keys(ROLE_TO_TASK_CATEGORY)).toHaveLength(9);
+  });
+
+  it('maps code_expert to code_generation', () => {
+    expect(ROLE_TO_TASK_CATEGORY['code_expert']).toBe('code_generation');
+  });
+
+  it('maps architecture_expert to architecture', () => {
+    expect(ROLE_TO_TASK_CATEGORY['architecture_expert']).toBe('architecture');
+  });
+
+  it('maps security_expert to security_review', () => {
+    expect(ROLE_TO_TASK_CATEGORY['security_expert']).toBe('security_review');
+  });
+
+  it('maps research_expert to research', () => {
+    expect(ROLE_TO_TASK_CATEGORY['research_expert']).toBe('research');
+  });
+
+  it('maps documentation_expert to documentation', () => {
+    expect(ROLE_TO_TASK_CATEGORY['documentation_expert']).toBe('documentation');
+  });
+
+  it('maps testing_expert to testing', () => {
+    expect(ROLE_TO_TASK_CATEGORY['testing_expert']).toBe('testing');
+  });
+
+  it('maps devops_expert to devops', () => {
+    expect(ROLE_TO_TASK_CATEGORY['devops_expert']).toBe('devops');
+  });
+});
+
+// ============================================================================
+// resolveAdapterForModelPreference
+// ============================================================================
+
+describe('resolveAdapterForModelPreference', () => {
+  it('returns fallback for unknown model', () => {
+    const fallback = { execute: vi.fn() };
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const result = resolveAdapterForModelPreference('unknown', fallback as any, mockLogger as any);
+    expect(result).toBe(fallback);
+  });
+
+  it('returns resilient adapter for known model', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const result = resolveAdapterForModelPreference('claude-opus', undefined, mockLogger as any);
+    expect(result).toBeDefined();
+    expect(result).toHaveProperty('complete');
+    expect(result).toHaveProperty('stream');
+  });
+
+  it('matches by cliAlias', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const result = resolveAdapterForModelPreference('opus', undefined, mockLogger as any);
+    expect(result).toBeDefined();
+    expect(result).toHaveProperty('complete');
+  });
+});
+
+// ============================================================================
+// resolveAdapterForRole
+// ============================================================================
+
+describe('resolveAdapterForRole', () => {
+  it('returns adapter for known role', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const result = resolveAdapterForRole('code_expert', undefined, mockLogger as any);
+    expect(result).toBeDefined();
+  });
+
+  it('returns fallback for unknown role', () => {
+    const fallback = { execute: vi.fn() };
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const result = resolveAdapterForRole('unknown_expert', fallback as any, mockLogger as any);
+    expect(result).toBe(fallback);
+  });
+
+  it('logs auto-routing info for known role', () => {
+    mockLogger.info.mockClear();
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    resolveAdapterForRole('architecture_expert', undefined, mockLogger as any);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      'Auto-routing expert to specialized CLI',
+      expect.objectContaining({
+        role: 'architecture_expert',
+        category: 'architecture',
+        preferredCli: 'gemini',
+      })
+    );
+  });
+
+  it('routes research_expert to gemini', () => {
+    mockLogger.info.mockClear();
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    resolveAdapterForRole('research_expert', undefined, mockLogger as any);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      'Auto-routing expert to specialized CLI',
+      expect.objectContaining({ preferredCli: 'gemini' })
+    );
+  });
+
+  it('routes code_expert to codex', () => {
+    mockLogger.info.mockClear();
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    resolveAdapterForRole('code_expert', undefined, mockLogger as any);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      'Auto-routing expert to specialized CLI',
+      expect.objectContaining({ preferredCli: 'codex' })
+    );
+  });
+});
+
+// ============================================================================
+// getExpertFallbackChain (#1532)
+// ============================================================================
+
+describe('getExpertFallbackChain', () => {
+  it('returns fallback CLIs for security_expert excluding primary', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const chain = getExpertFallbackChain('security_expert', 'codex', mockLogger as any);
+    expect(chain.length).toBeGreaterThan(0);
+    expect(chain).not.toContain('codex');
+  });
+
+  it('omits CLIs disabled by NEXUS_DISABLED_CLIS (#6590)', () => {
+    const saved = process.env['NEXUS_DISABLED_CLIS'];
+    try {
+      delete process.env['NEXUS_DISABLED_CLIS'];
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      const full = getExpertFallbackChain('code_expert', 'opencode', mockLogger as any);
+      expect(full.some((c) => c === 'gemini' || c === 'codex')).toBe(true);
+      process.env['NEXUS_DISABLED_CLIS'] = 'gemini,codex';
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      const chain = getExpertFallbackChain('code_expert', 'opencode', mockLogger as any);
+      expect(chain).not.toContain('gemini');
+      expect(chain).not.toContain('codex');
+    } finally {
+      if (saved === undefined) delete process.env['NEXUS_DISABLED_CLIS'];
+      else process.env['NEXUS_DISABLED_CLIS'] = saved;
+    }
+  });
+
+  it('keeps a disabled CLI whose family the gateway serves (#6720, transport-scoped)', () => {
+    const saved = process.env['NEXUS_DISABLED_CLIS'];
+    try {
+      process.env['NEXUS_DISABLED_CLIS'] = 'gemini,codex';
+      // The gateway serves openai (codex's family) but not google (gemini's).
+      setGatewaySlotCatalog([fakeGatewayModel('gpt-5.5')]);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      const chain = getExpertFallbackChain('code_expert', 'opencode', mockLogger as any);
+      expect(chain).toContain('codex');
+      expect(chain).not.toContain('gemini');
+    } finally {
+      _resetGatewaySlotCatalog();
+      if (saved === undefined) delete process.env['NEXUS_DISABLED_CLIS'];
+      else process.env['NEXUS_DISABLED_CLIS'] = saved;
+    }
+  });
+
+  it('returns empty array for unknown role', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const chain = getExpertFallbackChain('unknown_role', 'claude', mockLogger as any);
+    expect(chain).toEqual([]);
+  });
+
+  it('returns fallback CLIs for code_expert excluding codex', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const chain = getExpertFallbackChain('code_expert', 'codex', mockLogger as any);
+    expect(chain.length).toBeGreaterThan(0);
+    expect(chain).not.toContain('codex');
+    // code_expert fallback: claude should be first after codex
+    expect(chain[0]).toBe('claude');
+  });
+
+  it('preserves chain order after filtering', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const chain = getExpertFallbackChain('security_expert', 'codex', mockLogger as any);
+    // security_review override: ['codex', 'gemini', 'claude', 'opencode']
+    // After excluding codex: ['gemini', 'claude', 'opencode']
+    expect(chain[0]).toBe('gemini');
+    expect(chain[1]).toBe('claude');
+  });
+
+  it('returns all CLIs when excludeCli is not in chain', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+    const chain = getExpertFallbackChain('code_expert', 'nonexistent', mockLogger as any);
+    expect(chain.length).toBeGreaterThanOrEqual(4);
+  });
+});

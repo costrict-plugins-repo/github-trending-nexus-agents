@@ -1,0 +1,836 @@
+/**
+ * Tests for Codex MCP Adapter
+ *
+ * Verifies MCP-based Codex adapter functionality.
+ * Now extends BaseCliAdapter (Issue #1140).
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { PassThrough } from 'node:stream';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Use vi.hoisted to ensure proper hoisting with forks pool (Issue #582)
+const mocks = vi.hoisted(() => {
+  const mockClient = vi.fn();
+  const mockTransport = vi.fn();
+  const mockExecAsync = vi.fn();
+  return { mockClient, mockTransport, mockExecAsync };
+});
+
+// Mock the MCP SDK modules via sdk-facade
+vi.mock('../../mcp/sdk-facade/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../mcp/sdk-facade/index.js')>()),
+  Client: mocks.mockClient,
+  StdioClientTransport: mocks.mockTransport,
+}));
+
+// Mock child_process and util for BaseCliAdapter.getVersion()
+vi.mock('node:child_process', () => ({
+  spawn: vi.fn(),
+  exec: vi.fn(),
+  execFile: vi.fn(),
+}));
+
+// Transport tests use a measured healthy host; sandbox behavior has its own suite.
+vi.mock('../codex-sandbox-preflight.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../codex-sandbox-preflight.js')>()),
+  codexSandboxPreflight: () => Promise.resolve({ status: 'ok' as const }),
+}));
+
+vi.mock('node:util', () => ({
+  promisify: vi.fn((_fn: unknown) => mocks.mockExecAsync),
+}));
+
+// Re-export for test access
+const Client = mocks.mockClient;
+
+import { CodexMcpAdapter } from './codex-mcp-adapter.js';
+import { isCallerInputCliError } from '../cli-error-helpers.js';
+import {
+  getDefaultModelForCli,
+  getCliModelName,
+  getModelPricing,
+} from '../../config/model-config-helpers.js';
+import { getDefaultRegistry } from '../../config/model-registry.js';
+
+/** Expected default CLI model name, derived from the canonical registry. */
+const EXPECTED_DEFAULT_ID = getCliModelName(getDefaultModelForCli('codex'));
+
+describe('CodexMcpAdapter', () => {
+  let adapter: CodexMcpAdapter;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    // Set up default MCP Client mock (Issue #582)
+
+    Client.mockImplementation(function () {
+      return {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn(),
+      };
+    });
+
+    // Set up default transport mock
+
+    mocks.mockTransport.mockImplementation(function () {
+      return {
+        close: vi.fn().mockResolvedValue(undefined),
+      };
+    });
+
+    // Set up default exec mock for version check (via BaseCliAdapter)
+    mocks.mockExecAsync.mockResolvedValue({ stdout: 'codex version 0.77.0' });
+
+    adapter = new CodexMcpAdapter();
+  });
+
+  afterEach(async () => {
+    await adapter.dispose();
+  });
+
+  describe('constructor', () => {
+    it('should create adapter with default model', () => {
+      expect(adapter.name).toBe('codex');
+      expect(adapter.transport).toBe('mcp');
+    });
+
+    it('should use custom model when provided', () => {
+      const customAdapter = new CodexMcpAdapter({ model: 'o3-mini' });
+      expect(customAdapter.getModelInfo().id).toBe('o3-mini');
+    });
+  });
+
+  describe('capabilities', () => {
+    it('should return correct capability profile', () => {
+      const caps = adapter.capabilities;
+
+      expect(caps.reasoning).toBe(10);
+      expect(caps.contextWindow).toBe(1_050_000);
+      expect(caps.codeGeneration).toBe(10);
+      expect(caps.speed).toBe(7);
+      // gpt-6.1-sol carries gpt-5.6-sol's unmeasured cost score 4 (#6842).
+      expect(caps.cost).toBe(4);
+    });
+  });
+
+  describe('getModelInfo()', () => {
+    it('omits cost info when the registry explicitly leaves the default unpriced', () => {
+      const registry = getDefaultRegistry();
+      const getEntry = registry.getEntry.bind(registry);
+      const modelId = getDefaultModelForCli('codex');
+      const spy = vi.spyOn(registry, 'getEntry').mockImplementation((id) => {
+        const entry = { ...getEntry(id) };
+        if (id === modelId) delete entry.pricing;
+        return entry;
+      });
+      try {
+        const info = adapter.getModelInfo();
+        expect(info.costPerMillionInput).toBeUndefined();
+        expect(info.costPerMillionOutput).toBeUndefined();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('should return correct model info for default model (from registry)', () => {
+      const info = adapter.getModelInfo();
+
+      expect(info.id).toBe(EXPECTED_DEFAULT_ID);
+      expect(info.contextWindow).toBe(1_050_000);
+      expect(info.maxOutput).toBe(128_000);
+    });
+
+    it('should report canonical registry cost info for the default model', () => {
+      const info = adapter.getModelInfo();
+
+      const pricing = getModelPricing(getDefaultModelForCli('codex'));
+      expect(info.costPerMillionInput).toBe(pricing?.inputPer1M);
+      expect(info.costPerMillionOutput).toBe(pricing?.outputPer1M);
+    });
+
+    it('should return correct info for gpt-6-luna model (from registry)', () => {
+      const miniAdapter = new CodexMcpAdapter({ model: 'gpt-6-luna' });
+      const info = miniAdapter.getModelInfo();
+
+      expect(info.id).toBe('gpt-6-luna');
+      // gpt-6-luna is codex-5.1-mini's cliModelName since codex-cli 0.155.1
+      // stopped serving gpt-5.4-mini (#5091 → 2026-09-23 remap): models.dev /
+      // LiteLLM pricing {0.1, 0.5}, 1.05M context.
+      expect(info.costPerMillionInput).toBe(0.1);
+      expect(info.costPerMillionOutput).toBe(0.5);
+      expect(info.contextWindow).toBe(1_050_000);
+    });
+  });
+
+  describe('initialize()', () => {
+    it('should create MCP client and transport', async () => {
+      await adapter.initialize();
+
+      expect(Client).toHaveBeenCalledWith(
+        { name: 'nexus-agents', version: '2.0.0' },
+        { capabilities: {} }
+      );
+    });
+
+    it('should not reinitialize if already connected', async () => {
+      await adapter.initialize();
+      await adapter.initialize();
+
+      // Client should only be created once
+      expect(Client).toHaveBeenCalledTimes(1);
+    });
+
+    describe('recursion guard (#3350)', () => {
+      const prev = process.env.NEXUS_MCP_DEPTH;
+      afterEach(() => {
+        if (prev === undefined) delete process.env.NEXUS_MCP_DEPTH;
+        else process.env.NEXUS_MCP_DEPTH = prev;
+      });
+
+      it('stamps the spawned codex child with NEXUS_MCP_DEPTH=1 at top level', async () => {
+        delete process.env.NEXUS_MCP_DEPTH;
+        await adapter.initialize();
+
+        expect(mocks.mockTransport).toHaveBeenCalledWith(
+          expect.objectContaining({
+            command: 'codex',
+            args: expect.arrayContaining(['mcp-server']),
+            env: { NEXUS_MCP_DEPTH: '1' },
+          })
+        );
+      });
+
+      it('refuses to spawn codex mcp-server when already nested (breaks the loop)', async () => {
+        process.env.NEXUS_MCP_DEPTH = '1';
+        const nested = new CodexMcpAdapter();
+
+        await expect(nested.initialize()).rejects.toThrow(
+          /recursive codex.*nexus MCP spawn loop|#3350/i
+        );
+        // No transport spawned — the cycle is cut before any `codex mcp-server`.
+        expect(mocks.mockTransport).not.toHaveBeenCalled();
+        await nested.dispose();
+      });
+    });
+
+    // #6093: the voter seats run through this spawn. On hosts with
+    // `kernel.apparmor_restrict_unprivileged_userns=1` bwrap cannot bring up
+    // loopback, so the `sandbox: 'read-only'` tool call below fails before
+    // codex reads a file; the legacy landlock backend reads and still refuses
+    // writes. Linux-only, so the argv must be exactly `['mcp-server']` elsewhere.
+    describe('legacy landlock on linux (#6093)', () => {
+      const prev = process.env.NEXUS_MCP_DEPTH;
+      beforeEach(() => {
+        delete process.env.NEXUS_MCP_DEPTH;
+      });
+      afterEach(() => {
+        if (prev === undefined) delete process.env.NEXUS_MCP_DEPTH;
+        else process.env.NEXUS_MCP_DEPTH = prev;
+      });
+
+      const spawnArgsFor = async (platform: NodeJS.Platform): Promise<unknown> => {
+        const platformAdapter = new CodexMcpAdapter({ platform });
+        await platformAdapter.initialize();
+        await platformAdapter.dispose();
+        const call = mocks.mockTransport.mock.calls[0]?.[0] as { args: unknown };
+        return call.args;
+      };
+
+      it('spawns `codex mcp-server -c features.use_legacy_landlock=true` on linux', async () => {
+        expect(await spawnArgsFor('linux')).toEqual([
+          'mcp-server',
+          '-c',
+          'features.use_legacy_landlock=true',
+        ]);
+      });
+
+      it.each(['darwin', 'win32'] as const)(
+        'spawns a bare `codex mcp-server` on %s',
+        async (platform) => {
+          expect(await spawnArgsFor(platform)).toEqual(['mcp-server']);
+        }
+      );
+
+      it('defaults the platform gate to process.platform', async () => {
+        await adapter.initialize();
+        const call = mocks.mockTransport.mock.calls[0]?.[0] as { args: string[] };
+        expect(call.args.includes('features.use_legacy_landlock=true')).toBe(
+          process.platform === 'linux'
+        );
+      });
+    });
+  });
+
+  describe('selected sandbox args (#6841 item 3)', () => {
+    it.each([
+      { status: 'ok' as const, sandboxArgs: [] },
+      { status: 'ok' as const, sandboxArgs: ['-c', 'features.use_legacy_landlock=true'] },
+      { status: 'unknown' as const, reason: 'unmeasured', sandboxArgs: [] },
+    ])('uses the selected args on direct initialize for $status', async (measurement) => {
+      const selected = new CodexMcpAdapter({ platform: 'linux', sandboxProbe: () => measurement });
+      await selected.initialize();
+      expect(mocks.mockTransport.mock.calls[0]?.[0]).toMatchObject({
+        args: ['mcp-server', ...measurement.sandboxArgs],
+      });
+      await selected.dispose();
+    });
+
+    it('awaits selection before spawning on direct initialize', async () => {
+      let finish!: (result: { status: 'ok'; sandboxArgs: string[] }) => void;
+      const sandboxProbe = vi.fn(
+        () =>
+          new Promise<{ status: 'ok'; sandboxArgs: string[] }>((resolve) => {
+            finish = resolve;
+          })
+      );
+      const selected = new CodexMcpAdapter({ platform: 'linux', sandboxProbe });
+      const pending = selected.initialize();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(mocks.mockTransport).not.toHaveBeenCalled();
+      finish({ status: 'ok', sandboxArgs: [] });
+      await pending;
+      await selected.initialize();
+      expect(sandboxProbe).toHaveBeenCalledTimes(1);
+      expect(mocks.mockTransport.mock.calls[0]?.[0]).toMatchObject({ args: ['mcp-server'] });
+      await selected.dispose();
+    });
+
+    it('refuses a broken sandbox on direct initialize before spawning', async () => {
+      const selected = new CodexMcpAdapter({
+        sandboxProbe: () => ({ status: 'broken', reason: 'bubblewrap panic' }),
+      });
+      await expect(selected.initialize()).rejects.toThrow('Codex read-only sandbox unavailable');
+      expect(mocks.mockTransport).not.toHaveBeenCalled();
+      await selected.dispose();
+    });
+
+    it.each(['linux', 'darwin'] as const)(
+      'retains compatibility for an injected unknown without args on %s',
+      async (platform) => {
+        const selected = new CodexMcpAdapter({
+          platform,
+          sandboxProbe: () => ({ status: 'unknown', reason: 'injected old shape' }),
+        });
+        await selected.initialize();
+        expect(mocks.mockTransport.mock.calls[0]?.[0]).toMatchObject({
+          args: [
+            'mcp-server',
+            ...(platform === 'linux' ? ['-c', 'features.use_legacy_landlock=true'] : []),
+          ],
+        });
+        await selected.dispose();
+      }
+    );
+  });
+
+  describe('execute()', () => {
+    describe('single MCP result parser (#7073)', () => {
+      // documented-format, unverified against a live capture.
+      // The installed codex lacks a working mcp-server command (connection
+      // closed; direct invocation reports "stdin is not a terminal").
+      // MCP specifies absent isError as false:
+      // https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/schema/2025-06-18/schema.ts
+      function fixture(name: string): unknown {
+        return JSON.parse(
+          readFileSync(new URL(`../parsers/fixtures/${name}`, import.meta.url), 'utf8')
+        ) as unknown;
+      }
+
+      async function replay(
+        result: unknown
+      ): Promise<Awaited<ReturnType<CodexMcpAdapter['execute']>>> {
+        Client.mockImplementationOnce(function () {
+          return {
+            connect: vi.fn().mockResolvedValue(undefined),
+            callTool: vi.fn().mockResolvedValue(result),
+          };
+        });
+        return adapter.execute({ content: 'Reply with the single word ok' }, { allowRetry: false });
+      }
+
+      it('accepts absent isError: documented-format, unverified against a live capture', async () => {
+        const result = await replay(fixture('codex-mcp-success.documented.json'));
+        expect(result.ok).toBe(true);
+        if (result.ok) expect(result.value.text).toBe('ok');
+      });
+
+      it('rejects isError true: documented-format, unverified against a live capture', async () => {
+        const result = await replay(fixture('codex-mcp-error.documented.json'));
+        expect(result.ok).toBe(false);
+        if (!result.ok) expect(result.error.message).toContain('Tool execution failed');
+      });
+
+      it('rejects empty content: documented-format, unverified against a live capture', async () => {
+        const result = await replay({ content: [] });
+        expect(result.ok).toBe(false);
+        if (!result.ok) expect(result.error.code).toBe('PARSE_ERROR');
+      });
+    });
+
+    describe('working directory binding (#7012)', () => {
+      function clientReturning(): {
+        connect: ReturnType<typeof vi.fn>;
+        callTool: ReturnType<typeof vi.fn>;
+      } {
+        const client = {
+          connect: vi.fn().mockResolvedValue(undefined),
+          callTool: vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] }),
+        };
+        Client.mockImplementation(function () {
+          return client;
+        });
+        return client;
+      }
+
+      it.each([
+        { initialized: false, sessionId: undefined },
+        { initialized: false, sessionId: 'thread-7012' },
+        { initialized: true, sessionId: undefined },
+        { initialized: true, sessionId: 'thread-7012' },
+      ])(
+        'refuses workDir before calling a tool ($initialized, $sessionId)',
+        async ({ initialized, sessionId }) => {
+          const client = clientReturning();
+          if (initialized) await adapter.initialize();
+          const result = await adapter.execute({
+            content: 'review the scratch tree',
+            options: { workDir: '/srv/scratch-7012' },
+            ...(sessionId !== undefined ? { sessionId } : {}),
+          });
+
+          expect(result.ok).toBe(false);
+          if (result.ok) return;
+          expect(result.error).toMatchObject({
+            code: 'EXECUTION_ERROR',
+            cli: 'codex',
+            retryable: false,
+          });
+          expect(isCallerInputCliError(result.error)).toBe(true);
+          expect(result.error.message).toMatch(/MCP.*workDir.*cwd/);
+          expect(client.callTool).not.toHaveBeenCalled();
+          if (!initialized) expect(mocks.mockTransport).not.toHaveBeenCalled();
+        }
+      );
+
+      it.each([undefined, {}, { workDir: '' }, { workDir: '   ' }])(
+        'keeps the codex request unchanged without a bound directory (%j)',
+        async (options) => {
+          const client = clientReturning();
+          const result = await adapter.execute({
+            content: 'review',
+            ...(options !== undefined ? { options } : {}),
+          });
+
+          expect(result.ok).toBe(true);
+          expect(client.callTool).toHaveBeenCalledExactlyOnceWith({
+            name: 'codex',
+            arguments: { prompt: 'review', sandbox: 'read-only', 'approval-policy': 'never' },
+          });
+        }
+      );
+    });
+
+    it('should call MCP tool and return response', async () => {
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: 'Hello from Codex!' }],
+          isError: false,
+        }),
+      };
+
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+
+      const newAdapter = new CodexMcpAdapter();
+      const result = await newAdapter.execute({ content: 'Say hello' });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.text).toBe('Hello from Codex!');
+        expect(result.value.durationMs).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it('captures the mcp-server stderr written during the call as response.stderr (#6094)', async () => {
+      // `codex mcp-server` is spawned with `stderr: 'pipe'` and the pipe was
+      // never read. A sandbox failure inside the codex tool loop (bwrap on a
+      // userns-restricted host) is written there while the tool result still
+      // carries the model's parsed answer.
+      const transportStderr = new PassThrough();
+      mocks.mockTransport.mockImplementationOnce(function () {
+        return { close: vi.fn().mockResolvedValue(undefined), stderr: transportStderr };
+      });
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn().mockImplementation(async () => {
+          transportStderr.write('bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n');
+          await new Promise((r) => setImmediate(r));
+          return { content: [{ type: 'text', text: '{"decision":"approve"}' }], isError: false };
+        }),
+      };
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+
+      const newAdapter = new CodexMcpAdapter();
+      const result = await newAdapter.execute({ content: 'vote' });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.text).toBe('{"decision":"approve"}');
+        expect(result.value.stderr).toContain('bwrap: loopback: Failed RTM_NEWADDR');
+      }
+      // Nothing written after the call is attributed to it.
+      transportStderr.write('later noise\n');
+      await new Promise((r) => setImmediate(r));
+      if (result.ok) expect(result.value.stderr).not.toContain('later noise');
+    });
+
+    it('two overlapping calls share one pipe, so NEITHER is attributed the stderr (#6094)', async () => {
+      // The registry caches one adapter per CLI and roles run under
+      // Promise.all, so the pipe is process-wide. Attributing a line written
+      // during two overlapping calls to both of them would classify a seat that
+      // read the artifact as unverifiable. Ambiguous attribution is dropped;
+      // classification then falls through to the reasoning fallback.
+      const transportStderr = new PassThrough();
+      mocks.mockTransport.mockImplementationOnce(function () {
+        return { close: vi.fn().mockResolvedValue(undefined), stderr: transportStderr };
+      });
+      let calls = 0;
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn().mockImplementation(async () => {
+          calls++;
+          if (calls === 1) {
+            transportStderr.write('bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n');
+          }
+          await new Promise((r) => setImmediate(r));
+          await new Promise((r) => setImmediate(r));
+          return { content: [{ type: 'text', text: `{"call":${String(calls)}}` }], isError: false };
+        }),
+      };
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+
+      const newAdapter = new CodexMcpAdapter();
+      await newAdapter.initialize();
+      const [a, b] = await Promise.all([
+        newAdapter.execute({ content: 'vote 1' }),
+        newAdapter.execute({ content: 'vote 2' }),
+      ]);
+
+      expect(a.ok && b.ok).toBe(true);
+      if (a.ok) expect('stderr' in a.value).toBe(false);
+      if (b.ok) expect('stderr' in b.value).toBe(false);
+
+      // A later, un-overlapped call on the same adapter is attributed again.
+      const c = await newAdapter.execute({ content: 'vote 3' });
+      expect(c.ok).toBe(true);
+    });
+
+    it('a call with a silent stderr pipe carries no stderr key', async () => {
+      mocks.mockTransport.mockImplementationOnce(function () {
+        return { close: vi.fn().mockResolvedValue(undefined), stderr: new PassThrough() };
+      });
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi
+          .fn()
+          .mockResolvedValue({ content: [{ type: 'text', text: 'ok' }], isError: false }),
+      };
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+      const result = await new CodexMcpAdapter().execute({ content: 'vote' });
+      expect(result.ok).toBe(true);
+      if (result.ok) expect('stderr' in result.value).toBe(false);
+    });
+
+    it('should handle tool execution errors', async () => {
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: 'Error message' }],
+          isError: true,
+        }),
+      };
+
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+
+      const newAdapter = new CodexMcpAdapter();
+      const result = await newAdapter.execute({ content: 'This will fail' });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe('EXECUTION_ERROR');
+        expect(result.error.message).toBe('Error message');
+      }
+    });
+
+    it('should handle empty response', async () => {
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn().mockResolvedValue({
+          content: [],
+          isError: false,
+        }),
+      };
+
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+
+      const newAdapter = new CodexMcpAdapter();
+      const result = await newAdapter.execute({ content: 'Empty response' });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe('PARSE_ERROR');
+      }
+    });
+
+    it('should call codex tool with correct arguments', async () => {
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: 'Response' }],
+        }),
+      };
+
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+
+      const newAdapter = new CodexMcpAdapter();
+      await newAdapter.execute({
+        content: 'Test task',
+        model: 'o3-mini',
+      });
+
+      // Codex MCP server exposes 'codex' tool with these arguments
+      // @see https://developers.openai.com/codex/mcp/
+      expect(mockClient.callTool).toHaveBeenCalledWith({
+        name: 'codex',
+        arguments: {
+          prompt: 'Test task',
+          model: 'o3-mini',
+          sandbox: 'read-only',
+          'approval-policy': 'never',
+        },
+      });
+    });
+
+    it('translates a registry id in task.model to the codex slug (#5091)', async () => {
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: 'Response' }],
+        }),
+      };
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+
+      const newAdapter = new CodexMcpAdapter();
+      await newAdapter.execute({ content: 'Test task', model: 'codex-5.3' });
+
+      expect(mockClient.callTool).toHaveBeenCalledWith({
+        name: 'codex',
+        arguments: expect.objectContaining({ model: 'gpt-5.6-terra' }),
+      });
+    });
+
+    it('passes a model unknown to the registry through verbatim and warns (#5091)', async () => {
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: 'Response' }],
+        }),
+      };
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+      const mockLogger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        child: vi.fn().mockReturnThis(),
+        setLevel: vi.fn(),
+      };
+
+      const newAdapter = new CodexMcpAdapter({ logger: mockLogger });
+      await newAdapter.execute({ content: 'Test task', model: 'codex-unknown-xyz' });
+
+      expect(mockClient.callTool).toHaveBeenCalledWith({
+        name: 'codex',
+        arguments: expect.objectContaining({ model: 'codex-unknown-xyz' }),
+      });
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('not in the model registry'),
+        expect.objectContaining({ model: 'codex-unknown-xyz' })
+      );
+    });
+
+    it('should use codex-reply tool for session continuation', async () => {
+      const mockClient = {
+        connect: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: 'Response' }],
+        }),
+      };
+
+      vi.mocked(Client).mockImplementationOnce(function () {
+        return mockClient as never;
+      });
+
+      const newAdapter = new CodexMcpAdapter();
+      await newAdapter.execute({
+        content: 'Follow up question',
+        sessionId: 'thread-123',
+      });
+
+      expect(mockClient.callTool).toHaveBeenCalledWith({
+        name: 'codex-reply',
+        arguments: {
+          prompt: 'Follow up question',
+          threadId: 'thread-123',
+        },
+      });
+    });
+  });
+
+  describe('getVersion()', () => {
+    it('should return version string', async () => {
+      const version = await adapter.getVersion();
+
+      expect(version).toBe('0.77.0');
+    });
+
+    it('should cache version after first call', async () => {
+      const version1 = await adapter.getVersion();
+      const version2 = await adapter.getVersion();
+
+      expect(version1).toBe(version2);
+      expect(mocks.mockExecAsync).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('healthCheck()', () => {
+    it('should return healthy status when connected', async () => {
+      const health = await adapter.healthCheck();
+
+      expect(health.healthy).toBe(true);
+      expect(health.version).toBe('0.77.0');
+      expect(health.versionStatus).toBe('supported');
+    });
+  });
+
+  describe('getCapacity()', () => {
+    it('should return real codex capacity status (#2714)', async () => {
+      // Pre-#2714 asserted 100k (the DEFAULT_CAPACITY_FALLBACK). Now
+      // lazy-init returns codex's real DEFAULT_TOKEN_LIMIT.
+      const capacity = await adapter.getCapacity();
+
+      expect(capacity.remainingTokens).toBe(500_000); // codex DEFAULT_TOKEN_LIMIT
+      expect(capacity.rateLimited).toBe(false);
+      expect(capacity.utilizationPercent).toBe(0);
+    });
+  });
+
+  describe('dispose()', () => {
+    it('should close MCP connection', async () => {
+      await adapter.initialize();
+      await adapter.dispose();
+
+      // After dispose, next execute should reinitialize
+      expect(adapter.transport).toBe('mcp');
+    });
+  });
+});
+
+describe('CodexMcpAdapter read-only MCP isolation (#6970)', () => {
+  let home: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    home = mkdtempSync(join(tmpdir(), 'nexus-6970-mcp-'));
+    vi.stubEnv('HOME', home);
+    mocks.mockTransport.mockImplementation(function () {
+      return { close: vi.fn().mockResolvedValue(undefined) };
+    });
+    mocks.mockExecAsync.mockResolvedValue({ stdout: 'codex version 0.77.0' });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function clientReturning(): { connect: unknown; callTool: ReturnType<typeof vi.fn> } {
+    const client = {
+      connect: vi.fn().mockResolvedValue(undefined),
+      callTool: vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] }),
+    };
+    vi.mocked(Client).mockImplementationOnce(function () {
+      return client as never;
+    });
+    return client;
+  }
+
+  function writeUserConfig(text: string): void {
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    writeFileSync(join(home, '.codex', 'config.toml'), text);
+  }
+
+  /** Keeps the host's real /etc/codex out of the scan. */
+  class HermeticCodexMcpAdapter extends CodexMcpAdapter {
+    protected override codexSystemConfigFiles(): readonly string[] {
+      return [];
+    }
+  }
+
+  it('a read-only thread carries one disable per configured server in `config`', async () => {
+    writeUserConfig('[mcp_servers.alpha]\ncommand = "a"\n[mcp_servers.beta]\nurl = "http://b"\n');
+    const client = clientReturning();
+    const result = await new HermeticCodexMcpAdapter().execute({
+      content: 'review',
+      accessMode: 'read-only-analysis',
+    });
+    expect(result.ok).toBe(true);
+    const call = client.callTool.mock.calls[0]?.[0] as { arguments: Record<string, unknown> };
+    expect(call.arguments['config']).toEqual({
+      'mcp_servers.alpha.enabled': false,
+      'mcp_servers.beta.enabled': false,
+    });
+    expect(call.arguments['sandbox']).toBe('read-only');
+  });
+
+  it('a default-mode thread carries no config', async () => {
+    writeUserConfig('[mcp_servers.alpha]\ncommand = "a"\n');
+    const client = clientReturning();
+    await new HermeticCodexMcpAdapter().execute({ content: 'review' });
+    const call = client.callTool.mock.calls[0]?.[0] as { arguments: Record<string, unknown> };
+    expect(call.arguments).not.toHaveProperty('config');
+  });
+
+  it('an unparseable config refuses the read-only task without connecting', async () => {
+    writeUserConfig('[mcp_servers.alpha\n');
+    const result = await new HermeticCodexMcpAdapter().execute({
+      content: 'review',
+      accessMode: 'read-only-analysis',
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.message).toMatch(/read-only analysis mode/);
+    expect(mocks.mockTransport).not.toHaveBeenCalled();
+  });
+});

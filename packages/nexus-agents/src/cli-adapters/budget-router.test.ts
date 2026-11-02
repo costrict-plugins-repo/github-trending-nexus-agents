@@ -1,0 +1,937 @@
+/**
+ * Tests for budget-constrained task router.
+ * (Source: Issue #102, arXiv:2508.21141)
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { BudgetRouter, createBudgetRouter } from './budget-router.js';
+import { estimateArmCostUsd } from './budget-arm-cost.js';
+import { estimateCost, estimateTokens } from './budget-utils.js';
+import { computeTokenCost } from '../learning/token-cost-core.js';
+import { DEFAULT_CAPABILITIES } from './types-capability.js';
+import { createModelToCliAdapter } from './model-to-cli-adapter.js';
+import { buildGatewaySlotRouterArm, gatewayServedSlotOf } from './gateway-slot-arm.js';
+import {
+  setGatewaySlotCatalog,
+  _resetGatewaySlotCatalog,
+} from '../adapters/gateway-family-slots.js';
+import { fakeGatewayModel } from '../testing/adapters/fake-gateway-model.js';
+import type { IModelAdapter } from '../core/index.js';
+import { routingArmCliSlot } from './types.js';
+import { getDefaultModelForCli, getModelPricing } from '../config/model-config-helpers.js';
+import type {
+  ICliAdapter,
+  CliTask,
+  CliResponse,
+  CliName,
+  CapabilityProfile,
+  HealthStatus,
+  CapacityStatus,
+  ModelInfo,
+  BudgetRouterOptions,
+  RoutingArmId,
+} from './types.js';
+
+// Mock adapter factory
+function createMockAdapter(
+  name: CliName,
+  capabilities: Partial<CapabilityProfile> = {}
+): ICliAdapter {
+  const defaultCaps: CapabilityProfile = {
+    reasoning: 8,
+    contextWindow: 200000,
+    codeGeneration: 8,
+    speed: 7,
+    cost: 5,
+    ...capabilities,
+  };
+
+  return {
+    name,
+    transport: 'subprocess',
+    capabilities: defaultCaps,
+    execute: vi.fn().mockResolvedValue({
+      ok: true,
+      value: {
+        text: 'Test response',
+        usage: { inputTokens: 100, outputTokens: 200, totalTokens: 300 },
+        costUsd: 0.001,
+        durationMs: 1000,
+      } satisfies CliResponse,
+    }),
+    healthCheck: vi.fn().mockResolvedValue({
+      healthy: true,
+      version: '1.0.0',
+      versionStatus: 'supported',
+      lastChecked: new Date(),
+    } satisfies HealthStatus),
+    getCapacity: vi.fn().mockResolvedValue({
+      remainingTokens: 100000,
+      remainingRequests: 100,
+      resetTime: new Date(Date.now() + 3600000),
+      utilizationPercent: 10,
+      rateLimited: false,
+      // eslint-disable-next-line @typescript-eslint/no-deprecated -- fixture supplies the required public compatibility alias
+      exhausted: false,
+      quotaExhausted: false,
+      observed: true,
+    } satisfies CapacityStatus),
+    getVersion: vi.fn().mockResolvedValue('1.0.0'),
+    getModelInfo: vi.fn().mockReturnValue({
+      id: 'test-model',
+      name: 'Test Model',
+      contextWindow: 200000,
+    } satisfies ModelInfo),
+    initialize: vi.fn().mockResolvedValue(undefined),
+    dispose: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+describe('BudgetRouter', () => {
+  let adapters: Map<CliName, ICliAdapter>;
+  let router: BudgetRouter;
+
+  beforeEach(() => {
+    adapters = new Map([
+      ['claude', createMockAdapter('claude', { cost: 5 })],
+      ['gemini', createMockAdapter('gemini', { cost: 9 })],
+      ['codex', createMockAdapter('codex', { cost: 7 })],
+    ]);
+
+    router = new BudgetRouter(adapters, {
+      sessionBudget: {
+        tokenBudget: 10000,
+        costBudgetUsd: 1.0,
+        resetIntervalMs: 0, // Disable auto-reset for tests
+      },
+      warningThresholds: {
+        info: 50,
+        warning: 75,
+        critical: 90,
+      },
+      enforceHardLimits: true,
+    });
+  });
+
+  afterEach(() => {
+    router.dispose();
+  });
+
+  describe('getSessionBudget', () => {
+    it('should return initial budget state', () => {
+      const budget = router.getSessionBudget();
+
+      expect(budget.tokenBudget).toBe(10000);
+      expect(budget.costBudgetUsd).toBe(1.0);
+      expect(budget.tokensUsed).toBe(0);
+      expect(budget.costSpentUsd).toBe(0);
+      expect(budget.tokensRemaining).toBe(10000);
+      expect(budget.costRemainingUsd).toBe(1.0);
+      expect(budget.utilizationPercent).toBe(0);
+    });
+  });
+
+  describe('updateBudget', () => {
+    it('should update token usage', () => {
+      router.updateBudget({ tokens: 1000 });
+
+      const budget = router.getSessionBudget();
+      expect(budget.tokensUsed).toBe(1000);
+      expect(budget.tokensRemaining).toBe(9000);
+    });
+
+    it('should update cost usage', () => {
+      router.updateBudget({ costUsd: 0.5 });
+
+      const budget = router.getSessionBudget();
+      expect(budget.costSpentUsd).toBe(0.5);
+      expect(budget.costRemainingUsd).toBe(0.5);
+    });
+
+    it('should accumulate multiple updates', () => {
+      router.updateBudget({ tokens: 1000, costUsd: 0.1 });
+      router.updateBudget({ tokens: 2000, costUsd: 0.2 });
+
+      const budget = router.getSessionBudget();
+      expect(budget.tokensUsed).toBe(3000);
+      expect(budget.costSpentUsd).toBeCloseTo(0.3, 10);
+    });
+  });
+
+  describe('resetBudget', () => {
+    it('should reset all usage to zero', () => {
+      router.updateBudget({ tokens: 5000, costUsd: 0.5 });
+      router.resetBudget();
+
+      const budget = router.getSessionBudget();
+      expect(budget.tokensUsed).toBe(0);
+      expect(budget.costSpentUsd).toBe(0);
+      expect(budget.tokensRemaining).toBe(10000);
+      expect(budget.costRemainingUsd).toBe(1.0);
+    });
+  });
+
+  describe('checkBudget', () => {
+    it('should return within budget for small task', () => {
+      const task: CliTask = { content: 'Hello world' };
+
+      const result = router.checkBudget(task);
+
+      expect(result.withinBudget).toBe(true);
+      expect(result.adapter).not.toBeNull();
+      expect(result.estimatedTokens).toBeGreaterThan(0);
+      expect(result.estimatedCostUsd).toBeGreaterThan(0);
+    });
+
+    it('should prefer cheaper adapters', () => {
+      const task: CliTask = { content: 'Hello world' };
+
+      const result = router.checkBudget(task);
+
+      // Claude and Gemini are tied at cost 6 (DEFAULT_CAPABILITIES, not mock);
+      // Codex is 5. Any of the tied-highest adapters is acceptable.
+      expect(['claude', 'gemini']).toContain(result.adapter?.name);
+    });
+
+    it('should generate warnings when approaching budget limits', () => {
+      // Use 60% of budget
+      router.updateBudget({ tokens: 6000 });
+
+      const task: CliTask = { content: 'Test task' };
+      const result = router.checkBudget(task);
+
+      expect(result.warnings.length).toBeGreaterThan(0);
+      expect(result.warnings.some((w) => w.constraint === 'tokens')).toBe(true);
+    });
+
+    it('should reject tasks exceeding per-task budget', () => {
+      const task: CliTask = { content: 'A'.repeat(100000) }; // Large task
+
+      const result = router.checkBudget(task, { maxTokens: 100 });
+
+      expect(result.withinBudget).toBe(false);
+    });
+
+    it('rejects a task whose fastest candidate exceeds maxLatencyMs (#4907)', () => {
+      // `maxLatencyMs` was Zod-validated, defaulted, and copied from routing
+      // YAML — and read by nothing. No input could make it bind, so a consumer
+      // reporting "no latency violations" reported the absence of a check.
+      // The fastest entry in DEFAULT_COST_MODELS is codex at 1000ms.
+      const task: CliTask = { content: 'Test task' };
+
+      const result = router.checkBudget(task, { maxLatencyMs: 500 });
+
+      expect(result.withinBudget).toBe(false);
+      expect(result.adapter).toBeNull();
+    });
+
+    it('admits a task whose candidate meets maxLatencyMs (#4907)', () => {
+      // The pair: 5000ms clears every profile in the table, so the constraint
+      // is being evaluated rather than always failing.
+      const task: CliTask = { content: 'Test task' };
+
+      const result = router.checkBudget(task, { maxLatencyMs: 5000 });
+
+      expect(result.withinBudget).toBe(true);
+      expect(result.adapter).not.toBeNull();
+    });
+
+    it('reports estimatedLatencyMs as unmeasured when no candidate fits', () => {
+      // Naming the empty case: with no adapter selected there is no latency to
+      // report, and 0 would read as instantaneous.
+      const task: CliTask = { content: 'Test task' };
+
+      const result = router.checkBudget(task, { maxLatencyMs: 1 });
+
+      expect(result.estimatedLatencyMs).toBeUndefined();
+    });
+
+    it('should project budget after task', () => {
+      const task: CliTask = { content: 'Test task' };
+
+      const result = router.checkBudget(task);
+
+      expect(result.projectedBudget.tokensUsed).toBeGreaterThan(0);
+      expect(result.projectedBudget.tokensRemaining).toBeLessThan(10000);
+    });
+  });
+
+  describe('routeWithBudget', () => {
+    it('should return success for task within budget', async () => {
+      const task: CliTask = { content: 'Hello world' };
+
+      const result = await router.routeWithBudget(task);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.withinBudget).toBe(true);
+        expect(result.value.adapter).not.toBeNull();
+      }
+    });
+
+    it('should return error when budget exceeded with hard limits', async () => {
+      // Exhaust token budget
+      router.updateBudget({ tokens: 9900 });
+
+      const task: CliTask = { content: 'A'.repeat(1000) }; // Needs more tokens
+
+      const result = await router.routeWithBudget(task);
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe('BUDGET_EXCEEDED');
+        expect(result.error.constraint).toBeDefined();
+        expect(result.error.suggestion).toBeDefined();
+      }
+    });
+
+    it('should allow over-budget when hard limits disabled', async () => {
+      const softRouter = new BudgetRouter(adapters, {
+        sessionBudget: {
+          tokenBudget: 100,
+          costBudgetUsd: 0.001,
+          resetIntervalMs: 0,
+        },
+        enforceHardLimits: false,
+      });
+
+      const task: CliTask = { content: 'Test task that exceeds budget' };
+
+      const result = await softRouter.routeWithBudget(task);
+
+      expect(result.ok).toBe(true);
+      softRouter.dispose();
+    });
+  });
+
+  describe('executeWithBudget', () => {
+    it('should execute task and update budget', async () => {
+      const task: CliTask = { content: 'Hello world' };
+
+      const result = await router.executeWithBudget(task);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.text).toBe('Test response');
+        expect(result.value.budgetAfter.tokensUsed).toBeGreaterThan(0);
+      }
+    });
+
+    it('should reject task when budget exceeded', async () => {
+      // Exhaust budget
+      router.updateBudget({ tokens: 9900, costUsd: 0.99 });
+
+      const task: CliTask = { content: 'A'.repeat(1000) };
+
+      const result = await router.executeWithBudget(task);
+
+      expect(result.ok).toBe(false);
+    });
+
+    it('should use actual usage from response', async () => {
+      const task: CliTask = { content: 'Hello world' };
+
+      await router.executeWithBudget(task);
+
+      const budget = router.getSessionBudget();
+      // Mock returns 300 total tokens
+      expect(budget.tokensUsed).toBe(300);
+    });
+  });
+
+  describe('warning thresholds', () => {
+    it('should generate info warning at 50% utilization', () => {
+      router.updateBudget({ tokens: 4000 }); // 40%
+
+      const task: CliTask = { content: 'A'.repeat(1500) }; // ~15%
+      const result = router.checkBudget(task);
+
+      const infoWarnings = result.warnings.filter((w) => w.level === 'info');
+      expect(infoWarnings.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('should generate warning at 75% utilization', () => {
+      router.updateBudget({ tokens: 7000 }); // 70%
+
+      const task: CliTask = { content: 'A'.repeat(1000) }; // ~10%
+      const result = router.checkBudget(task);
+
+      const warnings = result.warnings.filter((w) => w.level === 'warning');
+      expect(warnings.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('should generate critical warning at 90% utilization', () => {
+      router.updateBudget({ tokens: 8500 }); // 85%
+
+      const task: CliTask = { content: 'A'.repeat(1000) }; // ~10%
+      const result = router.checkBudget(task);
+
+      const criticalWarnings = result.warnings.filter((w) => w.level === 'critical');
+      expect(criticalWarnings.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  describe('createBudgetRouter', () => {
+    it('should create a BudgetRouter instance', () => {
+      const router = createBudgetRouter(adapters);
+      expect(router).toBeInstanceOf(BudgetRouter);
+      (router as BudgetRouter).dispose();
+    });
+
+    it('should accept custom options', () => {
+      const options: BudgetRouterOptions = {
+        sessionBudget: {
+          tokenBudget: 50000,
+          costBudgetUsd: 5.0,
+        },
+      };
+
+      const router = createBudgetRouter(adapters, options);
+      const budget = router.getSessionBudget();
+
+      expect(budget.tokenBudget).toBe(50000);
+      expect(budget.costBudgetUsd).toBe(5.0);
+      (router as BudgetRouter).dispose();
+    });
+  });
+});
+
+// ============================================================================
+// Per-task-class cost ceiling (#4196)
+// ============================================================================
+
+// Partial-mock the registry pricing lookup so the fail-closed (missing
+// pricing) branch is testable; all other exports stay real.
+vi.mock('../config/model-config-helpers.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../config/model-config-helpers.js')>();
+  return { ...actual, getModelPricing: vi.fn(actual.getModelPricing) };
+});
+
+describe('BudgetRouter task-class cost ceiling (#4196)', () => {
+  // 'implement a function' → detectTaskCategory → code_generation.
+  // Deterministic pricing fixtures for the canonical per-CLI defaults:
+  //   claude → claude-fable-5 ($10/$50 per 1M)
+  //   gemini → gemini-3-pro   ($2/$12 per 1M)
+  //   codex  → fixture without pricing (cost ceiling fails closed)
+  // With maxTokens 10_000 output: claude ≈ $0.50, gemini ≈ $0.12.
+  const ceilingTask: CliTask = { content: 'implement a function', maxTokens: 10_000 };
+  const candidates: CliName[] = ['claude', 'gemini', 'codex'];
+
+  beforeEach(() => {
+    const prices = new Map([
+      [getDefaultModelForCli('claude'), { inputPer1M: 10, outputPer1M: 50 }],
+      [getDefaultModelForCli('gemini'), { inputPer1M: 2, outputPer1M: 12 }],
+    ]);
+    vi.mocked(getModelPricing).mockImplementation((modelId) => prices.get(modelId));
+  });
+
+  function makeAdapters(): Map<CliName, ICliAdapter> {
+    return new Map<CliName, ICliAdapter>([
+      ['claude', createMockAdapter('claude')],
+      ['gemini', createMockAdapter('gemini')],
+      ['codex', createMockAdapter('codex')],
+    ]);
+  }
+
+  afterEach(async () => {
+    // Re-point the partial mock at the real implementation after each test.
+    const helpers = await import('../config/model-config-helpers.js');
+    const actual = await vi.importActual<typeof import('../config/model-config-helpers.js')>(
+      '../config/model-config-helpers.js'
+    );
+    vi.mocked(helpers.getModelPricing).mockImplementation(actual.getModelPricing);
+  });
+
+  it('returns candidates unchanged when no ceilings are configured (default OFF)', () => {
+    const r = new BudgetRouter(makeAdapters());
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual(candidates);
+    r.dispose();
+  });
+
+  it('returns candidates unchanged when the task class has no ceiling', () => {
+    const r = new BudgetRouter(makeAdapters(), {
+      taskClassCostCeilings: { architecture: 0.001 },
+    });
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual(candidates);
+    r.dispose();
+  });
+
+  it('returns candidates unchanged when the task matches no category', () => {
+    const r = new BudgetRouter(makeAdapters(), {
+      taskClassCostCeilings: { code_generation: 0.001 },
+    });
+    const vague: CliTask = { content: 'hello there', maxTokens: 10_000 };
+    expect(r.filterByTaskClassCeiling(vague, candidates)).toEqual(candidates);
+    r.dispose();
+  });
+
+  it('excludes candidates whose registry-priced estimate exceeds the class ceiling', () => {
+    const r = new BudgetRouter(makeAdapters(), {
+      taskClassCostCeilings: { code_generation: 0.2 },
+    });
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual(['gemini']);
+    r.dispose();
+  });
+
+  it('keeps priced candidates under a generous ceiling and excludes unpriced codex', () => {
+    const r = new BudgetRouter(makeAdapters(), {
+      taskClassCostCeilings: { code_generation: 5.0 },
+    });
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual(['claude', 'gemini']);
+    r.dispose();
+  });
+
+  it('fails CLOSED when pricing is missing — candidate excluded, no return-all fallback', async () => {
+    const helpers = await import('../config/model-config-helpers.js');
+    vi.mocked(helpers.getModelPricing).mockReturnValue(undefined);
+    const r = new BudgetRouter(makeAdapters(), {
+      taskClassCostCeilings: { code_generation: 5.0 },
+    });
+    // Every candidate has unknown cost → ALL fail the ceiling (fail-closed),
+    // NOT the filterByPreferenceTier-style return-all-candidates pattern.
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual([]);
+    r.dispose();
+  });
+});
+
+// ============================================================================
+// Gateway arms under the task-class ceiling (#4392 increment 2, step 1)
+// ============================================================================
+
+describe('BudgetRouter task-class cost ceiling — gateway arms (#4392 inc 2)', () => {
+  // Same task as the #4196 suite: code_generation, ~10k output tokens.
+  // gemini (gemini-3-pro, $2/$12) ≈ $0.12 sits under a 0.2 ceiling; claude
+  // (claude-fable-5, $10/$50) ≈ $0.50 sits over it. The gateway arm is the
+  // subject; the vendor arms are the control that must not move.
+  const ceilingTask: CliTask = { content: 'implement a function', maxTokens: 10_000 };
+  const candidates: RoutingArmId[] = ['claude', 'gemini', 'api:custom-openai'];
+
+  function makeRouter(): BudgetRouter {
+    return new BudgetRouter(new Map<RoutingArmId, ICliAdapter>(), {
+      taskClassCostCeilings: { code_generation: 0.2 },
+    });
+  }
+
+  beforeEach(() => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('excludes an UNDECLARED gateway arm (fail-closed) and leaves vendor arms unchanged', () => {
+    const r = makeRouter();
+    // Before this step api:custom-openai was silently priced as opencode's
+    // default model ($3/$15 ≈ $0.15) and slipped under the ceiling.
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual(['gemini']);
+    r.dispose();
+  });
+
+  it('admits a gateway declared free', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'free');
+    const r = makeRouter();
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual([
+      'gemini',
+      'api:custom-openai',
+    ]);
+    r.dispose();
+  });
+
+  it('prices a gateway declared priced:<in>,<out> at that flat rate', () => {
+    // $2/$10 per 1M with ~10k output → ≈ $0.10: under the 0.2 ceiling.
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced:2,10');
+    const cheap = makeRouter();
+    expect(cheap.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual([
+      'gemini',
+      'api:custom-openai',
+    ]);
+    cheap.dispose();
+
+    // $50/$50 per 1M with ~10k output → ≈ $0.50: over the 0.2 ceiling.
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced:50,50');
+    const dear = makeRouter();
+    expect(dear.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual(['gemini']);
+    dear.dispose();
+  });
+
+  it('a scoped declaration for another endpoint leaves this gateway undeclared', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'corp-proxy=free');
+    const r = makeRouter();
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual(['gemini']);
+    r.dispose();
+  });
+
+  it('excludes bare priced with no catalogue and no NEXUS_CUSTOM_MODEL (#6404)', () => {
+    // api:custom-openai never gets a catalogue. Before #6404 bare `priced`
+    // fell back to the display slot (opencode's default model, ≈ $0.15) and
+    // slipped under the 0.2 ceiling — the same number the undeclared case
+    // used to invent.
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced');
+    vi.stubEnv('NEXUS_CUSTOM_MODEL', undefined);
+    const r = makeRouter();
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual(['gemini']);
+    r.dispose();
+  });
+
+  it('prices bare priced at NEXUS_CUSTOM_MODEL when that model is registry-priced (#6404)', () => {
+    // gpt-4o ($2.5/$10) with ~10k output ≈ $0.10: under the 0.2 ceiling.
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced');
+    vi.stubEnv('NEXUS_CUSTOM_MODEL', 'gpt-4o');
+    const r = makeRouter();
+    expect(r.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual([
+      'gemini',
+      'api:custom-openai',
+    ]);
+    r.dispose();
+
+    // claude-fable-5 ($10/$50) ≈ $0.50: over the ceiling. The display-slot
+    // fallback would have admitted it at ≈ $0.15.
+    vi.stubEnv('NEXUS_CUSTOM_MODEL', 'claude-fable-5');
+    const dear = makeRouter();
+    expect(dear.filterByTaskClassCeiling(ceilingTask, candidates)).toEqual(['gemini']);
+    dear.dispose();
+  });
+});
+
+describe('estimateArmCostUsd (#4392 inc 2)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('is undefined for an undeclared gateway arm, never 0', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', undefined);
+    expect(estimateArmCostUsd('api:custom-openai', 1_000, 1_000)).toBeUndefined();
+  });
+
+  it('is 0 for a gateway declared local', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'local');
+    expect(estimateArmCostUsd('api:custom-openai', 1_000, 1_000)).toBe(0);
+  });
+
+  it('is the flat rate for priced:<in>,<out>', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced:2,10');
+    // 1M input at $2 + 1M output at $10.
+    expect(estimateArmCostUsd('api:custom-openai', 1_000_000, 1_000_000)).toBeCloseTo(12, 6);
+  });
+
+  it('a vendor arm is priced by the registry regardless of the declaration', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'free');
+    const viaArm = estimateArmCostUsd('api:google', 1_000, 1_000);
+    const pricing = getModelPricing('gemini-3-pro');
+    expect(pricing).toBeDefined();
+    expect(viaArm).toBe(computeTokenCost({ input: 1_000, output: 1_000 }, pricing!).costUsd);
+    expect(viaArm).toBeGreaterThan(0);
+  });
+
+  it('accepts an explicit env so callers need not mutate process.env', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', undefined);
+    expect(
+      estimateArmCostUsd('api:custom-openai', 1_000, 1_000, { NEXUS_GATEWAY_COST: 'free' })
+    ).toBe(0);
+  });
+});
+
+// ============================================================================
+// checkBudget / selectAdapterWithinBudget — gateway arms (#6393, #4392 inc 2)
+// ============================================================================
+
+describe('BudgetRouter checkBudget — gateway arms (#6393)', () => {
+  // The #6392 review ran this exact shape with NEXUS_GATEWAY_COST unset and
+  // saw `withinBudget: true` at estimatedCostUsd ≈ 0.15 — opencode's default
+  // model rate, because a gateway adapter's display `name` is its slot and
+  // `checkBudget` priced `adapter.name` instead of the arm.
+  const task: CliTask = { content: 'implement a function', maxTokens: 10_000 };
+  const inputTokens = estimateTokens(task.content);
+  const outputTokens = 10_000;
+  const budget = { maxCostUsd: 1 };
+
+  function makeRouter(arms: readonly RoutingArmId[]): BudgetRouter {
+    const adapters = new Map<RoutingArmId, ICliAdapter>(
+      arms.map((arm) => [
+        arm,
+        { ...createMockAdapter(routingArmCliSlot(arm) ?? 'opencode'), name: arm },
+      ])
+    );
+    return new BudgetRouter(adapters, {
+      sessionBudget: { tokenBudget: 1_000_000, costBudgetUsd: 100, resetIntervalMs: 0 },
+    });
+  }
+
+  beforeEach(() => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', undefined);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    const helpers = await import('../config/model-config-helpers.js');
+    const actual = await vi.importActual<typeof import('../config/model-config-helpers.js')>(
+      '../config/model-config-helpers.js'
+    );
+    vi.mocked(helpers.getModelPricing).mockImplementation(actual.getModelPricing);
+  });
+
+  it('an UNDECLARED gateway is not within budget and no cost is fabricated for it', async () => {
+    const r = makeRouter(['api:custom-openai']);
+    const result = r.checkBudget(task, budget);
+    expect(result.withinBudget).toBe(false);
+    expect(result.adapter).toBeNull();
+    // Named empty case: nothing selectable → the existing "nothing would run"
+    // $0, never opencode's ≈$0.15; the reason travels on the record instead.
+    expect(result.estimatedCostUsd).toBe(0);
+    expect(result.unpricedArms).toEqual([
+      { arm: 'api:custom-openai', reason: 'gateway cost unset' },
+    ]);
+    const routed = await r.routeWithBudget(task, budget);
+    expect(routed.ok).toBe(false);
+    r.dispose();
+  });
+
+  it('names an INVALID declaration as the reason', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'metered');
+    const r = makeRouter(['api:custom-openai']);
+    const result = r.checkBudget(task, budget);
+    expect(result.withinBudget).toBe(false);
+    expect(result.unpricedArms?.[0]?.reason).toMatch(/^gateway cost invalid \(/);
+    r.dispose();
+  });
+
+  it('a gateway declared free is within budget at $0', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'free');
+    const r = makeRouter(['api:custom-openai']);
+    const result = r.checkBudget(task, budget);
+    expect(result.withinBudget).toBe(true);
+    expect(result.adapter).not.toBeNull();
+    expect(result.estimatedCostUsd).toBe(0);
+    // Absent, not empty: every candidate could be priced.
+    expect(result.unpricedArms).toBeUndefined();
+    r.dispose();
+  });
+
+  it('a gateway declared priced:<in>,<out> is priced by computeTokenCost at that flat rate', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced:2,10');
+    const r = makeRouter(['api:custom-openai']);
+    const result = r.checkBudget(task, budget);
+    const expected = computeTokenCost(
+      { input: inputTokens, output: outputTokens },
+      { inputPer1M: 2, outputPer1M: 10 }
+    ).costUsd;
+    expect(result.withinBudget).toBe(true);
+    expect(result.estimatedCostUsd).toBeCloseTo(expected, 12);
+    expect(result.estimatedCostUsd).toBeGreaterThan(0);
+    r.dispose();
+
+    // The same flat rate binds: $50/$50 with ~10k output ≈ $0.50 > 0.4.
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced:50,50');
+    const dear = makeRouter(['api:custom-openai']);
+    expect(dear.checkBudget(task, { maxCostUsd: 0.4 }).withinBudget).toBe(false);
+    dear.dispose();
+  });
+
+  it('bare priced on a model with no registry pricing stays fail-closed, with the gap named', () => {
+    // Previously pinned the display SLOT's missing pricing (a mocked
+    // getModelPricing): since #6404 bare priced never consults the slot, so
+    // the unpriced subject is the model NEXUS_CUSTOM_MODEL pins.
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced');
+    vi.stubEnv('NEXUS_CUSTOM_MODEL', 'mystery-gateway-model');
+    const r = makeRouter(['api:custom-openai']);
+    const result = r.checkBudget(task, budget);
+    expect(result.withinBudget).toBe(false);
+    expect(result.unpricedArms?.[0]?.reason).toMatch(
+      /mystery-gateway-model has no registry pricing/
+    );
+    r.dispose();
+  });
+
+  it('bare priced with no catalogue and no NEXUS_CUSTOM_MODEL is fail-closed, naming the fix (#6404)', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'priced');
+    vi.stubEnv('NEXUS_CUSTOM_MODEL', undefined);
+    const r = makeRouter(['api:custom-openai']);
+    const result = r.checkBudget(task, budget);
+    expect(result.withinBudget).toBe(false);
+    expect(result.unpricedArms?.[0]?.reason).toBe(
+      'gateway cost priced without a catalogue or model: declare priced:<in>,<out> or set NEXUS_CUSTOM_MODEL'
+    );
+    r.dispose();
+  });
+
+  it('skips the undeclared gateway but still selects a priceable vendor arm, and says so', () => {
+    // Give the unpriced gateway priority explicitly; the native Flash default
+    // now has a higher cost score than opencode, so insertion order is insufficient.
+    const priorCost = DEFAULT_CAPABILITIES.opencode.cost;
+    Object.assign(DEFAULT_CAPABILITIES.opencode, { cost: 10 });
+    const r = makeRouter(['api:custom-openai', 'gemini']);
+    try {
+      const result = r.checkBudget(task, budget);
+      expect(result.withinBudget).toBe(true);
+      expect(result.adapter?.name).toBe('gemini');
+      expect(result.estimatedCostUsd).toBeCloseTo(
+        estimateCost('gemini', inputTokens, outputTokens),
+        12
+      );
+      expect(result.unpricedArms).toEqual([
+        { arm: 'api:custom-openai', reason: 'gateway cost unset' },
+      ]);
+    } finally {
+      Object.assign(DEFAULT_CAPABILITIES.opencode, { cost: priorCost });
+      r.dispose();
+    }
+  });
+
+  it.each<RoutingArmId>(['claude', 'gemini', 'codex', 'api:google'])(
+    'pins the conservative resolveCliCostPer1M number for CLI slot / vendor arm %s',
+    (arm) => {
+      // Control: the pre-#6393 formula, `estimateCost(displaySlot, in, out)`,
+      // must survive for every non-gateway arm — declared or not.
+      const before =
+        arm === 'api:google'
+          ? (estimateArmCostUsd(arm, inputTokens, outputTokens) ?? NaN)
+          : estimateCost(routingArmCliSlot(arm) ?? 'opencode', inputTokens, outputTokens);
+      expect(before).toBeGreaterThan(0);
+      for (const decl of [undefined, 'free']) {
+        vi.stubEnv('NEXUS_GATEWAY_COST', decl);
+        const r = makeRouter([arm]);
+        const result = r.checkBudget(task, budget);
+        expect(result.withinBudget).toBe(true);
+        expect(result.estimatedCostUsd).toBeCloseTo(before, 12);
+        expect(result.unpricedArms).toBeUndefined();
+        r.dispose();
+      }
+    }
+  );
+});
+
+describe('BudgetRouter endpoint metadata (#7151)', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  function endpointRouter(contextWindow: number): BudgetRouter {
+    const adapter = createMockAdapter('opencode', { contextWindow });
+    return new BudgetRouter(new Map([['api:gw-prod', adapter]]), {
+      sessionBudget: { tokenBudget: 10_000_000, costBudgetUsd: 100, resetIntervalMs: 0 },
+    });
+  }
+
+  it('rejects a task exceeding the endpoint context even when opencode would admit it', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'free');
+    const router = endpointRouter(1_024);
+    const result = router.checkBudget({ content: 'explain parser', maxTokens: 2_048 });
+    expect(result.withinBudget).toBe(false);
+    expect(result.adapter).toBeNull();
+    router.dispose();
+  });
+
+  it('admits a task within the endpoint context even when opencode would reject it', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'free');
+    const router = endpointRouter(2_000_000);
+    const result = router.checkBudget(
+      { content: 'explain parser', maxTokens: 1_200_000 },
+      { maxTokens: 1_500_000 }
+    );
+    expect(result.withinBudget).toBe(true);
+    router.dispose();
+  });
+
+  it('reports endpoint latency as unmeasured rather than using opencode latency', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'free');
+    const router = endpointRouter(1_024);
+    const result = router.checkBudget(
+      { content: 'explain parser', maxTokens: 32 },
+      { maxLatencyMs: 1 }
+    );
+    expect(result.withinBudget).toBe(true);
+    expect(result.estimatedLatencyMs).toBeUndefined();
+    router.dispose();
+  });
+});
+
+describe('API model quality stays separate from CLI defaults (#7423)', () => {
+  it('ranks the API bridge by its own profile rather than the Flash display slot', () => {
+    vi.stubEnv('NEXUS_GATEWAY_COST', 'free');
+    const priorCost = DEFAULT_CAPABILITIES.gemini.cost;
+    Object.assign(DEFAULT_CAPABILITIES.gemini, { cost: 9 });
+    const pro = createModelToCliAdapter({ modelId: 'gemini-3.1-pro-preview' } as IModelAdapter, {
+      name: 'gemini',
+      capabilities: {
+        reasoning: 10,
+        contextWindow: 1_048_576,
+        codeGeneration: 9,
+        speed: 8,
+        cost: 6,
+      },
+    });
+    const alternative = createModelToCliAdapter({ modelId: 'control-model' } as IModelAdapter, {
+      name: 'opencode',
+      capabilities: { reasoning: 8, contextWindow: 200000, codeGeneration: 8, speed: 7, cost: 8 },
+    });
+    const router = new BudgetRouter(
+      new Map<RoutingArmId, ICliAdapter>([
+        ['api:google', pro],
+        ['api:custom-openai', alternative],
+      ]),
+      { sessionBudget: { resetIntervalMs: 0 } }
+    );
+    try {
+      // Flash's CLI cost score is 9; Google's API Pro score is 6. The endpoint
+      // score of 8 distinguishes metadata reuse from accidental slot collapse.
+      expect(router.checkBudget({ content: 'bounded task' }).adapter).toBe(alternative);
+    } finally {
+      Object.assign(DEFAULT_CAPABILITIES.gemini, { cost: priorCost });
+      router.dispose();
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+describe('Gateway budget selection uses the actual serving model (#7423)', () => {
+  it.each([9, 5])(
+    'keeps an affordable control eligible regardless of native Gemini cost score %s',
+    async (nativeCostScore) => {
+      vi.stubEnv('NEXUS_DISABLED_CLIS', 'gemini');
+      vi.stubEnv('NEXUS_GATEWAY_COST', 'free;openai-compat=priced:2,12');
+      const priorCost = DEFAULT_CAPABILITIES.gemini.cost;
+      Object.assign(DEFAULT_CAPABILITIES.gemini, { cost: nativeCostScore });
+      const model = fakeGatewayModel('gemini-3.1-pro-preview', 'api:openai-compat');
+      setGatewaySlotCatalog([model]);
+      const createCli = vi.fn(() => createMockAdapter('gemini'));
+      const gateway = buildGatewaySlotRouterArm('gemini', createCli, () => Promise.resolve(false));
+      expect(gateway).toBeDefined();
+      expect(gateway).not.toBe('unavailable');
+      if (gateway === undefined || gateway === 'unavailable')
+        throw new Error('Gateway fixture missing');
+      const control = createModelToCliAdapter({ modelId: 'control-model' } as IModelAdapter, {
+        name: 'opencode',
+        capabilities: { reasoning: 8, contextWindow: 200000, codeGeneration: 8, speed: 7, cost: 8 },
+      });
+      const router = new BudgetRouter(
+        new Map<RoutingArmId, ICliAdapter>([
+          ['gemini', gateway],
+          ['api:custom-openai', control],
+        ]),
+        { sessionBudget: { costBudgetUsd: 0.01, resetIntervalMs: 0 } }
+      );
+      try {
+        expect(gatewayServedSlotOf(gateway)?.modelId).toBe('gemini-3.1-pro-preview');
+        expect(gateway.capabilities.cost).toBe(6);
+        // Both pass the per-task ceiling. Actual Pro costs $0.014, above the
+        // session's $0.01; the higher cost-efficiency control is explicitly free.
+        const task = { content: 'x'.repeat(4000), maxTokens: 1000 };
+        const checked = router.checkBudget(task);
+        expect(checked.withinBudget).toBe(true);
+        expect(checked.adapter === control).toBe(true);
+        expect(checked.estimatedCostUsd).toBe(0);
+        const routed = await router.routeWithBudget(task);
+        expect(routed.ok).toBe(true);
+        if (routed.ok) expect(routed.value.adapter).toBe(control);
+        expect(createCli).not.toHaveBeenCalled();
+        expect(model.complete).not.toHaveBeenCalled();
+        expect(model.stream).not.toHaveBeenCalled();
+      } finally {
+        router.dispose();
+        await gateway.dispose();
+        Object.assign(DEFAULT_CAPABILITIES.gemini, { cost: priorCost });
+        _resetGatewaySlotCatalog();
+        vi.unstubAllEnvs();
+      }
+    }
+  );
+});

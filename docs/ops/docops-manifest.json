@@ -1,0 +1,43 @@
+{
+  "version": "1.0.0",
+  "description": "DocOps pipeline manifest for enforcement gates",
+  "created": "2026-02-01",
+  "pipeline_files": [
+    "scripts/generate-repo-index.ts",
+    "scripts/inject-governance.ts",
+    "scripts/check-docops-skill.ts",
+    "scripts/check-docs-indexed.ts",
+    ".github/workflows/docs-check.yml",
+    ".github/workflows/deploy-website.yml",
+    ".github/workflows/link-check.yml",
+    "docs/ops/docops-spec.md",
+    "scripts/generate-tool-reference.ts"
+  ],
+  "skill_file": "skills/documentation-management/SKILL.md",
+  "pipeline_notes_dir": "skills/documentation-management/pipeline-notes",
+  "canonical_index": "docs/README.md",
+  "generated_outputs": {
+    "capabilities": "docs/reference/capabilities.md",
+    "repo_index": "artifacts/repo-index.json"
+  },
+  "ci_validation": {
+    "workflow": ".github/workflows/docs-check.yml",
+    "jobs": [
+      "typedoc-check",
+      "repo-index",
+      "link-check",
+      "docs-coverage",
+      "secrets-scan",
+      "docops-skill-sync",
+      "canonical-index",
+      "markdown-lint",
+      "spell-check"
+    ]
+  },
+  "enforcement_rules": {
+    "canonical_index_required": true,
+    "no_parallel_indexes": true,
+    "generated_must_match_source": true,
+    "docops_changes_require_skill_update": true
+  }
+}

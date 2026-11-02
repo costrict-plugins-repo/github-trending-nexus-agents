@@ -1,0 +1,301 @@
+/**
+ * Agentic Memory Types
+ *
+ * Type definitions for A-MEM agentic memory with Zettelkasten-style
+ * dynamic linking, attribute extraction, and memory evolution.
+ *
+ * @module context/agentic-memory-types
+ * (Source: Issue #122, arXiv:2502.12110)
+ */
+
+import { z } from 'zod';
+import type { Result } from '../core/result.js';
+import type { MemoryEntry, MemoryError, IContextMemoryBackend } from './memory-backend-types.js';
+import type { RelationType } from './graph-memory-types.js';
+import { RelationTypeSchema } from './graph-memory-types.js';
+
+// Re-export primitives for backward compatibility
+export {
+  EntityType,
+  EntityTypeSchema,
+  type EntityReference,
+  EntityReferenceSchema,
+  EvolutionType,
+  EvolutionTypeSchema,
+  type EvolutionResult,
+  EvolutionResultSchema,
+  type LinkSuggestion,
+  LinkSuggestionSchema,
+} from './agentic-memory-primitives.js';
+
+// Import primitives for use in this file
+import type {
+  EntityReference,
+  EvolutionResult,
+  LinkSuggestion,
+} from './agentic-memory-primitives.js';
+
+// ============================================================================
+// Memory Attributes (Zettelkasten-style)
+// ============================================================================
+
+/**
+ * A-MEM attributes for a memory entry.
+ * These are automatically extracted when storing memories.
+ */
+export interface MemoryAttributes {
+  /** Auto-extracted keywords from content */
+  readonly keywords: readonly string[];
+  /** Semantic tags (broader categories) */
+  readonly semanticTags: readonly string[];
+  /** Contextual description (brief summary) */
+  readonly contextDescription: string;
+  /** Entity references extracted from content */
+  readonly entities: readonly EntityReference[];
+  /** When attributes were last updated */
+  readonly attributesUpdatedAt: Date;
+}
+
+// ============================================================================
+// Agentic Memory Entry
+// ============================================================================
+
+/**
+ * Memory entry with A-MEM attributes attached.
+ */
+export interface AgenticMemoryEntry extends MemoryEntry {
+  /** Auto-extracted attributes */
+  readonly attributes: MemoryAttributes;
+}
+
+// ============================================================================
+// Store Result
+// ============================================================================
+
+/**
+ * Result of an agentic store operation.
+ */
+export interface AgenticStoreResult {
+  /** The stored entry with extracted attributes */
+  readonly entry: AgenticMemoryEntry;
+  /** Suggested links to other memories */
+  readonly linkSuggestions: readonly LinkSuggestion[];
+  /** Detected evolution relationships */
+  readonly evolution: readonly EvolutionResult[];
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/**
+ * Configuration for attribute extraction.
+ */
+export interface ExtractionConfig {
+  /** Maximum keywords to extract (default: 10) */
+  readonly maxKeywords: number;
+  /** Maximum semantic tags (default: 5) */
+  readonly maxSemanticTags: number;
+  /** Maximum context description length in chars (default: 200) */
+  readonly maxContextLength: number;
+  /** Maximum entities to extract (default: 10) */
+  readonly maxEntities: number;
+}
+
+/** Zod schema for ExtractionConfig validation. */
+export const ExtractionConfigSchema = z.object({
+  maxKeywords: z.number().int().positive().max(50),
+  maxSemanticTags: z.number().int().positive().max(20),
+  maxContextLength: z.number().int().positive().max(500),
+  maxEntities: z.number().int().positive().max(30),
+});
+
+/**
+ * Configuration for automatic linking behavior.
+ */
+export interface LinkingConfig {
+  /** Minimum confidence to suggest links (default: 0.5) */
+  readonly suggestionThreshold: number;
+  /** Maximum link suggestions per memory (default: 5) */
+  readonly maxSuggestions: number;
+  /** Relationship types to consider for linking */
+  readonly allowedTypes: readonly RelationType[];
+}
+
+/** Zod schema for LinkingConfig validation. */
+export const LinkingConfigSchema = z.object({
+  suggestionThreshold: z.number().min(0).max(1),
+  maxSuggestions: z.number().int().positive().max(20),
+  allowedTypes: z.array(RelationTypeSchema),
+});
+
+/**
+ * Options for linking related memories.
+ */
+export interface LinkingOptions {
+  /** Minimum confidence threshold for applying links (default: 0.7) */
+  readonly threshold?: number;
+  /** Maximum links to apply (default: config.maxSuggestions) */
+  readonly maxLinks?: number;
+  /** Whether to create bidirectional links (default: true) */
+  readonly bidirectional?: boolean;
+}
+
+// ============================================================================
+// Agentic Memory Interface
+// ============================================================================
+
+/**
+ * Agentic memory interface implementing A-MEM Zettelkasten-style organization.
+ * Extends IContextMemoryBackend with automatic attribute extraction, dynamic linking,
+ * and memory evolution detection.
+ *
+ * (Source: Issue #122, arXiv:2502.12110)
+ */
+export interface IAgenticMemory extends IContextMemoryBackend {
+  /**
+   * Store a memory with automatic attribute extraction.
+   * Extracts keywords, tags, entities, and context from the value.
+   * Does NOT auto-link; call linkRelatedMemories() separately.
+   * @param key - Memory key
+   * @param value - Memory value (text content for extraction)
+   * @param metadata - Memory metadata (importance, tags, ttl)
+   * @returns Store result with extracted attributes and suggestions
+   */
+  storeWithAttributes(
+    key: string,
+    value: unknown,
+    metadata: import('./memory-backend-types.js').MemoryMetadata
+  ): Promise<Result<AgenticStoreResult, MemoryError>>;
+
+  /**
+   * Retrieve a memory with its A-MEM attributes.
+   * @param key - Memory key
+   * @returns Entry with attributes or null if not found
+   */
+  retrieveWithAttributes(key: string): Promise<Result<AgenticMemoryEntry | null, MemoryError>>;
+
+  /**
+   * Search with A-MEM enhanced retrieval.
+   * Uses keywords and semantic tags for better relevance scoring.
+   * @param query - Search query
+   * @param limit - Max results (default: 10)
+   * @returns Entries sorted by relevance
+   */
+  searchAgentic(query: string, limit?: number): Promise<Result<AgenticMemoryEntry[], MemoryError>>;
+
+  /**
+   * Get link suggestions for a memory entry.
+   * Analyzes keyword overlap and entity co-occurrence.
+   * Does NOT modify state.
+   * @param key - Memory key to analyze
+   * @param limit - Max suggestions (default: config.maxSuggestions)
+   * @returns Suggested links ranked by confidence
+   */
+  suggestLinks(key: string, limit?: number): Promise<Result<LinkSuggestion[], MemoryError>>;
+
+  /**
+   * Link related memories based on suggestions.
+   * Creates graph relationships for suggestions meeting threshold.
+   * @param key - Memory key to link from
+   * @param opts - Linking options (threshold, maxLinks, bidirectional)
+   * @returns Number of links created
+   */
+  linkRelatedMemories(key: string, opts?: LinkingOptions): Promise<Result<number, MemoryError>>;
+
+  /**
+   * Detect evolution relationships with existing memories.
+   * Identifies refinements, contradictions, extensions, supersessions.
+   * @param key - Memory key to analyze
+   * @returns Detected evolution relationships
+   */
+  detectEvolution(key: string): Promise<Result<EvolutionResult[], MemoryError>>;
+
+  /**
+   * Refresh attributes for a memory (re-extract).
+   * Updates keywords, tags, entities, and context from current value.
+   * @param key - Memory key
+   * @returns Updated attributes
+   */
+  refreshAttributes(key: string): Promise<Result<MemoryAttributes, MemoryError>>;
+
+  /**
+   * Find memories that share attributes with the given key.
+   * @param key - Memory key
+   * @param attributeType - Type of attribute to match
+   * @param limit - Max results (default: 10)
+   * @returns Entries sharing attributes
+   */
+  findBySharedAttributes(
+    key: string,
+    attributeType: 'keywords' | 'semanticTags' | 'entities',
+    limit?: number
+  ): Promise<Result<AgenticMemoryEntry[], MemoryError>>;
+
+  /** Get extraction config. */
+  getExtractionConfig(): ExtractionConfig;
+
+  /** Update extraction config. */
+  updateExtractionConfig(config: Partial<ExtractionConfig>): void;
+
+  /** Get linking config. */
+  getLinkingConfig(): LinkingConfig;
+
+  /** Update linking config. */
+  updateLinkingConfig(config: Partial<LinkingConfig>): void;
+}
+
+// ============================================================================
+// Backend Configuration
+// ============================================================================
+
+/**
+ * Configuration for AgenticMemoryBackend.
+ */
+export interface AgenticMemoryConfig {
+  /** Path to SQLite database file */
+  readonly dbPath: string;
+  /** Directory for Markdown exports */
+  readonly markdownDir: string;
+  /** Attribute extraction config (uses defaults if not provided) */
+  readonly extraction?: Partial<ExtractionConfig>;
+  /** Linking config (uses defaults if not provided) */
+  readonly linking?: Partial<LinkingConfig>;
+  /** Whether to auto-expire TTL entries (default: true) */
+  readonly autoExpire?: boolean;
+}
+
+/** Zod schema for AgenticMemoryConfig validation. */
+export const AgenticMemoryConfigSchema = z.object({
+  dbPath: z.string().min(1),
+  markdownDir: z.string().min(1),
+  extraction: ExtractionConfigSchema.partial().optional(),
+  linking: LinkingConfigSchema.partial().optional(),
+  autoExpire: z.boolean().optional(),
+});
+
+// ============================================================================
+// Default Configuration
+// ============================================================================
+
+/** Default extraction configuration. */
+export const DEFAULT_EXTRACTION_CONFIG: ExtractionConfig = {
+  maxKeywords: 10,
+  maxSemanticTags: 5,
+  maxContextLength: 200,
+  maxEntities: 10,
+};
+
+/** Default linking configuration. */
+export const DEFAULT_LINKING_CONFIG: LinkingConfig = {
+  suggestionThreshold: 0.5,
+  maxSuggestions: 5,
+  allowedTypes: ['related_to', 'derived_from', 'same_entity'],
+};
+
+/** Default agentic memory configuration. */
+export const DEFAULT_AGENTIC_MEMORY_CONFIG = {
+  extraction: DEFAULT_EXTRACTION_CONFIG,
+  linking: DEFAULT_LINKING_CONFIG,
+  autoExpire: true,
+} as const;

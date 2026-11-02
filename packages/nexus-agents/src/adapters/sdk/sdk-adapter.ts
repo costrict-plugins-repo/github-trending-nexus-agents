@@ -1,0 +1,698 @@
+import type { ExecutionAccessMode } from '../../core/types/model.js';
+/* eslint max-lines: ["error", { "max": 500, "skipBlankLines": true, "skipComments": true }] */
+// AI SDK model lifecycle, response mapping, and error fidelity remain cohesive
+// under the file's governance allowance (#6618).
+/**
+ * nexus-agents/adapters/sdk - Base SDK Adapter
+ *
+ * Implements IModelAdapter using the Vercel AI SDK's generateText/streamText
+ * APIs. Provides a unified adapter for any AI SDK-supported provider.
+ *
+ * @module adapters/sdk/sdk-adapter
+ * (Source: Issue #1123 — AI SDK provider layer)
+ */
+
+import type {
+  CompletionRequest,
+  CompletionResponse,
+  ContentBlock,
+  ResponseFormat,
+  StreamChunk,
+  Result,
+  ILogger,
+  TokenUsage,
+  IModelAdapter,
+} from '../../core/index.js';
+import { ModelError, ModelCapability, createLogger, getErrorMessage } from '../../core/index.js';
+import { BaseAdapter, AdapterModelError } from '../base-adapter.js';
+import { ErrorCode, ok } from '../../core/index.js';
+import {
+  isRateLimitLikeError,
+  resolveRetryAfterMs,
+  RETRY_AFTER_CONTEXT_KEY,
+} from '../rate-limit-detector.js';
+import { sanitizeOutput } from '../../security/output-sanitizer.js';
+import { PROVIDER_ENV_KEYS, type SdkAdapterConfig, type SdkProviderId } from './types.js';
+import {
+  readCustomApiSurface,
+  readDirectOpenAiSurface,
+  readGatewayEnv,
+  redactApiKey,
+} from './gateway-env.js';
+import { readGatewayTransport } from '../gateway-http.js';
+import {
+  createOpenAICompatClient,
+  validateOpenAICompatBaseUrl,
+  type OpenAICompatConfig,
+} from '../openai-compat-adapter.js';
+import { planOptionalParams, type DroppedParam } from '../optional-params.js';
+import { readSdkReportedModel } from './sdk-model-report.js';
+import { isStructuredTextResult } from './ai-sdk-shapes.js';
+import type {
+  AiSdkFunctions,
+  AiSdkModel,
+  GenerateTextResult,
+  StreamTextResult,
+} from './ai-sdk-shapes.js';
+
+/** Maps SDK counters without presenting a partial component sum as a total. */
+function mapSdkUsage(usage: GenerateTextResult['usage']): TokenUsage | undefined {
+  const { inputTokens, outputTokens, totalTokens } = usage;
+  if (totalTokens !== undefined) {
+    return { inputTokens: inputTokens ?? 0, outputTokens: outputTokens ?? 0, totalTokens };
+  }
+  if (inputTokens === undefined || outputTokens === undefined) return undefined;
+  return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
+}
+
+/** AI SDK provider factory: creates a provider instance that is callable as a model factory. */
+type ProviderFactory = (opts: Record<string, unknown>) => ProviderInstance;
+
+/**
+ * AI SDK provider instance: callable to create a model on the provider's
+ * default surface. `@ai-sdk/openai` also exposes `.chat` and `.responses`
+ * (#6645); they are optional here because other providers lack them.
+ */
+type ProviderInstance = ((id: string) => AiSdkModel) & {
+  readonly chat?: (id: string) => AiSdkModel;
+  readonly responses?: (id: string) => AiSdkModel;
+};
+
+/** Build an OpenAI-provider model on the chosen API surface (#6645, #6654). */
+function modelOnSurface(
+  provider: ProviderInstance,
+  surface: ReturnType<typeof readCustomApiSurface>,
+  modelId: string
+): AiSdkModel {
+  const build = surface === 'chat' ? provider.chat : provider.responses;
+  if (typeof build !== 'function') {
+    throw new Error(`AI SDK OpenAI provider has no '${surface}' model factory`);
+  }
+  return build(modelId);
+}
+
+/** The API surface an adapter's provider is pinned to, read once at construction. */
+function apiSurfaceFor(
+  providerId: SdkProviderId
+): ReturnType<typeof readCustomApiSurface> | undefined {
+  if (providerId === 'openai') return readDirectOpenAiSurface();
+  return undefined;
+}
+
+/**
+ * Extracts a named provider factory from a dynamically-imported AI SDK module.
+ *
+ * AI SDK provider modules export factory functions (e.g., createAnthropic, createOpenAI)
+ * that return callable provider instances. Since these are optional peer dependencies
+ * loaded via dynamic import, we validate the shape at runtime rather than relying on
+ * compile-time types.
+ */
+function extractProviderFactory(
+  mod: Record<string, unknown>,
+  factoryName: string
+): ProviderFactory {
+  const factory = mod[factoryName];
+  if (typeof factory !== 'function') {
+    throw new Error(`AI SDK module missing expected export: ${factoryName}`);
+  }
+  return factory as ProviderFactory;
+}
+
+/**
+ * Validates a dynamically-imported AI SDK module has the expected generateText/streamText exports.
+ *
+ * The 'ai' package is an optional peer dependency loaded via dynamic import.
+ * We validate the shape at runtime to avoid unsafe casts.
+ */
+/**
+ * Validate that a dynamically-imported `ai` module exposes the functions this
+ * adapter needs; throw a clear, per-export error otherwise. Exported for direct
+ * unit testing (#3449) so the "missing export" cases don't need a global module
+ * mock (`vi.doMock`/`resetModules`), whose state leaked across parallel tests.
+ */
+export function extractAiSdkFunctions(mod: Record<string, unknown>): AiSdkFunctions {
+  const generateText = mod['generateText'];
+  const streamText = mod['streamText'];
+  const generateObject = mod['generateObject'];
+  const output = mod['Output'];
+  const objectOutput =
+    typeof output === 'object' && output !== null
+      ? (output as Record<string, unknown>)['object']
+      : undefined;
+  const jsonSchema = mod['jsonSchema'];
+  if (typeof generateText !== 'function') {
+    throw new Error("AI SDK module missing expected export: 'generateText'");
+  }
+  if (typeof streamText !== 'function') {
+    throw new Error("AI SDK module missing expected export: 'streamText'");
+  }
+  // Still surfaced (deprecated) for API compatibility; the adapter does not call it.
+  if (typeof generateObject !== 'function') {
+    throw new Error("AI SDK module missing expected export: 'generateObject'");
+  }
+  // Structured output uses generateText with Output.object + jsonSchema.
+  if (typeof objectOutput !== 'function') {
+    throw new Error("AI SDK module missing expected export: 'Output.object'");
+  }
+  if (typeof jsonSchema !== 'function') {
+    throw new Error("AI SDK module missing expected export: 'jsonSchema'");
+  }
+  return {
+    generateText: generateText as AiSdkFunctions['generateText'],
+    streamText: streamText as AiSdkFunctions['streamText'],
+    // eslint-disable-next-line @typescript-eslint/no-deprecated -- preserve the exported legacy handle; execution uses generateText
+    generateObject: generateObject as AiSdkFunctions['generateObject'],
+    objectOutput: objectOutput as AiSdkFunctions['objectOutput'],
+    jsonSchema: jsonSchema as AiSdkFunctions['jsonSchema'],
+  };
+}
+
+/**
+ * Resolves the API key for a given provider.
+ * Priority: explicit config > environment variable. The `custom-openai`
+ * key goes through the canonical gateway-env resolver.
+ */
+function resolveApiKey(providerId: SdkProviderId, configKey?: string): string | undefined {
+  if (configKey !== undefined) return configKey;
+  if (providerId === 'custom-openai') return readGatewayEnv().apiKey;
+  return process.env[PROVIDER_ENV_KEYS[providerId]];
+}
+
+/** Resolve the custom alias through the gateway's canonical validation and transport. */
+function gatewayConfigFor(
+  config: SdkAdapterConfig,
+  apiKey: string | undefined,
+  logger: ILogger
+): OpenAICompatConfig | undefined {
+  if (config.providerId !== 'custom-openai') return undefined;
+  const baseUrl = validateOpenAICompatBaseUrl(config.baseUrl ?? readGatewayEnv().baseUrl);
+  return {
+    baseUrl,
+    apiKey: apiKey ?? '',
+    logger,
+    omitDefaultTokenCap: true,
+    ...readGatewayTransport(baseUrl, process.env, logger),
+    apiSurface: readCustomApiSurface(),
+    ...(config.timeout !== undefined && { timeout: config.timeout }),
+    ...(config.maxRetries !== undefined && { maxRetries: config.maxRetries }),
+  };
+}
+
+/**
+ * Maps AI SDK finish reasons to our StopReason type.
+ */
+function mapFinishReason(reason: string): CompletionResponse['stopReason'] {
+  switch (reason) {
+    case 'stop':
+    case 'end-turn':
+      return 'end_turn';
+    case 'length':
+      return 'max_tokens';
+    case 'tool-calls':
+      return 'tool_use';
+    // #6618: 'content-filter' is never mapped as a finish: the adapter turns it into
+    // an error before a response is built (see assertValidCompletion), because
+    // every consumer reads a mapped response as an answer.
+    default:
+      return 'end_turn';
+  }
+}
+
+/** A completion that must surface as an error, never as an empty success (#6607, #6618). */
+interface NonAnswer {
+  /** Why the completion carries no answer. */
+  readonly reason: 'content_filter' | 'reasoning_truncated' | 'completion_interrupted';
+  readonly detail: string;
+  readonly reasoningTokens?: number;
+}
+
+const CONTENT_FILTERED: NonAnswer = {
+  reason: 'content_filter',
+  detail: 'the reply was blocked by a content filter',
+};
+
+const COMPLETION_INTERRUPTED: NonAnswer = {
+  reason: 'completion_interrupted',
+  detail: 'the provider ended the response without a completion signal (finish interrupted)',
+};
+
+const REASONING_TRUNCATED: NonAnswer = {
+  reason: 'reasoning_truncated',
+  detail:
+    'the completion budget was spent on reasoning before any output (empty reply, finish length)',
+};
+
+/**
+ * A non-answer as a non-retryable `MODEL_ERROR` (#6607, #6618). `context.reason`
+ * names which kind it was, so telemetry can tell a refusal from a
+ * reasoning-exhausted budget. `source` is `provider/model`.
+ */
+function nonAnswerError(source: string, nonAnswer: NonAnswer, servedModel?: string): ModelError {
+  return new ModelError(`${source}: ${nonAnswer.detail}`, {
+    code: ErrorCode.MODEL_ERROR,
+    context: {
+      reason: nonAnswer.reason,
+      ...(servedModel !== undefined ? { servedModel } : {}),
+      ...(nonAnswer.reasoningTokens !== undefined
+        ? { reasoningTokens: nonAnswer.reasoningTokens }
+        : {}),
+    },
+  });
+}
+
+/**
+ * Classifies whether a completion result is a non-answer and throws a `ModelError` if so (#6618).
+ */
+function assertValidCompletion(
+  source: string,
+  finishReason: string,
+  hasContent: boolean,
+  servedModel?: string
+): void {
+  if (finishReason === 'interrupted') {
+    throw nonAnswerError(source, COMPLETION_INTERRUPTED, servedModel);
+  }
+  if (finishReason === 'content-filter') {
+    throw nonAnswerError(source, CONTENT_FILTERED, servedModel);
+  }
+  if (finishReason === 'length' && !hasContent) {
+    throw nonAnswerError(source, REASONING_TRUNCATED, servedModel);
+  }
+}
+
+/**
+ * Awaits and validates the stream finish reason (#6618).
+ */
+async function assertValidStreamFinish(
+  source: string,
+  result: StreamTextResult,
+  totalText: string
+): Promise<void> {
+  if (result.finishReason === undefined) return;
+  const finishReason = await result.finishReason;
+  assertValidCompletion(source, finishReason, totalText !== '');
+}
+
+/**
+ * Categorizes an error into an ErrorCode for the circuit breaker.
+ */
+function categorizeError(error: unknown): ErrorCode {
+  if (isRateLimitLikeError(error)) {
+    return ErrorCode.MODEL_RATE_LIMITED;
+  }
+  const message = getErrorMessage(error).toLowerCase();
+  if (message.includes('timeout') || message.includes('timed out')) {
+    return ErrorCode.MODEL_TIMEOUT;
+  }
+  if (message.includes('401') || message.includes('unauthorized') || message.includes('api key')) {
+    return ErrorCode.CONFIG_INVALID;
+  }
+  return ErrorCode.MODEL_ERROR;
+}
+
+/**
+ * AI SDK adapter implementing IModelAdapter.
+ *
+ * Uses Vercel AI SDK (npm: ai) for model interaction instead of
+ * CLI subprocess spawning. Built-in providers use their `@ai-sdk/*` package;
+ * the public custom-openai identifier delegates to the gateway HTTP adapter.
+ */
+export class SdkAdapter extends BaseAdapter {
+  /** This concrete API only returns content/tool descriptions; it executes no host tools. */
+  supportsAccessMode(
+    _mode: ExecutionAccessMode,
+    _signal?: AbortSignal
+  ): Promise<boolean | undefined> {
+    return Promise.resolve(this.constructor === SdkAdapter ? true : undefined);
+  }
+
+  private readonly sdkProviderId: SdkProviderId;
+  private model: AiSdkModel | undefined;
+  private sdkFunctions: AiSdkFunctions | undefined;
+  private readonly sdkConfig: SdkAdapterConfig;
+  /** Compatibility-only custom provider delegates to the canonical gateway client. */
+  private readonly gatewayConfig: OpenAICompatConfig | undefined;
+  private gatewayAdapter: IModelAdapter | undefined;
+  /**
+   * OpenAI API surface: for the direct `openai` provider only when `OPENAI_BASE_URL` names a non-OpenAI host
+   * (#6654). `undefined` keeps the provider's default surface.
+   */
+  private readonly apiSurface: ReturnType<typeof readCustomApiSurface> | undefined;
+  /** Inflight init promise for coalescing concurrent calls (Issue #1438). */
+  private initPromise: Promise<void> | undefined;
+  constructor(config: SdkAdapterConfig, logger?: ILogger) {
+    const apiKey = resolveApiKey(config.providerId, config.apiKey);
+    super({
+      providerId: `sdk-${config.providerId}`,
+      modelId: config.modelId,
+      capabilities: [ModelCapability.COMPLETION, ModelCapability.STREAMING],
+      logger: logger ?? createLogger({ adapter: `sdk-${config.providerId}` }),
+      ...(apiKey !== undefined ? { apiKey } : {}),
+      ...(config.timeout !== undefined ? { timeout: config.timeout } : {}),
+      ...(config.maxRetries !== undefined ? { maxRetries: config.maxRetries } : {}),
+    });
+    this.sdkProviderId = config.providerId;
+    this.sdkConfig = config;
+    this.gatewayConfig = gatewayConfigFor(config, apiKey, this.logger);
+    this.apiSurface = apiSurfaceFor(config.providerId);
+  }
+
+  /** Lazily acquire the B client, preserving missing-key failure at first use. */
+  private resolveGatewayAdapter(): IModelAdapter | undefined {
+    if (this.gatewayConfig === undefined) return undefined;
+    if (this.gatewayAdapter !== undefined) return this.gatewayAdapter;
+    const apiKey = resolveApiKey(this.sdkConfig.providerId, this.sdkConfig.apiKey);
+    if (apiKey === undefined) {
+      throw new AdapterModelError(`No API key for ${this.sdkConfig.providerId}`, {
+        code: ErrorCode.CONFIG_INVALID,
+      });
+    }
+    this.gatewayAdapter = createOpenAICompatClient(this.modelId, { ...this.gatewayConfig, apiKey });
+    return this.gatewayAdapter;
+  }
+
+  /**
+   * Lazily initialize the AI SDK model and functions.
+   * This allows the adapter to be created without the AI SDK installed,
+   * failing only when actually used.
+   */
+  private async ensureInitialized(): Promise<void> {
+    if (this.model !== undefined) return;
+    // Coalesce concurrent init calls into a single load (Issue #1438)
+    if (this.initPromise !== undefined) {
+      await this.initPromise;
+      return;
+    }
+    this.initPromise = this.doInitialize();
+    try {
+      await this.initPromise;
+    } finally {
+      this.initPromise = undefined;
+    }
+  }
+
+  private async doInitialize(): Promise<void> {
+    const apiKey = resolveApiKey(this.sdkConfig.providerId, this.sdkConfig.apiKey);
+    if (apiKey === undefined) {
+      throw new AdapterModelError(`No API key for ${this.sdkProviderId}`, {
+        code: ErrorCode.CONFIG_INVALID,
+      });
+    }
+
+    // Dynamic import — AI SDK is an optional peer dependency
+    const providerModule = await this.loadProvider(apiKey);
+    this.model = providerModule.model;
+
+    // AI SDK is an optional peer dependency — validate shape at runtime
+    this.sdkFunctions = extractAiSdkFunctions(await import('ai'));
+  }
+
+  /**
+   * Loads the provider-specific AI SDK module.
+   *
+   * Each @ai-sdk/* package exports a factory function (e.g., createAnthropic)
+   * that returns a callable provider instance. We use extractProviderFactory()
+   * to validate the export exists at runtime, since these are optional peer deps.
+   */
+  private async loadProvider(apiKey: string): Promise<{ model: AiSdkModel }> {
+    switch (this.sdkProviderId) {
+      case 'custom-openai':
+        throw new AdapterModelError('custom-openai must use the gateway HTTP adapter', {
+          code: ErrorCode.CONFIG_INVALID,
+        });
+      case 'anthropic': {
+        const mod = await import('@ai-sdk/anthropic');
+        const factory = extractProviderFactory(mod, 'createAnthropic');
+        const provider = factory({ apiKey });
+        return { model: provider(this.modelId) };
+      }
+      case 'openai': {
+        const mod = await import('@ai-sdk/openai');
+        const factory = extractProviderFactory(mod, 'createOpenAI');
+        const provider = factory({ apiKey });
+        // The provider reads OPENAI_BASE_URL itself; a gateway there gets chat
+        // completions unless NEXUS_CUSTOM_API_SURFACE=responses (#6654).
+        if (this.apiSurface === undefined) return { model: provider(this.modelId) };
+        return { model: modelOnSurface(provider, this.apiSurface, this.modelId) };
+      }
+      case 'google': {
+        const mod = await import('@ai-sdk/google');
+        const factory = extractProviderFactory(mod, 'createGoogleGenerativeAI');
+        const provider = factory({ apiKey });
+        return { model: provider(this.modelId) };
+      }
+    }
+  }
+
+  /**
+   * Maps our CompletionRequest to AI SDK generateText options.
+   */
+  private buildSdkOptions(
+    request: CompletionRequest,
+    retainReportBody = false
+  ): {
+    options: Record<string, unknown>;
+    dropped: readonly DroppedParam[];
+  } {
+    const options: Record<string, unknown> = {
+      model: this.model,
+      // AI SDK 7 requires opt-in to preserve our system-role message contract.
+      allowSystemInMessages: true,
+      ...(retainReportBody ? { include: { responseBody: true } } : {}),
+      messages: request.messages.map((m) => ({
+        role: m.role === 'system' ? 'system' : m.role,
+        content:
+          typeof m.content === 'string'
+            ? m.content
+            : m.content.map((c: ContentBlock) => {
+                if (c.type === 'text') return { type: 'text' as const, text: c.text };
+                return c;
+              }),
+      })),
+    };
+
+    if (request.systemPrompt !== undefined) {
+      options['system'] = request.systemPrompt;
+    }
+    // #4068: the temperature drop-decision (#4061/#4062: Claude after Opus 4.6 and
+    // OpenAI reasoning models reject a non-1.0 temperature with a 400; the AI-SDK
+    // path routes to both, so omit the param for those models — 1.0 is the API
+    // default, equivalent) is centralized in the shared planOptionalParams seam.
+    const plan = planOptionalParams(request, this.modelId);
+    if (plan.temperature !== undefined) {
+      options['temperature'] = plan.temperature;
+    }
+    if (request.maxTokens !== undefined) {
+      options['maxOutputTokens'] = request.maxTokens;
+    }
+    if (request.stop !== undefined) {
+      options['stopSequences'] = request.stop;
+    }
+
+    // #4069: report dropped params so complete() can surface them as warnings.
+    return { options, dropped: plan.dropped };
+  }
+
+  /** generateText path (text / absent responseFormat). */
+  private async completeText(
+    sdk: AiSdkFunctions,
+    options: Record<string, unknown>
+  ): Promise<CompletionResponse> {
+    const result = await sdk.generateText(options);
+    assertValidCompletion(
+      `${this.providerId}/${this.modelId}`,
+      result.finishReason,
+      result.text !== '' && result.text.trim() !== '',
+      result.response.modelId
+    );
+    const usage = mapSdkUsage(result.usage);
+    const reportedModel = readSdkReportedModel(result.response.body, this.logger);
+    return {
+      content: [{ type: 'text', text: result.text }],
+      ...(usage !== undefined ? { usage } : {}),
+      stopReason: mapFinishReason(result.finishReason),
+      model: result.response.modelId,
+      ...(reportedModel !== undefined ? { reportedModel } : {}),
+    };
+  }
+
+  /**
+   * Structured generateText path (#3433) — json_object / json_schema responseFormat.
+   *
+   * Uses the AI SDK `jsonSchema` helper to build the schema handle
+   * (permissive `{ type: 'object' }` for json_object), then stringifies the
+   * returned object into a text content block so downstream parsers /
+   * extractTextFromResponse keep working unchanged.
+   */
+  private async completeStructured(
+    sdk: AiSdkFunctions,
+    options: Record<string, unknown>,
+    responseFormat: Exclude<ResponseFormat, { type: 'text' }>
+  ): Promise<CompletionResponse> {
+    const rawSchema: Record<string, unknown> =
+      responseFormat.type === 'json_schema' ? responseFormat.schema : { type: 'object' };
+    const schema = sdk.jsonSchema(rawSchema);
+    const result: unknown = await sdk.generateText({
+      ...options,
+      output: sdk.objectOutput({ schema }),
+    });
+    if (!isStructuredTextResult(result)) {
+      throw new Error(
+        'AI SDK generateText returned an unexpected structured result shape ' +
+          '(missing text/output/usage/finishReason/response.modelId)'
+      );
+    }
+    // ai 7 parses `output` from `text` only when text is non-empty or the finish is
+    // `stop`; otherwise the getter throws. Classify the non-answer finish first so
+    // content-filter / empty-length keep their typed errors.
+    const { finishReason, response } = result;
+    const source = `${this.providerId}/${this.modelId}`;
+    assertValidCompletion(source, finishReason, result.text.trim() !== '', response.modelId);
+    const output = result.output;
+    const usage = mapSdkUsage(result.usage);
+    const reportedModel = readSdkReportedModel(result.response.body, this.logger);
+    return {
+      content: [{ type: 'text', text: JSON.stringify(output) }],
+      ...(usage !== undefined ? { usage } : {}),
+      stopReason: mapFinishReason(result.finishReason),
+      model: result.response.modelId,
+      ...(reportedModel !== undefined ? { reportedModel } : {}),
+    };
+  }
+
+  async complete(request: CompletionRequest): Promise<Result<CompletionResponse, ModelError>> {
+    try {
+      const gateway = this.resolveGatewayAdapter();
+      if (gateway !== undefined) return await gateway.complete(request);
+      await this.ensureInitialized();
+      this.logRequest(request);
+
+      const sdk = this.sdkFunctions;
+      if (sdk === undefined) {
+        throw new Error(
+          `SDK not initialized for model '${this.sdkConfig.modelId}' (provider: ${this.sdkProviderId}). ` +
+            'Ensure ensureInitialized() completes before calling complete().'
+        );
+      }
+      const { options, dropped } = this.buildSdkOptions(request, true);
+
+      // #3433: native structured output. json_object/json_schema route
+      // through generateText + Output.object; text uses the default output.
+      const responseFormat = request.responseFormat;
+      const base =
+        responseFormat !== undefined && responseFormat.type !== 'text'
+          ? await this.completeStructured(sdk, options, responseFormat)
+          : await this.completeText(sdk, options);
+
+      // #4069: surface params dropped by the seam (e.g. temperature) as warnings.
+      // Omitted entirely when nothing was dropped (exactOptionalPropertyTypes).
+      const response: CompletionResponse =
+        dropped.length > 0 ? { ...base, warnings: dropped } : base;
+
+      this.logResponse(response);
+      return ok(response);
+    } catch (error: unknown) {
+      const code = categorizeError(error);
+      return this.toErrorResult(error, code);
+    }
+  }
+
+  async *stream(request: CompletionRequest): AsyncIterable<StreamChunk> {
+    const gateway = this.resolveGatewayAdapter();
+    if (gateway !== undefined) {
+      yield* gateway.stream(request);
+      return;
+    }
+    // Ensure initialization and SDK readiness before entering the generator body.
+    // Errors thrown before the first yield in an async generator bypass for-await-of
+    // try/catch in callers, so we validate eagerly and wrap the body in try/catch.
+    await this.ensureInitialized();
+    this.logRequest(request);
+
+    const sdk = this.sdkFunctions;
+    if (sdk === undefined) {
+      throw new AdapterModelError('SDK not initialized after ensureInitialized()', {
+        code: ErrorCode.CONFIG_INVALID,
+      });
+    }
+
+    const { options } = this.buildSdkOptions(request);
+
+    // First yield establishes the generator — errors after this point are
+    // properly caught by callers using for-await-of with try/catch.
+    yield { type: 'message_start', message: { model: this.modelId } };
+
+    const result = sdk.streamText(options);
+    let index = 0;
+    yield { type: 'content_block_start', index, contentBlock: { type: 'text', text: '' } };
+
+    let totalText = '';
+    for await (const text of result.textStream) {
+      // #3317 finding #8: skip empty-string deltas — the SDK can emit zero-length
+      // chunks (keepalives/segment boundaries); a `text_delta` with `text: ''` is
+      // noise that downstream re-assemblers must otherwise special-case.
+      if (text === '') continue;
+      totalText += text;
+      yield {
+        type: 'content_block_delta',
+        index,
+        delta: { type: 'text_delta', text },
+      };
+    }
+
+    await assertValidStreamFinish(`${this.providerId}/${this.modelId}`, result, totalText);
+
+    yield { type: 'content_block_stop', index };
+    index++;
+    yield {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      // #4835: no usage is reported on this path, so none is emitted —
+      // zero-filling all three made an unmeasured stream indistinguishable
+      // from one that consumed nothing. `usage` is optional on the chunk.
+    };
+    yield { type: 'message_stop' };
+  }
+
+  /**
+   * Converts a caught error into a Result error with categorized ErrorCode.
+   */
+  private toErrorResult(error: unknown, code: ErrorCode): Result<CompletionResponse, ModelError> {
+    if (error instanceof ModelError) {
+      this.logger.error(`SDK adapter error (${this.sdkConfig.providerId})`, error);
+      return { ok: false, error };
+    }
+
+    // Scrub API keys + bearer tokens out of upstream SDK error messages
+    // before they hit logs or the surfaced ModelError. Parity with the
+    // subprocess-adapter path. Audit #2824. The RESOLVED key is redacted by
+    // exact match first (#4392 inc 3): a gateway key has no vendor shape the
+    // pattern sanitizer knows, and a 401 body may echo the key it rejected.
+    const apiKey = resolveApiKey(this.sdkConfig.providerId, this.sdkConfig.apiKey);
+    const safeMessage = sanitizeOutput(redactApiKey(getErrorMessage(error), apiKey));
+    // Never the original object: its message AND its stack's first line carry
+    // the raw text. The name is kept so the log still says what was thrown.
+    const errorObj = new Error(safeMessage);
+    if (error instanceof Error) errorObj.name = error.name;
+    this.logger.error(`SDK adapter error (${this.sdkConfig.providerId})`, errorObj);
+    // #4606: this path builds the ModelError itself rather than going through
+    // `BaseAdapter.transformError`, so it has to capture the horizon too. The
+    // AI SDK's `APICallError` carries `responseHeaders` as a plain record;
+    // `resolveRetryAfterMs` reads only `retry-after` out of it and returns a
+    // number, so no header bag reaches the error or the logs. Parsed off the
+    // SANITIZED message, so a scrubbed credential can't be re-read from it.
+    const retryAfterMs =
+      code === ErrorCode.MODEL_RATE_LIMITED ? resolveRetryAfterMs(error, safeMessage) : undefined;
+    // AdapterModelError extends ModelError — no cast needed
+    const modelError = new AdapterModelError(
+      `${this.sdkConfig.providerId} SDK error: ${safeMessage}`,
+      {
+        code,
+        ...(retryAfterMs !== undefined
+          ? { context: { [RETRY_AFTER_CONTEXT_KEY]: retryAfterMs } }
+          : {}),
+      }
+    );
+    return { ok: false, error: modelError };
+  }
+}

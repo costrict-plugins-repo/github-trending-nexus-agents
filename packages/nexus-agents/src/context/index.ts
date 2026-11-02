@@ -1,0 +1,307 @@
+/**
+ * nexus-agents/context
+ *
+ * Context management utilities including token counting, context budgeting,
+ * and work balancing for multi-agent orchestration.
+ *
+ * (Source: cli-project_plan.md v2.1.0, Phase 4)
+ */
+
+// Token counting
+export {
+  TokenCounter,
+  createTokenCounter,
+  TokenCounterProvider,
+  TokenCountError,
+  type ITokenCounter,
+  type TokenCounterConfig,
+  type TokenCountResult,
+} from './token-counter.js';
+
+// Token Budget Tracking (Issue #304, Epic #301)
+export {
+  TokenBudgetTracker,
+  createTokenBudgetTracker,
+  TokenBudgetError,
+  DEFAULT_TOKEN_BUDGET_CONFIG,
+} from './token-budget-tracker.js';
+
+export type {
+  ITokenBudgetTracker,
+  TokenBudgetConfig,
+  TokenUsageRecord,
+  BudgetCheckResult,
+  BudgetStats,
+  BudgetWarning,
+  BudgetWarningLevel,
+  BudgetEnforcementMode,
+} from './token-budget-types.js';
+
+// Work balancer removed in #4378 (7/0 consensus vote). It was a second,
+// unconsumed routing implementation — it carried its own weighted capability
+// scoring alongside a task queue, duplicating the concern SharedTaskAnalyzer +
+// TopsisRouter own canonically. Capacity-aware routing exclusion belongs in the
+// CompositeRouter stage chain instead; see #4373, which carries the ported
+// capacity-semantics tests.
+//
+// Note for anyone chasing a symbol that used to be re-exported here: the names
+// below were NOT unique to the work balancer, so a same-named type elsewhere is
+// a different type, not a replacement. Exact status of each:
+//
+//   TaskProfile     — core/task-analysis/task-profile-adapter.ts:28. Exported
+//                     from its own module; NOT in any exports/*.ts public barrel.
+//   CapacityInfo    — adapters/capacity-monitor-types.ts:15. Same: module-level
+//                     export only, not public.
+//   ScoreBreakdown  — agents/experts/expert-selector-types.ts:71. This one IS
+//                     public, via exports/agents.ts.
+//   QueuedTask      — workflows/task-queue.ts:16 is `interface QueuedTask<T>`:
+//                     module-private (no `export`) AND generic, so it is neither
+//                     reachable nor substitutable for the deleted non-generic type.
+//
+// If you need the deleted shape, define it locally — do not reach for a
+// same-named type above expecting compatibility.
+
+// Memory Backend
+export {
+  HybridMemoryBackend,
+  MemoryImportance,
+  MemoryError,
+  MemoryMetadataSchema,
+  MemoryEntrySchema,
+  MemoryImportanceSchema,
+  HybridMemoryConfigSchema,
+} from './memory-backend.js';
+
+export type {
+  IContextMemoryBackend,
+  MemoryMetadata,
+  MemoryEntry,
+  HybridMemoryConfig,
+  ISQLiteDatabase,
+  ISQLiteStatement,
+} from './memory-backend.js';
+
+// Typed Memory Architecture (Issue #101)
+export { TypedMemory, createTypedMemory } from './typed-memory.js';
+export { MemoryType, MemoryTypeSchema, DEFAULT_RELEVANCE_CONFIG } from './memory-types.js';
+export { CoreMemoryDataSchema, EpisodeDataSchema, SemanticFactSchema } from './memory-types.js';
+export {
+  ProcedureSchema,
+  ProcedureStepSchema,
+  ResourceReferenceSchema,
+  VaultEntrySchema,
+} from './memory-types.js';
+
+export type {
+  ITypedMemory,
+  ICoreMemory,
+  IEpisodicMemory,
+  ISemanticMemory,
+  IProceduralMemory,
+  IResourceMemory,
+  IKnowledgeVault,
+  TypedMemoryEntry,
+  TypedMemoryStats,
+  TypedMemoryPruneResult,
+  CoreMemoryData,
+  EpisodeData,
+  SemanticFact,
+  Procedure,
+  ProcedureStep,
+  ResourceReference,
+  VaultEntry,
+  RelevanceFilterConfig,
+} from './memory-types.js';
+
+// Session Memory (Issue #130, arXiv:2303.11366 - Reflexion)
+export {
+  SessionMemory,
+  createSessionMemory,
+  SessionMemoryError,
+  SessionLearningSchema,
+  CompletedTaskSchema,
+  ResolvedErrorSchema,
+  SessionEpisodeSchema,
+} from './session-memory.js';
+
+export type {
+  SessionMemoryConfig,
+  SessionLearning,
+  CompletedTask,
+  ResolvedError,
+  SessionEpisode,
+} from './session-memory.js';
+
+// Graph Memory (Issue #142, arXiv:2308.09687 - MiRIX)
+export { GraphMemoryBackend, createGraphMemory, RelationTypes } from './graph-memory.js';
+
+export type {
+  IGraphMemory,
+  GraphEdge,
+  GraphMemoryConfig,
+  TraversalOptions,
+  TraversalResult,
+  RelationType,
+  AddRelationshipOptions,
+} from './graph-memory.js';
+
+// Adaptive Memory (Issue #143, arXiv:2310.08560)
+export {
+  AdaptiveMemoryBackend,
+  createAdaptiveMemory,
+  DEFAULT_SCORING_CONFIG,
+} from './adaptive-memory.js';
+
+export type {
+  IAdaptiveMemory,
+  AdaptiveMemoryConfig,
+  ScoringConfig,
+  PriorityScore,
+  ScoredMemoryEntry,
+  PriorityRetrievalOptions,
+} from './adaptive-memory.js';
+
+// Agentic Memory (Issue #122, arXiv:2502.12110 - A-MEM)
+export {
+  AgenticMemoryBackend,
+  createAgenticMemory,
+  EntityType,
+  EvolutionType,
+  DEFAULT_EXTRACTION_CONFIG,
+  DEFAULT_LINKING_CONFIG,
+  DEFAULT_AGENTIC_MEMORY_CONFIG,
+} from './agentic-memory.js';
+
+export type {
+  IAgenticMemory,
+  AgenticMemoryConfig,
+  AgenticMemoryEntry,
+  AgenticStoreResult,
+  MemoryAttributes,
+  ExtractionConfig,
+  LinkingConfig,
+  LinkingOptions,
+  LinkSuggestion,
+  EvolutionResult,
+  EntityReference,
+} from './agentic-memory.js';
+
+// Hindsight Belief Memory (Issue #336, arXiv:2512.12818)
+export { HindsightBeliefMemory } from './belief-memory.js';
+export { BeliefConfidence, BeliefSourceType } from './belief-core-types.js';
+
+export type {
+  Belief,
+  BeliefMemoryConfig,
+  BeliefMemoryStats,
+  BeliefQuery,
+  BeliefUpdate,
+  Counterfactual,
+  HindsightRecord,
+  IHindsightBeliefMemory,
+} from './belief-types.js';
+
+// MobiMem Memory System (Issue #149, arXiv:2512.15784)
+export { MobiMem, createMobiMem, DEFAULT_MOBIMEM_CONFIG } from './mobimem.js';
+
+export type {
+  IMobiMem,
+  IProfileMemory,
+  IExperienceMemory,
+  IActionCache,
+  MobiMemConfig,
+  MobiMemStats,
+  ProfileEntry,
+  ExperienceEntry,
+  ActionCacheEntry,
+  ActionStep,
+  ExecutionOutcome,
+} from './mobimem.js';
+
+// Routing Memory Bridge (Issue #461, #148, #149)
+export {
+  RoutingMemory,
+  createRoutingMemory,
+  DEFAULT_ROUTING_MEMORY_CONFIG,
+} from './routing-memory.js';
+
+export type {
+  IRoutingMemory,
+  RoutingMemoryConfig,
+  RoutingMemoryStats,
+  ModelPerformance,
+  ModelPreference,
+  ExperiencePattern,
+  CachedActionResult,
+} from './routing-memory.js';
+
+// Context Pressure Monitor (Context Exhaustion Prevention)
+export {
+  createContextPressureMonitor,
+  calculateLevel,
+  getRecommendedAction,
+  shouldAutoCheckpoint,
+  type ContextPressureMonitor,
+} from './context-pressure-monitor.js';
+
+export {
+  DEFAULT_PRESSURE_CONFIG,
+  type ContextPressureConfig,
+  type PressureLevel,
+  type PressureEvent,
+  type PressureStats,
+} from './context-pressure-types.js';
+
+// ContextRetriever — unified read surface across every shared memory backend.
+// Phase 2 of #2792 (closes #2794). Phase 3 (#2795) adds inferTaskCategory +
+// summarizeContextForPrompt for entry-point wiring.
+export {
+  getContextForTask,
+  inferTaskCategory,
+  summarizeContextForPrompt,
+  type ContextRetrieverOptions,
+  type UnifiedContext,
+} from './context-retriever.js';
+
+// Unified memory cross-ranker (#3236) — collapses the per-backend lists in
+// UnifiedContext into one comparable, sorted RankedMemoryItem[].
+export {
+  rankMemories,
+  topRankedWithinBudget,
+  type RankedMemoryItem,
+  type RankedMemorySource,
+  type RankMemoriesOptions,
+} from './context-retriever-helpers.js';
+
+// Repo-map context provider (#4254, Phase 3 of epic #4251) — the module import
+// graph ranked by PageRank centrality, budget-clipped, with an import-graph-only
+// caveat. Pull-shaped + flag-gated (NEXUS_REPO_MAP); default off.
+export {
+  buildRepoMap,
+  computeModulePageRank,
+  rankRepoMapEntries,
+  taskNeedsRepoMap,
+  getRepoMapForTask,
+  REPO_MAP_FLAG,
+  REPO_MAP_CAVEAT,
+  DEFAULT_REPO_MAP_TOKEN_BUDGET,
+  type RepoMapEntry,
+  type BuildRepoMapOptions,
+  type RepoMapProviderOptions,
+} from './repo-map.js';
+
+// Per-call token ledger (#4252, Phase 0 of epic #4251) — records input/output
+// tokens per call tagged by context-source, so the C3 (#4253)/C1' (#4254)
+// savings are measurable rather than assumed.
+export {
+  TokenLedger,
+  getTokenLedger,
+  CONTEXT_SOURCE_TAGS,
+  TokenLedgerEventSchema,
+  type ContextSourceTag,
+  type TokenLedgerEvent,
+  type TokenLedgerConfig,
+  type TokenLedgerAggregate,
+  type TokenLedgerSummary,
+  type TokenLedgerWindow,
+} from './token-ledger.js';

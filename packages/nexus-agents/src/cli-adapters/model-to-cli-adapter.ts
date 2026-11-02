@@ -1,0 +1,386 @@
+/**
+ * Model-to-CLI Adapter Bridge (#3422)
+ *
+ * The inverse of {@link createCliToModelAdapter}: wraps an `IModelAdapter`
+ * (direct-API adapter — Anthropic/OpenAI/Google/custom-OpenAI) to implement
+ * `ICliAdapter`, so a CompositeRouter — which operates on `Map<_, ICliAdapter>`
+ * — can route to API adapters and record their bandit outcomes on a *distinct*
+ * arm (epic #3317 step 1, Option C). The routing arm id is the Map key
+ * (`api:<vendor>`). Built-in vendor bridges retain their display CLI slot;
+ * gateway bridges use `api:<endpoint>` as their own name for health/breakers.
+ *
+ * @module cli-adapters/model-to-cli-adapter
+ */
+
+import type { AuthProbeResult } from '../cli/cli-auth-probe.js';
+import type { LevelOutcome } from '../cli/cli-readiness.js';
+import { adapterReadiness, servesListedModel } from './cli-admission.js';
+import type {
+  Result,
+  IModelAdapter,
+  CompletionRequest,
+  CompletionResponse,
+  ExecutionAccessMode,
+} from '../core/index.js';
+import { ok, err, ModelError } from '../core/index.js';
+import { getDefaultRegistry } from '../config/model-registry.js';
+import { FALLBACK_CONTEXT_WINDOW } from '../config/model-config-helpers.js';
+import {
+  isRateLimitText,
+  isRateLimitLikeError,
+  isDurableCapacityError,
+  parseRetryAfterMs,
+  retryAfterMsFromContext,
+} from '../adapters/rate-limit-detector.js';
+import { CapacityTracker, createCapacityTracker } from './capacity-tracker.js';
+import { toCliTokenUsage } from './token-usage-bridge.js';
+import { validatedModelIdentity } from './model-identity.js';
+import { withEnforcedAccessMode } from './access-mode.js';
+import { breakerKeys } from './breaker-key.js';
+import { mapModelErrorToCategory } from './circuit-breaker.js';
+import { isCallerCancelled } from '../adapters/abort-utils.js';
+import { ownsGatewayCircuitAdmission } from '../adapters/gateway-arm-adapter.js';
+import type { CircuitBreakerRegistry } from './circuit-breaker.js';
+import type {
+  ICliAdapter,
+  CliTask,
+  CliResponse,
+  CliError,
+  CliErrorCode,
+  CliModelInfo,
+  RoutingArmId,
+  CliTransport,
+  CapabilityProfile,
+  ExecutionOptions,
+  ModelInfo,
+  HealthStatus,
+  CapacityStatus,
+  EndpointArmId,
+} from './types.js';
+import { isEndpointArmId, routingArmCliSlot } from './types.js';
+
+/** Configuration for {@link ModelToCliAdapter}. */
+export interface ModelToCliAdapterConfig {
+  /**
+   * Adapter identity. Gateway endpoints use their `api:<endpoint>` arm id so
+   * health and breaker readers cannot confuse them with a CLI slot.
+   */
+  readonly name: RoutingArmId;
+  /**
+   * Routing capability profile (TOPSIS/preference scoring). Supply the
+   * display slot's registry profile; falls back to a neutral mid profile.
+   */
+  readonly capabilities?: CapabilityProfile;
+}
+
+/** Default context window when the model adapter exposes no capability hint. */
+const DEFAULT_CONTEXT_WINDOW = FALLBACK_CONTEXT_WINDOW;
+
+/** Neutral mid capability profile used when the caller supplies none. */
+const NEUTRAL_CAPABILITIES: CapabilityProfile = {
+  reasoning: 7,
+  contextWindow: DEFAULT_CONTEXT_WINDOW,
+  codeGeneration: 7,
+  speed: 7,
+  cost: 5,
+};
+
+/** Direct-API calls are outbound requests; tag them as the subprocess-style transport. */
+const API_TRANSPORT: CliTransport = 'subprocess';
+
+/**
+ * Bridge adapter that wraps `IModelAdapter` to implement `ICliAdapter`.
+ */
+export class ModelToCliAdapter implements ICliAdapter {
+  readonly name: RoutingArmId;
+  readonly transport: CliTransport = API_TRANSPORT;
+  readonly capabilities: CapabilityProfile;
+  /**
+   * Read-only analysis mode is satisfied by construction (#6768): this bridge
+   * sends the task as one user message with no tool definitions, so the model
+   * has nothing to run on the host. The mode is also forwarded on the request
+   * (see {@link toCompletionRequest}), so a wrapped model adapter that does
+   * touch the host (a CLI behind `CliToModelAdapter`) applies its own
+   * enforcement or refuses.
+   */
+  readonly enforcesReadOnlyAnalysis = true;
+  /**
+   * Workspace-edit mode is satisfied by construction too (#6792), for the same
+   * reason: no tool definitions, so the model runs no command, fetches nothing
+   * and loads no MCP server. It edits no file either, which is narrower than
+   * the mode allows, never wider. The mode is forwarded on the request so a
+   * wrapped CLI applies its own enforcement or refuses.
+   */
+  readonly enforcesWorkspaceEdit = true;
+
+  private readonly modelAdapter: IModelAdapter;
+
+  /**
+   * Per-arm capacity state (#4602). The same canonical `CapacityTracker` the
+   * subprocess adapters use — this bridge previously answered `getCapacity()`
+   * from literals, so no API/SDK arm could report a quota signal at all.
+   * Per-instance, so one arm's exhaustion never speaks for another's.
+   */
+  private readonly capacityTracker: CapacityTracker;
+
+  /** Exact admission ownership; other API adapters still need the integration's gate. */
+  ownsCircuitAdmission(registry: CircuitBreakerRegistry): boolean {
+    return ownsGatewayCircuitAdmission(this.modelAdapter, this.name, registry);
+  }
+
+  constructor(modelAdapter: IModelAdapter, config: ModelToCliAdapterConfig) {
+    this.modelAdapter = modelAdapter;
+    this.name = config.name;
+    // Dynamic endpoints resolve the model they send, never a CLI display slot.
+    const entry =
+      routingArmCliSlot(config.name) === undefined
+        ? getDefaultRegistry().getEntry(modelAdapter.modelId)
+        : undefined;
+    this.capabilities = config.capabilities ?? {
+      ...NEUTRAL_CAPABILITIES,
+      ...entry?.qualityScores,
+      contextWindow: entry?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    };
+    this.capacityTracker = createCapacityTracker(config.name);
+  }
+
+  /** Build a single-turn CompletionRequest from a CliTask. */
+  private toCompletionRequest(task: CliTask, options?: ExecutionOptions): CompletionRequest {
+    const request: CompletionRequest = {
+      messages: [{ role: 'user', content: task.content }],
+      ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+    };
+    if (task.systemPrompt !== undefined) {
+      (request as { systemPrompt: string }).systemPrompt = task.systemPrompt;
+    }
+    if (task.maxTokens !== undefined) {
+      (request as { maxTokens: number }).maxTokens = task.maxTokens;
+    }
+    if (options?.timeoutMs !== undefined) {
+      (request as { timeoutMs: number }).timeoutMs = options.timeoutMs;
+    }
+    if (task.accessMode !== undefined) {
+      (request as { accessMode: ExecutionAccessMode }).accessMode = task.accessMode;
+    }
+    return request;
+  }
+
+  /** Flatten a CompletionResponse's content blocks to plain text. */
+  private toText(response: CompletionResponse): string {
+    return response.content
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+  }
+
+  /** Convert a CompletionResponse to a CliResponse. */
+  private toCliResponse(response: CompletionResponse): CliResponse {
+    const usage = response.usage;
+    const reportedModel = validatedModelIdentity(response.reportedModel);
+    return {
+      text: this.toText(response),
+      // Omit rather than zero-fill (#4439): a synthesised 0/0/0 is
+      // indistinguishable from a real zero-token call downstream. A present
+      // usage crosses the type boundary through the one conversion (#4440),
+      // which — unlike the hand copy this replaced — carries
+      // `inputTokensMeasured` (#4835) instead of dropping it.
+      ...(usage !== undefined ? { usage: toCliTokenUsage(usage) } : {}),
+      model: response.model,
+      ...(reportedModel !== undefined ? { reportedModel } : {}),
+      ...this.gatewayArmField(),
+    };
+  }
+
+  /**
+   * The model adapter's gateway-arm marker, when it carries a valid one
+   * (#6624), so an outcome writer prices a gateway-served call by the arm's
+   * declaration. Read by shape, like `isGatewayModelAdapter`.
+   */
+  private gatewayArmField(): { gatewayArm?: EndpointArmId } {
+    const arm: unknown = (this.modelAdapter as { gatewayArm?: unknown }).gatewayArm;
+    return typeof arm === 'string' && isEndpointArmId(arm) ? { gatewayArm: arm } : {};
+  }
+
+  /**
+   * Convert a ModelError to a CliError. Rate-limit text → RATE_LIMITED
+   * (retryable); everything else → EXECUTION_ERROR (non-retryable) so the
+   * routing/circuit layers see a real, typed failure.
+   *
+   * #4602: parses `retryAfterMs` off the message, mirroring
+   * `base-adapter.ts`'s `createError`. Pre-fix this bridge classified
+   * RATE_LIMITED and then threw the provider's stated horizon away — and that
+   * horizon is the sole input `CapacityTracker.recordProviderQuotaExhaustion`
+   * accepts, so the API/SDK arms could never assert quota exhaustion.
+   *
+   * Only parsed on a retryable error, as on the subprocess path: a wait hint
+   * inside a 500 body is not a rate-limit assertion.
+   *
+   * #4606: the adapter that raised this error already captured the HTTP
+   * `Retry-After` header, which the message never carries — Anthropic states
+   * no horizon in its 429 body at all. That captured value wins; the message
+   * parse remains the fallback for a `ModelError` raised outside `BaseAdapter`.
+   */
+  private toCliError(error: ModelError): CliError {
+    const rateLimited = isRateLimitText(error.message);
+    const code: CliErrorCode = rateLimited ? 'RATE_LIMITED' : 'EXECUTION_ERROR';
+    const retryAfterMs = rateLimited
+      ? (retryAfterMsFromContext(error.context) ?? parseRetryAfterMs(error.message))
+      : undefined;
+    const base: CliError = {
+      code,
+      message: error.message,
+      cli: this.name,
+      retryable: rateLimited,
+      ...(retryAfterMs !== undefined && { retryAfterMs }),
+    };
+    return error.cause instanceof Error ? { ...base, cause: error.cause } : base;
+  }
+
+  /**
+   * Feed a provider's own rate-limit assertion into capacity tracking (#4602).
+   *
+   * The API-side counterpart of `BaseCliAdapter.recordQuotaSignal`. The
+   * tracker — not this adapter — decides whether the stated wait is long
+   * enough to mean durable quota rather than a per-minute throttle.
+   */
+  private recordQuotaSignal(error: CliError): void {
+    if (error.code !== 'RATE_LIMITED') return;
+    this.capacityTracker.recordProviderQuotaExhaustion(error.retryAfterMs);
+  }
+
+  async execute(task: CliTask, options?: ExecutionOptions): Promise<Result<CliResponse, CliError>> {
+    const gatewayArm = this.gatewayArmField().gatewayArm;
+    // Only the gateway SLOT view needs a recorder here. Other model bridges
+    // keep their existing recording ownership (no cross-arm aliases).
+    // Lazy registry lookup avoids the registry → slot arm → bridge import cycle.
+    const breaker =
+      gatewayArm !== undefined && this.modelAdapter.providerId === `cli-${this.name}`
+        ? (await import('./cli-circuit-breaker.js'))
+            .getDefaultCliCircuitBreakerRegistry()
+            .getArmBreaker(breakerKeys.forArm({ name: this.name, gatewayArm }))
+        : undefined;
+    const result = await this.modelAdapter.complete(this.toCompletionRequest(task, options));
+    if (!result.ok) {
+      const cliError = this.toCliError(result.error);
+      const category = mapModelErrorToCategory(result.error);
+      // Transient throttles clear on their own; durable quota caps still count
+      // (#3423/#5359), matching the API and gateway-arm recorders.
+      const transientRateLimit =
+        !isDurableCapacityError(result.error) &&
+        (category === 'rate_limit' || isRateLimitLikeError(result.error));
+      if (!isCallerCancelled(result.error) && !transientRateLimit) {
+        breaker?.recordFailure(category);
+      }
+      this.recordQuotaSignal(cliError);
+      return err(cliError);
+    }
+    breaker?.recordSuccess();
+    // #6792: no tools were sent, so the call ran nothing on the host; the
+    // response says so and states the mode it was served under.
+    const response: CliResponse = {
+      ...withEnforcedAccessMode(this.toCliResponse(result.value), task),
+      textOnly: true,
+    };
+    // A served request is direct evidence the provider is serving; the tracker
+    // uses it both to count the window and to retire a stale assertion.
+    this.capacityTracker.recordUsage(response.usage);
+    return ok(response);
+  }
+
+  /** Configuration validation is not authentication; this arm has no local auth probe. */
+  authStatus(): Promise<AuthProbeResult> {
+    return Promise.resolve({
+      cli: this.name,
+      state: 'unknown',
+      reason: 'API authentication is unmeasured',
+    });
+  }
+
+  /** Default is unmeasured; an explicit live call delegates to the bounded completion probe. */
+  readiness(options?: {
+    readonly live?: boolean;
+    readonly timeoutMs?: number;
+  }): Promise<LevelOutcome> {
+    return adapterReadiness(this, options);
+  }
+
+  /** Model-list evidence only; missing, empty, failing and unlisted models remain unknown. */
+  serves(modelId: string): Promise<'yes' | 'no' | 'unknown'> {
+    return servesListedModel(this, modelId);
+  }
+
+  /** Health is derived from the model adapter's config validation. */
+  async healthCheck(): Promise<HealthStatus> {
+    const valid = this.modelAdapter.validateConfig();
+    return Promise.resolve({
+      healthy: valid.ok,
+      version: 'api',
+      versionStatus: 'supported',
+      // In-process API adapter: there is no binary to be missing, so it is
+      // always reachable and only its config can be wrong (#5060).
+      reachable: true,
+      lastChecked: new Date(0),
+      ...(valid.ok ? {} : { message: valid.error.message }),
+    });
+  }
+
+  /**
+   * Report this arm's capacity from its `CapacityTracker` (#4602).
+   *
+   * Previously this returned literals: `POSITIVE_INFINITY` remaining,
+   * `quotaExhausted: false`, `observed: false`. The `observed: false` half was
+   * honest (#4374 — nothing had been observed), but `quotaExhausted: false`
+   * asserted a measurement that never happened, and since `assessCapacity`
+   * reaches `'exhausted'` only through `quotaExhausted`, it made every
+   * API/SDK arm unexcludable for quota by construction — a check that cannot
+   * fail, whatever the provider said.
+   *
+   * The tracker keeps the honest empty case: until this arm has served a call
+   * or a provider has asserted a horizon, it reports `observed: false` and the
+   * stage grades it `unmeasured`, never `healthy`.
+   */
+  getCapacity(): Promise<CapacityStatus> {
+    return Promise.resolve(this.capacityTracker.getCapacity());
+  }
+
+  getVersion(): Promise<string> {
+    return Promise.resolve('api');
+  }
+
+  getModelInfo(): ModelInfo {
+    return {
+      id: this.modelAdapter.modelId,
+      name: this.modelAdapter.modelId,
+      contextWindow:
+        routingArmCliSlot(this.name) === undefined
+          ? this.capabilities.contextWindow
+          : DEFAULT_CONTEXT_WINDOW,
+    };
+  }
+
+  /** Delegate to the model adapter's listModels surface when present (#2529). */
+  async listModels(): Promise<readonly CliModelInfo[]> {
+    if (this.modelAdapter.listModels === undefined) return [];
+    const models = await this.modelAdapter.listModels();
+    return models.map((m) => ({
+      id: m.id,
+      ...(m.ownedBy !== undefined ? { provider: m.ownedBy } : {}),
+    }));
+  }
+
+  initialize(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  dispose(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/** Creates an ICliAdapter from an IModelAdapter (direct-API adapter). */
+export function createModelToCliAdapter(
+  modelAdapter: IModelAdapter,
+  config: ModelToCliAdapterConfig
+): ModelToCliAdapter {
+  return new ModelToCliAdapter(modelAdapter, config);
+}

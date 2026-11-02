@@ -1,0 +1,692 @@
+/**
+ * Unit tests for repo-analyze.ts core logic functions.
+ *
+ * Tests pure functions: normalizeRepoId, detectPackageManager,
+ * detectCiProvider, detectSecurityTooling, detectFramework,
+ * getLanguageRecommendations, identifyGaps, analyzeRepo.
+ *
+ * @module mcp/tools/repo-analyze.test
+ * (Issue #1340)
+ */
+
+import { describe, it, expect } from 'vitest';
+import {
+  normalizeRepoId,
+  detectPackageManager,
+  detectCiProvider,
+  detectSecurityTooling,
+  detectFramework,
+  getLanguageRecommendations,
+  identifyGaps,
+  analyzeGitHubRepo,
+  analyzeRepo,
+  type GhRepoMetadata,
+} from './repo-analyze.js';
+import type { ExecFileFn } from './repo-analyze-types.js';
+
+// ============================================================================
+// normalizeRepoId
+// ============================================================================
+
+describe('normalizeRepoId', () => {
+  it('returns owner/repo from plain format', () => {
+    expect(normalizeRepoId('owner/repo')).toBe('owner/repo');
+  });
+
+  it('extracts owner/repo from full GitHub URL', () => {
+    expect(normalizeRepoId('https://github.com/owner/repo')).toBe('owner/repo');
+  });
+
+  it('extracts owner/repo from GitHub URL with .git suffix', () => {
+    expect(normalizeRepoId('https://github.com/owner/repo.git')).toBe('owner/repo');
+  });
+
+  it('extracts owner/repo from URL with trailing slash', () => {
+    expect(normalizeRepoId('https://github.com/owner/repo/')).toBe('owner/repo');
+  });
+
+  it('extracts owner/repo from URL with subpaths', () => {
+    expect(normalizeRepoId('https://github.com/owner/repo/tree/main')).toBe('owner/repo');
+  });
+
+  it('throws on invalid format — single word', () => {
+    expect(() => normalizeRepoId('justarepo')).toThrow('Invalid repo format');
+  });
+
+  it('throws on empty string', () => {
+    expect(() => normalizeRepoId('')).toThrow('Invalid repo format');
+  });
+
+  it('throws on nested path without github.com', () => {
+    expect(() => normalizeRepoId('a/b/c')).toThrow('Invalid repo format');
+  });
+});
+
+// ============================================================================
+// detectPackageManager
+// ============================================================================
+
+describe('detectPackageManager', () => {
+  it('detects pnpm from pnpm-lock.yaml', () => {
+    expect(detectPackageManager(['pnpm-lock.yaml', 'package.json'])).toBe('pnpm');
+  });
+
+  it('detects yarn from yarn.lock', () => {
+    expect(detectPackageManager(['yarn.lock', 'package.json'])).toBe('yarn');
+  });
+
+  it('detects npm from package-lock.json', () => {
+    expect(detectPackageManager(['package-lock.json', 'package.json'])).toBe('npm');
+  });
+
+  it('detects cargo from Cargo.toml', () => {
+    expect(detectPackageManager(['Cargo.toml', 'src'])).toBe('cargo');
+  });
+
+  it('detects go from go.mod', () => {
+    expect(detectPackageManager(['go.mod', 'main.go'])).toBe('go');
+  });
+
+  it('detects pip from requirements.txt', () => {
+    expect(detectPackageManager(['requirements.txt'])).toBe('pip');
+  });
+
+  it('detects pip from pyproject.toml', () => {
+    expect(detectPackageManager(['pyproject.toml'])).toBe('pip');
+  });
+
+  it('detects bundler from Gemfile', () => {
+    expect(detectPackageManager(['Gemfile'])).toBe('bundler');
+  });
+
+  it('detects maven from pom.xml', () => {
+    expect(detectPackageManager(['pom.xml', 'src'])).toBe('maven');
+  });
+
+  it('detects gradle from build.gradle', () => {
+    expect(detectPackageManager(['build.gradle'])).toBe('gradle');
+  });
+
+  it('detects gradle from build.gradle.kts', () => {
+    expect(detectPackageManager(['build.gradle.kts'])).toBe('gradle');
+  });
+
+  it('returns null when no manager detected', () => {
+    expect(detectPackageManager(['README.md', 'src'])).toBeNull();
+  });
+
+  it('returns first match — pnpm beats npm', () => {
+    expect(detectPackageManager(['pnpm-lock.yaml', 'package-lock.json', 'package.json'])).toBe(
+      'pnpm'
+    );
+  });
+
+  it('handles empty entries', () => {
+    expect(detectPackageManager([])).toBeNull();
+  });
+});
+
+// ============================================================================
+// detectCiProvider
+// ============================================================================
+
+describe('detectCiProvider', () => {
+  it('detects github-actions from .github', () => {
+    expect(detectCiProvider(['.github', 'src'])).toBe('github-actions');
+  });
+
+  it('detects gitlab-ci from .gitlab-ci.yml', () => {
+    expect(detectCiProvider(['.gitlab-ci.yml'])).toBe('gitlab-ci');
+  });
+
+  it('detects jenkins from Jenkinsfile', () => {
+    expect(detectCiProvider(['Jenkinsfile'])).toBe('jenkins');
+  });
+
+  it('detects circleci from .circleci', () => {
+    expect(detectCiProvider(['.circleci'])).toBe('circleci');
+  });
+
+  it('detects travis from .travis.yml', () => {
+    expect(detectCiProvider(['.travis.yml'])).toBe('travis');
+  });
+
+  it('detects azure-devops from azure-pipelines.yml', () => {
+    expect(detectCiProvider(['azure-pipelines.yml'])).toBe('azure-devops');
+  });
+
+  it('detects concourse', () => {
+    expect(detectCiProvider(['concourse'])).toBe('concourse');
+  });
+
+  it('returns null when no CI detected', () => {
+    expect(detectCiProvider(['src', 'README.md'])).toBeNull();
+  });
+
+  it('returns first match — github-actions wins', () => {
+    expect(detectCiProvider(['.github', '.gitlab-ci.yml'])).toBe('github-actions');
+  });
+});
+
+// ============================================================================
+// detectSecurityTooling
+// ============================================================================
+
+describe('detectSecurityTooling', () => {
+  it('detects semgrep from .semgrep.yml', () => {
+    expect(detectSecurityTooling(['.semgrep.yml'])).toContain('semgrep');
+  });
+
+  it('detects semgrep from .semgrep directory', () => {
+    expect(detectSecurityTooling(['.semgrep'])).toContain('semgrep');
+  });
+
+  it('detects snyk from .snyk', () => {
+    expect(detectSecurityTooling(['.snyk'])).toContain('snyk');
+  });
+
+  it('detects security-policy from SECURITY.md', () => {
+    expect(detectSecurityTooling(['SECURITY.md'])).toContain('security-policy');
+  });
+
+  it('detects grype from .grype.yaml', () => {
+    expect(detectSecurityTooling(['.grype.yaml'])).toContain('grype');
+  });
+
+  it('detects codeowners from CODEOWNERS', () => {
+    expect(detectSecurityTooling(['CODEOWNERS'])).toContain('codeowners');
+  });
+
+  it('detects multiple tools at once', () => {
+    const tools = detectSecurityTooling(['.semgrep.yml', 'SECURITY.md', 'CODEOWNERS']);
+    expect(tools).toHaveLength(3);
+    expect(tools).toContain('semgrep');
+    expect(tools).toContain('security-policy');
+    expect(tools).toContain('codeowners');
+  });
+
+  it('returns empty array when no tools detected', () => {
+    expect(detectSecurityTooling(['src', 'package.json'])).toEqual([]);
+  });
+});
+
+// ============================================================================
+// detectFramework
+// ============================================================================
+
+describe('detectFramework', () => {
+  it('detects helmfile', () => {
+    expect(detectFramework(['helmfile.yaml'])).toBe('helmfile');
+  });
+
+  it('detects helmfile from gotmpl variant', () => {
+    expect(detectFramework(['helmfile.yaml.gotmpl'])).toBe('helmfile');
+  });
+
+  it('detects nextjs from next.config.js', () => {
+    expect(detectFramework(['next.config.js', 'package.json'])).toBe('nextjs');
+  });
+
+  it('detects nextjs from next.config.ts', () => {
+    expect(detectFramework(['next.config.ts', 'package.json'])).toBe('nextjs');
+  });
+
+  it('detects angular from angular.json', () => {
+    expect(detectFramework(['angular.json', 'package.json'])).toBe('angular');
+  });
+
+  it('detects vite from vite.config.ts', () => {
+    expect(detectFramework(['vite.config.ts', 'package.json'])).toBe('vite');
+  });
+
+  it('detects vite from vite.config.js', () => {
+    expect(detectFramework(['vite.config.js'])).toBe('vite');
+  });
+
+  it('detects typescript from tsconfig.json + package.json', () => {
+    expect(detectFramework(['tsconfig.json', 'package.json'])).toBe('typescript');
+  });
+
+  it('does not detect typescript from tsconfig.json alone', () => {
+    expect(detectFramework(['tsconfig.json'])).toBeNull();
+  });
+
+  it('returns null when no framework detected', () => {
+    expect(detectFramework(['src', 'README.md'])).toBeNull();
+  });
+
+  it('first match wins — helmfile beats nextjs', () => {
+    expect(detectFramework(['helmfile.yaml', 'next.config.js'])).toBe('helmfile');
+  });
+});
+
+// ============================================================================
+// getLanguageRecommendations
+// ============================================================================
+
+describe('getLanguageRecommendations', () => {
+  it('returns SAST and SCA recommendations for TypeScript without security tooling', () => {
+    const recs = getLanguageRecommendations('TypeScript', []);
+    expect(recs).toHaveLength(2);
+    expect(recs[0]).toContain('SAST');
+    expect(recs[1]).toContain('SCA');
+  });
+
+  it('skips SAST recommendation when semgrep is present', () => {
+    const recs = getLanguageRecommendations('TypeScript', ['semgrep']);
+    expect(recs.some((r) => r.includes('SAST'))).toBe(false);
+    expect(recs.some((r) => r.includes('SCA'))).toBe(true);
+  });
+
+  it('skips SCA recommendation when osv-scanner or grype is present', () => {
+    const recs = getLanguageRecommendations('TypeScript', ['osv-scanner']);
+    expect(recs.some((r) => r.includes('SAST'))).toBe(true);
+    expect(recs.some((r) => r.includes('SCA'))).toBe(false);
+  });
+
+  it('returns empty when snyk covers both SAST and SCA', () => {
+    const recs = getLanguageRecommendations('TypeScript', ['snyk']);
+    expect(recs).toHaveLength(0);
+  });
+
+  it('returns empty for null language', () => {
+    expect(getLanguageRecommendations(null, [])).toEqual([]);
+  });
+
+  it('returns empty for unknown language', () => {
+    expect(getLanguageRecommendations('Brainfuck', [])).toEqual([]);
+  });
+
+  it('returns recommendations for Python', () => {
+    const recs = getLanguageRecommendations('Python', []);
+    expect(recs).toHaveLength(2);
+    expect(recs[0]).toContain('Python');
+    expect(recs[0]).toContain('bandit');
+  });
+
+  it('returns recommendations for Go', () => {
+    const recs = getLanguageRecommendations('Go', []);
+    expect(recs.some((r) => r.includes('gosec'))).toBe(true);
+  });
+
+  it('returns recommendations for Shell — SCA empty', () => {
+    const recs = getLanguageRecommendations('Shell', []);
+    expect(recs).toHaveLength(1); // Only SAST, no SCA for shell
+    expect(recs[0]).toContain('shellcheck');
+  });
+});
+
+// ============================================================================
+// identifyGaps
+// ============================================================================
+
+describe('identifyGaps', () => {
+  const fullEntries = [
+    '.github',
+    'SECURITY.md',
+    'CODEOWNERS',
+    'LICENSE',
+    '.semgrep.yml',
+    'tests',
+    '.gitignore',
+    'package.json',
+  ];
+
+  it('returns no gaps for a fully-equipped repo', () => {
+    expect(identifyGaps(fullEntries, 'github-actions')).toEqual([]);
+  });
+
+  it('flags missing CI', () => {
+    const gaps = identifyGaps(fullEntries, null);
+    expect(gaps).toContain('No CI/CD configuration detected');
+  });
+
+  it('flags missing SECURITY.md', () => {
+    const entries = fullEntries.filter((e) => e !== 'SECURITY.md');
+    const gaps = identifyGaps(entries, 'github-actions');
+    expect(gaps).toContain('No SECURITY.md policy');
+  });
+
+  it('flags missing CODEOWNERS when every location GitHub honours was checked', () => {
+    const entries = fullEntries.filter((e) => e !== 'CODEOWNERS');
+    // `listed: true` with an empty listing is the faithful fixture: we looked in
+    // .github/ and it was not there. Without it the answer is unmeasured, not
+    // absent — see the sibling test below (#6018).
+    const gaps = identifyGaps(entries, 'github-actions', 'TypeScript', undefined, {
+      codeowners: { entries: [], listed: true },
+    });
+    expect(gaps).toContain('No CODEOWNERS file');
+  });
+
+  it('does NOT flag CODEOWNERS when .github/ exists but could not be listed (#6018)', () => {
+    const entries = [...fullEntries.filter((e) => e !== 'CODEOWNERS'), '.github'];
+    const gaps = identifyGaps(entries, 'github-actions', 'TypeScript', undefined, {
+      codeowners: { entries: [], listed: false },
+    });
+    expect(gaps).not.toContain('No CODEOWNERS file');
+  });
+
+  it('finds CODEOWNERS in .github/, where most repos put it (#6018)', () => {
+    const entries = [...fullEntries.filter((e) => e !== 'CODEOWNERS'), '.github'];
+    const gaps = identifyGaps(entries, 'github-actions', 'TypeScript', undefined, {
+      codeowners: { entries: ['CODEOWNERS'], listed: true },
+    });
+    expect(gaps).not.toContain('No CODEOWNERS file');
+  });
+
+  it('flags missing LICENSE', () => {
+    const entries = fullEntries.filter((e) => e !== 'LICENSE');
+    const gaps = identifyGaps(entries, 'github-actions');
+    expect(gaps).toContain('No LICENSE file');
+  });
+
+  it('accepts LICENSE.md as alternative', () => {
+    const entries = fullEntries.map((e) => (e === 'LICENSE' ? 'LICENSE.md' : e));
+    const gaps = identifyGaps(entries, 'github-actions');
+    expect(gaps).not.toContain('No LICENSE file');
+  });
+
+  it('flags missing SAST/SCA scanning', () => {
+    const entries = fullEntries.filter((e) => e !== '.semgrep.yml');
+    const gaps = identifyGaps(entries, 'github-actions');
+    expect(gaps).toContain('No SAST/SCA security scanning configured');
+  });
+
+  it('.grype.yaml satisfies SAST/SCA check', () => {
+    const entries = fullEntries.map((e) => (e === '.semgrep.yml' ? '.grype.yaml' : e));
+    const gaps = identifyGaps(entries, 'github-actions');
+    expect(gaps).not.toContain('No SAST/SCA security scanning configured');
+  });
+
+  it('flags missing tests for a language the probes understand', () => {
+    const entries = fullEntries.filter((e) => e !== 'tests');
+    // Also remove package.json to prevent monorepo detection
+    const noTests = entries.filter((e) => e !== 'package.json');
+    const gaps = identifyGaps(noTests, 'github-actions', 'TypeScript');
+    expect(gaps).toContain('No test directory detected');
+  });
+
+  it('does NOT flag missing tests for a language with no probe (#6018)', () => {
+    // Rust keeps tests in `#[cfg(test)]` modules and per-crate tests/ dirs,
+    // neither visible in a top-level listing. Reporting their absence was a
+    // default wearing the costume of a measurement: a 9-crate workspace with
+    // 1385 #[test] functions was told it had no tests.
+    const rustEntries = ['Cargo.toml', 'crates', 'src', 'README.md', '.github'];
+    const gaps = identifyGaps(rustEntries, 'github-actions', 'Rust');
+    expect(gaps).not.toContain('No test directory detected');
+  });
+
+  it('still flags a Rust repo with a real root tests/ dir as HAVING tests', () => {
+    // A positive detection is trusted regardless of language — only the
+    // negative needs the language guard.
+    const rustEntries = ['Cargo.toml', 'crates', 'tests'];
+    const gaps = identifyGaps(rustEntries, 'github-actions', 'Rust');
+    expect(gaps).not.toContain('No test directory detected');
+  });
+
+  it('does NOT flag a dual-licensed repo as having no LICENSE (#6018)', () => {
+    // LICENSE-APACHE + LICENSE-MIT is the Rust/Go convention. The old exact-name
+    // check reported "No LICENSE file" for a repo whose own topLevelEntries
+    // listed both, in the same response.
+    const entries = ['Cargo.toml', 'LICENSE-APACHE', 'LICENSE-MIT', 'SECURITY.md', '.gitignore'];
+    const gaps = identifyGaps(entries, 'github-actions', 'Rust');
+    expect(gaps).not.toContain('No LICENSE file');
+  });
+
+  it('vitest.config.ts satisfies test detection', () => {
+    const entries = fullEntries.filter((e) => e !== 'tests');
+    entries.push('vitest.config.ts');
+    const gaps = identifyGaps(entries, 'github-actions');
+    expect(gaps).not.toContain('No test directory detected');
+  });
+
+  it('monorepo pattern satisfies test detection', () => {
+    const entries = fullEntries.filter((e) => e !== 'tests');
+    entries.push('packages');
+    const gaps = identifyGaps(entries, 'github-actions');
+    expect(gaps).not.toContain('No test directory detected');
+  });
+
+  it('flags missing .gitignore', () => {
+    const entries = fullEntries.filter((e) => e !== '.gitignore');
+    const gaps = identifyGaps(entries, 'github-actions');
+    expect(gaps).toContain('No .gitignore file');
+  });
+
+  it('appends language-specific recommendations when SAST/SCA gap exists', () => {
+    const entries = fullEntries.filter((e) => e !== '.semgrep.yml');
+    const gaps = identifyGaps(entries, 'github-actions', 'TypeScript', []);
+    expect(gaps).toContain('No SAST/SCA security scanning configured');
+    expect(gaps.some((g) => g.includes('TypeScript project missing SAST'))).toBe(true);
+  });
+
+  it('skips language recs when no generic SAST gap', () => {
+    const gaps = identifyGaps(fullEntries, 'github-actions', 'TypeScript', []);
+    expect(gaps.some((g) => g.includes('TypeScript'))).toBe(false);
+  });
+});
+
+// ============================================================================
+// analyzeRepo (integration of all helpers)
+// ============================================================================
+
+describe('analyzeRepo', () => {
+  const baseMetadata: GhRepoMetadata = {
+    name: 'repo',
+    full_name: 'owner/repo',
+    description: 'A sample project',
+    language: 'TypeScript',
+    default_branch: 'main',
+    stargazers_count: 42,
+    license: { spdx_id: 'MIT' },
+  };
+
+  const fullEntries = [
+    '.github',
+    'SECURITY.md',
+    'CODEOWNERS',
+    'LICENSE',
+    '.semgrep.yml',
+    'tests',
+    '.gitignore',
+    'package.json',
+    'tsconfig.json',
+    'pnpm-lock.yaml',
+    'Dockerfile',
+    'Makefile',
+  ];
+
+  it('produces complete analysis for well-equipped repo', () => {
+    const result = analyzeRepo(baseMetadata, fullEntries);
+    expect(result.name).toBe('owner/repo');
+    expect(result.language).toBe('TypeScript');
+    expect(result.framework).toBe('typescript');
+    expect(result.packageManager).toBe('pnpm');
+    expect(result.ciProvider).toBe('github-actions');
+    expect(result.hasDockerfile).toBe(true);
+    expect(result.hasMakefile).toBe(true);
+    expect(result.hasTests).toBe(true);
+    expect(result.license).toBe('MIT');
+    expect(result.description).toBe('A sample project');
+    expect(result.defaultBranch).toBe('main');
+    expect(result.stars).toBe(42);
+    expect(result.gaps).toEqual([]);
+  });
+
+  it('handles null license', () => {
+    const meta = { ...baseMetadata, license: null };
+    const result = analyzeRepo(meta, fullEntries);
+    expect(result.license).toBeNull();
+  });
+
+  it('returns readonly copy of entries', () => {
+    const entries = ['src', 'README.md'];
+    const result = analyzeRepo(baseMetadata, entries);
+    expect(result.topLevelEntries).toEqual(entries);
+  });
+
+  it('detects docker-compose variants', () => {
+    const r1 = analyzeRepo(baseMetadata, ['docker-compose.yml']);
+    expect(r1.hasDockerfile).toBe(true);
+
+    const r2 = analyzeRepo(baseMetadata, ['docker-compose.yaml']);
+    expect(r2.hasDockerfile).toBe(true);
+  });
+
+  it('detects Dockerfile.<purpose> variants (#2730)', () => {
+    // The repo this codebase lives in has Dockerfile.npm-verify /
+    // Dockerfile.opencode / Dockerfile.sandbox — the pre-fix exact-match
+    // check reported hasDockerfile: false against the nexus-agents repo.
+    const r1 = analyzeRepo(baseMetadata, ['Dockerfile.sandbox']);
+    expect(r1.hasDockerfile).toBe(true);
+
+    const r2 = analyzeRepo(baseMetadata, ['Dockerfile.dev', 'Dockerfile.prod']);
+    expect(r2.hasDockerfile).toBe(true);
+
+    // Negative: a string that starts with 'Dockerfile' but isn't one
+    // (no dot suffix) should NOT match — e.g. a file literally named 'Dockerfiler'.
+    const r3 = analyzeRepo(baseMetadata, ['Dockerfiler']);
+    expect(r3.hasDockerfile).toBe(false);
+  });
+
+  it('detects Helm charts via Chart.yaml', () => {
+    const result = analyzeRepo(baseMetadata, ['Chart.yaml']);
+    expect(result.hasHelmCharts).toBe(true);
+  });
+
+  it('detects Helm charts via charts directory', () => {
+    const result = analyzeRepo(baseMetadata, ['charts']);
+    expect(result.hasHelmCharts).toBe(true);
+  });
+
+  it('detects Helm charts via helm directory', () => {
+    const result = analyzeRepo(baseMetadata, ['helm']);
+    expect(result.hasHelmCharts).toBe(true);
+  });
+});
+
+describe('an unlistable .github/workflows stays unmeasured (#6035)', () => {
+  const SAST_GAP = 'No SAST/SCA security scanning configured';
+  const SAST_UNVERIFIED = 'SAST/SCA scanning unverified — .github/workflows could not be listed';
+  // A repo with CI configured, so the SAST gap is the only thing under test.
+  const ENTRIES = ['README.md', 'package.json', 'LICENSE', '.github'];
+
+  it('asserts the gap when the listing SUCCEEDED and found no scanner', () => {
+    const gaps = identifyGaps(ENTRIES, 'github-actions', 'TypeScript', [], {
+      workflowsMeasured: true,
+    });
+    expect(gaps).toContain(SAST_GAP);
+    expect(gaps).not.toContain(SAST_UNVERIFIED);
+  });
+
+  it('states it as unverified when the listing FAILED', () => {
+    // The measured consequence: a 403 from a secondary rate limit, or a token
+    // without `contents` scope, used to render as a confident "no scanning
+    // configured" for a repo that may well run CodeQL.
+    const gaps = identifyGaps(ENTRIES, 'github-actions', 'TypeScript', [], {
+      workflowsMeasured: false,
+    });
+    expect(gaps).not.toContain(SAST_GAP);
+    expect(gaps).toContain(SAST_UNVERIFIED);
+  });
+
+  it('still removes the gap outright when a scanner WAS detected', () => {
+    // Detection beats unmeasured: if a tool is visible we know the answer.
+    const gaps = identifyGaps(ENTRIES, 'github-actions', 'TypeScript', ['codeql'], {
+      workflowsMeasured: false,
+    });
+    expect(gaps).not.toContain(SAST_GAP);
+    expect(gaps).not.toContain(SAST_UNVERIFIED);
+  });
+
+  it('reports workflowsMeasured on the analysis, defaulting to measured', () => {
+    const metadata = {
+      full_name: 'o/r',
+      language: 'TypeScript',
+      default_branch: 'main',
+      stargazers_count: 1,
+    } as Parameters<typeof analyzeRepo>[0];
+    expect(analyzeRepo(metadata, ENTRIES, [], { workflowsMeasured: true }).workflowsMeasured).toBe(
+      true
+    );
+    expect(analyzeRepo(metadata, ENTRIES, [], { workflowsMeasured: false }).workflowsMeasured).toBe(
+      false
+    );
+  });
+
+  it('an omitted listings object means measured, and the gap stays asserted', () => {
+    // Pins resolveListings' default. Flipping it to false broke no test until
+    // this existed -- an unpinned default is how this whole class starts.
+    // TRUE is right here: an omitted flag comes from a caller that ran no
+    // listing step at all, not from one whose listing FAILED. A failed listing
+    // passes false explicitly.
+    const metadata = {
+      full_name: 'o/r',
+      language: 'TypeScript',
+      default_branch: 'main',
+      stargazers_count: 1,
+    } as Parameters<typeof analyzeRepo>[0];
+    const analysis = analyzeRepo(metadata, ENTRIES);
+    expect(analysis.workflowsMeasured).toBe(true);
+    expect(analysis.gaps).toContain(SAST_GAP);
+    expect(analysis.gaps).not.toContain(SAST_UNVERIFIED);
+  });
+
+  it('an unmeasured listing does not silently drop the gap entirely', () => {
+    // The lazy fix would be to remove the gap when unmeasured, which reads as
+    // "scanning is configured" -- the same misreport pointed the other way.
+    const gaps = identifyGaps(ENTRIES, 'github-actions', 'TypeScript', [], {
+      workflowsMeasured: false,
+    });
+    expect(gaps.some((g) => g.includes('SAST'))).toBe(true);
+  });
+});
+
+describe('the workflows fetch itself reports listed:false (#6035, the seam)', () => {
+  // Reverting fetchWorkflowEntries to report listed:true on error broke NONE of
+  // the tests above -- they inject the flag into identifyGaps rather than
+  // deriving it. These drive the real fetch through the tool entry point.
+  const SAST_GAP = 'No SAST/SCA security scanning configured';
+  const SAST_UNVERIFIED = 'SAST/SCA scanning unverified — .github/workflows could not be listed';
+
+  const METADATA = JSON.stringify({
+    name: 'r',
+    full_name: 'o/r',
+    description: null,
+    language: 'TypeScript',
+    default_branch: 'main',
+    stargazers_count: 1,
+    license: { spdx_id: 'MIT' },
+  });
+
+  /** A `gh` stub whose `.github/workflows` listing behaves as `workflows` says. */
+  function ghStub(workflows: 'ok' | 'throws'): ExecFileFn {
+    return (_cmd, args) => {
+      const target = (args ?? []).join(' ');
+      if (target.includes('contents/.github/workflows')) {
+        if (workflows === 'throws') throw new Error('HTTP 403: rate limit exceeded');
+        return Promise.resolve({ stdout: '[]' });
+      }
+      if (target.includes('contents/.github')) return Promise.resolve({ stdout: '[]' });
+      if (target.includes('/languages')) return Promise.resolve({ stdout: '{"TypeScript":100}' });
+      if (target.includes('contents')) {
+        return Promise.resolve({ stdout: '["README.md","package.json",".github"]' });
+      }
+      return Promise.resolve({ stdout: METADATA });
+    };
+  }
+
+  it('a 403 on the workflows listing yields workflowsMeasured:false and no asserted gap', async () => {
+    const analysis = await analyzeGitHubRepo({ repo: 'o/r', depth: 'shallow' }, ghStub('throws'));
+    expect(analysis.workflowsMeasured).toBe(false);
+    expect(analysis.gaps).not.toContain(SAST_GAP);
+    expect(analysis.gaps).toContain(SAST_UNVERIFIED);
+  });
+
+  it('a successful empty listing yields workflowsMeasured:true and keeps the gap', async () => {
+    const analysis = await analyzeGitHubRepo({ repo: 'o/r', depth: 'shallow' }, ghStub('ok'));
+    expect(analysis.workflowsMeasured).toBe(true);
+    expect(analysis.gaps).toContain(SAST_GAP);
+    expect(analysis.gaps).not.toContain(SAST_UNVERIFIED);
+  });
+});

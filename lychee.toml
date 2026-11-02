@@ -1,0 +1,94 @@
+# lychee configuration for nexus-agents
+# https://github.com/lycheeverse/lychee
+#
+# Run: lychee . --config lychee.toml
+# Or use npx: npx lychee . --config lychee.toml
+
+# Maximum number of concurrent link checks
+max_concurrency = 32
+
+# Timeout for each request (seconds)
+timeout = 30
+
+# User agent
+user_agent = "lychee/nexus-agents-link-checker"
+
+# Exclude specific paths
+exclude_path = [
+  "node_modules",
+  ".git",
+  "dist",
+  "coverage",
+  ".pnpm-store",
+  "packages/nexus-agents/src/**/*.test.ts",
+  "packages/nexus-agents/docs/api",
+  # Generated per-tool MCP reference (#3687) — internal links regenerate with the
+  # tool set; not hand-curated, so excluded (mirrors docs/api).
+  "docs/reference/tools",
+  "logs",
+  # Archived docs have stale cross-references to pre-archive paths;
+  # not worth maintaining link accuracy in frozen historical documents.
+  "docs/archive",
+]
+
+# Exclude specific URLs
+exclude = [
+  # Localhost and development URLs
+  "^http://localhost",
+  "^http://127.0.0.1",
+  "^http://0.0.0.0",
+  # Example domains
+  "^https?://example\\.com",
+  "^https?://example\\.org",
+  # Placeholder URLs
+  "^https?://your-",
+  "^https?://\\<",
+  # Rate-limited or authentication-required
+  "^https://twitter\\.com",
+  "^https://x\\.com",
+  "^https://api\\.anthropic\\.com",
+  "^https://api\\.openai\\.com",
+  "^https://api\\.google\\.com",
+  # arxiv.org can be rate-limited
+  "^https://arxiv\\.org/abs/\\d+",
+  # Model context protocol (may not have public docs)
+  "^https://modelcontextprotocol\\.io",
+]
+
+# Accept specific status codes as valid
+accept = [
+  200,
+  204,
+  301,
+  302,
+  307,
+  308,
+]
+
+# Include specific file types
+include_mail = false
+include_verbatim = true
+
+# Retry configuration
+max_retries = 3
+retry_wait_time = 2
+
+# Skip certificate validation for internal links
+insecure = false
+
+# Output format
+format = "detailed"
+
+# File types to check (regex patterns)
+include = [
+  ".*\\.md$",
+  ".*\\.mdx$",
+  ".*\\.json$",
+  ".*\\.yaml$",
+  ".*\\.yml$",
+  ".*\\.html$",
+]
+
+# Cache results
+cache = true
+max_cache_age = "1d"

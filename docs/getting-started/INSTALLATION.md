@@ -1,0 +1,641 @@
+---
+title: 'Installation Guide'
+description: Detailed installation instructions for nexus-agents across all platforms, Docker, and CI/CD environments
+diataxis: how-to
+audience: user
+tier: 2
+keywords: [installation, setup, docker, npm, pnpm, getting-started]
+---
+
+# Installation
+
+Detailed installation instructions for nexus-agents across all platforms, Docker, and CI/CD environments.
+
+## System Requirements
+
+### Required
+
+| Component | Version  | Notes                              |
+| --------- | -------- | ---------------------------------- |
+| Node.js   | 24.x LTS | Earlier versions are not supported |
+| npm       | 10.x     | Or pnpm 9.x (recommended)          |
+
+### Optional
+
+| Component    | Purpose                        |
+| ------------ | ------------------------------ |
+| Docker       | Sandboxed code execution       |
+| Claude CLI   | Enhanced Claude model access   |
+| agy          | Enhanced Gemini model access   |
+| Codex CLI    | Enhanced OpenAI model access   |
+| OpenCode CLI | Enhanced OpenCode model access |
+
+### API Keys
+
+You need at least one model provider API key:
+
+| Provider  | Variable            | Get Key                                                |
+| --------- | ------------------- | ------------------------------------------------------ |
+| Anthropic | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com) |
+| OpenAI    | `OPENAI_API_KEY`    | [platform.openai.com](https://platform.openai.com)     |
+| Google AI | `GOOGLE_AI_API_KEY` | [aistudio.google.com](https://aistudio.google.com)     |
+
+For local models via Ollama, no API key is required. Ollama support requires configuration of the `OLLAMA_HOST` environment variable.
+
+## Installation Methods
+
+### npm (Recommended)
+
+Install globally for CLI access:
+
+```bash
+npm install -g nexus-agents
+```
+
+> **Linux / macOS without nvm or asdf?** A bare `npm install -g` will fail with
+> `EACCES: permission denied, mkdir '/usr/local/lib/node_modules/...'` because
+> the system npm prefix is not user-writable. **Do not run `sudo npm install -g`**
+> — npm itself recommends against it. Instead, configure a user-local prefix
+> once:
+>
+> ```bash
+> mkdir -p ~/.npm-global
+> npm config set prefix '~/.npm-global'
+> echo 'export PATH=~/.npm-global/bin:$PATH' >> ~/.bashrc   # or ~/.zshrc
+> source ~/.bashrc
+> npm install -g nexus-agents
+> ```
+>
+> If you can't or don't want to change the prefix, use `npx nexus-agents`
+> (see below) — every invocation works without a global install.
+
+After install, you'll see a hint to run setup. Configure everything:
+
+```bash
+nexus-agents setup    # Configures MCP, hooks, data dirs, OpenCode, config
+```
+
+Verify installation:
+
+```bash
+nexus-agents doctor        # Checks CLIs, API keys, sqlite, data dirs
+nexus-agents doctor --fix  # Auto-fix missing data dirs and config
+nexus-agents auth status   # Show per-CLI auth state + login fix instructions
+```
+
+### pnpm
+
+If you prefer pnpm:
+
+```bash
+pnpm add -g nexus-agents
+```
+
+**pnpm installs an older version than npm does, by design.** pnpm's
+[`minimumReleaseAge`](https://pnpm.io/supply-chain-security) setting defaults
+to 1440 minutes: a version is not resolvable until it has been on the registry
+for a day. nexus-agents publishes several times on a busy day, so
+`pnpm add -g nexus-agents` (and `pnpm update -g nexus-agents`) silently
+resolves `latest` to the newest version that is at least a day old — measured
+in a clean `node:22` container with pnpm 11.25: npm installed 8.9.4, pnpm
+installed 8.3.0, no warning either way. To install the newest version through
+pnpm, opt out for that command:
+
+```bash
+pnpm add -g nexus-agents --config.minimumReleaseAge=0
+```
+
+or set `minimumReleaseAge: 0` in your global pnpm config. The one-day delay is
+a supply-chain safeguard; keep it unless you need a fix that shipped today.
+
+### npx (No Install)
+
+Run without installing:
+
+```bash
+npx nexus-agents doctor
+npx nexus-agents --help
+```
+
+### From Source
+
+For development or customization:
+
+```bash
+# Clone the repository
+git clone https://github.com/nexus-substrate/nexus-agents.git
+cd nexus-agents
+
+# Install dependencies
+pnpm install
+
+# Build
+pnpm build
+
+# Link globally
+pnpm link --global
+```
+
+### Docker
+
+Run in a container:
+
+```bash
+# Pull the image
+docker pull ghcr.io/nexus-substrate/nexus-agents:latest
+
+# Run with API key
+docker run -e ANTHROPIC_API_KEY="sk-ant-..." \
+  ghcr.io/nexus-substrate/nexus-agents:latest
+```
+
+Or build locally:
+
+```bash
+docker build -t nexus-agents .
+docker run -e ANTHROPIC_API_KEY="sk-ant-..." nexus-agents
+```
+
+## Platform-Specific Instructions
+
+### macOS
+
+```bash
+# Install Node.js 24 via Homebrew
+brew install node@24
+
+# Add to PATH
+echo 'export PATH="/opt/homebrew/opt/node@24/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+
+# Install nexus-agents
+npm install -g nexus-agents
+
+# Verify
+nexus-agents doctor
+```
+
+### Linux (Ubuntu/Debian)
+
+```bash
+# Install Node.js 24 via NodeSource
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# Install nexus-agents
+npm install -g nexus-agents
+
+# Verify
+nexus-agents doctor
+```
+
+### Linux (Fedora/RHEL)
+
+```bash
+# Install Node.js 24
+sudo dnf module enable nodejs:24
+sudo dnf install nodejs
+
+# Install nexus-agents
+npm install -g nexus-agents
+
+# Verify
+nexus-agents doctor
+```
+
+### Windows
+
+```powershell
+# Install Node.js 24 via winget
+winget install OpenJS.NodeJS.LTS
+
+# Or via Chocolatey
+choco install nodejs-lts
+
+# Install nexus-agents
+npm install -g nexus-agents
+
+# Verify
+nexus-agents doctor
+```
+
+### Windows (WSL)
+
+Follow the Linux instructions inside WSL. This is the recommended approach for Windows users.
+
+## Installing Optional CLIs
+
+The external CLI adapters provide enhanced capabilities:
+
+### Claude CLI
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude auth login
+```
+
+### Antigravity CLI (`agy`) — serves the Gemini arm
+
+The standalone `gemini` CLI (`@google/gemini-cli`) is retired: it exits 55 with
+`IneligibleTierError` on every invocation. The `gemini` routing arm now spawns
+`agy`, Google's Antigravity CLI, which serves the Gemini models. Install `agy`
+following Google's Antigravity instructions, sign in through `agy` itself, then
+confirm it is on `PATH`:
+
+```bash
+agy --version
+agy models    # lists the model slugs agy accepts
+```
+
+Sign in through `agy`; do not rely on an API key. `agy` does not use
+`~/.gemini/oauth_creds.json` (#4391), and `GOOGLE_AI_API_KEY` does not appear
+in the `agy` 1.3.1 binary. `GEMINI_API_KEY` does appear in it, but with `agy`
+signed in, a bogus `GEMINI_API_KEY` left `agy models` output unchanged. Whether
+a signed-out `agy` falls back to `GEMINI_API_KEY` has not been measured.
+
+### Codex CLI
+
+```bash
+npm install -g @openai/codex
+codex auth login
+```
+
+### OpenCode CLI
+
+```bash
+npm install -g opencode-ai
+```
+
+OpenCode supports custom OpenAI-compatible endpoints, enabling routing to any hosted model that exposes an OpenAI-compatible API.
+
+## MCP Client Configuration
+
+### Claude Desktop
+
+Add to your MCP configuration file:
+
+**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+**Linux:** `~/.config/claude/claude_desktop_config.json`
+
+**Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "nexus-agents": {
+      "command": "nexus-agents",
+      "args": ["--mode=server"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-your-key-here"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop to load the configuration.
+
+### Claude CLI
+
+Add to `.mcp.json` in your project root (or run `nexus-agents setup` for automatic configuration):
+
+```json
+{
+  "mcpServers": {
+    "nexus-agents": {
+      "command": "nexus-agents",
+      "args": ["--mode=server"]
+    }
+  }
+}
+```
+
+## Data Storage
+
+As of epic #2872, nexus-agents splits runtime data into two roots when run inside a git repo:
+
+- **Per-repo** state (tied to one codebase's work) → `<repo>/.nexus-agents/` (auto-gitignored)
+- **Cross-repo** state (shared across all your projects) → `~/.nexus-agents/`
+
+| Directory          | Scope      | Resolves to             | Purpose                                                       |
+| ------------------ | ---------- | ----------------------- | ------------------------------------------------------------- |
+| `memory/`          | cross-repo | `~/.nexus-agents/`      | SQLite databases for agentic, adaptive, typed memory backends |
+| `memory/beliefs/`  | cross-repo | `~/.nexus-agents/`      | Belief memory JSON snapshots                                  |
+| `learning/`        | cross-repo | `~/.nexus-agents/`      | Cross-session task outcomes and distilled rules               |
+| `voting/`          | cross-repo | `~/.nexus-agents/`      | Consensus vote correlation data                               |
+| `research/`        | cross-repo | `~/.nexus-agents/`      | Research catalog                                              |
+| `auth/`            | cross-repo | `~/.nexus-agents/`      | REST API auth tokens (owner-only permissions)                 |
+| `sessions/`        | per-repo   | `<repo>/.nexus-agents/` | Session journals (JSONL)                                      |
+| `checkpoints/`     | per-repo   | `<repo>/.nexus-agents/` | Wave + pipeline checkpoints                                   |
+| `traces/`, `runs/` | per-repo   | `<repo>/.nexus-agents/` | Pipeline execution traces                                     |
+| `audit/`           | per-repo   | `<repo>/.nexus-agents/` | JSONL audit logs                                              |
+
+Run `nexus-agents setup` to pre-create this structure, or it will be created lazily on first use. `nexus-agents doctor` reports the resolved location of every subdir. Override the whole split with `NEXUS_DATA_DIR=<path>`, or opt out entirely with `NEXUS_REPO_PREFERRED=0` (all state in `~/.nexus-agents/`). In a sandbox without a writable `~`, cross-repo state transparently falls back to `<repo>/.nexus-agents/`.
+
+### Native code and install scripts
+
+**Nothing in nexus-agents needs to compile at install time, and the CLI works with install scripts blocked.** Both halves are gated, not asserted — see below.
+
+Persistent memory (agentic, adaptive, typed, mobimem, decay) runs on **`node:sqlite`**, a Node builtin, since [#5388](https://github.com/nexus-substrate/nexus-agents/issues/5388) — and 9.0 requires Node ≥ 24 for the more mature SQLite implementation and longer LTS support window. It replaced `better-sqlite3`, whose install script built a native binding: where install scripts were blocked, `npm install` still exited `0` and the CLI then died with `Could not locate the bindings file`. A builtin has no install script to skip.
+
+The polyglot (Python/Go) security scanner does load native tree-sitter grammars, from `@ast-grep/lang-python` and `@ast-grep/lang-go`. Those ship **prebuilt** `.so` files inside their own npm tarballs for Linux, macOS (x64 + arm64) and Windows x64, so they neither download nor compile anything on a supported platform.
+
+Three production packages declare an install script: `@ast-grep/lang-go`, `@ast-grep/lang-python` and `@google/genai`. Every one is inert for this package's purposes. Two verify a grammar that already ships in their tarball, and one is literally `echo`. (Through 8.82.1, a fourth, `protobufjs@7`, arrived through `@google/genai`. The repository's security floor now lifts the bundled copy to 8.x, which has no install script, #6488.) That claim is enforced rather than trusted ([#5427](https://github.com/nexus-substrate/nexus-agents/issues/5427)):
+
+- `scripts/check-install-scripts.ts` installs the packed tarball with npm and fails if any install script appears that is not in `scripts/install-script-allowlist.json`, if an allowlisted one changes what it runs, or if an allowlisted entry no longer exists.
+- `scripts/verify-npm-install.sh` installs with `--ignore-scripts` in a container with **no compiler present**, then proves the SQLite path and the polyglot scanner both still work. The scanner has to return two named findings from a fixture, so "found nothing" cannot pass for "clean".
+
+Run `nexus-agents verify` to see both checks, `SQLite Storage` and `Native Grammars`, reported by name.
+
+#### These dependencies ship inside the nexus-agents tarball
+
+A package cannot pre-approve its dependencies' install scripts. npm's `allowScripts` and pnpm's `approve-builds` are settings on _your_ side. So on releases up to and including 8.82.0, a consent-gated package manager asked you about those four packages, and in two configurations that blocked the install ([#6481](https://github.com/nexus-substrate/nexus-agents/issues/6481)):
+
+| configuration                                                      | releases ≤ 8.82.0                                                                |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `pnpm add -g nexus-agents` in a terminal (pnpm 12)                 | stops at "Choose which packages to build"; nothing is installed until you answer |
+| `npm install -g nexus-agents` with `strict-allow-scripts` (npm 12) | exits `1` with `ESTRICTALLOWSCRIPTS`                                             |
+| npm 12 / pnpm, non-interactive                                     | exits `0`, prints a blocked-scripts warning                                      |
+
+Later releases list `@ast-grep/lang-go`, `@ast-grep/lang-python`, `@google/genai` and `@modelcontextprotocol/sdk` in `bundleDependencies`. They arrive inside the nexus-agents tarball rather than as separate installs. npm 12 (default and strict) and pnpm 12 (in a terminal or not) then install with no prompt, no warning and no script executed, and the grammars still load. npm 10 and 11 run a bundled package's script exactly as they ran it before.
+
+`@modelcontextprotocol/sdk` has no install script. It is bundled because `@google/genai` declares it as an optional peer, and npm's installer treats a bundled package's peers as part of the bundle. Leave it out and a consumer install gets empty directories for about 90 packages, and the CLI cannot start. `scripts/stage-publish.ts` refuses to stage a tarball in that state.
+
+The trade: a bundled package is fixed at the version resolved when nexus-agents was released. `npm audit` still reports it, but a fix reaches you through a nexus-agents release, not through `npm update` of the dependency.
+
+If you are stuck on 8.82.0 or earlier, either upgrade, or approve the four packages once:
+
+| install                                     | command                                                                                                                                             |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| globally with npm                           | `npm install -g --allow-scripts=@ast-grep/lang-go,@ast-grep/lang-python,@google/genai,protobufjs nexus-agents`                                      |
+| globally with pnpm                          | `pnpm add -g nexus-agents --allow-build=@ast-grep/lang-go --allow-build=@ast-grep/lang-python --allow-build=@google/genai --allow-build=protobufjs` |
+| into a project (`npm install nexus-agents`) | `npm install-scripts approve <pkg>`, which writes `allowScripts` into your project's `package.json`                                                 |
+
+## CI/CD Integration
+
+### GitHub Actions
+
+```yaml
+name: CI with nexus-agents
+
+on: [push, pull_request]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install nexus-agents
+        run: npm install -g nexus-agents
+
+      - name: Run code review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          nexus-agents orchestrate "Review the changes in this PR" \
+            --format json > review.json
+```
+
+### GitLab CI
+
+```yaml
+code-review:
+  image: node:24
+  script:
+    - npm install -g nexus-agents
+    - nexus-agents orchestrate "Review this merge request"
+  variables:
+    ANTHROPIC_API_KEY: $ANTHROPIC_API_KEY
+```
+
+### Jenkins
+
+```groovy
+pipeline {
+    agent {
+        docker { image 'node:24' }
+    }
+    environment {
+        ANTHROPIC_API_KEY = credentials('anthropic-api-key')
+    }
+    stages {
+        stage('Review') {
+            steps {
+                sh 'npm install -g nexus-agents'
+                sh 'nexus-agents orchestrate "Review this build"'
+            }
+        }
+    }
+}
+```
+
+## Docker Compose
+
+For development environments:
+
+```yaml
+version: '3.8'
+
+services:
+  nexus-agents:
+    image: ghcr.io/nexus-substrate/nexus-agents:latest
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - NEXUS_LOG_LEVEL=debug
+    volumes:
+      - ./nexus-agents.yaml:/app/nexus-agents.yaml:ro
+      - ./workflows:/app/workflows:ro
+    ports:
+      - '3000:3000' # REST API
+```
+
+## Verifying Installation
+
+After installation, run the doctor command:
+
+```bash
+nexus-agents doctor
+```
+
+Illustrative excerpt for a host with all four CLIs installed and signed in
+(your versions and details will differ; the environment, capability, registry
+and storage sections are omitted):
+
+```
+Nexus Agents Doctor
+===================
+
+Checking CLI installations...
+
+✓ Claude CLI
+  Version: 2.1.292 (supported)
+  Auth: CLI auth
+  Capacity: unknown (no usage observed this session)
+  Auth evidence: artifact (claude credentials file)
+
+⚠ Gemini CLI
+  Version: 1.3.1 (supported)
+  Auth: unverified (no non-interactive auth check)
+  Capacity: unknown (no usage observed this session)
+  Auth evidence: none (agy probe unknown)
+
+✓ Codex CLI
+  Version: 0.160.0 (supported)
+  Auth: CLI auth
+  Capacity: unknown (no usage observed this session)
+  Auth evidence: probe (codex login status)
+
+✓ Opencode CLI
+  Version: 1.2.0 (supported)
+  Auth: CLI auth
+  Capacity: unknown (no usage observed this session)
+  Auth evidence: probe (opencode auth list)
+
+Checking MCP configuration...
+
+✓ MCP Server mode: Ready
+⚠ MCP Client mode: unavailable — codex-cli ≥0.154 has no mcp-server subcommand; using codex exec
+✓ Voter transport: CLI subprocess
+  Set NEXUS_OPENAI_COMPAT_URL and NEXUS_OPENAI_COMPAT_KEY for faster in-process voting
+
+Summary: 1 issue(s) found (CLI gemini)
+```
+
+The `Gemini CLI` row reports the `agy` binary, which serves the Gemini arm.
+`agy` offers no non-interactive auth check, so doctor reports its auth as
+`unverified` and counts the row as an issue even when `agy` is signed in.
+
+## Updating
+
+### npm
+
+```bash
+npm update -g nexus-agents
+```
+
+### pnpm
+
+```bash
+pnpm update -g nexus-agents
+```
+
+### From Source
+
+```bash
+cd nexus-agents
+git pull
+pnpm install
+pnpm build
+```
+
+## Uninstalling
+
+### npm
+
+```bash
+npm uninstall -g nexus-agents
+```
+
+### pnpm
+
+```bash
+pnpm remove -g nexus-agents
+```
+
+### Clean Configuration
+
+Remove configuration files:
+
+```bash
+# Remove config
+rm -rf ~/.config/nexus-agents
+
+# Remove MCP entry from Claude Desktop config
+# Edit ~/Library/Application Support/Claude/claude_desktop_config.json
+```
+
+## Troubleshooting
+
+### `npm warn deprecated` on install (benign — no action needed)
+
+Installing `nexus-agents` prints one deprecation warning. It is **benign,
+expected, and safe to ignore** — it comes from a transitive dependency of an
+upstream package, not from anything in the nexus-agents runtime.
+
+(The `prebuild-install@…: No longer maintained` warning listed here previously
+came from `better-sqlite3` and no longer appears at all: #5388 removed that
+dependency.)
+
+| Warning                                                                | Where it comes from                                               | Why it's harmless                                                                                                                                                                      |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `node-domexception@…: Use your platform's native DOMException instead` | `@google/genai` → `google-auth-library` → `gaxios` → `node-fetch` | A `DOMException` polyfill that is a no-op on Node ≥ 22 (which ships a native `DOMException`). Inert at runtime. ([#4044](https://github.com/nexus-substrate/nexus-agents/issues/4044)) |
+
+Neither can currently be removed by upgrading: both persist in the **latest**
+versions of those upstream packages, and a library's `overrides` do not
+propagate to consumers. They will clear once the upstream maintainers drop the
+deprecated transitive deps; the linked issues track that.
+
+### "Cannot find module" errors
+
+Clear the npm cache and reinstall:
+
+```bash
+npm cache clean --force
+npm install -g nexus-agents
+```
+
+### Permission errors on Linux/macOS
+
+Fix npm permissions:
+
+```bash
+# Option 1: Use a node version manager (recommended)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+nvm install 24
+nvm use 24
+
+# Option 2: Change npm prefix
+npm config set prefix ~/.npm-global
+echo 'export PATH=~/.npm-global/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### PATH not configured
+
+Find and add the npm bin directory:
+
+```bash
+# Find the directory
+npm config get prefix
+
+# Add to PATH (bash)
+echo 'export PATH="$(npm config get prefix)/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+# Add to PATH (zsh)
+echo 'export PATH="$(npm config get prefix)/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### Docker permission denied
+
+Add your user to the docker group:
+
+```bash
+sudo usermod -aG docker $USER
+# Log out and back in
+```
+
+## Related Documentation
+
+- [Configuration](./CONFIGURATION.md) - Set up models, experts, and routing
+- [Sandboxed Usage](../guides/SANDBOXED-USAGE.md) - Docker / restricted-FS / team-distribution flows
+- [Quick Start](../../QUICK_START.md) - Try your first orchestration
+- [CLI Usage](../ENTRYPOINTS.md) - Learn all CLI commands

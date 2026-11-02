@@ -1,0 +1,328 @@
+/**
+ * Tests for entrypoint extractor.
+ *
+ * @module indexer/entrypoint-extractor.test
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { sanitizeValue, extractEntrypoints } from './entrypoint-extractor.js';
+import { FAKE_OPENAI_KEY, FAKE_GITHUB_PAT, FAKE_BEARER_TOKEN } from '../testing/test-secrets.js';
+
+/** Timeout for tests that use ts-morph AST parsing (CPU-intensive under contention). */
+const AST_PARSE_TIMEOUT = 15_000;
+
+beforeEach(() => {
+  vi.restoreAllMocks();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+// ============================================================================
+// Sanitization Tests
+// ============================================================================
+
+describe('sanitizeValue', () => {
+  it('should redact OpenAI API keys', () => {
+    const input = `Key: ${FAKE_OPENAI_KEY}`;
+    const result = sanitizeValue(input);
+    expect(result).toBe('Key: [REDACTED]');
+  });
+
+  it('should redact Anthropic API keys', () => {
+    // 95 chars after sk-ant-
+    const key = 'sk-ant-' + 'a'.repeat(95);
+    const input = `API key is ${key}`;
+    const result = sanitizeValue(input);
+    expect(result).toContain('[REDACTED]');
+  });
+
+  it('should redact GitHub PATs', () => {
+    const input = `Token: ${FAKE_GITHUB_PAT}`;
+    const result = sanitizeValue(input);
+    expect(result).toContain('[REDACTED]');
+    expect(result).not.toContain('ghp_TESTFAKE');
+  });
+
+  it('should redact GitLab PATs', () => {
+    const input = 'Token: glpat-abcdefghijklmno12345';
+    const result = sanitizeValue(input);
+    expect(result).toBe('Token: [REDACTED]');
+  });
+
+  it('should redact Bearer tokens', () => {
+    const input = `Auth: ${FAKE_BEARER_TOKEN}`;
+    const result = sanitizeValue(input);
+    expect(result).toBe('Auth: [REDACTED]');
+  });
+
+  it('should redact hex strings (potential secrets)', () => {
+    const input = 'Hash: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
+    const result = sanitizeValue(input);
+    expect(result).toBe('Hash: [REDACTED]');
+  });
+
+  it('should redact localhost URLs', () => {
+    const input = 'Server: localhost:3000';
+    const result = sanitizeValue(input);
+    expect(result).toBe('Server: [REDACTED]');
+  });
+
+  it('should redact private IPs (192.168.x.x)', () => {
+    const input = 'IP: 192.168.1.100';
+    const result = sanitizeValue(input);
+    expect(result).toBe('IP: [REDACTED]');
+  });
+
+  it('should redact private IPs (10.x.x.x)', () => {
+    const input = 'IP: 10.0.0.1';
+    const result = sanitizeValue(input);
+    expect(result).toBe('IP: [REDACTED]');
+  });
+
+  it('should not redact normal text', () => {
+    const input = 'This is a normal description without secrets';
+    const result = sanitizeValue(input);
+    expect(result).toBe(input);
+  });
+
+  it('should handle multiple patterns in one string', () => {
+    const input = `Server at localhost:8080, key ${FAKE_GITHUB_PAT}`;
+    const result = sanitizeValue(input);
+    expect(result).toContain('[REDACTED]');
+    expect(result).not.toContain('localhost');
+    expect(result).not.toContain('ghp_');
+  });
+});
+
+// ============================================================================
+// Full Extraction Tests
+// ============================================================================
+
+describe('extractEntrypoints', () => {
+  it('should return a valid result structure', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    expect(result).toHaveProperty('success');
+    expect(result).toHaveProperty('errors');
+    expect(result).toHaveProperty('warnings');
+    expect(Array.isArray(result.errors)).toBe(true);
+    expect(Array.isArray(result.warnings)).toBe(true);
+  });
+
+  it('should extract CLI commands when successful', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      expect(result.manifest.cli_commands).toBeDefined();
+      expect(Array.isArray(result.manifest.cli_commands)).toBe(true);
+      // CLI commands may be empty if ts-morph can't resolve HELP_TEXT patterns
+      // in the bundled output — this is a limitation of static AST extraction
+    }
+  });
+
+  it('should extract MCP tools when successful', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      expect(result.manifest.mcp_tools).toBeDefined();
+      expect(Array.isArray(result.manifest.mcp_tools)).toBe(true);
+    }
+  });
+
+  it('should include schema version', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      expect(result.manifest.schema_version).toBe('1.0');
+    }
+  });
+
+  it('should include generation timestamp', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      expect(result.manifest.generated_at).toBeDefined();
+      expect(typeof result.manifest.generated_at).toBe('string');
+    }
+  });
+});
+
+// ============================================================================
+// CLI Command Extraction Tests
+// ============================================================================
+
+describe('extractCliCommands', () => {
+  it('should extract known commands', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest && result.manifest.cli_commands.length > 0) {
+      const commandNames = result.manifest.cli_commands.map((c) => c.name);
+
+      // Check for expected commands (when AST extraction succeeds)
+      expect(commandNames).toContain('doctor');
+      expect(commandNames).toContain('orchestrate');
+    }
+  });
+
+  it('should include source file information', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      for (const cmd of result.manifest.cli_commands) {
+        expect(cmd.source_file).toBeDefined();
+        expect(cmd.source_line).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('should extract command descriptions', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      const doctor = result.manifest.cli_commands.find((c) => c.name === 'doctor');
+      if (doctor) {
+        expect(doctor.description).toBeDefined();
+        expect(doctor.description.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('should extract subcommands for composite commands', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      const workflow = result.manifest.cli_commands.find((c) => c.name === 'workflow');
+      if (workflow?.subcommands) {
+        expect(workflow.subcommands).toContain('list');
+        expect(workflow.subcommands).toContain('run');
+      }
+    }
+  });
+});
+
+// ============================================================================
+// MCP Tool Extraction Tests
+// ============================================================================
+
+describe('extractMcpTools', () => {
+  it('should extract known tools', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest && result.manifest.mcp_tools.length > 0) {
+      const toolNames = result.manifest.mcp_tools.map((t) => t.name);
+
+      // Check for expected tools (when AST extraction succeeds)
+      expect(toolNames).toContain('orchestrate');
+    }
+  });
+
+  it('should include parameter information', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      const orchestrate = result.manifest.mcp_tools.find((t) => t.name === 'orchestrate');
+      if (orchestrate) {
+        expect(orchestrate.parameters).toBeDefined();
+        expect(Array.isArray(orchestrate.parameters)).toBe(true);
+
+        // Check for task parameter
+        const taskParam = orchestrate.parameters.find((p) => p.name === 'task');
+        if (taskParam) {
+          expect(taskParam.type).toBeDefined();
+        }
+      }
+    }
+  });
+
+  it('should include tool descriptions', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      for (const tool of result.manifest.mcp_tools) {
+        expect(tool.description).toBeDefined();
+        // Description may be empty string if AST parser can't extract it
+        expect(typeof tool.description).toBe('string');
+      }
+    }
+  });
+});
+
+// ============================================================================
+// REST Endpoint Extraction Tests
+// ============================================================================
+
+// ============================================================================
+// Edge Cases and Error Handling
+// ============================================================================
+
+describe('error handling', () => {
+  it('should handle missing package root gracefully', () => {
+    const result = extractEntrypoints({
+      packageRoot: 'nonexistent/path',
+    });
+
+    // Should return errors but not throw
+    expect(result.success).toBe(false);
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+});
+
+// ============================================================================
+// Integration Tests
+// ============================================================================
+
+describe('integration', () => {
+  it('should produce consistent output structure', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+    });
+
+    if (result.success && result.manifest) {
+      // Verify all arrays are readonly (immutable)
+      expect(Object.isFrozen(result.manifest.cli_commands)).toBe(false); // Not frozen, but readonly type
+      expect(Array.isArray(result.manifest.cli_commands)).toBe(true);
+      expect(Array.isArray(result.manifest.mcp_tools)).toBe(true);
+    }
+  });
+
+  it('should sanitize values by default', { timeout: AST_PARSE_TIMEOUT }, () => {
+    const result = extractEntrypoints({
+      packageRoot: 'packages/nexus-agents',
+      sanitize: true,
+    });
+
+    if (result.success && result.manifest) {
+      // Check that no sensitive patterns exist in output
+      const jsonOutput = JSON.stringify(result.manifest);
+      expect(jsonOutput).not.toContain('sk-ant-');
+      expect(jsonOutput).not.toContain('ghp_');
+      expect(jsonOutput).not.toContain('Bearer ');
+    }
+  });
+});

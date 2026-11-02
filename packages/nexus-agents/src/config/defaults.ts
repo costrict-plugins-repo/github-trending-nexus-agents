@@ -1,0 +1,381 @@
+/**
+ * Central Configuration Defaults
+ *
+ * Consolidates common default values used across the codebase.
+ * This prevents scattered magic numbers and ensures consistency.
+ *
+ * Usage:
+ *   import { DEFAULTS, TIMEOUT_PROFILES, getTimeoutForCli } from '../config/defaults.js';
+ *   const timeout = options.timeout ?? DEFAULTS.TIMEOUT_DEFAULTS.cliMs;
+ *   const cliTimeout = getTimeoutForCli('claude', 'complex');
+ *
+ * Nothing here reads a NEXUS_* variable. The env-driven knobs live in the
+ * canonical timeout modules (config/timeouts/*) and in config/env-schema.ts.
+ *
+ * @module config/defaults
+ * (Source: Central config consolidation initiative)
+ */
+
+// Re-export types from defaults-types
+export type {
+  TaskComplexity,
+  TimeoutProfile,
+  KnownCliName,
+  TimeoutDefaults,
+  RateLimitDefaults,
+  ToolRateLimitConfig,
+  RetryDefaults,
+  CircuitBreakerDefaults,
+} from './defaults-types.js';
+
+export { isTaskComplexity, isKnownCliName } from './defaults-types.js';
+
+// Re-export timeout profiles (delegates to config/timeouts.ts)
+export {
+  TIMEOUT_PROFILES,
+  getTimeoutProfile,
+  getTimeoutForCli,
+} from './defaults-timeout-profiles.js';
+
+// Re-export canonical timeout modules (Issue #984)
+export {
+  CLI_TIMEOUTS,
+  VOTE_TIMEOUTS,
+  MCP_TIMEOUTS,
+  WORKFLOW_TIMEOUTS,
+  GRAPH_TIMEOUTS,
+  PER_CLI_TASK_TIMEOUTS,
+  API_TIMEOUTS,
+  INTERNAL_TIMEOUTS,
+  TEST_TIMEOUTS,
+  TIMEOUT_ENV_VARS,
+  getCliTimeoutProfile,
+  getCliTimeout,
+  resolveVoteTimeout,
+  resolveEnvTimeout,
+  validateTimeout,
+  BACKOFF_CONFIG,
+  AGENT_ROUTER_TIMEOUTS,
+  CODEX_MCP_TIMEOUTS,
+} from './timeouts.js';
+
+// Re-export env helpers (internal use)
+export { parseIntEnv, parseFloatEnv, parseBoolEnv } from './defaults-env.js';
+
+import { createGetToolRateLimit } from './defaults-env.js';
+import { DEFAULT_EXECUTION_MODE } from './schemas-security.js';
+import {
+  API_TIMEOUTS as _API,
+  WORKFLOW_TIMEOUTS as _WF,
+  MCP_TIMEOUTS as _MCP,
+  INTERNAL_TIMEOUTS as _INT,
+  TEST_TIMEOUTS as _TEST,
+  CLI_TIMEOUTS as _CLI,
+} from './timeouts.js';
+
+// ============================================================================
+// Default Model IDs (#2200 Child 4)
+// ============================================================================
+
+/**
+ * Default model identifier for the custom OpenAI-compatible API gateway.
+ *
+ * Used by both `cli/setup-custom-api.ts` (write to nexus-agents.yaml) and
+ * `adapters/auto-adapter.ts` (NEXUS_CUSTOM_MODEL env-var fallback). Single
+ * source of truth so changes flow through all consumers.
+ *
+ * `gpt-4o` was the previous value, chosen because it was widely supported across
+ * OpenAI-compatible gateways. It is now END-OF-LIFE at OpenAI, so defaulting to
+ * it points new operators at a model their gateway may well refuse (#4408).
+ *
+ * A custom gateway can serve anything, so ANY default here is a guess — the
+ * right long-term answer is to discover the model list from the endpoint
+ * (`GET /v1/models`, which this repo already implements) rather than assume one.
+ * Until that is wired, guess a current model instead of a retired one.
+ *
+ * Operators are expected to override via `NEXUS_CUSTOM_MODEL`.
+ */
+export const CUSTOM_API_DEFAULT_MODEL = 'gpt-5.6-sol';
+
+// ============================================================================
+// Central Defaults Object
+// ============================================================================
+
+/**
+ * Central defaults object containing all configuration categories.
+ */
+export const DEFAULTS = {
+  /**
+   * Default timeout settings in milliseconds.
+   * Values sourced from config/timeouts.ts (Issue #984).
+   */
+  TIMEOUT_DEFAULTS: {
+    /** CLI tool execution timeout in milliseconds. */
+    cliMs: _CLI.default.standard,
+    // cliSimpleMs / cliComplexMs removed in #4180 — never read by any production
+    // code (the matching NEXUS_TIMEOUT_CLISIMPLE/CLICOMPLEX env vars were silent
+    // no-ops, #2977 class). Per-complexity CLI timeouts come from
+    // getTimeoutForCli/TIMEOUT_PROFILES (CLI_TIMEOUTS in config/timeouts.ts).
+    /** API request timeout in milliseconds. */
+    apiMs: _API.defaultMs,
+    /** Maximum API timeout in milliseconds. */
+    apiMaxMs: _API.maxMs,
+    /** Workflow-level timeout in milliseconds (5 minutes). */
+    workflowMs: _WF.workflowMs,
+    /** Maximum workflow timeout in milliseconds (30 minutes). */
+    workflowMaxMs: _WF.workflowMaxMs,
+    /** Step-level timeout in milliseconds. */
+    stepMs: _INT.selfEvalMs,
+    /** MCP operation default timeout in milliseconds (generic, not per-tool). */
+    mcpMs: _API.defaultMs,
+    /** MCP operation maximum timeout in milliseconds. */
+    mcpMaxMs: _MCP.maxMs,
+    /** Health check timeout in milliseconds. */
+    healthCheckMs: _INT.healthCheckMs,
+    /** Global test run timeout in milliseconds (10 minutes). */
+    testGlobalMs: _TEST.globalMs,
+    /** Per-task test timeout in milliseconds. */
+    testTaskMs: _TEST.taskMs,
+    /** Circuit breaker reset timeout in milliseconds. */
+    circuitBreakerResetMs: _INT.circuitBreakerResetMs,
+  },
+
+  /**
+   * Default rate limit settings for outbound operations.
+   */
+  RATE_LIMIT_DEFAULTS: {
+    /** Global requests per minute. */
+    requestsPerMinute: 60,
+    /** Whether rate limiting is enabled by default. */
+    enabled: true,
+    /** Maximum number of concurrent requests. */
+    maxConcurrent: 4,
+    /** Token bucket capacity. */
+    capacity: 100,
+    /** Token bucket refill rate per second. */
+    refillRate: 10,
+    /** Refill interval in milliseconds. */
+    refillIntervalMs: 100,
+  },
+
+  /**
+   * Per-tool rate limit defaults for MCP tools.
+   * (Source: Issue #274 Phase 2 - per-tool rate limits)
+   */
+  TOOL_RATE_LIMITS: {
+    orchestrate: { capacity: 10, refillRate: 10, refillIntervalMs: 60_000 },
+    delegate: { capacity: 20, refillRate: 20, refillIntervalMs: 60_000 },
+    workflow: { capacity: 5, refillRate: 5, refillIntervalMs: 60_000 },
+    expert: { capacity: 30, refillRate: 30, refillIntervalMs: 60_000 },
+  },
+
+  /**
+   * Default retry strategy settings for transient failures.
+   */
+  RETRY_DEFAULTS: {
+    /** Maximum retry attempts before failing. */
+    maxRetries: 3,
+    /** Base delay between retries in milliseconds. */
+    baseDelayMs: 1_000,
+    /** Maximum delay between retries in milliseconds. */
+    maxDelayMs: 30_000,
+    /** Jitter factor (0-1) to randomize retry delays. */
+    jitterFactor: 0.1,
+  },
+
+  /**
+   * Workflow-specific retry defaults.
+   */
+  WORKFLOW_RETRY_DEFAULTS: {
+    /** Maximum retry attempts for workflow steps. */
+    maxRetries: 2,
+    /** Base delay for workflow retries in milliseconds. */
+    baseDelayMs: 2_000,
+    /** Maximum delay for workflow retries in milliseconds. */
+    maxDelayMs: 60_000,
+    /** Jitter factor for workflow retries. */
+    jitterFactor: 0.15,
+  },
+
+  /**
+   * CLI-specific retry defaults.
+   */
+  CLI_RETRY_DEFAULTS: {
+    /** Maximum retry attempts for CLI operations. */
+    maxRetries: 2,
+    /** Base delay for CLI retries in milliseconds. */
+    baseDelayMs: 5_000,
+    /** Maximum delay for CLI retries in milliseconds. */
+    maxDelayMs: 60_000,
+    /** Jitter factor for CLI retries. */
+    jitterFactor: 0.2,
+  },
+
+  /**
+   * Test framework retry defaults.
+   */
+  TEST_RETRY_DEFAULTS: {
+    /** Maximum retries per test task. */
+    maxRetries: 2,
+    /** Whether to retry failed tasks by default. */
+    retryFailedTasks: true,
+  },
+
+  /**
+   * Default buffer sizing for batching and chunked processing.
+   */
+  BUFFER_DEFAULTS: {
+    /** Preferred batch size for bulk operations. */
+    batchSize: 100,
+    /** Chunk size for streaming or segmented processing. */
+    chunkSize: 256,
+    /** Maximum items allowed in a buffer. */
+    maxItems: 1_000,
+    /** Maximum memory size in bytes (10 MB). */
+    maxMemoryBytes: 10 * 1024 * 1024,
+    /** Log buffer flush interval in milliseconds. */
+    logFlushIntervalMs: 5_000,
+  },
+
+  // WORKER_DEFAULTS removed in #2977 — the eight settings under this category
+  // (maxWorkers, poolSize, idleTimeoutMs, workflowMaxParallel, testParallelism,
+  // evaluationMaxWorkers, eventBusMaxHistory, swarmObserverMaxEvents) had zero
+  // production consumers. `getWorkerConfig()` was never called from anywhere
+  // in src/, and the matching NEXUS_WORKERS_* env vars were silent no-ops.
+  // Silent config rot is worse than missing knobs; re-add when a concrete
+  // consumer exists.
+
+  /**
+   * Default circuit breaker settings.
+   * (Source: Issue #81 - Circuit breaker for CLI failures)
+   */
+  CIRCUIT_BREAKER_DEFAULTS: {
+    /** Failure threshold to open circuit. */
+    failureThreshold: 5,
+    /** Reset timeout in milliseconds. */
+    resetTimeoutMs: 30_000,
+    /** Success threshold to close circuit in half-open state. */
+    halfOpenSuccessThreshold: 2,
+    /** Whether to count timeouts as failures. */
+    countTimeoutsAsFailures: true,
+    /** Whether to count auth failures as failures. */
+    countAuthFailuresAsFailures: false,
+    /** Whether to count rate limit errors as failures (#1529). */
+    countRateLimitsAsFailures: true,
+    /** Maximum requests allowed in half-open state. */
+    halfOpenMaxRequests: 3,
+  },
+
+  /**
+   * Default context/memory settings.
+   */
+  CONTEXT_DEFAULTS: {
+    /** Maximum context tokens. */
+    maxTokens: 100_000,
+    /** Token budget warning threshold (80%). */
+    warningThreshold: 0.8,
+    /** Token budget critical threshold (95%). */
+    criticalThreshold: 0.95,
+    /** Maximum history entries to retain. */
+    maxHistoryEntries: 1_000,
+  },
+
+  /**
+   * Default provider/model settings.
+   */
+  PROVIDER_DEFAULTS: {
+    /** Default timeout for provider API calls in ms. */
+    timeout: 30_000,
+    /** Maximum retries for provider requests. */
+    maxRetries: 3,
+    /** Default model tier. */
+    defaultTier: 'balanced' as const,
+    /** Default temperature. */
+    temperatureDefault: 0.3,
+    /** Minimum temperature. */
+    temperatureMin: 0,
+    /** Maximum temperature. */
+    temperatureMax: 1,
+    /** Billing mode: 'plan' (monthly subscription) or 'api' (pay-per-token). Env: NEXUS_BILLING_MODE */
+    billingMode: 'plan' as const,
+  },
+
+  /**
+   * Security-related defaults.
+   */
+  SECURITY_DEFAULTS: {
+    /** Maximum system prompt length in characters. */
+    maxSystemPromptLength: 4_000,
+    /** Default policy execution mode — the schema's constant (#6431). */
+    policyDefaultMode: DEFAULT_EXECUTION_MODE,
+    /** Default policy mode. */
+    policyMode: 'enforce' as const,
+    /** Default sandbox mode. */
+    sandboxMode: 'policy' as const,
+    /** Whether to fall back to policy mode if container unavailable. */
+    sandboxFallbackToPolicy: true,
+    /** Whether network is enabled in container mode. */
+    sandboxNetworkEnabled: false,
+  },
+} as const;
+
+// ============================================================================
+// Type Exports for DEFAULTS
+// ============================================================================
+
+/** Type for the DEFAULTS object (readonly/const). */
+export type DefaultsConfig = typeof DEFAULTS;
+
+/** Type for timeout defaults (readonly/const). */
+export type TimeoutDefaultsConst = typeof DEFAULTS.TIMEOUT_DEFAULTS;
+
+/** Type for rate limit defaults (readonly/const). */
+export type RateLimitDefaultsConst = typeof DEFAULTS.RATE_LIMIT_DEFAULTS;
+
+/** Type for retry defaults (readonly/const). */
+export type RetryDefaultsConst = typeof DEFAULTS.RETRY_DEFAULTS;
+
+/** Type for buffer defaults (readonly/const). */
+export type BufferDefaults = typeof DEFAULTS.BUFFER_DEFAULTS;
+
+/** Type for circuit breaker defaults (readonly/const). */
+export type CircuitBreakerDefaultsConst = typeof DEFAULTS.CIRCUIT_BREAKER_DEFAULTS;
+
+/** Type for context defaults (readonly/const). */
+export type ContextDefaults = typeof DEFAULTS.CONTEXT_DEFAULTS;
+
+/** Type for provider defaults (readonly/const). */
+export type ProviderDefaults = typeof DEFAULTS.PROVIDER_DEFAULTS;
+
+/** Type for security defaults (readonly/const). */
+export type SecurityDefaults = typeof DEFAULTS.SECURITY_DEFAULTS;
+
+// ============================================================================
+// Environment Override Functions (bound to DEFAULTS)
+// ============================================================================
+
+// getTimeout removed in #4939. It promised "environment override support" for
+// NEXUS_TIMEOUT_{CLI,API,WORKFLOW,MCP} and had zero production callers — the
+// only reachable effect of setting one was `config get` answering
+// `Source: (env)`. Read DEFAULTS.TIMEOUT_DEFAULTS.* directly; env-driven
+// timeouts are the *_TIMEOUT_MS and NEXUS_TIMEOUT_CLASS_*_MS families.
+//
+// getRetryConfig, getRateLimitConfig and getCircuitBreakerConfig removed in
+// #5903. They promised "environment override support" for twelve NEXUS_*
+// variables that no running code read: `config get` reported them as
+// `Source: (env)` while the rate limiter took `enabled` from the config file,
+// retry used the static DEFAULT_RETRY_CONFIG, and the circuit breakers carried
+// their own config. Same treatment as the worker knobs in #2977 and the
+// per-complexity CLI timeouts in #4180. Read DEFAULTS.* directly.
+
+/**
+ * Gets the tool rate limit configuration for a specific tool category.
+ *
+ * @param tool - Tool category (orchestrate, delegate, workflow, expert)
+ * @returns Rate limit configuration
+ */
+export const getToolRateLimit = createGetToolRateLimit(DEFAULTS.TOOL_RATE_LIMITS);
+
+// getEnvVarDocumentation removed in #4939. After #2977 and #5903 its only
+// remaining table was the four NEXUS_TIMEOUT_* rows, and those named variables
+// nothing read; a generator advertising zero real overrides is not documentation.

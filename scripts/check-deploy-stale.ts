@@ -1,0 +1,287 @@
+/**
+ * Deploy-staleness detector (#4506).
+ *
+ * The website went **14 days** without a successful deploy. One run wedged in
+ * `queued` on 2026-08-09 held the `pages` concurrency group, and 34 subsequent
+ * runs were cancelled before starting a job. Nothing reported it: the site
+ * returned HTTP 200 the whole time, serving v2.173.6 while `main` reached
+ * v3.3.2 — a full major version behind, including documentation for a method
+ * that had been deleted weeks earlier.
+ *
+ * ## Why state-divergence rather than run age
+ *
+ * Chosen 7/7 by a `higher_order` panel on #4506. Age-based and queue-health
+ * alarms both measure *mechanisms*; this measures the **outcome** anyone
+ * actually cares about — is the published artifact current? That catches every
+ * upstream cause: the wedged run, a fail-fast pipeline, a disabled workflow, a
+ * trigger that silently stopped matching, or a deploy that succeeds while
+ * publishing nothing (which is #4507, and happened).
+ *
+ * Two conditions the panel attached, both load-bearing:
+ *
+ *  - **Fail closed on unmeasured.** An unreachable or unparsable site is NOT
+ *    evidence of health. It reports `unmeasured`, which is a failure — per the
+ *    repo rule that a gate must be able to represent absence rather than
+ *    defaulting to a pass.
+ *  - **A grace window.** The contrarian correctly noted that "no threshold
+ *    tuning" was overclaimed: deploys take time, so a version bump legitimately
+ *    leads the site briefly. That window is minutes, not days, and is far
+ *    easier to set than an age threshold.
+ *
+ * Security posture: read-only, no credentials, bounded response read, and the
+ * version is extracted with an anchored pattern rather than a loose digit
+ * scan — the fetched page is untrusted input.
+ *
+ * @module scripts/check-deploy-stale
+ * (Source: Issue #4506)
+ */
+
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { ROOT } from './script-paths.js';
+
+/** Deploys legitimately lag a version bump by minutes. Beyond this, it is stale. */
+export const GRACE_MINUTES = 45;
+
+/** Cap on the fetched page so an unbounded response cannot exhaust memory. */
+const MAX_BYTES = 512 * 1024;
+
+const SITE_URL = 'https://nexus-substrate.github.io/nexus-agents/';
+
+export type DeployStatus = 'current' | 'deploying' | 'stale' | 'unmeasured';
+
+export interface StalenessInput {
+  readonly siteVersion: string | undefined;
+  readonly repoVersion: string;
+  readonly minutesSincePublish: number;
+}
+
+export interface StalenessVerdict {
+  readonly status: DeployStatus;
+  readonly ok: boolean;
+  readonly reason: string;
+}
+
+/**
+ * Extract the published version from the rendered page.
+ *
+ * Anchored on the site's own title convention rather than scanning for any
+ * digit triple, so unrelated version-shaped text cannot be mistaken for the
+ * deployed version. Untrusted input: no eval, no interpolation.
+ */
+export function parseSiteVersion(html: string): string | undefined {
+  // Anchored on either:
+  // 1. Explicit site-version element (<span class="site-version">11.5.9</span>)
+  // 2. The live footer colophon ("nexus-agents v11.5.9 · MIT licensed")
+  // 3. The legacy hero-version element for backwards-compatibility
+  // Unrelated version-shaped text outside these anchors is ignored.
+  const m =
+    /(?:class="[^"]*\bsite-version\b[^"]*"[^>]*>|hero-version[^>]*>|nexus-agents\s+)v?(\d+\.\d+\.\d+)/i.exec(
+      html
+    );
+  return m?.[1];
+}
+
+/** Compare the deployed surface against the repo's source of truth. */
+export function assessDeployStaleness(input: StalenessInput): StalenessVerdict {
+  if (input.siteVersion === undefined) {
+    return {
+      status: 'unmeasured',
+      ok: false,
+      reason:
+        'The live site version could not be read. That is not evidence the deploy is healthy — ' +
+        'an unreadable surface is unmeasured, and unmeasured fails.',
+    };
+  }
+
+  if (input.siteVersion === input.repoVersion) {
+    return {
+      status: 'current',
+      ok: true,
+      reason: `Live site and package.json agree at ${input.repoVersion}.`,
+    };
+  }
+
+  // An unreadable publish time is not "a long time ago". Defaulting it that
+  // way is what made the grace window dead: the workflow never supplied
+  // MINUTES_SINCE_PUBLISH, the script fell back to 9999, and the branch below
+  // could not be reached — so the detector fired on every release during the
+  // normal deploy window. Report the gap in the input rather than guessing
+  // past it.
+  if (!Number.isFinite(input.minutesSincePublish) || input.minutesSincePublish < 0) {
+    return {
+      status: 'unmeasured',
+      ok: false,
+      reason:
+        `Site at ${input.siteVersion}, repo at ${input.repoVersion}, but the publish time ` +
+        'could not be read — so whether this gap is a normal deploy window or a real stall ' +
+        'is unmeasured. Not evidence of either.',
+    };
+  }
+
+  if (input.minutesSincePublish < GRACE_MINUTES) {
+    return {
+      status: 'deploying',
+      ok: true,
+      reason: `Site at ${input.siteVersion}, repo at ${input.repoVersion}, within the ${String(GRACE_MINUTES)}-minute deploy window.`,
+    };
+  }
+
+  return {
+    status: 'stale',
+    ok: false,
+    reason:
+      `Live site is serving ${input.siteVersion} but package.json is ${input.repoVersion}. ` +
+      'The published site does not reflect main — readers are getting documentation for an older release.',
+  };
+}
+
+/** Read the repo's source-of-truth version. */
+function readRepoVersion(): string {
+  const p = join(ROOT, 'packages/nexus-agents/package.json');
+  return (JSON.parse(readFileSync(p, 'utf-8')) as { version: string }).version;
+}
+
+/** npm registry metadata endpoint; `time` maps each version to its publish ISO date. */
+const REGISTRY_URL = 'https://registry.npmjs.org/nexus-agents';
+
+/**
+ * Minutes since `version` was published to npm, or undefined if unreadable.
+ *
+ * The script derives this itself rather than taking it from the environment.
+ * It was an env input supplied by the workflow, the workflow never supplied
+ * it, and the grace window that depends on it was therefore unreachable for
+ * the detector's entire life — a guard broken by the one thing about it that
+ * lived somewhere else. Owning the input removes that failure mode: there is
+ * no wiring left to forget.
+ *
+ * `MINUTES_SINCE_PUBLISH` still overrides, for tests and for a caller that
+ * already knows.
+ */
+/**
+ * Minutes since the registry last published ANYTHING, or `NaN` if unreadable.
+ *
+ * This bounds the absent-version case (#5430). "npm does not have the version
+ * *yet*" is a bounded-time claim, and #5077 is the proof it can be unbounded:
+ * four versions were skipped on npm while every release run reported success.
+ * `release.yml` and `deploy-website.yml` are independent workflows over the
+ * same version bump, so a merged version PR can leave the site wedged AND the
+ * version missing from npm — and an unconditional `0` then sits inside the
+ * grace window on every run, reporting `deploying / ok` forever. That is the
+ * "healthy while stale" outcome #4506 built this detector to end.
+ *
+ * A registry that published something minutes ago and does not yet have our
+ * version is credibly mid-publish. One that has been idle for days is not: the
+ * publish did not happen. The function cannot distinguish those from the
+ * version's own absence — both arrive as `undefined` — so it asks the registry
+ * when it last did anything instead.
+ *
+ * `GRACE_MINUTES` is reused rather than a second threshold invented: a publish
+ * that has not landed within the site's deploy window is not in flight either.
+ *
+ * `created` is excluded because it dates the package, not a publish. It only
+ * changes the answer when there is nothing else in the map — and that is
+ * precisely the case it must not answer: a freshly created package with zero
+ * published versions would otherwise read as "activity one minute ago", i.e.
+ * mid-publish, forever. (It cannot drag a max backwards; excluding it is about
+ * reachability, not ordering.) `modified` IS counted — it is the last publish
+ * time, and answers this question most directly when present.
+ */
+function registryIdleMinutes(time: Record<string, string>, nowMs: number): number {
+  let newestMs = Number.NaN;
+  for (const [key, value] of Object.entries(time)) {
+    if (key === 'created') continue;
+    const ms = Date.parse(value);
+    if (Number.isNaN(ms)) continue;
+    if (Number.isNaN(newestMs) || ms > newestMs) newestMs = ms;
+  }
+  if (Number.isNaN(newestMs)) return Number.NaN;
+  return (nowMs - newestMs) / 60_000;
+}
+
+/** The `time` map shape this reads out of the npm registry response. */
+export interface RegistryTimes {
+  readonly time?: Record<string, string>;
+}
+
+/**
+ * Minutes since `version` was published, from a registry body.
+ *
+ * Extracted as a pure function because this seam is where all three of this
+ * detector's bugs lived (#4551, #4557, and the unpublished-version case) while
+ * its unit tests stayed green throughout — they exercised the assessor with
+ * SUPPLIED inputs, and every bug was in what the input turned out to be. The
+ * I/O wrapper below is now the only untested part.
+ *
+ * Four outcomes, deliberately distinct:
+ *  - published → elapsed minutes
+ *  - **absent, registry still active** → `0`, a deploy in flight; npm does not
+ *    have the version, so the site cannot be serving it
+ *  - **absent, registry idle** → `NaN`. See {@link registryIdleMinutes}.
+ *  - unparseable or no `time` map → `NaN`, reported as unmeasured
+ */
+export function elapsedMinutesFrom(body: RegistryTimes, version: string, nowMs: number): number {
+  // No `time` map at all is a malformed or unexpected response — unmeasured.
+  // Collapsing it into the absent-version case would report a registry we
+  // could not understand as "just published", i.e. healthy. Caught by the
+  // test written for this seam, before it shipped.
+  if (body.time === undefined) return Number.NaN;
+
+  const published = body.time[version];
+  if (published === undefined) {
+    const idle = registryIdleMinutes(body.time, nowMs);
+    return Number.isFinite(idle) && idle < GRACE_MINUTES ? 0 : Number.NaN;
+  }
+
+  const publishedMs = Date.parse(published);
+  if (Number.isNaN(publishedMs)) return Number.NaN;
+  return (nowMs - publishedMs) / 60_000;
+}
+
+async function minutesSincePublish(version: string): Promise<number> {
+  const override = process.env['MINUTES_SINCE_PUBLISH'];
+  if (override !== undefined && override.trim() !== '') return Number(override);
+
+  try {
+    const res = await fetch(REGISTRY_URL, { redirect: 'follow' });
+    if (!res.ok) return Number.NaN;
+    return elapsedMinutesFrom((await res.json()) as RegistryTimes, version, Date.now());
+  } catch {
+    // Unreadable, which the assessor reports as unmeasured — not as "long ago".
+    return Number.NaN;
+  }
+}
+
+/** Fetch the live page, bounded; undefined on any failure (reported as unmeasured). */
+async function fetchSite(): Promise<string | undefined> {
+  try {
+    const res = await fetch(SITE_URL, { redirect: 'follow' });
+    if (!res.ok) return undefined;
+    const text = await res.text();
+    return text.slice(0, MAX_BYTES);
+  } catch {
+    return undefined;
+  }
+}
+
+async function main(): Promise<void> {
+  const repoVersion = readRepoVersion();
+  const [html, elapsed] = await Promise.all([fetchSite(), minutesSincePublish(repoVersion)]);
+
+  const verdict = assessDeployStaleness({
+    siteVersion: html === undefined ? undefined : parseSiteVersion(html),
+    repoVersion,
+    minutesSincePublish: elapsed,
+  });
+
+  console.log(`[${verdict.status}] ${verdict.reason}`);
+  if (!verdict.ok) {
+    console.log(`::error::Deploy staleness: ${verdict.reason}`);
+    process.exitCode = 1;
+  }
+}
+
+if (process.argv[1]?.endsWith('check-deploy-stale.ts') === true) {
+  void main();
+}

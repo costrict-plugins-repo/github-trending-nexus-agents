@@ -1,0 +1,347 @@
+---
+title: CLI Delegation Guide
+description: Practical guide for delegating tasks to Claude, Gemini, Codex, and OpenCode CLIs
+diataxis: how-to
+audience: project
+tier: 2
+keywords: [cli, delegation, routing, adapter, claude, gemini, codex, opencode]
+---
+
+# CLI Delegation Guide
+
+**Tier 2** | Practical guide for delegating tasks to external CLIs
+**Hub:** [README.md](./README.md) | **Routing Architecture:** [ROUTING_SYSTEM.md](../architecture/ROUTING_SYSTEM.md)
+
+---
+
+## Overview
+
+This guide covers when and how to delegate tasks to Claude, Gemini, Codex, or OpenCode CLIs. Based on real testing with measured performance metrics.
+
+---
+
+## Decision Flowchart
+
+```
+Task arrives
+    │
+    ├─ Large codebase analysis (>500 files)?
+    │       └─ YES → Gemini (1M context)
+    │
+    ├─ Code generation / boilerplate?
+    │       └─ YES → Codex (3-6s latency)
+    │
+    ├─ Complex reasoning / architecture?
+    │       └─ YES → Claude (highest quality)
+    │
+    ├─ Custom model / OpenAI-compatible endpoint?
+    │       └─ YES → OpenCode (gateway routing)
+    │
+    └─ Simple query / quick task?
+            └─ Gemini (cost-effective)
+```
+
+---
+
+## CLI Profiles
+
+### Gemini (via `agy`)
+
+The standalone `gemini` CLI is retired: it exits 55 with `IneligibleTierError`
+on every invocation (#4389). The `gemini` routing arm keeps its name but spawns
+`agy` (Google's Antigravity CLI), which serves the Gemini models.
+
+**Strengths:** Massive context window, fast codebase analysis, cost-effective.
+
+| Metric      | Measured Value | Notes                      |
+| ----------- | -------------- | -------------------------- |
+| Latency     | 10-73s         | Measured on the old CLI    |
+| Max Context | 1M tokens      | ~978 files in single query |
+| Best For    | Analysis       | Code review, exploration   |
+| Cost        | Low            | Free tier available        |
+
+**Invocation:**
+
+```bash
+# Non-interactive prompt mode; model slugs come from `agy models`
+agy --model gemini-3.1-pro-high --print "Analyze this codebase for security issues"
+
+# Large prompts on stdin, with the workspace named explicitly (#6254)
+cat prompt.md | agy --output-format json --add-dir "$PWD"
+```
+
+**JSON Output Parsing:**
+
+`--output-format json` returns
+`{conversation_id, status, response, duration_seconds, num_turns, usage}`.
+agy exits 0 even when the run failed, so check `status`, never the exit code.
+A `SUCCESS` envelope with an empty `response` is a stalled turn (#6277), not an
+empty answer. In this repo, reuse `AgyResponseParser`
+(`packages/nexus-agents/src/cli-adapters/parsers/agy-parser.ts`).
+
+```typescript
+function parseAgyOutput(output: string): string {
+  const result = JSON.parse(output) as { status: string; response?: string; error?: string };
+  if (result.status !== 'SUCCESS') throw new Error(result.error ?? `agy status ${result.status}`);
+  if (result.response === undefined || result.response.trim() === '') {
+    throw new Error('agy returned an empty response');
+  }
+  return result.response;
+}
+```
+
+### Codex CLI
+
+**Strengths:** Fast code generation, optimized for implementation tasks.
+
+| Metric      | Measured Value | Notes                        |
+| ----------- | -------------- | ---------------------------- |
+| Latency     | 3-6s           | Consistently fast            |
+| Max Context | 128K tokens    | Sufficient for most tasks    |
+| Best For    | Generation     | Boilerplate, implementations |
+| Cost        | Medium         | Per-token pricing            |
+
+**Invocation:**
+
+```bash
+# Non-interactive execution mode (required for automation)
+codex exec "Implement a rate limiter class in TypeScript"
+
+# With specific output format
+codex exec "Generate Jest tests for auth.ts" --format code
+```
+
+**Important:** Always use `codex exec` for non-interactive mode. The default `codex` command expects interactive input.
+
+### Claude CLI
+
+**Strengths:** Highest reasoning quality, best for complex decisions.
+
+| Metric      | Measured Value | Notes                       |
+| ----------- | -------------- | --------------------------- |
+| Latency     | 5-30s          | Depends on task complexity  |
+| Max Context | 200K tokens    | Sufficient for most tasks   |
+| Best For    | Reasoning      | Architecture, complex logic |
+| Cost        | Higher         | Premium for quality         |
+
+**Invocation:**
+
+```bash
+# Standard prompt
+claude "Design the authentication flow for this system"
+
+# With file context
+claude "Review this PR" --files "src/**/*.ts"
+```
+
+### OpenCode CLI
+
+**Strengths:** OpenAI-compatible gateway, custom model routing, MCP integration.
+
+| Metric      | Measured Value  | Notes                             |
+| ----------- | --------------- | --------------------------------- |
+| Latency     | 5-30s           | Depends on provider/model         |
+| Max Context | Model-dependent | Uses configured provider's limits |
+| Best For    | Custom models   | OpenAI-compatible endpoints       |
+| Cost        | Varies          | Depends on configured provider    |
+
+**Invocation:**
+
+```bash
+# Version check
+opencode --version
+
+# Interactive mode (default)
+opencode
+```
+
+**Configuration:** OpenCode uses `opencode.json` for MCP server and provider configuration:
+
+```json
+{
+  "mcp": {
+    "nexus-agents": {
+      "type": "local",
+      "command": ["node", "dist/cli.js", "--mode=server"]
+    }
+  }
+}
+```
+
+OpenCode supports custom OpenAI-compatible endpoints via its provider configuration, enabling routing through any API gateway. See [CUSTOM_ENDPOINT_SETUP.md](../guides/CUSTOM_ENDPOINT_SETUP.md) for details.
+
+---
+
+## Task-CLI Matching Matrix
+
+| Task Type               | Primary CLI | Fallback | Rationale                      |
+| ----------------------- | ----------- | -------- | ------------------------------ |
+| Codebase exploration    | Gemini      | Claude   | 1M context handles large repos |
+| Security audit          | Claude      | Gemini   | Reasoning quality matters      |
+| Boilerplate generation  | Codex       | Claude   | Speed + code focus             |
+| Architecture decisions  | Claude      | -        | No substitute for reasoning    |
+| Test generation         | Codex       | Claude   | Pattern matching sufficient    |
+| Documentation writing   | Claude      | Gemini   | Quality prose needed           |
+| Quick questions         | Gemini      | Codex    | Cost-effective                 |
+| Refactoring suggestions | Claude      | Gemini   | Context understanding needed   |
+| Custom model routing    | OpenCode    | Claude   | OpenAI-compatible endpoints    |
+
+---
+
+## Integration with nexus-agents
+
+### Using the CompositeRouter
+
+The routing system automatically selects the optimal CLI:
+
+```typescript
+import { createCompositeRouter } from 'nexus-agents';
+
+const router = createCompositeRouter({
+  enableBudgetFilter: true,
+  enableTopsisRanking: true,
+  enableLinUCBSelection: true,
+});
+
+const decision = await router.route({
+  description: 'Analyze codebase for performance issues',
+  contextTokens: 50000,
+  constraints: { maxLatencyMs: 30000 },
+});
+
+// decision.cliName: 'gemini' | 'claude' | 'codex'
+// decision.confidence: 0.0-1.0
+// decision.reason: "Selected gemini: large context (50k tokens) favors 1M window"
+```
+
+### Manual Delegation via Subprocess
+
+For direct CLI invocation:
+
+```typescript
+import { execFileSync, execSync } from 'child_process';
+
+function delegateToGemini(prompt: string): string {
+  // agy serves the gemini arm. Prompt on stdin: no shell, no argv length limit.
+  const output = execFileSync('agy', ['--output-format', 'json', '--print-timeout', '115s'], {
+    input: prompt,
+    encoding: 'utf-8',
+    timeout: 120000, // 2 minute timeout
+  });
+  return parseAgyOutput(output); // agy exits 0 on failure; see above
+}
+
+function delegateToCodex(prompt: string): string {
+  const result = execSync(`codex exec "${prompt.replace(/"/g, '\\"')}"`, {
+    encoding: 'utf-8',
+    timeout: 30000, // 30 second timeout
+  });
+  return result;
+}
+```
+
+### Routing Audit
+
+Debug routing decisions before execution:
+
+```bash
+nexus-agents routing-audit "Implement sorting algorithm" --format=json
+```
+
+Output shows:
+
+- Task profile (complexity, context requirements)
+- Budget filter results
+- TOPSIS scores per CLI
+- Final selection with reasoning
+
+---
+
+## Troubleshooting
+
+### Gemini Issues
+
+**Problem:** Output contains markdown instead of raw JSON.
+
+**Solution:** Parse with fence stripping (see JSON Output Parsing above).
+
+**Problem:** Timeout on large context.
+
+**Solution:** Increase timeout to 120s. For very large contexts (>500K tokens), consider chunking.
+
+### Codex Issues
+
+**Problem:** Command hangs waiting for input.
+
+**Solution:** Use `codex exec` instead of `codex`. The exec subcommand runs non-interactively.
+
+**Problem:** Truncated output.
+
+**Solution:** Check `--max-tokens` flag. Default may be low for large generations.
+
+### Claude Issues
+
+**Problem:** Rate limited.
+
+**Solution:** Check `ANTHROPIC_API_KEY` tier. Implement exponential backoff:
+
+```typescript
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i === maxRetries - 1) throw error;
+      await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, i)));
+    }
+  }
+  throw new Error('Unreachable');
+}
+```
+
+### General Issues
+
+**Problem:** CLI not found.
+
+**Solution:** Verify installation:
+
+```bash
+which agy && agy --version   # the gemini arm runs agy
+which codex && codex --version
+which claude && claude --version
+```
+
+**Problem:** Wrong CLI selected.
+
+**Solution:** Use `routing-audit` to understand selection. Override with explicit budget constraints:
+
+```typescript
+router.route({
+  description: 'task',
+  constraints: { maxLatencyMs: 5000 }, // Forces fast CLI
+});
+```
+
+---
+
+## Best Practices
+
+1. **Prefer automatic routing** - Let CompositeRouter decide unless you have specific requirements.
+
+2. **Set appropriate timeouts** - Gemini: 120s, Codex: 30s, Claude: 60s.
+
+3. **Handle JSON parsing** - Always strip potential markdown fencing from Gemini output.
+
+4. **Use exec mode** - Codex requires `exec` subcommand for non-interactive use.
+
+5. **Monitor costs** - Enable budget filtering to prevent runaway spending.
+
+6. **Log routing decisions** - Record `decision.reason` for debugging.
+
+---
+
+## Related Documents
+
+- **Routing System:** [ROUTING_SYSTEM.md](../architecture/ROUTING_SYSTEM.md)
+- **Agent Development:** [AGENT_DEVELOPMENT.md](./AGENT_DEVELOPMENT.md)
+- **Tool Development:** [TOOL_DEVELOPMENT.md](./TOOL_DEVELOPMENT.md)

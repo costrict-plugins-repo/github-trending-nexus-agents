@@ -1,0 +1,3197 @@
+/* eslint-disable max-lines -- one renderer per injected section of CLAUDE.md/AGENTS.md (tools, experts, workflows, skills, rules, env table) kept in the file that owns the injection markers; the 3,200 lines are the section catalogue, and every section is gated by the same check mode */
+/**
+ * Governance Injection Script
+ *
+ * Generates and injects documentation for MCP tools, expert types,
+ * workflow templates, and skills into CLAUDE.md from canonical source code.
+ * Prevents documentation drift by reading directly from source of truth.
+ *
+ * Per System Mandate - Constraint #4: MCP Governance Injection
+ *
+ * Usage:
+ *   pnpm exec tsx scripts/inject-governance.ts          # inject all sections
+ *   pnpm exec tsx scripts/inject-governance.ts inject    # same as above
+ *   pnpm exec tsx scripts/inject-governance.ts check     # CI validation mode
+ *
+ * @module scripts/inject-governance
+ * (Source: Issue #569, #761)
+ */
+
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { basename, dirname, join, relative } from 'node:path';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import * as prettier from 'prettier';
+import { Node, Project, SyntaxKind, SourceFile } from 'ts-morph';
+import { parse as parseYaml } from 'yaml';
+import { ROOT } from './script-paths.js';
+import { parseRegisteredToolNames } from './parse-tool-manifest.js';
+import { parseCommandCatalog, type ParsedCatalogEntry } from './parse-cli-command-catalog.js';
+import { TOOL_DESCRIPTIONS, README_TOOL_DESCRIPTIONS } from './tool-descriptions-data.js';
+import { loadBaseline, runDistinctnessCheck } from './check-tool-distinctness.js';
+import { scanToolFilesWithCoverage } from './check-tool-output-consistency.js';
+import {
+  newOffenders as newMemoryContractOffenders,
+  readBaseline as readMemoryContractBaseline,
+  scan as scanMemoryContract,
+} from './check-memory-contract.js';
+import { checkStrategyManifestRegistry } from './check-strategy-manifest-drift.js';
+import { STRATEGY_MANIFEST_REGISTRY } from '../packages/nexus-agents/src/orchestration/strategy-manifest-registry.js';
+import { checkAuthorityTierDeclarations } from './check-authority-tier-drift.js';
+import { GOVERNANCE_STAMP_DIGEST_LENGTH } from './governance-stamp-exemption.js';
+import { MARKERS } from './governance-markers.js';
+import { governorPathsFromCodeowners, unresolvedGovernorPatterns } from './governor-section.js';
+const CLAUDE_MD_PATH = join(ROOT, 'CLAUDE.md');
+const README_PATH = join(ROOT, 'README.md');
+// #3334: docs/ENTRYPOINTS.md carries TWO MCP-tool enumerations (a prose
+// markdown table + a `BEGIN:MCP_TOOLS` YAML block) that drifted to 42/45
+// while REGISTERED_TOOL_NAMES grew. Both are now generated from the same
+// registry + TOOL_DESCRIPTIONS corpus as the CLAUDE.md / README surfaces.
+const ENTRYPOINTS_PATH = join(ROOT, 'docs/ENTRYPOINTS.md');
+// #5458: docs/ENTRYPOINTS.md's CLI command tables are generated from the
+// command catalog (the same literal `--help` renders from). Deliberately NOT
+// one of `getGovernanceSourceDate()`'s inputs: a catalog edit must not move
+// the governance version stamp (#5491).
+const CLI_COMMAND_CATALOG = join(ROOT, 'packages/nexus-agents/src/cli-command-catalog.ts');
+const TOOLS_INDEX = join(ROOT, 'packages/nexus-agents/src/mcp/tools/index.ts');
+// #3566: the canonical tool-name list is now the leaf `TOOL_MANIFEST` array;
+// `REGISTERED_TOOL_NAMES` is a derived re-export, so the parser reads the manifest.
+const TOOL_MANIFEST_FILE = join(ROOT, 'packages/nexus-agents/src/mcp/tools/tool-manifest.ts');
+const EXPERT_CONFIG = join(ROOT, 'packages/nexus-agents/src/agents/experts/expert-config.ts');
+const TEMPLATE_TYPES = join(ROOT, 'packages/nexus-agents/src/workflows/template-types.ts');
+const SKILLS_DIR = join(ROOT, 'skills');
+const AGENTS_DIR = join(ROOT, 'agents');
+const PACKAGE_JSON_PATH = join(ROOT, 'packages/nexus-agents/package.json');
+
+// Additional inject targets for #1837 count-drift prevention.
+const AGENTS_MD_PATH = join(ROOT, 'AGENTS.md');
+const PLUGIN_JSON_PATH = join(ROOT, '.claude-plugin/plugin.json');
+const MARKETPLACE_JSON_PATH = join(ROOT, '.claude-plugin/marketplace.json');
+const PLUGIN_INSTALL_PATH = join(ROOT, 'docs/getting-started/PLUGIN_INSTALL.md');
+// MCP-spec server.json — what the model context protocol registry reads.
+// Drifted to 2.53.0 while package.json was at 2.63.1; see #2326 / #2327.
+const SERVER_JSON_PATH = join(ROOT, 'packages/nexus-agents/server.json');
+
+/**
+ * Write `content` to `path` after running it through prettier with the
+ * filepath's parser, so the on-disk shape exactly matches what
+ * `lint-staged → prettier --write` produces on commit (#2290).
+ *
+ * Without this, `inject-governance.ts` and the lint-staged hook produce
+ * subtly different padding on markdown tables — one trailing-space
+ * difference is enough to fail the docs-check `Verify injection
+ * idempotency` step on every tool/expert/workflow add.
+ */
+async function writeFormatted(path: string, content: string): Promise<void> {
+  writeFileSync(path, await formatWithPrettier(path, content));
+}
+
+/**
+ * A prettier failure — a malformed `.prettierrc`, a construct its parser
+ * rejects — named by the file it was formatting (#6087). `check` reports it as
+ * `governance:check: could not format <path>: <prettier message>` and fails
+ * with exit 1, instead of the CLI dying on an unhandled rejection with a stack
+ * trace as the only output. Typed so the check path can catch exactly this and
+ * let generator invariants (malformed AGNOSTIC:BODY markers) keep throwing.
+ */
+export class FormatError extends Error {
+  constructor(path: string, cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    super(`could not format ${path}: ${message}`, { cause });
+    this.name = 'FormatError';
+  }
+}
+
+/**
+ * The ONE formatting authority for generated files (#6062): prettier, with the
+ * config resolved for `path` and `path`'s parser. The governor gate instead
+ * resolves config and plugins from the trusted script checkout (#6369). Every writer
+ * ({@link writeFormatted}) and the CLAUDE.md render ({@link renderClaudeMd})
+ * that `check` compares go through here, so what `inject` writes and what
+ * `check` expects are normalized by the same pass. When they were not, any
+ * AGENTS.md prose prettier reshapes (an inline code span wrapped across a line
+ * break is enough) made `check` fail forever while prescribing an `inject`
+ * that changed nothing.
+ */
+export async function formatWithPrettier(path: string, content: string): Promise<string> {
+  try {
+    // The governor gate treats the target as data: even formatter config can execute JS.
+    const formatterPath =
+      process.env['NEXUS_GOVERNOR_GATE'] === '1'
+        ? join(dirname(fileURLToPath(import.meta.url)), '..', basename(path))
+        : path;
+    const config = await prettier.resolveConfig(formatterPath);
+    return await prettier.format(content, { ...(config ?? {}), filepath: formatterPath });
+  } catch (error: unknown) {
+    throw new FormatError(path, error);
+  }
+}
+
+// Markers for governance sections
+
+// #3446: the AGENTS.md agnostic body is delimited by these markers. The text
+// strictly BETWEEN them (exclusive of the marker lines) is the single source
+// of harness-neutral content that re-enters CLAUDE.md via the generated block.
+const AGNOSTIC_BODY_START = '<!-- AGNOSTIC:BODY:START -->';
+const AGNOSTIC_BODY_END = '<!-- AGNOSTIC:BODY:END -->';
+
+// #3334: the ENTRYPOINTS.md YAML block already shipped with these markers
+// (a different convention from the GOVERNANCE:* family). Reuse them rather
+// than re-marking the block, so the diff stays minimal.
+const ENTRYPOINTS_YAML_START = '<!-- BEGIN:MCP_TOOLS -->';
+const ENTRYPOINTS_YAML_END = '<!-- END:MCP_TOOLS -->';
+
+// #3334: tools whose ENTRYPOINTS auth surface is not the default
+// "None (local)" / `none`. Only `run_dev_pipeline` is currently optional
+// (it can take a GitHub token). Keyed by tool name; the value is the
+// canonical auth label rendered in both the prose table and the YAML block.
+const ENTRYPOINTS_TOOL_AUTH: Record<string, { prose: string; yaml: string }> = {
+  run_dev_pipeline: { prose: 'Optional', yaml: 'optional' },
+};
+
+const ENTRYPOINTS_DEFAULT_AUTH = { prose: 'None (local)', yaml: 'none' } as const;
+
+const SKILLS_INDEX_PATH = join(SKILLS_DIR, 'index.yaml');
+const RULES_DIR = join(ROOT, '.rules');
+
+// ============================================================================
+// Registry Extraction
+// ============================================================================
+
+interface ToolMetadata {
+  name: string;
+  description: string;
+}
+
+interface ExpertMetadata {
+  role: string;
+  displayName: string;
+}
+
+interface WorkflowMetadata {
+  name: string;
+  category: string;
+}
+
+interface SkillMetadata {
+  name: string;
+  filename: string;
+}
+
+/**
+ * Workflow row rendered from skills/index.yaml — the canonical, auto-generated
+ * skill registry (#2317). Description is the first line of the skill's
+ * descriptive blob; triggers are taken verbatim.
+ */
+interface WorkflowRow {
+  name: string;
+  description: string;
+  triggers: readonly string[];
+}
+
+// Curated MCP tool descriptions live in `tool-descriptions-data.ts` (imported
+// at the top of this file) so the #2650 distinctness lint can import the same
+// corpus this script renders into the CLAUDE.md / README tables.
+// `extractMcpTools()` below validates TOOL_DESCRIPTIONS against the canonical
+// tools array in index.ts.
+
+/**
+ * Extract registered MCP tools from the canonical tools/index.ts.
+ * Reads the `tools` array in `registerTools()` return value and
+ * matches against curated descriptions.
+ */
+function extractMcpTools(): ToolMetadata[] {
+  // #3566: source of truth is the leaf `TOOL_MANIFEST` array in tool-manifest.ts.
+  // Fall back to tools/index.ts (`REGISTERED_TOOL_NAMES`) for pre-#3566 checkouts.
+  const manifestExists = existsSync(TOOL_MANIFEST_FILE);
+  const sourceFile = manifestExists ? TOOL_MANIFEST_FILE : TOOLS_INDEX;
+  if (!existsSync(sourceFile)) {
+    console.error('MCP tool manifest/index not found: ' + sourceFile);
+    return [];
+  }
+
+  const content = readFileSync(sourceFile, 'utf-8');
+
+  // Extract the tool names by walking the AST (#3596). Source of truth is the
+  // module-level `TOOL_MANIFEST` array (or, pre-#3566, `REGISTERED_TOOL_NAMES`),
+  // with a legacy inline `tools: [...]` fallback for very old checkouts. AST
+  // parsing reads a literal regardless of formatting and is the seam that lets the
+  // list become fully derived later (a regex over a literal cannot).
+  const toolNames = parseRegisteredToolNames(content);
+  if (toolNames.length === 0) {
+    console.error('Could not parse tools array from ' + sourceFile);
+    return [];
+  }
+
+  // Warn about tools in code but not in description map
+  for (const name of toolNames) {
+    if (!(name in TOOL_DESCRIPTIONS)) {
+      console.warn(
+        `WARNING: Tool '${name}' found in code but not in TOOL_DESCRIPTIONS map. Add a description.`
+      );
+    }
+  }
+
+  return toolNames.map((name) => ({
+    name,
+    description: TOOL_DESCRIPTIONS[name] ?? `${name} tool`,
+  }));
+}
+
+/**
+ * Extract built-in expert types from expert-config.ts.
+ * Reads the BuiltInExpertType union type.
+ */
+function extractExpertTypes(): ExpertMetadata[] {
+  if (!existsSync(EXPERT_CONFIG)) {
+    console.error('Expert config not found: ' + EXPERT_CONFIG);
+    return [];
+  }
+
+  const content = readFileSync(EXPERT_CONFIG, 'utf-8');
+
+  // Extract from BuiltInExpertType union
+  const typeMatch = content.match(/type\s+BuiltInExpertType\s*=\s*([\s\S]*?);/);
+  if (typeMatch?.[1] === undefined) {
+    console.error('Could not parse BuiltInExpertType from expert-config.ts');
+    return [];
+  }
+
+  const roles = typeMatch[1]
+    .split('|')
+    .map((s) => s.trim().replace(/['"]/g, ''))
+    .filter((s) => s.length > 0);
+
+  return roles.map((role) => ({
+    role,
+    displayName: role.charAt(0).toUpperCase() + role.slice(1),
+  }));
+}
+
+/**
+ * Parse category mapping from TEMPLATE_CATEGORIES in file content.
+ */
+function parseCategoryMap(content: string): Map<string, string> {
+  const categoryMatch = content.match(
+    /TEMPLATE_CATEGORIES[\s\S]*?=\s*\{([\s\S]*?)\}\s*(?:as\s*const)?;/
+  );
+  const categoryMap = new Map<string, string>();
+  if (categoryMatch?.[1] !== undefined) {
+    const entries = categoryMatch[1].matchAll(/'([^']+)':\s*'([^']+)'/g);
+    for (const entry of entries) {
+      if (entry[1] !== undefined && entry[2] !== undefined) {
+        categoryMap.set(entry[1], entry[2]);
+      }
+    }
+  }
+  return categoryMap;
+}
+
+/**
+ * Extract built-in workflow templates from template-types.ts.
+ * Reads the BUILT_IN_TEMPLATES const array.
+ */
+function extractWorkflowTemplates(): WorkflowMetadata[] {
+  if (!existsSync(TEMPLATE_TYPES)) {
+    console.error('Template types not found: ' + TEMPLATE_TYPES);
+    return [];
+  }
+
+  const content = readFileSync(TEMPLATE_TYPES, 'utf-8');
+  const templatesMatch = content.match(/BUILT_IN_TEMPLATES\s*=\s*\[([\s\S]*?)\]\s*as\s*const/);
+  if (templatesMatch?.[1] === undefined) {
+    console.error('Could not parse BUILT_IN_TEMPLATES from template-types.ts');
+    return [];
+  }
+
+  const names = templatesMatch[1]
+    .split('\n')
+    .map((line) => line.match(/'([^']+)'/)?.[1])
+    .filter((name): name is string => name !== undefined);
+
+  const categoryMap = parseCategoryMap(content);
+  return names.map((name) => ({
+    name,
+    category: categoryMap.get(name) ?? 'custom',
+  }));
+}
+
+/**
+ * Extract skills from .claude/skills/ directory.
+ */
+/**
+ * Extract the canonical skill list from `skills/index.yaml` (#2317).
+ * The YAML index is itself auto-generated by `scripts/generate-skills-index.ts`,
+ * so each skill's description and triggers come from a single source of truth.
+ *
+ * Falls back to `[]` if the index is missing — `extractSkills()` (the count-
+ * source) still scans the directory directly, so the count probes keep working.
+ */
+function parseSkillEntries(parsed: unknown): unknown[] | null {
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const skills = (parsed as { skills?: unknown }).skills;
+  return Array.isArray(skills) ? skills : null;
+}
+
+function toWorkflowRow(entry: unknown): WorkflowRow | null {
+  if (typeof entry !== 'object' || entry === null) return null;
+  const e = entry as { name?: unknown; description?: unknown; triggers?: unknown };
+  if (typeof e.name !== 'string') return null;
+  const description = typeof e.description === 'string' ? e.description : '';
+  const triggers = Array.isArray(e.triggers)
+    ? e.triggers.filter((t): t is string => typeof t === 'string')
+    : [];
+  return { name: e.name, description: firstSentence(description), triggers };
+}
+
+function extractWorkflowRows(): WorkflowRow[] {
+  if (!existsSync(SKILLS_INDEX_PATH)) {
+    console.error('skills/index.yaml not found: ' + SKILLS_INDEX_PATH);
+    return [];
+  }
+  const entries = parseSkillEntries(parseYaml(readFileSync(SKILLS_INDEX_PATH, 'utf-8')));
+  if (entries === null) {
+    console.error('skills/index.yaml: missing or malformed `skills` array');
+    return [];
+  }
+  const rows = entries.map(toWorkflowRow).filter((r): r is WorkflowRow => r !== null);
+  return rows.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Returns the first sentence of a multi-line description, with newlines
+ * collapsed to spaces. We deliberately do NOT truncate — the table cell
+ * width is dynamic, and a one-sentence cap is enough to keep rows scannable
+ * without losing meaning.
+ */
+function firstSentence(text: string): string {
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (collapsed === '') return '';
+  const periodIdx = collapsed.indexOf('. ');
+  return periodIdx === -1 ? collapsed : collapsed.slice(0, periodIdx + 1);
+}
+
+function extractSkills(): SkillMetadata[] {
+  if (!existsSync(SKILLS_DIR)) {
+    console.error('Skills directory not found: ' + SKILLS_DIR);
+    return [];
+  }
+
+  // Canonical layout (#1828): skills/<name>/SKILL.md
+  const dirs = readdirSync(SKILLS_DIR, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && existsSync(join(SKILLS_DIR, e.name, 'SKILL.md')))
+    .map((e) => e.name)
+    .sort();
+
+  return dirs.map((name) => ({
+    name,
+    filename: join(name, 'SKILL.md'),
+  }));
+}
+
+/**
+ * Count plugin-native agents from agents/<name>.md (#1837).
+ */
+function extractAgents(): string[] {
+  if (!existsSync(AGENTS_DIR)) return [];
+  return readdirSync(AGENTS_DIR)
+    .filter((f) => f.endsWith('.md') && f !== 'index.yaml')
+    .map((f) => f.replace(/\.md$/, ''))
+    .sort();
+}
+
+// ============================================================================
+// Generation
+// ============================================================================
+
+/**
+ * Generate the MCP tools reference for CLAUDE.md. Emits a flat
+ * comma-separated list of tool names — descriptions and schemas live in
+ * `docs/ENTRYPOINTS.md` and the README MCP tools table (which still gets
+ * the long form via `generateReadmeToolTable`). The CLAUDE.md form is
+ * tuned for context efficiency: agents need to know the name to look up
+ * the schema, not re-read 38 one-line descriptions on every conversation.
+ */
+function generateToolIndex(tools: ToolMetadata[]): string {
+  const names = tools.map((t) => '`' + t.name + '`').join(', ');
+
+  const lines = [
+    MARKERS.toolIndexStart,
+    '',
+    '## MCP Tools Reference',
+    '',
+    `**${String(tools.length)} MCP tools registered.** Full schemas, parameter docs, and one-line summaries in [docs/ENTRYPOINTS.md](./docs/ENTRYPOINTS.md) and the README MCP tools table. Names below; look up the schema before calling.`,
+    '',
+    names,
+    '',
+    `_Auto-generated from source. ${String(tools.length)} tools registered._`,
+    '',
+    MARKERS.toolIndexEnd,
+  ];
+
+  return lines.join('\n');
+}
+
+/**
+ * Inject the MCP tools reference between its markers. Soft-skips when the
+ * markers are absent, like {@link injectWorkflowIndex} and
+ * {@link injectRulesIndex}: the same injector writes AGENTS.md's copy (#6105)
+ * and CLAUDE.md's, so a file without the markers is left alone rather than
+ * having the section appended to it.
+ */
+function injectToolIndex(content: string, tools: ToolMetadata[]): string {
+  if (!content.includes(MARKERS.toolIndexStart)) return content;
+  return injectSection(
+    content,
+    MARKERS.toolIndexStart,
+    MARKERS.toolIndexEnd,
+    generateToolIndex(tools)
+  );
+}
+
+/**
+ * Generate the README MCP tools table. Uses short descriptions from
+ * `README_TOOL_DESCRIPTIONS`, falling back to the long `TOOL_DESCRIPTIONS`
+ * entry when no short variant exists (with a warning so the maintainer
+ * notices and writes one).
+ */
+function generateReadmeToolTable(tools: ToolMetadata[]): string {
+  const rows = tools.map((t) => {
+    const short = README_TOOL_DESCRIPTIONS[t.name];
+    if (short === undefined) {
+      console.warn(
+        `WARNING: Tool '${t.name}' has no README short description. ` +
+          `Add one to README_TOOL_DESCRIPTIONS in scripts/inject-governance.ts. ` +
+          `Falling back to long description.`
+      );
+    }
+    return { name: t.name, desc: short ?? t.description };
+  });
+
+  const toolCells = rows.map((r) => '`' + r.name + '`');
+  const descCells = rows.map((r) => r.desc);
+  const toolColWidth = Math.max('Tool'.length, ...toolCells.map((c) => c.length));
+  const descColWidth = Math.max('Description'.length, ...descCells.map((c) => c.length));
+
+  const header = `| ${'Tool'.padEnd(toolColWidth)} | ${'Description'.padEnd(descColWidth)} |`;
+  const separator = `| ${'-'.repeat(toolColWidth)} | ${'-'.repeat(descColWidth)} |`;
+
+  const lines = [MARKERS.readmeToolsStart, '', header, separator];
+
+  for (const row of rows) {
+    const paddedName = ('`' + row.name + '`').padEnd(toolColWidth);
+    lines.push(`| ${paddedName} | ${row.desc.padEnd(descColWidth)} |`);
+  }
+
+  lines.push('');
+  lines.push(MARKERS.readmeToolsEnd);
+
+  return lines.join('\n');
+}
+
+// ============================================================================
+// ENTRYPOINTS.md MCP tool enumerations (#3334)
+// ============================================================================
+
+/** Auth label for a tool in the ENTRYPOINTS surfaces (prose + YAML). */
+function entrypointsAuth(name: string): { prose: string; yaml: string } {
+  return ENTRYPOINTS_TOOL_AUTH[name] ?? ENTRYPOINTS_DEFAULT_AUTH;
+}
+
+/**
+ * One-line ENTRYPOINTS description for a tool. Sourced from the same
+ * `TOOL_DESCRIPTIONS` corpus the CLAUDE.md / README surfaces use, collapsed
+ * to its first sentence so the table cell stays scannable. Throws if a
+ * registered tool has no description — the prose table must never emit a
+ * blank row (#3334). Backslashes are escaped FIRST, then `|`, so a description
+ * can't break the markdown column or smuggle a half-escaped pipe past the
+ * escaping (CodeQL js/incomplete-sanitization).
+ */
+function entrypointsToolDescription(t: ToolMetadata): string {
+  const raw = TOOL_DESCRIPTIONS[t.name];
+  if (raw === undefined || raw.trim() === '') {
+    throw new Error(
+      `Tool '${t.name}' is registered but has no TOOL_DESCRIPTIONS entry — ` +
+        `add one in scripts/tool-descriptions-data.ts before generating ENTRYPOINTS (#3334).`
+    );
+  }
+  return firstSentence(raw).replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+}
+
+/**
+ * Generate the ENTRYPOINTS.md prose MCP tools table (#3334). Four columns —
+ * Tool, Description, Auth, Rate Limit — every registered tool rendered exactly
+ * once. Column padding mirrors `generateReadmeToolTable` so prettier produces
+ * no follow-up diff. Rate Limit is uniform ("Shared bucket") because every
+ * tool shares the single token bucket; Auth comes from `ENTRYPOINTS_TOOL_AUTH`.
+ */
+function generateEntrypointsToolTable(tools: ToolMetadata[]): string {
+  const rows = tools.map((t) => ({
+    name: '`' + t.name + '`',
+    desc: entrypointsToolDescription(t),
+    auth: entrypointsAuth(t.name).prose,
+    rate: 'Shared bucket',
+  }));
+
+  const toolW = Math.max('Tool'.length, ...rows.map((r) => r.name.length));
+  const descW = Math.max('Description'.length, ...rows.map((r) => r.desc.length));
+  const authW = Math.max('Auth'.length, ...rows.map((r) => r.auth.length));
+  const rateW = Math.max('Rate Limit'.length, ...rows.map((r) => r.rate.length));
+
+  const lines = [
+    MARKERS.entrypointsToolsStart,
+    '',
+    `| ${'Tool'.padEnd(toolW)} | ${'Description'.padEnd(descW)} | ${'Auth'.padEnd(authW)} | ${'Rate Limit'.padEnd(rateW)} |`,
+    `| ${'-'.repeat(toolW)} | ${'-'.repeat(descW)} | ${'-'.repeat(authW)} | ${'-'.repeat(rateW)} |`,
+  ];
+  for (const r of rows) {
+    lines.push(
+      `| ${r.name.padEnd(toolW)} | ${r.desc.padEnd(descW)} | ${r.auth.padEnd(authW)} | ${r.rate.padEnd(rateW)} |`
+    );
+  }
+  lines.push('');
+  lines.push(
+    `_Auto-generated from \`REGISTERED_TOOL_NAMES\` + \`TOOL_DESCRIPTIONS\` by \`scripts/inject-governance.ts\`. ${String(tools.length)} tools._`,
+    '',
+    MARKERS.entrypointsToolsEnd
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Generate the ENTRYPOINTS.md `BEGIN:MCP_TOOLS` YAML block (#3334). Preserves
+ * the pre-existing schema (`mcp_tools:` → `rate_limiting:` + `tools:` list of
+ * `{ name, auth }`) so downstream YAML consumers are unaffected; only the
+ * `tools:` list is regenerated, one entry per registered tool.
+ */
+function generateEntrypointsYamlBlock(tools: ToolMetadata[]): string {
+  const lines = [
+    ENTRYPOINTS_YAML_START,
+    '',
+    '```yaml',
+    'mcp_tools:',
+    "  rate_limiting: 'shared token bucket (capacity: 100, refill: 10/sec)'",
+    '  tools:',
+  ];
+  for (const t of tools) {
+    lines.push(`    - name: ${t.name}`);
+    lines.push(`      auth: ${entrypointsAuth(t.name).yaml}`);
+  }
+  lines.push('```', '', ENTRYPOINTS_YAML_END);
+  return lines.join('\n');
+}
+
+/**
+ * Read the CLI command catalog (#5458). Returns `[]` with an error when the
+ * file is missing or parses to nothing; the generator below refuses to render
+ * from `[]`, so a broken parser fails the check instead of emitting an empty
+ * table that reads as "no commands".
+ */
+function extractCliCommands(): ParsedCatalogEntry[] {
+  if (!existsSync(CLI_COMMAND_CATALOG)) {
+    console.error('CLI command catalog not found: ' + CLI_COMMAND_CATALOG);
+    return [];
+  }
+  const entries = parseCommandCatalog(readFileSync(CLI_COMMAND_CATALOG, 'utf-8'));
+  if (entries.length === 0) {
+    console.error('Could not parse COMMAND_CATALOG from ' + CLI_COMMAND_CATALOG);
+  }
+  return entries;
+}
+
+/**
+ * Audience bands in `--help` order, with the heading each renders under. The
+ * headings mirror `AUDIENCE_HEADINGS` in the catalog module so the doc groups
+ * commands the way `--help --all` does. `internal` IS rendered here — it is
+ * hidden from `--help` but these are real commands, and the reference is the
+ * one place a reader can find them.
+ */
+const CLI_AUDIENCE_HEADINGS: readonly { audience: string; heading: string }[] = [
+  { audience: 'essential', heading: 'Essential — install, configure, run' },
+  { audience: 'advanced', heading: 'Advanced — day-to-day extras' },
+  { audience: 'maintainer', heading: 'Maintainer — benchmarks, releases, deep diagnostics' },
+  { audience: 'internal', heading: 'Internal — dev/eval loops (hidden from --help)' },
+];
+
+/**
+ * One ENTRYPOINTS table cell for a catalog description: whitespace collapsed
+ * (a prettier-wrapped literal is still one line), backslashes escaped FIRST,
+ * then `|` — the same order as `entrypointsToolDescription`, for the same
+ * reason (a half-escaped pipe must not break the column) — then `<`, because
+ * a bare `<repo>` or `<path>` placeholder is inline HTML to markdownlint
+ * (MD033). Prettier preserves `\<` verbatim, so the block stays idempotent.
+ * Catalog descriptions carry no code spans, so `<` never needs to survive raw.
+ */
+function cliDescriptionCell(description: string): string {
+  return description
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/</g, '\\<');
+}
+
+/** One two-column `| Command | Description |` table, padded like the tool table. */
+function cliCommandTable(entries: readonly ParsedCatalogEntry[]): string[] {
+  const rows = entries.map((e) => ({
+    name: '`' + e.command + '`',
+    desc: cliDescriptionCell(e.description),
+  }));
+  const nameW = Math.max('Command'.length, ...rows.map((r) => r.name.length));
+  const descW = Math.max('Description'.length, ...rows.map((r) => r.desc.length));
+  const lines = [
+    `| ${'Command'.padEnd(nameW)} | ${'Description'.padEnd(descW)} |`,
+    `| ${'-'.repeat(nameW)} | ${'-'.repeat(descW)} |`,
+  ];
+  for (const r of rows) lines.push(`| ${r.name.padEnd(nameW)} | ${r.desc.padEnd(descW)} |`);
+  return lines;
+}
+
+/**
+ * Generate the ENTRYPOINTS.md CLI command tables (#5458): one `###` section per
+ * audience band, every catalog entry rendered exactly once. Only the columns
+ * the catalog vouches for — name and description — are generated; the
+ * hand-written subcommand/mode material lives OUTSIDE the markers, because no
+ * catalog field supplies it and inventing a column would be documentation the
+ * source cannot back. Throws on an empty catalog or an audience the heading
+ * table does not know: both would otherwise drop commands silently.
+ */
+function generateEntrypointsCliTables(commands: readonly ParsedCatalogEntry[]): string {
+  if (commands.length === 0) {
+    throw new Error(
+      'COMMAND_CATALOG parsed to zero entries — refusing to render an empty CLI table (#5458).'
+    );
+  }
+  const known = new Set(CLI_AUDIENCE_HEADINGS.map((b) => b.audience));
+  const unknown = commands.filter((c) => !known.has(c.audience)).map((c) => c.command);
+  if (unknown.length > 0) {
+    throw new Error(
+      `Catalog audience not in CLI_AUDIENCE_HEADINGS for: ${unknown.join(', ')} — ` +
+        'add the band to scripts/inject-governance.ts (#5458).'
+    );
+  }
+  const lines = [MARKERS.entrypointsCliStart, ''];
+  for (const band of CLI_AUDIENCE_HEADINGS) {
+    const entries = commands.filter((c) => c.audience === band.audience);
+    if (entries.length === 0) continue;
+    lines.push(`### ${band.heading}`, '', ...cliCommandTable(entries), '');
+  }
+  lines.push(
+    `_Auto-generated from \`COMMAND_CATALOG\` (\`packages/nexus-agents/src/cli-command-catalog.ts\`) by \`scripts/inject-governance.ts\`. ${String(commands.length)} commands._`,
+    '',
+    MARKERS.entrypointsCliEnd
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Inject the CLI command tables (#5458). Soft-skips when the CLI markers are
+ * absent so an un-prepped checkout is left alone rather than having a block
+ * appended at the end of the file.
+ */
+function applyEntrypointsCliInjection(
+  content: string,
+  commands: readonly ParsedCatalogEntry[]
+): string {
+  if (!content.includes(MARKERS.entrypointsCliStart)) return content;
+  return injectSection(
+    content,
+    MARKERS.entrypointsCliStart,
+    MARKERS.entrypointsCliEnd,
+    generateEntrypointsCliTables(commands)
+  );
+}
+
+/**
+ * Regenerate both ENTRYPOINTS.md enumerations (prose table + YAML block) in
+ * one pass (#3334). The prose table is injected via the GOVERNANCE marker
+ * family; the YAML block reuses its own pre-existing `BEGIN/END:MCP_TOOLS`
+ * markers. Returns the updated content; throws (via the description lookup)
+ * if any registered tool lacks a description.
+ */
+function applyEntrypointsInjections(content: string, tools: ToolMetadata[]): string {
+  let next = injectSection(
+    content,
+    MARKERS.entrypointsToolsStart,
+    MARKERS.entrypointsToolsEnd,
+    generateEntrypointsToolTable(tools)
+  );
+  next = injectSection(
+    next,
+    ENTRYPOINTS_YAML_START,
+    ENTRYPOINTS_YAML_END,
+    generateEntrypointsYamlBlock(tools)
+  );
+  return next;
+}
+
+/**
+ * Write the regenerated ENTRYPOINTS.md enumerations (#3334). Soft-skips when
+ * the file or the prose-table markers are absent, so the script stays drop-in
+ * compatible with older checkouts that haven't been marker-prepped.
+ */
+async function injectEntrypoints(
+  tools: ToolMetadata[],
+  commands: readonly ParsedCatalogEntry[]
+): Promise<void> {
+  if (!existsSync(ENTRYPOINTS_PATH)) return;
+  const content = readFileSync(ENTRYPOINTS_PATH, 'utf-8');
+  if (!content.includes(MARKERS.entrypointsToolsStart)) return;
+  const updated = applyEntrypointsCliInjection(
+    applyEntrypointsInjections(content, tools),
+    commands
+  );
+  if (updated !== content) await writeFormatted(ENTRYPOINTS_PATH, updated);
+}
+
+/**
+ * Verify both ENTRYPOINTS.md enumerations are in sync with the canonical
+ * registry (#3334). Soft-skip when the file or prose-table markers are absent;
+ * otherwise fail (with a structured error) when regeneration would diff.
+ */
+function checkEntrypoints(tools: ToolMetadata[], commands: readonly ParsedCatalogEntry[]): boolean {
+  if (!existsSync(ENTRYPOINTS_PATH)) return true;
+  const content = readFileSync(ENTRYPOINTS_PATH, 'utf-8');
+  if (!content.includes(MARKERS.entrypointsToolsStart)) return true;
+  let ok = true;
+  if (applyEntrypointsInjections(content, tools) !== content) {
+    console.error(
+      'docs/ENTRYPOINTS.md MCP tool enumerations are stale (#3334). Run: pnpm governance:inject'
+    );
+    ok = false;
+  }
+  // #5458: reported separately so the message names which block drifted.
+  if (applyEntrypointsCliInjection(content, commands) !== content) {
+    console.error(
+      'docs/ENTRYPOINTS.md CLI command tables are stale (#5458). Run: pnpm governance:inject'
+    );
+    ok = false;
+  }
+  return ok;
+}
+
+/**
+ * Generate the Workflows table for CLAUDE.md (#2317).
+ *
+ * Source of truth: `skills/index.yaml` (itself auto-generated). Adding or
+ * removing a skill cannot drift the CLAUDE.md table — re-running this script
+ * picks up the change.
+ */
+function generateWorkflowIndex(rows: readonly WorkflowRow[]): string {
+  // CLAUDE.md form is a flat list of skill names. Detail (description,
+  // trigger keywords, instructions) lives in each `skills/<name>/SKILL.md`
+  // (Anthropic Agent Skills spec, #1828) and the harness routes on the
+  // SKILL.md frontmatter. Listing only names is enough for the agent to
+  // know what's available; it can read SKILL.md when it picks one.
+  const names = rows.map((r) => '`' + r.name + '`').join(', ');
+
+  const lines = [
+    MARKERS.workflowIndexStart,
+    '',
+    '## Workflows (via Skills)',
+    '',
+    `**${String(rows.length)} skills registered.** Each skill's detailed steps and trigger keywords live in \`skills/<name>/SKILL.md\` (Anthropic Agent Skills spec, #1828). Non-Claude agents discover via [\`skills/index.yaml\`](./skills/index.yaml) referenced from [AGENTS.md](./AGENTS.md).`,
+    '',
+    names,
+    '',
+    `_Auto-generated from \`skills/index.yaml\`. ${String(rows.length)} skills._`,
+    '',
+    MARKERS.workflowIndexEnd,
+  ];
+
+  return lines.join('\n');
+}
+
+// ============================================================================
+// Rules Index (#2657, Epic C) — AGENTS.md cross-adapter bridge
+// ============================================================================
+
+interface RuleMetadata {
+  /** Basename, e.g. `typescript.md`. */
+  readonly file: string;
+  /** Glob patterns from the `paths:` frontmatter field. */
+  readonly paths: readonly string[];
+  /** The `description:` frontmatter field — the "when to read" hint. */
+  readonly description: string;
+}
+
+/** Normalize a frontmatter `paths:` field (YAML list or scalar) to a string array. */
+function normalizePathsField(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map((p) => String(p));
+  if (typeof raw === 'string') return [raw];
+  return [];
+}
+
+/** Parse one `.rules/*.md` file's frontmatter into RuleMetadata. */
+function parseRuleFile(entry: string): RuleMetadata {
+  const content = readFileSync(join(RULES_DIR, entry), 'utf-8');
+  const match = /^---\n([\s\S]*?)\n---/.exec(content);
+  if (match?.[1] === undefined) {
+    throw new Error(`.rules/${entry}: missing frontmatter (run checkRuleFrontmatter)`);
+  }
+  const fm = parseYaml(match[1]) as Record<string, unknown>;
+  const paths = normalizePathsField(fm['paths']);
+  const description = typeof fm['description'] === 'string' ? fm['description'].trim() : '';
+  if (paths.length === 0 || description === '') {
+    throw new Error(`.rules/${entry}: frontmatter missing \`paths:\` or \`description:\``);
+  }
+  return { file: entry, paths, description };
+}
+
+/**
+ * Scan `.rules/*.md`, parsing the `paths:` + `description:` frontmatter that
+ * `checkRuleFrontmatter` (#2656) already requires. Both fields are consumed
+ * by `generateRulesIndex` — `paths:` is not dead metadata. Sorted by
+ * filename so the generated table is deterministic.
+ */
+function extractRules(): RuleMetadata[] {
+  if (!existsSync(RULES_DIR)) return [];
+  return readdirSync(RULES_DIR)
+    .sort()
+    .filter((entry) => entry.endsWith('.md'))
+    .map(parseRuleFile);
+}
+
+/**
+ * Generate the AGENTS.md "Rules index" table from `.rules/*.md` frontmatter.
+ * Columns are padded to fixed widths so the output is prettier-stable (the
+ * same approach as `generateReadmeToolTable`) — a re-run produces no diff.
+ */
+function generateRulesIndex(rules: readonly RuleMetadata[]): string {
+  const rows = rules.map((r) => ({
+    file: `[\`.rules/${r.file}\`](./.rules/${r.file})`,
+    applies: r.paths.map((p) => '`' + p + '`').join(', '),
+    when: r.description,
+  }));
+
+  const fileW = Math.max('File'.length, ...rows.map((r) => r.file.length));
+  const appliesW = Math.max('Applies to'.length, ...rows.map((r) => r.applies.length));
+  const whenW = Math.max('When to read'.length, ...rows.map((r) => r.when.length));
+
+  const lines = [
+    MARKERS.rulesIndexStart,
+    '',
+    'Load-bearing rules live at `.rules/*.md`. Read the relevant file when its topic applies. Claude Code autoloads these by keyword match; Codex / Gemini CLI / OpenCode only see a rule if it is listed here — this table is the cross-adapter bridge. See [docs/guides/RULE_PRECEDENCE.md](./docs/guides/RULE_PRECEDENCE.md) for the per-adapter precise reference.',
+    '',
+    `| ${'File'.padEnd(fileW)} | ${'Applies to'.padEnd(appliesW)} | ${'When to read'.padEnd(whenW)} |`,
+    `| ${'-'.repeat(fileW)} | ${'-'.repeat(appliesW)} | ${'-'.repeat(whenW)} |`,
+  ];
+  for (const r of rows) {
+    lines.push(
+      `| ${r.file.padEnd(fileW)} | ${r.applies.padEnd(appliesW)} | ${r.when.padEnd(whenW)} |`
+    );
+  }
+  lines.push('');
+  lines.push(
+    `_Auto-generated from \`.rules/*.md\` frontmatter by \`scripts/inject-governance.ts\`. ${String(rules.length)} rules._`,
+    '',
+    MARKERS.rulesIndexEnd
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Inject the Rules index into AGENTS.md (#2657). Soft-skips when AGENTS.md
+ * has no markers yet, so the script stays drop-in compatible with checkouts
+ * that have not been marker-prepped.
+ */
+function injectRulesIndex(content: string, rules: readonly RuleMetadata[]): string {
+  if (rules.length === 0 || !content.includes(MARKERS.rulesIndexStart)) return content;
+  return injectSection(
+    content,
+    MARKERS.rulesIndexStart,
+    MARKERS.rulesIndexEnd,
+    generateRulesIndex(rules)
+  );
+}
+
+// ============================================================================
+// AGENTS.md generated sections (#2657, #6105) — one render, like CLAUDE.md's
+// ============================================================================
+
+/**
+ * The toolchain facts the AGENTS.md footer states (#5142, item 2).
+ *
+ * The footer said `TypeScript: 5.9+` while `package.json` said `^6.0.3`, and
+ * `MCP Protocol: 2025-11-25` while the only occurrences of that date in
+ * source are comments. Nothing read the footer, and the AGENTS→CLAUDE copy
+ * guaranteed the two COPIES agreed while checking neither against anything —
+ * the generator had made the drift more durable, not less.
+ *
+ * Same remedy as the #5218 governance stamp: one computed value, rendered into
+ * AGENTS.md by the one render ({@link AGENTS_MD_INLINE_VALUES}, #6146) that
+ * `inject` writes and `check` compares. CLAUDE.md inherits it through the
+ * AGNOSTIC:BODY copy, so it is never a second writer. Until #6146 the rows
+ * were written by a replacer and probed separately (`buildToolchainProbes`),
+ * a third mechanism beside the sections and the inline values.
+ */
+interface Toolchain {
+  /** Major version of the `typescript` dependency, rendered `6.x`. */
+  typescript: string;
+  /** `engines.node` verbatim, e.g. `>=22.5.0`. */
+  node: string;
+  /** The SDK's `LATEST_PROTOCOL_VERSION` — what the server actually speaks. */
+  mcpProtocol: string;
+}
+
+/**
+ * The package directory whose installed SDK is the one the published server
+ * runs. Resolved from THIS file's location on purpose: `ROOT` may point at a
+ * test sandbox (`NEXUS_SCRIPT_ROOT`) that has no `node_modules`, and the
+ * sandbox's `package.json` declares the same SDK range as the real one.
+ */
+const INSTALLED_PACKAGE_JSON = fileURLToPath(
+  new URL('../packages/nexus-agents/package.json', import.meta.url)
+);
+
+function readToolchain(): Toolchain {
+  const pkg = JSON.parse(readFileSync(PACKAGE_JSON_PATH, 'utf-8')) as {
+    dependencies?: Record<string, string>;
+    engines?: Record<string, string>;
+  };
+  const tsRange = pkg.dependencies?.['typescript'];
+  const tsMajor = tsRange === undefined ? undefined : /(\d+)/.exec(tsRange)?.[1];
+  if (tsMajor === undefined) {
+    throw new Error(`cannot read a typescript major out of ${PACKAGE_JSON_PATH} dependencies`);
+  }
+  const node = pkg.engines?.['node'];
+  if (node === undefined || node === '') {
+    throw new Error(`cannot read engines.node out of ${PACKAGE_JSON_PATH}`);
+  }
+  // CJS build, so this is a synchronous `require` — the only async step in
+  // `checkGovernance()` is the prettier pass in `renderClaudeMd` (#6062, #6099).
+  const sdk = createRequire(INSTALLED_PACKAGE_JSON)('@modelcontextprotocol/sdk/types.js') as {
+    LATEST_PROTOCOL_VERSION?: unknown;
+  };
+  const mcpProtocol = sdk.LATEST_PROTOCOL_VERSION;
+  if (typeof mcpProtocol !== 'string' || mcpProtocol === '') {
+    throw new Error('@modelcontextprotocol/sdk did not export a string LATEST_PROTOCOL_VERSION');
+  }
+  return { typescript: `${tsMajor}.x`, node, mcpProtocol };
+}
+
+/** The footer rows, whatever value each currently carries. */
+const TOOLCHAIN_PATTERNS = {
+  typescript: /_TypeScript: [^_\n]+_/,
+  node: /_Node\.js: [^_\n]+_/,
+  mcpProtocol: /_MCP Protocol: [^_\n]+_/,
+} as const;
+
+/** What the AGENTS.md generated sections and inline values are rendered from. */
+interface AgentsMdSources {
+  tools: ToolMetadata[];
+  workflowRows: readonly WorkflowRow[];
+  rules: readonly RuleMetadata[];
+  /** For the `for all N skills.` phrase (#6130). */
+  skillCount: number;
+  /** For the three footer rows (#5142, #6146). */
+  toolchain: Toolchain;
+}
+
+function loadAgentsMdSources(r: Pick<GovernanceRegistries, 'tools' | 'skills'>): AgentsMdSources {
+  return {
+    tools: r.tools,
+    workflowRows: extractWorkflowRows(),
+    rules: extractRules(),
+    skillCount: r.skills.length,
+    toolchain: readToolchain(),
+  };
+}
+
+/** One generated section of AGENTS.md: its markers and the injector that writes it. */
+interface AgentsMdSection {
+  /** Named in the drift message, e.g. `AGENTS.md Rules index is stale`. */
+  readonly label: string;
+  /** The issue the message cites. */
+  readonly issue: string;
+  readonly start: string;
+  readonly end: string;
+  readonly apply: (content: string, sources: AgentsMdSources) => string;
+}
+
+/**
+ * The sections `inject` generates INTO AGENTS.md (#6105). Each injector is the
+ * one the CLAUDE.md render uses for the same section, so there is one
+ * generator per table and AGENTS.md is written from it rather than by hand.
+ *
+ * Before this, only the rules index was regenerated here; the workflow and tool
+ * tables inside the AGNOSTIC:BODY slice were hand-held. `renderClaudeMd` copied
+ * the stale table into CLAUDE.md and then overwrote it with the generated one,
+ * so CLAUDE.md was a fixed point: `check` could not see the stale AGENTS.md
+ * table, and `inject` did not repair it. Now the copy into CLAUDE.md carries
+ * the generated text already, and `check` measures AGENTS.md's copy in its own
+ * right ({@link checkAgentsMd}).
+ *
+ * The VERSION section (#6130) is rendered by the same `generateVersionSection`
+ * as CLAUDE.md's. Before, a replacer row in `buildAncillaryReplacements` wrote
+ * AGENTS.md's stamp (#5218) and nothing read it back: `renderClaudeMd` copied
+ * a stale stamp into CLAUDE.md and overwrote it with the computed one, so a
+ * hand-edited `_Governance Version:_` in AGENTS.md passed `check` on the real
+ * tree. The stamp now has one writer per file, and this render is the one
+ * `check` compares.
+ */
+const AGENTS_MD_SECTIONS: readonly AgentsMdSection[] = [
+  {
+    label: 'Rules index',
+    issue: '#2657',
+    start: MARKERS.rulesIndexStart,
+    end: MARKERS.rulesIndexEnd,
+    apply: (content, sources) => injectRulesIndex(content, sources.rules),
+  },
+  {
+    label: 'Workflows table',
+    issue: '#6105',
+    start: MARKERS.workflowIndexStart,
+    end: MARKERS.workflowIndexEnd,
+    apply: (content, sources) => injectWorkflowIndex(content, sources.workflowRows),
+  },
+  {
+    label: 'MCP Tools Reference',
+    issue: '#6105',
+    start: MARKERS.toolIndexStart,
+    end: MARKERS.toolIndexEnd,
+    apply: (content, sources) => injectToolIndex(content, sources.tools),
+  },
+  {
+    label: 'governance stamp',
+    issue: '#6130',
+    start: MARKERS.versionStart,
+    end: MARKERS.versionEnd,
+    apply: (content) => injectVersionSection(content),
+  },
+];
+
+/**
+ * The VERSION section for AGENTS.md (#6130): {@link generateVersionSection}
+ * between its markers, soft-skipping an absent pair like the other AGENTS.md
+ * injectors — `injectSection` would append one, and the write path must not
+ * fabricate a section into a document that never had one. Absence is named
+ * by {@link describeMissingAgentsMdSections} instead.
+ */
+function injectVersionSection(content: string): string {
+  if (!content.includes(MARKERS.versionStart)) return content;
+  return injectSection(content, MARKERS.versionStart, MARKERS.versionEnd, generateVersionSection());
+}
+
+function applyAgentsMdSections(content: string, sources: AgentsMdSources): string {
+  return AGENTS_MD_SECTIONS.reduce((next, section) => section.apply(next, sources), content);
+}
+
+/** One inline generated value of AGENTS.md: a phrase pattern and what it renders to. */
+interface AgentsMdInlineValue {
+  /** Named in the drift message, e.g. `AGENTS.md skills count is stale`. */
+  readonly label: string;
+  /** The issue the message cites. */
+  readonly issue: string;
+  /** Matches the phrase whatever value it currently carries. */
+  readonly pattern: RegExp;
+  readonly render: (sources: AgentsMdSources) => string;
+}
+
+/**
+ * The inline values `inject` rewrites inside AGENTS.md's prose: the count
+ * phrases (#1837, #6130) and the toolchain footer rows (#5142, #6146). They
+ * used to be replacer rows applied after the AGENTS.md render, the footer
+ * rows probed separately by `buildToolchainProbes`; now the render carries
+ * them all, so `renderAgentsMd` is the one write path for AGENTS.md's
+ * generated text and `check` measures each value against it. The count
+ * probes (`buildAgentsMdProbes`) still measure the count phrases against the
+ * registries — a different question, kept.
+ */
+const AGENTS_MD_INLINE_VALUES: readonly AgentsMdInlineValue[] = [
+  {
+    label: 'skills count',
+    issue: '#6130',
+    pattern: /for all \d+ skills\./,
+    render: (sources) => `for all ${String(sources.skillCount)} skills.`,
+  },
+  {
+    label: 'MCP tools count',
+    issue: '#6130',
+    pattern: /Nexus-agents exposes \d+ MCP tools/,
+    render: (sources) => `Nexus-agents exposes ${String(sources.tools.length)} MCP tools`,
+  },
+  {
+    label: 'TypeScript footer',
+    issue: '#6146',
+    pattern: TOOLCHAIN_PATTERNS.typescript,
+    render: (sources) => `_TypeScript: ${sources.toolchain.typescript}_`,
+  },
+  {
+    label: 'Node.js footer',
+    issue: '#6146',
+    pattern: TOOLCHAIN_PATTERNS.node,
+    render: (sources) => `_Node.js: ${sources.toolchain.node}_`,
+  },
+  {
+    label: 'MCP Protocol footer',
+    issue: '#6146',
+    pattern: TOOLCHAIN_PATTERNS.mcpProtocol,
+    render: (sources) => `_MCP Protocol: ${sources.toolchain.mcpProtocol}_`,
+  },
+];
+
+function applyAgentsMdInlineValues(content: string, sources: AgentsMdSources): string {
+  return AGENTS_MD_INLINE_VALUES.reduce(
+    (next, value) => next.replace(value.pattern, value.render(sources)),
+    content
+  );
+}
+
+/**
+ * The ONE render of AGENTS.md's generated text, the same shape as
+ * {@link renderClaudeMd} (#6099): every section injector, every inline value,
+ * then the shared prettier pass. `inject` writes this string; `check` compares
+ * it to the file. Pure with respect to AGENTS.md — reads the sources, writes
+ * nothing.
+ */
+async function renderAgentsMd(current: string, sources: AgentsMdSources): Promise<string> {
+  return formatWithPrettier(
+    AGENTS_MD_PATH,
+    applyAgentsMdInlineValues(applyAgentsMdSections(current, sources), sources)
+  );
+}
+
+/**
+ * One line per inline value whose on-disk phrase differs from the rendered
+ * one (#6130): `AGENTS.md skills count is stale (#6130): <on disk> → <expected>
+ * — AGENTS.md:N`, N being the 1-based line the on-disk phrase sits on
+ * (#6146; omitted when the phrase is absent on disk). A phrase absent from
+ * both is not drift of the value — the count probe names a missing count
+ * phrase, loudly (#5882), and a footer row absent from both is prose.
+ */
+function describeStaleAgentsMdInlineValues(expected: string, content: string): string[] {
+  const lines: string[] = [];
+  for (const value of AGENTS_MD_INLINE_VALUES) {
+    const match = value.pattern.exec(content);
+    const onDisk = match?.[0] ?? '<absent>';
+    const rendered = value.pattern.exec(expected)?.[0] ?? '<absent>';
+    if (onDisk === rendered) continue;
+    const at = match === null ? '' : ` — AGENTS.md:${String(lineNumberAt(content, match.index))}`;
+    lines.push(`AGENTS.md ${value.label} is stale (${value.issue}): ${onDisk} → ${rendered}${at}`);
+  }
+  return lines;
+}
+
+/** 1-based line of the character at `index`. */
+function lineNumberAt(content: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index; i++) if (content.charCodeAt(i) === 10) line++;
+  return line;
+}
+
+/** Whether either side of the first differing line is an inline generated value. */
+function isInlineValueLine(first: { expected: string; onDisk: string }): boolean {
+  return AGENTS_MD_INLINE_VALUES.some(
+    (v) => v.pattern.test(first.onDisk) || v.pattern.test(first.expected)
+  );
+}
+
+/** One block per generated section that differs: its first differing AGENTS.md line and both versions. */
+function describeStaleAgentsMdSections(expected: string, content: string): string[] {
+  const lines: string[] = [];
+  for (const section of AGENTS_MD_SECTIONS) {
+    const diff = firstInSpanDifference(expected, content, section.start, section.end);
+    if (diff === undefined) continue;
+    lines.push(
+      `AGENTS.md ${section.label} is stale (${section.issue}) — first difference at AGENTS.md:${String(diff.line)}`,
+      `  expected: ${diff.expected}`,
+      `  on disk:  ${diff.onDisk}`
+    );
+  }
+  return lines;
+}
+
+/**
+ * The drift message for {@link checkAgentsMd}: every generated section that
+ * differs, EACH named with its first differing AGENTS.md line and both versions
+ * of it (the governance stamp among them, #6130); every inline count phrase
+ * that differs, each with both values; and, when the first difference of the
+ * whole file falls outside every generated section and value (prose prettier
+ * reshapes), that line named as such. Each cause is measured independently,
+ * never behind the first difference. One `inject` repairs all of them, so the
+ * remedy is stated once.
+ */
+function describeAgentsMdDrift(expected: string, content: string): string {
+  const lines = [
+    ...describeStaleAgentsMdSections(expected, content),
+    ...describeStaleAgentsMdInlineValues(expected, content),
+  ];
+  const first = firstDifferingLine(expected, content);
+  const inSection = AGENTS_MD_SECTIONS.some((s) =>
+    isInsideSpan(content, first.index, s.start, s.end)
+  );
+  if (!inSection && !isInlineValueLine(first)) {
+    lines.push(
+      `AGENTS.md differs outside its generated sections — first difference at AGENTS.md:${String(first.index + 1)}`,
+      `  expected: ${first.expected}`,
+      `  on disk:  ${first.onDisk}`
+    );
+  }
+  lines.push('Run: pnpm governance:inject');
+  return lines.join('\n');
+}
+
+/**
+ * One line per generated section whose marker pair is absent on disk (#6133
+ * panel, rejecting seat). The injectors soft-skip a missing pair so the WRITE
+ * path never fabricates a section into a document that never had one — but
+ * that makes a deleted pair render as a fixed point, and AGENTS.md has no
+ * whole-file CI idempotency step to catch it. The check names the empty case
+ * instead of treating absence as health: every entry of
+ * {@link AGENTS_MD_SECTIONS} is required.
+ */
+function describeMissingAgentsMdSections(content: string): string[] {
+  return AGENTS_MD_SECTIONS.filter(
+    (s) => !content.includes(s.start) || !content.includes(s.end)
+  ).map(
+    (s) =>
+      `AGENTS.md is missing its generated ${s.label} section (markers ${s.start}/${s.end} not found); ` +
+      'restore the markers, then run: pnpm governance:inject'
+  );
+}
+
+/** AGENTS.md as read from disk and as rendered: the one render `check` measures and `inject` writes. */
+interface AgentsMdRender {
+  readonly content: string;
+  readonly rendered: string;
+}
+
+/**
+ * Read AGENTS.md and render it ONCE (#6167). Both files' renders consume the
+ * result: `inject` writes `rendered` to AGENTS.md and `renderClaudeMd` copies
+ * its AGNOSTIC:BODY slice, so an AGENTS.md value that is stale on disk is
+ * stale in exactly one place — the file — and the CLAUDE.md render is a fixed
+ * point whenever CLAUDE.md is current. Before this, the CLAUDE.md render
+ * copied the on-disk slice, and `check` reported a stale AGENTS.md count
+ * phrase or footer row twice: once as AGENTS.md drift (the finding) and once
+ * as CLAUDE.md block drift with the stale value labelled `expected`.
+ *
+ * Throws a plain Error when AGENTS.md is absent — it is a required source of
+ * CLAUDE.md, so a silent empty slice would erase the agnostic body (#3446) —
+ * and a {@link FormatError} when prettier rejects it.
+ */
+async function renderAgentsMdFromDisk(
+  registries: Pick<GovernanceRegistries, 'tools' | 'skills'>
+): Promise<AgentsMdRender> {
+  if (!existsSync(AGENTS_MD_PATH)) {
+    throw new Error(
+      `AGENTS.md not found at ${AGENTS_MD_PATH} — required by the CLAUDE.md generator (#3446)`
+    );
+  }
+  const content = readFileSync(AGENTS_MD_PATH, 'utf-8');
+  return { content, rendered: await renderAgentsMd(content, loadAgentsMdSources(registries)) };
+}
+
+/**
+ * `renderAgentsMd(content) === content` AND every generated section present:
+ * the AGENTS.md sibling of {@link checkClaudeMd} (#6105). The two are measured
+ * and reported independently — a missing section and a stale one can co-occur.
+ * The render arrives from {@link checkCrossAdapterDocGates}, which produced it
+ * once for both checks and already reported a formatter failure (#6167); a
+ * malformed `.rules/*.md` frontmatter still throws out of `extractRules`, as
+ * it did from `checkRulesIndex`.
+ */
+function checkAgentsMd({ content, rendered }: AgentsMdRender): boolean {
+  const missing = describeMissingAgentsMdSections(content);
+  for (const line of missing) console.error(line);
+  const stale = rendered !== content;
+  if (stale) console.error(describeAgentsMdDrift(rendered, content));
+  return missing.length === 0 && !stale;
+}
+
+// ============================================================================
+// Claude agnostic block (#3446, Phase 2+3) — CLAUDE.md generated from AGENTS.md
+// ============================================================================
+
+/**
+ * Slice the harness-neutral body out of AGENTS.md: the text strictly BETWEEN
+ * the `AGNOSTIC:BODY:START` / `AGNOSTIC:BODY:END` markers, exclusive of the
+ * marker lines themselves. This slice is the single authoritative source of
+ * agnostic prose — CLAUDE.md re-uses it verbatim via the generated block so no
+ * harness-neutral content is authored twice (#3446).
+ *
+ * `content` is the RENDERED AGENTS.md ({@link renderAgentsMdFromDisk}), never
+ * the file: the slice must carry the values `inject` is about to write, or a
+ * stale AGENTS.md value is reported as CLAUDE.md drift too (#6167).
+ *
+ * Throws if either marker is missing — AGENTS.md is a required source for the
+ * CLAUDE.md generator, so a silent empty slice would erase the agnostic body.
+ */
+function extractAgnosticBody(content: string): string {
+  const startIdx = content.indexOf(AGNOSTIC_BODY_START);
+  const endIdx = content.indexOf(AGNOSTIC_BODY_END);
+  if (startIdx === -1 || endIdx === -1) {
+    throw new Error(
+      `AGENTS.md is missing the AGNOSTIC:BODY markers (#3446) — cannot generate CLAUDE.md`
+    );
+  }
+  // Fail loud on malformed markers rather than emitting an empty/garbage slice
+  // that the drift gate would then "pass" against (silently erasing the agnostic
+  // body — the exact failure this generator must prevent). Reordered (END before
+  // START) → empty slice; duplicated → swallows a marker line (#3446 QA).
+  if (endIdx <= startIdx) {
+    throw new Error(
+      `AGENTS.md AGNOSTIC:BODY:END precedes START (#3446) — markers are reordered/malformed`
+    );
+  }
+  if (
+    content.lastIndexOf(AGNOSTIC_BODY_START) !== startIdx ||
+    content.lastIndexOf(AGNOSTIC_BODY_END) !== endIdx
+  ) {
+    throw new Error(
+      `AGENTS.md has duplicate AGNOSTIC:BODY markers (#3446) — exactly one pair is required`
+    );
+  }
+  // Take everything after the start marker line and before the end marker,
+  // then trim the surrounding blank lines so the injected block has exactly
+  // one blank line of padding (matching the "do not edit" note layout below).
+  const between = content.slice(startIdx + AGNOSTIC_BODY_START.length, endIdx);
+  return between.replace(/^\n+/, '').replace(/\n+$/, '');
+}
+
+/**
+ * Generate the CLAUDE.md agnostic block (#3446). The block is the AGENTS.md
+ * `AGNOSTIC:BODY` slice wrapped in the `GENERATED:FROM_AGENTS` markers with a
+ * "do not edit by hand" note, so an editor who opens CLAUDE.md knows the prose
+ * is owned by AGENTS.md and gated by `inject-governance.ts check`.
+ */
+function generateClaudeFromAgents(slice: string): string {
+  return [
+    MARKERS.claudeAgnosticStart,
+    '',
+    "<!-- DO NOT EDIT THIS BLOCK BY HAND. It is generated from AGENTS.md's",
+    '     AGNOSTIC:BODY slice by `scripts/inject-governance.ts` and gated in CI.',
+    '     Edit the agnostic prose in AGENTS.md; run `pnpm governance:inject`. (#3446) -->',
+    '',
+    slice,
+    '',
+    MARKERS.claudeAgnosticEnd,
+  ].join('\n');
+}
+
+/**
+ * Inject the generated agnostic block into CLAUDE.md (#3446). Soft-skips when
+ * CLAUDE.md has no `GENERATED:FROM_AGENTS` markers yet, so the script stays
+ * drop-in compatible with checkouts that have not been marker-prepped.
+ */
+function injectClaudeAgnosticBlock(content: string, agentsMd: string): string {
+  if (!content.includes(MARKERS.claudeAgnosticStart)) return content;
+  return injectSection(
+    content,
+    MARKERS.claudeAgnosticStart,
+    MARKERS.claudeAgnosticEnd,
+    generateClaudeFromAgents(extractAgnosticBody(agentsMd))
+  );
+}
+
+/** Marker for the side that ran out of lines before the other did. */
+const END_OF_FILE = '<end of file>';
+
+/**
+ * The first line at which two texts differ: its 0-based index plus the
+ * `expected` and `onDisk` text at that index (or `<end of file>` for a side
+ * that ran out of lines first). The caller guarantees the texts are not equal,
+ * so a line is always found. Both texts are identical before the index, so it
+ * is a valid line number in either.
+ */
+function firstDifferingLine(
+  expected: string,
+  onDisk: string
+): { index: number; expected: string; onDisk: string } {
+  const a = expected.split('\n');
+  const b = onDisk.split('\n');
+  const limit = Math.max(a.length, b.length);
+  let index = 0;
+  while (index < limit && a[index] === b[index]) index += 1;
+  return { index, expected: a[index] ?? END_OF_FILE, onDisk: b[index] ?? END_OF_FILE };
+}
+
+/** 0-based line of the first `marker` in `content` at or after `from`, or -1. */
+function lineOf(content: string, marker: string, from = 0): number {
+  const at = content.indexOf(marker, from);
+  return at === -1 ? -1 : content.slice(0, at).split('\n').length - 1;
+}
+
+/**
+ * Whether 0-based line `index` — the first line where the render and the
+ * on-disk file disagree — lies inside the on-disk `[start, end]` marker span.
+ * The two texts agree before `index`, so a marker that precedes it sits on the
+ * same line in both. A missing END marker reads as inside: the span lost its
+ * end, which is drift of that span, not prose outside it.
+ */
+function isInsideSpan(content: string, index: number, start: string, end: string): boolean {
+  const startLine = lineOf(content, start);
+  if (startLine === -1 || index < startLine) return false;
+  const endLine = lineOf(content, end, content.indexOf(start));
+  return endLine === -1 || index <= endLine;
+}
+
+/** Whether line `index` lies inside the on-disk GENERATED:FROM_AGENTS block. */
+function isInsideAgnosticBlock(content: string, index: number): boolean {
+  return isInsideSpan(content, index, MARKERS.claudeAgnosticStart, MARKERS.claudeAgnosticEnd);
+}
+
+/** The marker-inclusive `[start, end]` span of `text`, or `undefined` without both markers. */
+function markedSpanOf(text: string, start: string, end: string): string | undefined {
+  const a = text.indexOf(start);
+  const b = text.indexOf(end, a);
+  if (a === -1 || b === -1) return undefined;
+  return text.slice(a, b + end.length);
+}
+
+/**
+ * The first difference INSIDE the `[start, end]` span — its 1-based on-disk
+ * line and both versions of it — or `undefined` when the two spans agree
+ * (#6113 panel). Same single `expected` vs `content` measurement, aligned on
+ * the span's START marker in each text rather than on absolute line numbers,
+ * so an edit that inserts or removes lines above the span does not make every
+ * line of it read as different. A file with no complete on-disk span has no
+ * in-span line to name: that case is already reported by the first difference
+ * of the whole file.
+ */
+function firstInSpanDifference(
+  expected: string,
+  content: string,
+  start: string,
+  end: string
+): { line: number; expected: string; onDisk: string } | undefined {
+  const expectedSpan = markedSpanOf(expected, start, end);
+  const onDiskSpan = markedSpanOf(content, start, end);
+  if (expectedSpan === undefined || onDiskSpan === undefined) return undefined;
+  if (expectedSpan === onDiskSpan) return undefined;
+  const diff = firstDifferingLine(expectedSpan, onDiskSpan);
+  return {
+    line: lineOf(content, start) + diff.index + 1,
+    expected: diff.expected,
+    onDisk: diff.onDisk,
+  };
+}
+
+/** The 1-based on-disk line of the first difference inside the GENERATED:FROM_AGENTS block. */
+function firstInBlockDifference(expected: string, content: string): number | undefined {
+  return firstInSpanDifference(
+    expected,
+    content,
+    MARKERS.claudeAgnosticStart,
+    MARKERS.claudeAgnosticEnd
+  )?.line;
+}
+
+/**
+ * The data-loss warning (#6113 panel, rejecting seat): when the first
+ * difference is OUTSIDE the block, its remedy is a bare `inject` — which
+ * regenerates the block from AGENTS.md and silently overwrites any hand edit
+ * inside it. So the in-block scan runs regardless, and when the first
+ * difference was outside and an in-block difference also exists, the warning
+ * names that line. When the first difference is already inside the block the
+ * remedy already says AGENTS.md, so no extra line.
+ */
+function describeInBlockLoss(firstIsInside: boolean, inBlockLine: number | undefined): string[] {
+  if (firstIsInside || inBlockLine === undefined) return [];
+  return [
+    `the generated block also differs at CLAUDE.md:${String(inBlockLine)} — edits inside it are ` +
+      'overwritten by inject; move them to AGENTS.md first',
+  ];
+}
+
+/**
+ * The drift message for {@link checkClaudeMd}: WHERE (1-based CLAUDE.md line
+ * of the first difference), both versions of that line, and the remedy.
+ * "Stale" with no location is what turned a one-cycle fix into two (#6062).
+ *
+ * The cause is derived from where that line falls (#6099) — the two remedies
+ * differ, which is why the distinction is kept:
+ * - inside the GENERATED:FROM_AGENTS markers: the prose is owned by AGENTS.md,
+ *   so a hand edit here is reverted by `inject`; a wanted change goes there.
+ * - outside them (the end-of-file newline, prose prettier reshapes): `inject`
+ *   alone puts the file right. CI's idempotency step (`inject`, then `git diff
+ *   --exit-code CLAUDE.md`) diffs the whole file, so this is drift there too (#6087).
+ */
+function describeClaudeMdDrift(expected: string, content: string): string {
+  const diff = firstDifferingLine(expected, content);
+  const at = `first difference at CLAUDE.md:${String(diff.index + 1)}`;
+  const firstIsInside = isInsideAgnosticBlock(content, diff.index);
+  const [cause, remedy] = firstIsInside
+    ? [
+        `CLAUDE.md GENERATED:FROM_AGENTS block is stale (#3446) — ${at}`,
+        'Edit the agnostic prose in AGENTS.md, then run: pnpm governance:inject',
+      ]
+    : [`CLAUDE.md differs outside the generated block — ${at}`, 'Run: pnpm governance:inject'];
+  // Measured independently of the first difference, never behind it (#6113).
+  const inBlockLine = firstInBlockDifference(expected, content);
+  return [
+    cause,
+    `  expected: ${diff.expected}`,
+    `  on disk:  ${diff.onDisk}`,
+    remedy,
+    ...describeInBlockLoss(firstIsInside, inBlockLine),
+  ].join('\n');
+}
+
+/**
+ * Generate governance version section.
+ *
+ * The stamp is the commit date of the most recently changed canonical
+ * source file (#2571). Using a content-derived date instead of
+ * `new Date()` makes the inject output deterministic — the
+ * "Verify injection idempotency" CI step no longer flips red at the
+ * date rollover on branches that haven't been touched today. The
+ * staleness check in release-validate-helpers.ts:222 keeps working
+ * because the format is unchanged.
+ *
+ * `config/in-tree-data.ts` is deliberately NOT a source (#5491,
+ * panel option b): model pricing and slug data is not governance content, and
+ * is decoupled from CLAUDE.md so routine model updates never touch governance paths.
+ */
+export const GOVERNANCE_STAMP_SOURCES: readonly string[] = [
+  TOOLS_INDEX,
+  EXPERT_CONFIG,
+  TEMPLATE_TYPES,
+  SKILLS_INDEX_PATH,
+];
+
+/**
+ * The governance stamp: a digest of the four sources' CONTENT (#5943).
+ *
+ * It used to be `git log -1 --format=%cs` over those sources — the committer
+ * date, which GitHub's squash button rewrites to the merge moment. A PR stamped
+ * on day 1 and merged on day 2 left main with a stamp the injector would no
+ * longer compute, so `docs-check.yml`'s idempotency step (`inject` then
+ * `git diff --exit-code CLAUDE.md`, a WHOLE-LINE comparison) went red on the
+ * next PR that touched a stamp source — a PR that did not cause it. Author date
+ * (`%as`) is not a fix either; measured, GitHub rewrites that too.
+ *
+ * A digest is what the stamp was always trying to say — "this block corresponds
+ * to this state of its sources". A date only ever approximated that, and the
+ * squash rewrite is the proof the approximation could disagree with the thing it
+ * stood for. Ratified 6-1 at supermajority with `absolute_quorum`, option (a)
+ * taking 5 of 6 approvers.
+ *
+ * Reads NO git history, so no rewrite can move it. Content is normalised
+ * (CRLF and trailing whitespace) so a checkout difference cannot churn the
+ * stamp. A missing source contributes its absence rather than being skipped:
+ * a source that disappears MUST change the digest, or removing one would be
+ * invisible.
+ */
+function getGovernanceStamp(): string {
+  const hash = createHash('sha256');
+  for (const path of GOVERNANCE_STAMP_SOURCES) {
+    // RELATIVE to the repo root. Hashing the absolute path made the digest
+    // machine-specific — `/home/william/...` locally, `/home/runner/...` in CI
+    // — so the stamp disagreed with itself across environments and the drift
+    // check failed on this change's own first CI run. `extract-api-surface.ts`
+    // documents the identical failure ("a gate that always fails gets switched
+    // off"); this is the third time it has been hit in this repo.
+    hash.update(relative(ROOT, path));
+    hash.update('\0');
+    let content = '<absent>';
+    try {
+      // `path` is ALREADY absolute — the GOVERNANCE_STAMP_SOURCES entries are
+      // built with join(ROOT, …). An earlier version of this joined ROOT again,
+      // which resolved to nothing, sent every source down the catch below, and
+      // produced the SAME digest no matter what any source contained: a
+      // constant wearing the name of a measurement, in the very function
+      // written to stop that. Caught by the "changes when a source changes"
+      // test, which is why that test does not recompute the hash itself.
+      content = readFileSync(path, 'utf-8').replace(/\r\n/g, '\n').trimEnd();
+    } catch {
+      // Absent sources hash as the sentinel above, never as "skip".
+    }
+    hash.update(content);
+    hash.update('\0');
+  }
+  return hash.digest('hex').slice(0, GOVERNANCE_STAMP_DIGEST_LENGTH);
+}
+
+function generateVersionSection(): string {
+  const timestamp = getGovernanceStamp();
+
+  return [
+    MARKERS.versionStart,
+    '',
+    `_Governance Version: ${timestamp}_`,
+    '',
+    MARKERS.versionEnd,
+  ].join('\n');
+}
+
+// ============================================================================
+// Injection
+// ============================================================================
+
+/**
+ * Inject or update a section between markers.
+ */
+function injectSection(
+  content: string,
+  startMarker: string,
+  endMarker: string,
+  newSection: string
+): string {
+  const startIdx = content.indexOf(startMarker);
+  const endIdx = content.indexOf(endMarker);
+
+  if (startIdx !== -1 && endIdx !== -1) {
+    return content.slice(0, startIdx) + newSection + content.slice(endIdx + endMarker.length);
+  }
+
+  // Section doesn't exist - append before last "---" separator or at end
+  const insertPoint = content.lastIndexOf('\n---\n');
+  if (insertPoint !== -1) {
+    return content.slice(0, insertPoint) + '\n\n' + newSection + content.slice(insertPoint);
+  }
+
+  return content + '\n\n' + newSection;
+}
+
+// ============================================================================
+// Registry Summary (for check mode)
+// ============================================================================
+
+/**
+ * The counts CLAUDE.md states in prose. `null` means the phrase is absent —
+ * distinct from a phrase that says `0` — so `checkRegistryDrift` can report
+ * "not documented" instead of comparing against a default (#4586).
+ *
+ * Only tools and skills: CLAUDE.md carries no expert-type or workflow-template
+ * count (the `expert-config.ts (N types)` / `template-types.ts (N templates)`
+ * phrases the #761 extractor looked for left the file long ago), so those two
+ * probes were retired rather than kept as checks that cannot fail.
+ */
+interface DocumentedCounts {
+  tools: number | null;
+  skills: number | null;
+}
+
+/** First capture of `pattern` as an integer, or `null` when it does not match. */
+function documentedCount(content: string, pattern: RegExp): number | null {
+  const match = pattern.exec(content);
+  return match?.[1] === undefined ? null : parseInt(match[1], 10);
+}
+
+/**
+ * Extract the counts CLAUDE.md documents. The phrases are the ones the tool
+ * index and workflow index generators render (`**N MCP tools registered.**`,
+ * `**N skills registered.**`); the previous extractor counted tool-index table
+ * rows that the #2555 rewrite removed, so every documented count was 0 and
+ * the drift probes measured nothing on any run since.
+ */
+function extractDocumentedCounts(content: string): DocumentedCounts {
+  return {
+    tools: documentedCount(content, /\*\*(\d+) MCP tools registered\.\*\*/),
+    skills: documentedCount(content, /\*\*(\d+) skills registered\.\*\*/),
+  };
+}
+
+// ============================================================================
+// Commands
+// ============================================================================
+
+/**
+ * Verify that every registered MCP tool has an entry in
+ * `TOOL_ANNOTATIONS` (Issue #2648, Epic A). Tools registered without
+ * annotations silently fall back to MCP-spec defaults (destructive,
+ * non-idempotent, open-world), which break Epic B's prerequisite gates
+ * and degrade Claude / Codex / Gemini / OpenCode permission-prompt UX.
+ *
+ * Parses the canonical `TOOL_MANIFEST` as the source of truth and
+ * cross-references against `extractMcpTools()`. Reports missing entries
+ * AND stale entries (annotated but not registered).
+ */
+function checkToolAnnotations(tools: ToolMetadata[]): boolean {
+  // #3597: the per-tool annotation/side-effect data is folded INTO TOOL_MANIFEST
+  // (each `{ name, annotations, sideEffects }` entry). The manifest is the
+  // annotation source of truth; this gate verifies every registered tool's entry
+  // actually carries an `annotations` block (a name without one — which TS also
+  // rejects via `ToolManifestEntry` — would slip MCP-default hints).
+  if (!existsSync(TOOL_MANIFEST_FILE)) {
+    console.error('Missing src/mcp/tools/tool-manifest.ts (#2648/#3358/#3597)');
+    return false;
+  }
+  const content = readFileSync(TOOL_MANIFEST_FILE, 'utf-8');
+  // Names of manifest entries that pair a `name` with an `annotations: {` block.
+  const annotatedNames = new Set<string>();
+  const annotatedPattern = /name:\s*'([a-z_]+)',\s*annotations:\s*\{/g;
+  let annotated: RegExpExecArray | null;
+  while ((annotated = annotatedPattern.exec(content)) !== null) {
+    if (annotated[1] !== undefined) annotatedNames.add(annotated[1]);
+  }
+  const registeredNames = new Set(tools.map((t) => t.name));
+
+  const missing = [...registeredNames].filter((n) => !annotatedNames.has(n));
+  const stale = [...annotatedNames].filter((n) => !registeredNames.has(n));
+  if (missing.length === 0 && stale.length === 0) return true;
+
+  if (missing.length > 0) {
+    console.error('Registered tools missing annotations in TOOL_ANNOTATIONS (#2648):');
+    for (const n of missing) console.error('  - ' + n);
+  }
+  if (stale.length > 0) {
+    console.error('TOOL_ANNOTATIONS entries for tools that are not registered (#2648):');
+    for (const n of stale) console.error('  - ' + n);
+  }
+  return false;
+}
+
+/**
+ * Verify that every `.rules/*.md` file has frontmatter with `paths:` and
+ * `description:` fields (Issue #2656, Epic C). Frontmatter is the
+ * cross-adapter primitive that lets Codex / Gemini / OpenCode resolve
+ * rules deterministically — without it, those adapters silently miss
+ * the rule even when its topic applies.
+ *
+ * Frontmatter must:
+ *   1. Open with `---` on line 1.
+ *   2. Contain a `paths:` field (single string or YAML list).
+ *   3. Contain a `description:` field.
+ *   4. Close with a second `---` line.
+ *
+ * A missing `.rules/`, or one with no `*.md` in it, is reported as unmeasured
+ * and fails (#4586): `extractRules` returns `[]` for both and `injectRulesIndex`
+ * then leaves the on-disk index untouched, so without this guard a deleted
+ * rules directory rendered the whole governance check green.
+ */
+function checkRuleFrontmatter(): boolean {
+  const rulesDir = join(ROOT, '.rules');
+  if (!existsSync(rulesDir)) {
+    console.error('.rules/ directory missing — rule frontmatter unmeasured (#2656, #4586)');
+    return false;
+  }
+  const entries = readdirSync(rulesDir).filter((entry) => entry.endsWith('.md'));
+  if (entries.length === 0) {
+    console.error('.rules/ holds no *.md files — rule frontmatter unmeasured (#2656, #4586)');
+    return false;
+  }
+  const failures: string[] = [];
+  for (const entry of entries) {
+    const path = join(rulesDir, entry);
+    const content = readFileSync(path, 'utf-8');
+    if (!content.startsWith('---\n')) {
+      failures.push(`${entry}: missing opening frontmatter delimiter`);
+      continue;
+    }
+    const second = content.indexOf('\n---\n', 4);
+    if (second === -1) {
+      failures.push(`${entry}: missing closing frontmatter delimiter`);
+      continue;
+    }
+    const block = content.slice(4, second);
+    if (!/^paths:/m.test(block)) failures.push(`${entry}: missing \`paths:\``);
+    if (!/^description:/m.test(block)) failures.push(`${entry}: missing \`description:\``);
+  }
+  if (failures.length > 0) {
+    console.error('.rules/*.md frontmatter drift (#2656):');
+    for (const f of failures) console.error('  - ' + f);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Validate every entry in the CLAUDE.md "Canonical Paths" table resolves on
+ * disk (#2317, #2321). The table is intentionally hand-curated — adding or
+ * removing a row is a deliberate edit — but a row that points at a missing
+ * file silently misleads any agent that tries to Read it.
+ *
+ * Parses each row of the table that lives between the "## Canonical Paths"
+ * heading and the next blank-line-followed `---` separator, and checks that
+ * the path in the third backticked column exists from repo root.
+ */
+/**
+ * Verify that `docs/guides/RULE_PRECEDENCE.md` exists and contains a
+ * top-level section header for each of the four supported adapters
+ * (Issue #2655, Epic C). The doc is the cross-adapter bridge for rule
+ * loading; if any adapter's section is dropped, operators on that
+ * harness silently miss rules.
+ *
+ * Checks for `## Claude Code`, `## Codex CLI`, `## Gemini CLI`,
+ * `## OpenCode` as discrete header lines — substring matching is too
+ * loose because the body prose mentions every adapter throughout.
+ */
+function checkAdapterPrecedenceDocs(): boolean {
+  const path = join(ROOT, 'docs/guides/RULE_PRECEDENCE.md');
+  if (!existsSync(path)) {
+    console.error('Missing docs/guides/RULE_PRECEDENCE.md (#2655)');
+    return false;
+  }
+  const content = readFileSync(path, 'utf-8');
+  const required = ['## Claude Code', '## Codex CLI', '## Gemini CLI', '## OpenCode'];
+  // Match the header as a full line — `content.includes('## OpenCode')`
+  // would also accept `## OpenCodeXXX`, which defeats the check.
+  const lines = new Set(content.split('\n'));
+  const missing = required.filter((header) => !lines.has(header));
+  if (missing.length > 0) {
+    console.error(`RULE_PRECEDENCE.md missing section header(s): ${missing.join(', ')}`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * True when `source` contains an object literal with an `isError` property
+ * whose value is the `true` keyword — `{ isError: true }`, also through
+ * `true as const` / `true satisfies boolean` / `(true)`. Decided on the
+ * AST, so a comment or string that merely NAMES the convention cannot
+ * match (#5062). Not covered: shorthand `{ isError }` and any value that
+ * is not the literal keyword (a variable, a call) — the gate is about the
+ * raw literal, not data flow.
+ */
+function hasRawIsErrorLiteral(project: Project, fileName: string, source: string): boolean {
+  const sf = project.createSourceFile(fileName, source, { overwrite: true });
+  try {
+    return sourceHasRawIsErrorLiteral(sf);
+  } finally {
+    // One shared Project per check: drop each file after inspection so the
+    // in-memory program does not grow by every tool file scanned (#5062 review).
+    project.removeSourceFile(sf);
+  }
+}
+
+function sourceHasRawIsErrorLiteral(sf: SourceFile): boolean {
+  return sf.getDescendantsOfKind(SyntaxKind.PropertyAssignment).some((prop) => {
+    const nameNode = prop.getNameNode();
+    const name = Node.isStringLiteral(nameNode) ? nameNode.getLiteralText() : nameNode.getText();
+    if (name !== 'isError') return false;
+    let value = prop.getInitializer();
+    while (
+      value !== undefined &&
+      (Node.isAsExpression(value) ||
+        Node.isSatisfiesExpression(value) ||
+        Node.isParenthesizedExpression(value))
+    ) {
+      value = value.getExpression();
+    }
+    return value?.getKind() === SyntaxKind.TrueKeyword;
+  });
+}
+
+/**
+ * Verify every MCP tool returns errors through the structured error
+ * envelope (Issue #2649, Epic A) — no tool file may build a raw
+ * `{ isError: true }` literal. After the #2649 migration the only
+ * legitimate `isError: true` literal lives inside `toolStructuredError`
+ * in `tool-result.ts`; every other error return must go through that
+ * helper (or `toolError`, its back-compat alias).
+ *
+ * Scans `src/mcp/tools/**` (excluding `tool-result.ts` and tests). Each
+ * file is parsed and the object-literal AST is inspected, so a JSDoc or
+ * string mention of `isError: true` is not an offender and a property
+ * that follows a comment line inside a multi-line literal is (#5062) —
+ * the previous line-anchored regex got both of those wrong.
+ *
+ * A missing tools directory, or one in which zero files survive the
+ * exclusions, is unmeasured and fails (#4586) — the same rule as
+ * `checkToolOutputConsistency` (#5298). Exported so the test suite can drive
+ * that case: the directory also holds the manifest `loadAllRegistries` reads,
+ * so `checkGovernance` throws before reaching this gate when it is gone.
+ */
+export function checkMcpErrorEnvelope(): boolean {
+  const toolsDir = join(ROOT, 'packages/nexus-agents/src/mcp/tools');
+  if (!existsSync(toolsDir)) {
+    console.error(
+      'MCP error envelope: scanned 0 tool files — tools directory missing ' +
+        `(${toolsDir}); the check proved nothing (#2649, #4586).`
+    );
+    return false;
+  }
+  // Syntax only: no tsconfig, no lib files, no import resolution. Each tool
+  // file is parsed in isolation, so this is a parse per file, not a program.
+  const project = new Project({
+    useInMemoryFileSystem: true,
+    skipLoadingLibFiles: true,
+    skipFileDependencyResolution: true,
+  });
+  const offenders: string[] = [];
+  let scanned = 0;
+  for (const entry of readdirSync(toolsDir)) {
+    if (!entry.endsWith('.ts')) continue;
+    if (entry.endsWith('.test.ts') || entry === 'tool-result.ts') continue;
+    const content = readFileSync(join(toolsDir, entry), 'utf-8');
+    scanned += 1;
+    if (hasRawIsErrorLiteral(project, entry, content)) offenders.push(entry);
+  }
+  if (scanned === 0) {
+    console.error(
+      'MCP error envelope: scanned 0 tool files — the check proved nothing (#2649, #4586).'
+    );
+    return false;
+  }
+  if (offenders.length > 0) {
+    console.error(
+      'MCP tools with a raw `isError: true` literal — use toolStructuredError (#2649):'
+    );
+    for (const f of offenders) console.error('  - ' + f);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Verify no MCP tool-description pair has drifted into insufficient
+ * distinctness (Issue #2650, Epic A). Baseline-aware regression gate:
+ * fails on a NEW pair at/above the threshold in
+ * `docs/ops/tool-distinctness-baseline.json`, or a baseline pair whose
+ * similarity rose past the tolerance. The full lint + report logic lives
+ * in `check-tool-distinctness.ts`.
+ */
+function checkToolDistinctness(): boolean {
+  const result = runDistinctnessCheck(TOOL_DESCRIPTIONS, loadBaseline());
+  if (result.ok) return true;
+  for (const p of result.newOffenders) {
+    console.error(
+      `Tool-description distinctness: NEW overlapping pair ${p.a} <-> ${p.b} ` +
+        `(similarity ${p.similarity.toFixed(3)}) (#2650)`
+    );
+  }
+  for (const p of result.regressions) {
+    console.error(
+      `Tool-description distinctness: baseline pair ${p.a} <-> ${p.b} grew more similar ` +
+        `(${p.similarity.toFixed(3)}) (#2650)`
+    );
+  }
+  return false;
+}
+
+/**
+ * Tool names whose manifest `annotations` block lacks `readOnlyHint: true`.
+ * #3597: reads the folded-in annotations from each `TOOL_MANIFEST` entry
+ * (`name: '<tool>', annotations: { … },`) — the annotations no longer live in a
+ * standalone file.
+ */
+function extractNonReadOnlyTools(manifestSrc: string): Set<string> {
+  const names = new Set<string>();
+  // `annotations: {` has no nested braces, so the non-greedy body stops at its
+  // own closing `}` (before the `,` that precedes `sideEffects`).
+  const entryPattern = /name:\s*'([a-z_]+)',\s*annotations:\s*\{([\s\S]*?)\},/g;
+  let entry: RegExpExecArray | null;
+  while ((entry = entryPattern.exec(manifestSrc)) !== null) {
+    const name = entry[1];
+    const body = entry[2] ?? '';
+    if (name !== undefined && !/readOnlyHint:\s*true/.test(body)) names.add(name);
+  }
+  return names;
+}
+
+/** Tool names listed in `TOOL_PREREQUISITES` or `NO_PREREQUISITE`. */
+function extractPrerequisiteCoveredTools(prereqSrc: string): Set<string> {
+  const covered = new Set<string>();
+  for (const mapName of ['TOOL_PREREQUISITES', 'NO_PREREQUISITE']) {
+    const start = prereqSrc.indexOf(`export const ${mapName}`);
+    if (start === -1) continue;
+    const open = prereqSrc.indexOf('{', start);
+    const end = prereqSrc.indexOf('\n};', open);
+    const body = prereqSrc.slice(open, end === -1 ? undefined : end);
+    for (const m of body.matchAll(/^ {2}([a-z_]+):/gm)) {
+      if (m[1] !== undefined) covered.add(m[1]);
+    }
+  }
+  return covered;
+}
+
+/**
+ * Verify every non-read-only MCP tool has made a deliberate prerequisite
+ * decision (Issue #2652, Epic B). A tool that mutates state, emits audit
+ * entries, or acts on untrusted input must appear in either
+ * `TOOL_PREREQUISITES` (it declares a call-time predicate) or
+ * `NO_PREREQUISITE` (deliberately ungated, with a reason) in
+ * `src/mcp/middleware/tool-prerequisites.ts` — so a newly added sensitive
+ * tool cannot ship ungated by omission. Read-only tools are exempt.
+ *
+ * An empty non-read-only set is unmeasured and fails (#4586): the set comes
+ * from a regex over the manifest source, so a layout change the regex cannot
+ * follow empties it silently, and `missing` is then `[]` over nothing.
+ * Exported so the test suite can drive that case directly.
+ */
+export function checkToolPrerequisites(): boolean {
+  // #3597: readOnly hints are folded into TOOL_MANIFEST entries, so the
+  // non-read-only set is parsed from the manifest (was tool-annotations.ts,
+  // which #3444 had already had to chase across the #3358 move).
+  const prereqPath = join(ROOT, 'packages/nexus-agents/src/mcp/middleware/tool-prerequisites.ts');
+  if (!existsSync(TOOL_MANIFEST_FILE) || !existsSync(prereqPath)) {
+    console.error('Missing tool-manifest.ts or tool-prerequisites.ts (#2652)');
+    return false;
+  }
+  const nonReadOnly = extractNonReadOnlyTools(readFileSync(TOOL_MANIFEST_FILE, 'utf-8'));
+  if (nonReadOnly.size === 0) {
+    console.error(
+      'Tool prerequisites: manifest parse found zero non-read-only tools — the ' +
+        'prerequisite gate measured nothing (#2652, #4586). Either every tool is ' +
+        'read-only or the TOOL_MANIFEST layout no longer matches the parser.'
+    );
+    return false;
+  }
+  const covered = extractPrerequisiteCoveredTools(readFileSync(prereqPath, 'utf-8'));
+  const missing = [...nonReadOnly].filter((t) => !covered.has(t));
+  if (missing.length > 0) {
+    console.error('Non-read-only MCP tools with no prerequisite decision (#2652):');
+    for (const t of missing) console.error('  - ' + t);
+    console.error(
+      '  Add each to TOOL_PREREQUISITES (declare a predicate) or NO_PREREQUISITE ' +
+        '(with a reason) in src/mcp/middleware/tool-prerequisites.ts.'
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Verify no MCP tool's OUTPUT surface types a timestamp-named field as a
+ * bare `number` (Issue #2653, Epic B). A preventive lint — #2653's
+ * proposed runtime normalization layer was dropped after research found
+ * no current output heterogeneity; this catches a NEW tool diverging at
+ * source instead. Full logic in `check-tool-output-consistency.ts`.
+ */
+function checkToolOutputConsistency(): boolean {
+  const { violations, scanned, dirMissing } = scanToolFilesWithCoverage();
+  // #5298: `scanToolFiles()` returns [] when the tools directory does not
+  // resolve, so a moved or renamed path produced a clean governance verdict
+  // from a run that inspected zero files — with no count, path, or log to
+  // distinguish it from a genuine pass.
+  if (dirMissing || scanned === 0) {
+    console.error(
+      'Tool-output consistency: scanned 0 tool files — the check proved nothing. ' +
+        'Fix the tools path rather than trusting this run.'
+    );
+    return false;
+  }
+  if (violations.length === 0) return true;
+  console.error(
+    'Tool-output consistency: timestamp-named field(s) typed as a bare number (#2653):'
+  );
+  for (const v of violations) {
+    console.error(`  - ${v.file}:${String(v.line)} ${v.field}`);
+  }
+  console.error('  Type timestamps as an ISO-8601 string or a Date — see .rules/hooks.md.');
+  return false;
+}
+
+/**
+ * Phase 8 of #2766 — fail on new direct memory access (better-sqlite3
+ * Database, raw MobiMem ctor, outcomes.jsonl path) outside the
+ * baseline. The baseline lives at `docs/ops/memory-contract-baseline.json`
+ * and is regenerated by `pnpm exec tsx scripts/check-memory-contract.ts baseline`.
+ */
+function checkMemoryContract(): boolean {
+  const findings = scanMemoryContract();
+  const baseline = readMemoryContractBaseline();
+  const offenders = newMemoryContractOffenders(findings, baseline);
+  if (offenders.length === 0) return true;
+  console.error(
+    `Memory-contract drift: ${String(offenders.length)} new direct-access violation(s) (#2766 Phase 8):`
+  );
+  for (const f of offenders) {
+    console.error(`  - ${f.file}:${String(f.line)}  [${f.probeId}]`);
+    console.error(`    ${f.snippet}`);
+  }
+  console.error(
+    '  Fix: route through `getMemoryRegistry()` / `getSharedMobiMem()` / `getOutcomeStore()`,'
+  );
+  console.error(
+    '  OR regenerate the baseline: `pnpm exec tsx scripts/check-memory-contract.ts baseline` with a justification.'
+  );
+  return false;
+}
+
+/**
+ * Resolve a canonical-paths candidate against the repo. AGENTS.md's table uses
+ * a `src/...` shorthand that means `packages/nexus-agents/src/...`, while
+ * `packages/...` paths are repo-root-relative (#3446). Try repo-root first,
+ * then the nexus-agents package prefix as a fallback for the shorthand.
+ */
+function canonicalPathResolves(candidate: string): boolean {
+  if (existsSync(join(ROOT, candidate))) return true;
+  if (candidate.startsWith('src/')) {
+    return existsSync(join(ROOT, 'packages/nexus-agents', candidate));
+  }
+  return false;
+}
+
+/**
+ * Extract EVERY existence-checkable file path from one canonical-paths table
+ * row (empty if none — header/separator, or a row that only names a code
+ * symbol). The path cell may hold several backticked tokens (e.g. a row naming
+ * two source files); ALL file-path-shaped tokens (contain `/` or end in `.ts`)
+ * are returned and checked, so a broken path is caught wherever it sits in the
+ * row, not just in the last cell (#3446 QA). Directory markers (trailing `/`)
+ * are deliberately excluded — they are not existence-checked.
+ */
+function canonicalPathCandidates(line: string): string[] {
+  if (!line.startsWith('|')) return [];
+  if (/^\|\s*Concern\s*\|/.test(line) || /^\|\s*-+/.test(line)) return [];
+  return [...line.matchAll(/`([^`]+)`/g)]
+    .map((m) => m[1] ?? '')
+    .filter((t) => (t.includes('/') || t.endsWith('.ts')) && !t.endsWith('/'));
+}
+
+/**
+ * Validate that every file path in the "## Canonical paths" table resolves on
+ * disk (#2317, #2321, #3446). Repointed at AGENTS.md — the authoritative
+ * source of the canonical-paths table now that CLAUDE.md generates its copy
+ * from AGENTS.md's AGNOSTIC:BODY slice. The AGENTS table is `| Concern |
+ * Canonical path |`; only file paths are existence-checked (see
+ * `canonicalPathCandidate`).
+ */
+/**
+ * Every CODEOWNERS governor pattern must match at least one tracked file (#6034).
+ *
+ * `governorPathsFromCodeowners` returns the first token of each governor-section
+ * line. A pattern that matches nothing on disk is indistinguishable from one
+ * that matches everything it should: the count is unchanged, `started` and
+ * `terminated` stay healthy, #6030's non-empty guard is satisfied — and the path
+ * is silently ungoverned. Fail-OPEN.
+ *
+ * Three panel conditions shaped this, and each is load-bearing:
+ *
+ * 1. It matches with `matchesCodeownersPattern` — the SAME matcher both governor
+ *    gates use — against `git ls-files`. A separate glob engine or a bare
+ *    `existsSync` could pass a pattern the gates cannot match, which is this
+ *    very defect one layer over.
+ * 2. It runs under `governance:check` on EVERY PR, not gated on CODEOWNERS
+ *    edits. The likelier drift is not a typo but a RENAME: a PR moves
+ *    `src/audit/` and never touches CODEOWNERS, so a CODEOWNERS-filtered check
+ *    would not run on the PR that breaks it.
+ * 3. It names the pattern and its line, because "some pattern is stale" is not
+ *    actionable on a 14-entry list.
+ *
+ * Deliberately NOT inside the parser (the option the first panel preferred, on a
+ * premise I had got wrong — see #6034). Two reasons survived the correction:
+ * the parser is a pure text function with 10 hermetic test sites, and a stale
+ * pattern reaching `main` would make it throw, rendering every governor gate
+ * `indeterminate` and blocking every PR in the repo until CODEOWNERS is fixed.
+ * A check fails only the PR that introduces or exposes the drift.
+ */
+function checkGovernorPatternsResolve(): boolean {
+  const codeownersPath = join(ROOT, 'CODEOWNERS');
+  if (!existsSync(codeownersPath)) return true;
+  const text = readFileSync(codeownersPath, 'utf-8');
+
+  // The authoritative set, from the same parse both gates use — never a
+  // second, divergent scan of the file.
+  const patterns = governorPathsFromCodeowners(text);
+  if (patterns.length === 0) return true; // #6030's guard owns the empty case.
+
+  let tracked: string[];
+  try {
+    tracked = execFileSync('git', ['ls-files'], {
+      cwd: ROOT,
+      encoding: 'utf-8',
+      maxBuffer: 64 * 1024 * 1024,
+    })
+      .split('\n')
+      .filter((f: string) => f !== '');
+  } catch {
+    // Refuse to report a clean result over a scan that did not happen.
+    console.error('[governor-patterns] could not list tracked files; cannot verify patterns');
+    return false;
+  }
+
+  const unresolved = unresolvedGovernorPatterns(patterns, tracked, text.split('\n'));
+
+  if (unresolved.length > 0) {
+    console.error(
+      `Governor pattern(s) match no tracked file — those paths are NOT governed:\n` +
+        unresolved.map((u) => `  ${u}`).join('\n') +
+        `\nA renamed or deleted path needs its CODEOWNERS entry updated in the same PR.`
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Every early exit here is a failure, not a pass (#4586): a missing AGENTS.md,
+ * a renamed heading, or a section with no path entries each mean the table was
+ * not measured, and a table that is not measured cannot be reported as
+ * resolving.
+ */
+function checkCanonicalPaths(): boolean {
+  if (!existsSync(AGENTS_MD_PATH)) {
+    console.error('Canonical paths unmeasured: AGENTS.md missing (#2317, #4586)');
+    return false;
+  }
+  const content = readFileSync(AGENTS_MD_PATH, 'utf-8');
+  const headerIdx = content.search(/^## Canonical paths$/m);
+  if (headerIdx === -1) {
+    console.error(
+      'Canonical paths unmeasured: no "## Canonical paths" heading in AGENTS.md (#2317, #4586)'
+    );
+    return false;
+  }
+  const tail = content.slice(headerIdx);
+  // Stop at the first `###` subheading (e.g. "### Memory contract scope") so we
+  // only scan the top-level concern→path table, not the promotion table below.
+  const sectionEnd = tail.search(/\n### /);
+  const section = sectionEnd === -1 ? tail : tail.slice(0, sectionEnd);
+
+  const failures: string[] = [];
+  let candidates = 0;
+  for (const line of section.split('\n')) {
+    for (const candidate of canonicalPathCandidates(line)) {
+      candidates += 1;
+      if (!canonicalPathResolves(candidate)) failures.push(candidate);
+    }
+  }
+  if (candidates === 0) {
+    console.error(
+      'Canonical paths unmeasured: 0 path entries under "## Canonical paths" (#2317, #4586)'
+    );
+    return false;
+  }
+
+  if (failures.length > 0) {
+    console.error('Canonical Paths drift — these entries no longer resolve:');
+    for (const f of failures) console.error('  - ' + f);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Check a single registry for drift. Returns true only when CLAUDE.md states
+ * a count AND it equals the registry's. A count CLAUDE.md does not state is
+ * unmeasured and fails; a stated `0` is compared like any other value (#4586
+ * — the old `documented !== 0` guard let a doc claiming zero entries pass, and
+ * with the extractor returning 0 for every registry, skipped every probe). A
+ * registry that loaded zero entries is the other empty side and fails too.
+ */
+function checkRegistryDrift(label: string, documented: number | null, actual: number): boolean {
+  if (documented === null) {
+    console.error(`${label} count not documented in CLAUDE.md — drift unmeasured (#4586)`);
+    return false;
+  }
+  if (actual === 0) {
+    console.error(`${label} registry loaded 0 entries — drift unmeasured (#4586)`);
+    return false;
+  }
+  if (documented !== actual) {
+    console.error(`${label} drift: documented ${String(documented)}, actual ${String(actual)}`);
+    return false;
+  }
+  return true;
+}
+
+/** Print the passing-governance count summary. */
+function printGovernanceSummary(
+  actual: {
+    tools: ToolMetadata[];
+    experts: ExpertMetadata[];
+    workflows: WorkflowMetadata[];
+    skills: SkillMetadata[];
+  },
+  agentCount: number,
+  probeCount: number
+): void {
+  console.log('Governance check passed:');
+  console.log(`  MCP Tools: ${String(actual.tools.length)}`);
+  console.log(`  Expert Types: ${String(actual.experts.length)}`);
+  console.log(`  Workflow Templates: ${String(actual.workflows.length)}`);
+  console.log(`  Skills: ${String(actual.skills.length)}`);
+  console.log(`  Agents: ${String(agentCount)}`);
+  // #5882: the registry counts above say what the tree holds; this says how
+  // much of the plugin surface was actually probed for drift against them.
+  console.log(`  Count-drift probes run: ${String(probeCount)}`);
+}
+
+/**
+ * Check if governance is current (CI validation mode).
+ *
+ * Exported so the test suite (#3954) can drive the full check in-process
+ * against an isolated sandbox root (via `NEXUS_SCRIPT_ROOT`) instead of
+ * spawning `pnpm exec tsx` and mutating the real working tree.
+ */
+/**
+ * The cross-adapter documentation gates, grouped so `checkGovernance` stays
+ * under its line cap (#6034).
+ *
+ * Same device as {@link checkStrategyRegistryGates}, and the same reason: a
+ * function at its ceiling answers the next check with a cap bump instead of a
+ * decision (#6008). These four are one concern — whether the surface that
+ * Codex, Gemini CLI and OpenCode read still says what CLAUDE.md says: the
+ * harness-agnostic block, the per-adapter precedence doc, `.rules/` frontmatter,
+ * and AGENTS.md's generated sections — the rules index built from that
+ * frontmatter and the workflow and tool tables (#6105).
+ */
+async function checkCrossAdapterDocGates(
+  claudeMd: string,
+  registries: GovernanceRegistries
+): Promise<boolean[]> {
+  // The two source-side gates first: a malformed `.rules/*.md` frontmatter is
+  // named by `checkRuleFrontmatter` BEFORE `extractRules` throws on it inside
+  // the AGENTS.md render below (the render used to run last, after this gate).
+  const precedence = checkAdapterPrecedenceDocs();
+  const frontmatter = checkRuleFrontmatter();
+  // One AGENTS.md render for both files (#6167). A formatter failure on it is
+  // one actionable line (#6087); the CLAUDE.md render copies it, so CLAUDE.md
+  // is then unmeasured — reported as such, not as a second formatter line.
+  let agents: AgentsMdRender;
+  try {
+    agents = await renderAgentsMdFromDisk(registries);
+  } catch (error: unknown) {
+    if (!(error instanceof FormatError)) throw error;
+    console.error(`governance:check: ${error.message}`);
+    console.error('CLAUDE.md is unmeasured: its render copies the AGENTS.md render (#6167)');
+    return [false, precedence, frontmatter, false];
+  }
+  return [
+    await checkClaudeMd(claudeMd, registries, agents.rendered),
+    precedence,
+    frontmatter,
+    checkAgentsMd(agents),
+  ];
+}
+
+export async function checkGovernance(): Promise<boolean> {
+  if (!existsSync(CLAUDE_MD_PATH)) {
+    console.error('CLAUDE.md not found');
+    return false;
+  }
+
+  const content = readFileSync(CLAUDE_MD_PATH, 'utf-8');
+  const actual = loadAllRegistries();
+  const documented = extractDocumentedCounts(content);
+
+  const agents = extractAgents();
+  const ancillary = checkAncillaryCounts({
+    toolCount: actual.tools.length,
+    skillCount: actual.skills.length,
+    agentCount: agents.length,
+  });
+  const versionOk = checkPluginVersion();
+
+  const checks = [
+    checkRegistryDrift('MCP tools', documented.tools, actual.tools.length),
+    checkRegistryDrift('Skills', documented.skills, actual.skills.length),
+    content.includes(MARKERS.toolIndexStart) ||
+      (console.error('Tool index section not found'), false),
+    ancillary.ok,
+    versionOk,
+    checkReadmeToolTable(actual.tools),
+    checkEntrypoints(actual.tools, extractCliCommands()),
+    checkCanonicalPaths(),
+    checkGovernorPatternsResolve(),
+    ...(await checkCrossAdapterDocGates(content, actual)),
+    checkToolAnnotations(actual.tools),
+    checkMcpErrorEnvelope(),
+    checkToolDistinctness(),
+    checkToolPrerequisites(),
+    checkToolOutputConsistency(),
+    checkMemoryContract(),
+    checkServerJson(actual.tools.length),
+    checkWebsiteCapabilityCounts(actual),
+    ...checkStrategyRegistryGates(),
+  ];
+
+  const passed = checks.every(Boolean);
+  if (passed) printGovernanceSummary(actual, agents.length, ancillary.probeCount);
+  return passed;
+}
+
+/**
+ * The strategy-manifest-registry governance gates (Epic C/D). Grouped into one
+ * helper so `checkGovernance` stays within the per-function line budget:
+ * - #3837: the registry drift-gate (YAML↔TS drift, manifest↔ExecutionStrategy
+ *   bijection, YAML schema validation). Also `strategy-manifest:check`.
+ * - #3841: the authority-tier declaration gate (every manifest declares a tier;
+ *   an `enforce` declaration needs a floor-meeting evidence record + ratification,
+ *   ADR-0017). Also `authority-tier:check`.
+ */
+function checkStrategyRegistryGates(): boolean[] {
+  return [checkStrategyManifestRegistry(), checkAuthorityTierDeclarations()];
+}
+
+/**
+ * Verify that ancillary count surfaces (plugin manifests, AGENTS.md,
+ * install docs) match the canonical registry counts. (#1837)
+ */
+interface Probe {
+  path: string;
+  pattern: RegExp;
+  /**
+   * A count. The string form (#5142, the toolchain footer) left with those
+   * rows when they joined the AGENTS.md render (#6146).
+   */
+  expected: number;
+  label: string;
+}
+
+function buildAgentsMdProbes(t: number, s: number): Probe[] {
+  return [
+    {
+      path: AGENTS_MD_PATH,
+      pattern: /for all (\d+) skills\./,
+      expected: s,
+      label: 'AGENTS.md skills count',
+    },
+    {
+      path: AGENTS_MD_PATH,
+      pattern: /Nexus-agents exposes (\d+) MCP tools/,
+      expected: t,
+      label: 'AGENTS.md MCP tools count',
+    },
+  ];
+}
+
+function buildMarketplaceProbes(t: number, s: number, a: number): Probe[] {
+  return [
+    {
+      path: PLUGIN_JSON_PATH,
+      pattern: /(\d+) MCP tools for agent management/,
+      expected: t,
+      label: 'plugin.json MCP tools count',
+    },
+    {
+      path: MARKETPLACE_JSON_PATH,
+      pattern: /(\d+) MCP tools \(orchestrate/,
+      expected: t,
+      label: 'marketplace.json MCP tools count',
+    },
+    {
+      path: MARKETPLACE_JSON_PATH,
+      pattern: /, (\d+) skills,/,
+      expected: s,
+      label: 'marketplace.json skills count',
+    },
+    {
+      path: MARKETPLACE_JSON_PATH,
+      pattern: /, (\d+) expert agents/,
+      expected: a,
+      label: 'marketplace.json agents count',
+    },
+  ];
+}
+
+function buildPluginInstallProbes(t: number, s: number, a: number): Probe[] {
+  return [
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /- (\d+) MCP tools \(/,
+      expected: t,
+      label: 'PLUGIN_INSTALL MCP tools count',
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /- (\d+) skills \(research-and-vote/,
+      expected: s,
+      label: 'PLUGIN_INSTALL skills count',
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /- (\d+) agent mirrors/,
+      expected: a,
+      label: 'PLUGIN_INSTALL agent mirrors count',
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /After install, confirm the (\d+) MCP tools/,
+      expected: t,
+      label: 'PLUGIN_INSTALL verify tools count',
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /The (\d+) skills appear in `\/skills`/,
+      expected: s,
+      label: 'PLUGIN_INSTALL /skills count',
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /and the (\d+) agents in `\/agents`/,
+      expected: a,
+      label: 'PLUGIN_INSTALL /agents count',
+    },
+  ];
+}
+
+function buildAncillaryProbes(counts: AncillaryCounts): Probe[] {
+  const { toolCount: t, skillCount: s, agentCount: a } = counts;
+  return [
+    ...buildAgentsMdProbes(t, s),
+    ...buildMarketplaceProbes(t, s, a),
+    ...buildPluginInstallProbes(t, s, a),
+  ];
+}
+
+/**
+ * Run one count-drift probe.
+ *
+ * A missing target used to `return true` — a pass, with no output. That made
+ * "the file was read and agreed" indistinguishable from "the file is gone and
+ * nothing was checked", and it was the ONLY silent outcome: a present file
+ * whose pattern had drifted returned `false` and printed. So these probes went
+ * loud when they worked and quiet when they stopped working (#5882).
+ *
+ * `PLUGIN_INSTALL.md` alone carries 6 of them and lives under
+ * `docs/getting-started/`, which this repo reorganises routinely.
+ */
+function runProbe(probe: Probe): boolean {
+  if (!existsSync(probe.path)) {
+    console.error(`❌ ${probe.label}: ${probe.path} does not exist — probe not run`);
+    return false;
+  }
+  const content = readFileSync(probe.path, 'utf-8');
+  const match = probe.pattern.exec(content);
+  if (match === null) {
+    console.error(`❌ ${probe.label}: pattern not found in ${probe.path}`);
+    return false;
+  }
+  const actual = Number(match[1]);
+  if (actual !== probe.expected) {
+    console.error(
+      `❌ ${probe.label}: expected ${String(probe.expected)}, found ${String(actual)} in ${probe.path}`
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Count-drift probes, and how many ran.
+ *
+ * The count is reported so a future tolerant branch cannot hide behind the
+ * green summary: an operator can see "10 probes" become "4 probes" without
+ * having to notice an absence.
+ */
+function checkAncillaryCounts(counts: AncillaryCounts): { ok: boolean; probeCount: number } {
+  const probes = buildAncillaryProbes(counts);
+  // Not `.every()`: it short-circuits, so the first missing or drifted probe
+  // would suppress the report for every one after it. Run them all, then
+  // aggregate — the operator wants the whole list in one CI log.
+  const results = probes.map(runProbe);
+  // Zero probes is not a pass. `[].every()` reports health over a check that
+  // examined nothing — the same defect this function was just fixed for one
+  // level down, and the repo's own `nexus/no-vacuous-verdict` rule caught it
+  // here (#5882).
+  if (results.length === 0) {
+    console.error('❌ Count-drift probes: none were built — nothing was checked');
+    return { ok: false, probeCount: 0 };
+  }
+  return { ok: results.every(Boolean), probeCount: probes.length };
+}
+
+/**
+ * Apply the inline registry-count rewrites that update the documentation
+ * section's "(N types/templates/tools/skills)" markers. Pure string ops,
+ * extracted from injectGovernance() to keep that function under the
+ * max-lines-per-function gate (#2317).
+ */
+function applyInlineCountRewrites(
+  content: string,
+  counts: { experts: number; workflows: number; tools: number; skills: number }
+): string {
+  let next = content.replace(
+    /Experts:.*?`expert-config\.ts`\s*\(\d+\s*types\)/,
+    `Experts: \`expert-config.ts\` (${String(counts.experts)} types)`
+  );
+  next = next.replace(
+    /Workflows:.*?`template-types\.ts`\s*\(\d+\s*templates\)/,
+    `Workflows: \`template-types.ts\` (${String(counts.workflows)} templates)`
+  );
+  next = next.replace(
+    /MCP Tools:.*?`src\/mcp\/tools\/index\.ts`\s*\(\d+\s*tools\)/,
+    `MCP Tools: \`src/mcp/tools/index.ts\` (${String(counts.tools)} tools)`
+  );
+  next = next.replace(
+    /Skills:.*?`\.claude\/skills\/\*\.md`\s*\(\d+\s*skills\)/,
+    `Skills: \`skills/<name>/SKILL.md\` (${String(counts.skills)} skills)`
+  );
+  return next;
+}
+
+/**
+ * Inject the Workflows table (#2317). Soft-skip if the markers have not yet
+ * been added to CLAUDE.md so this script remains compatible with older
+ * checkouts that haven't migrated.
+ */
+function injectWorkflowIndex(content: string, rows: readonly WorkflowRow[]): string {
+  if (rows.length === 0 || !content.includes(MARKERS.workflowIndexStart)) return content;
+  return injectSection(
+    content,
+    MARKERS.workflowIndexStart,
+    MARKERS.workflowIndexEnd,
+    generateWorkflowIndex(rows)
+  );
+}
+
+/**
+ * Inject all governance sections into CLAUDE.md.
+ */
+interface GovernanceRegistries {
+  tools: ToolMetadata[];
+  experts: ExpertMetadata[];
+  workflows: WorkflowMetadata[];
+  skills: SkillMetadata[];
+}
+
+function loadAllRegistries(): GovernanceRegistries {
+  return {
+    tools: extractMcpTools(),
+    experts: extractExpertTypes(),
+    workflows: extractWorkflowTemplates(),
+    skills: extractSkills(),
+  };
+}
+
+function applyAllSectionInjections(
+  content: string,
+  r: GovernanceRegistries,
+  agentsMd: string
+): string {
+  // #3446: regenerate the agnostic body FIRST from AGENTS.md's AGNOSTIC:BODY
+  // slice, so the harness-neutral prose stays single-sourced. The remaining
+  // injections target the authored header / Claude-specific overlay markers,
+  // which live in disjoint regions of the file.
+  let next = injectClaudeAgnosticBlock(content, agentsMd);
+  // #6105: the slice arrives with these two tables already generated (it is
+  // the AGENTS.md render, #6167), so the two injections below are no-ops on
+  // it. They stay because CLAUDE.md's copy is still a hand-editable surface
+  // that `check` measures against this render.
+  next = injectToolIndex(next, r.tools);
+  next = injectWorkflowIndex(next, extractWorkflowRows());
+  next = applyInlineCountRewrites(next, {
+    experts: r.experts.length,
+    workflows: r.workflows.length,
+    tools: r.tools.length,
+    skills: r.skills.length,
+  });
+  return injectSection(next, MARKERS.versionStart, MARKERS.versionEnd, generateVersionSection());
+}
+
+/**
+ * The ONE render of CLAUDE.md (#6099): every generated section, in the order
+ * `inject` applies them ({@link applyAllSectionInjections}), then the shared
+ * prettier pass ({@link formatWithPrettier}). `inject` writes this string;
+ * `check` compares it to the file. Because there is no second regeneration,
+ * the two cannot drift: before this, `check` re-rendered only the agnostic
+ * block and simulated the rest by splicing the on-disk block back in, and
+ * its parity with CI's "inject, then `git diff --exit-code CLAUDE.md`" was
+ * closer but not total.
+ *
+ * The AGNOSTIC:BODY slice is copied from `agentsMd`, the RENDERED AGENTS.md
+ * (#6167) — rendered here from the file when the caller has not already done
+ * so ({@link injectGovernance} and {@link checkCrossAdapterDocGates} render it
+ * once and pass it to both files' paths). Copying the file instead made a
+ * stale AGENTS.md value CLAUDE.md drift as well, with the stale value
+ * labelled `expected`.
+ *
+ * Pure with respect to CLAUDE.md: reads AGENTS.md and the registries, writes
+ * nothing. Exported so the test can assert that.
+ */
+export async function renderClaudeMd(
+  currentClaudeMd: string,
+  registries: GovernanceRegistries = loadAllRegistries(),
+  agentsMd?: string
+): Promise<string> {
+  const rendered = agentsMd ?? (await renderAgentsMdFromDisk(registries)).rendered;
+  return formatWithPrettier(
+    CLAUDE_MD_PATH,
+    applyAllSectionInjections(currentClaudeMd, registries, rendered)
+  );
+}
+
+/**
+ * `renderClaudeMd(content) === content` (#6099): what CI's idempotency step
+ * measures on disk, measured in memory. Fails with the first differing line
+ * and the cause derived from where it falls ({@link describeClaudeMdDrift}).
+ *
+ * A formatter failure ({@link FormatError}) is an actionable line and a failed
+ * check (#6087); a generator invariant (malformed AGNOSTIC:BODY markers) still
+ * throws, as it did before, so it cannot be mistaken for a formatter error.
+ */
+async function checkClaudeMd(
+  content: string,
+  registries: GovernanceRegistries,
+  agentsMd: string
+): Promise<boolean> {
+  let expected: string;
+  try {
+    expected = await renderClaudeMd(content, registries, agentsMd);
+  } catch (error: unknown) {
+    if (!(error instanceof FormatError)) throw error;
+    console.error(`governance:check: ${error.message}`);
+    return false;
+  }
+  if (expected === content) return true;
+  console.error(describeClaudeMdDrift(expected, content));
+  return false;
+}
+
+/**
+ * Inject all governance sections (CLI default mode).
+ *
+ * Exported so the test suite (#3954) can drive injection in-process against an
+ * isolated sandbox root (via `NEXUS_SCRIPT_ROOT`).
+ */
+export async function injectGovernance(): Promise<void> {
+  if (!existsSync(CLAUDE_MD_PATH)) {
+    console.error('CLAUDE.md not found');
+    process.exit(1);
+  }
+  const registries = loadAllRegistries();
+  const { tools, experts, workflows, skills } = registries;
+  const agents = extractAgents();
+
+  // Render AGENTS.md's generated text ONCE (#2657 rules index; #6105 workflow
+  // and tool tables; #6130 governance stamp and count phrases; #6146 toolchain
+  // footer) and write it; the CLAUDE.md render below copies the SAME string
+  // (#6167), so a single `inject` cannot leave CLAUDE.md a pass behind an
+  // AGENTS.md value that just changed. Before #6167 the CLAUDE.md render
+  // re-read the file, which is why the AGENTS.md write had to come first
+  // (#5142); the order is kept, but nothing depends on it any more.
+  const agentsMd = await renderAgentsMdFromDisk(registries);
+  injectAgentsMd(agentsMd);
+
+  // #1837: keep ancillary count surfaces (plugin manifests, install docs)
+  // aligned with canonical registries. The AGENTS.md toolchain footer (#5142)
+  // is part of the AGENTS.md render above since #6146.
+  injectAncillaryCounts({
+    toolCount: tools.length,
+    skillCount: skills.length,
+    agentCount: agents.length,
+  });
+
+  // #6099: the same render `check` compares against the file.
+  const original = readFileSync(CLAUDE_MD_PATH, 'utf-8');
+  writeFileSync(CLAUDE_MD_PATH, await renderClaudeMd(original, registries, agentsMd.rendered));
+
+  // Inject README MCP tools table (#2269) — same registry, scannable
+  // descriptions. Soft-skip if README has no markers yet so this script
+  // remains drop-in compatible with older checkouts.
+  await injectReadmeToolTable(tools);
+
+  // #3334: regenerate both docs/ENTRYPOINTS.md MCP-tool enumerations (the
+  // prose table and the BEGIN:MCP_TOOLS YAML block) from the same registry —
+  // and (#5458) the CLI command tables from the command catalog.
+  await injectEntrypoints(tools, extractCliCommands());
+
+  // #1839: keep .claude-plugin/plugin.json `version` in sync with
+  // packages/nexus-agents/package.json so marketplace listing never
+  // drifts from the shipped npm package.
+  syncPluginVersion();
+
+  // #2327 + #2295 follow-up: sync packages/nexus-agents/server.json — the
+  // MCP-spec registry file — to package.json's version, canonical tool
+  // count, and the full `tools[]` array. The latter previously needed a
+  // manual edit per tool; CI's docs-content-drift gate (#2107) caught it
+  // every release.
+  syncServerJson(tools.map((t) => t.name));
+
+  // #2295 follow-up: sync ancillary count surfaces that the docs-content-
+  // drift gate (#2107) checks but didn't write. Each new tool used to
+  // require manual edits in 5+ places; now they all flow from this script.
+  syncWebsiteCapabilityCounts(registries);
+  syncDesignDocsToolCount(tools.length);
+  syncReadmeToolCount(tools.length);
+
+  console.log('Governance injected:');
+  console.log(`  MCP Tools: ${String(tools.length)}`);
+  console.log(`  Expert Types: ${String(experts.length)}`);
+  console.log(`  Workflow Templates: ${String(workflows.length)}`);
+  console.log(`  Skills: ${String(skills.length)}`);
+  console.log(`  Agents: ${String(agents.length)}`);
+}
+
+/**
+ * Verify the README MCP tools section is in sync with the canonical
+ * registry (#2269). Returns true if README is absent (soft-skip) OR has
+ * markers AND running the generator would produce no diff. Returns false
+ * (with a structured error) when markers exist but the table is stale —
+ * the maintainer must run `pnpm governance:inject` and commit.
+ */
+function checkReadmeToolTable(tools: ToolMetadata[]): boolean {
+  if (!existsSync(README_PATH)) return true;
+  const content = readFileSync(README_PATH, 'utf-8');
+  if (!content.includes(MARKERS.readmeToolsStart)) return true;
+  const expected = generateReadmeToolTable(tools);
+  const updated = injectSection(
+    content,
+    MARKERS.readmeToolsStart,
+    MARKERS.readmeToolsEnd,
+    expected
+  );
+  if (updated !== content) {
+    console.error('README MCP tools table is stale. Run: pnpm governance:inject');
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Write the README MCP tools table between governance markers (#2269).
+ * Soft-skip when README is missing or markers are absent so this script
+ * remains drop-in compatible with older checkouts that haven't been
+ * marker-prepped yet.
+ */
+async function injectReadmeToolTable(tools: ToolMetadata[]): Promise<void> {
+  if (!existsSync(README_PATH)) {
+    return;
+  }
+  const content = readFileSync(README_PATH, 'utf-8');
+  if (!content.includes(MARKERS.readmeToolsStart)) {
+    return;
+  }
+  const table = generateReadmeToolTable(tools);
+  const updated = injectSection(content, MARKERS.readmeToolsStart, MARKERS.readmeToolsEnd, table);
+  if (updated !== content) {
+    await writeFormatted(README_PATH, updated);
+  }
+}
+
+/**
+ * Write AGENTS.md's generated text (#2657, #6105, #6130) — the render `check`
+ * compares against the file ({@link renderAgentsMd}), produced once by
+ * {@link renderAgentsMdFromDisk} and shared with the CLAUDE.md render (#6167).
+ * Each injector soft-skips its own absent markers, so the script stays
+ * drop-in compatible with un-prepped checkouts.
+ */
+function injectAgentsMd({ content, rendered }: AgentsMdRender): void {
+  if (rendered !== content) writeFileSync(AGENTS_MD_PATH, rendered);
+}
+
+/**
+ * Apply count replacements across plugin + install docs (#1837).
+ * Each replacement is keyed on a stable phrase so the file remains
+ * hand-editable otherwise. Silent no-ops on missing files.
+ */
+interface AncillaryCounts {
+  toolCount: number;
+  skillCount: number;
+  agentCount: number;
+}
+
+interface Replacement {
+  path: string;
+  pattern: RegExp;
+  replacement: string;
+}
+
+/**
+ * Count replacements for the plugin manifests and the install doc. AGENTS.md's
+ * rows — the governance stamp (#5218), the two count phrases (#6130) and the
+ * toolchain footer (#5142, #6146) — moved into the AGENTS.md render: `check`
+ * compares that render to the file, and a value written here instead would be
+ * one the check cannot see.
+ */
+function buildAncillaryReplacements(c: AncillaryCounts): Replacement[] {
+  const { toolCount: t, skillCount: s, agentCount: a } = c;
+  return [
+    {
+      path: PLUGIN_JSON_PATH,
+      pattern: /\d+ MCP tools for agent management/,
+      replacement: `${String(t)} MCP tools for agent management`,
+    },
+    {
+      path: MARKETPLACE_JSON_PATH,
+      pattern:
+        /\d+ MCP tools \(orchestrate, consensus voting, research, pipelines\), \d+ skills, \d+ expert agents/,
+      replacement: `${String(t)} MCP tools (orchestrate, consensus voting, research, pipelines), ${String(s)} skills, ${String(a)} expert agents`,
+    },
+    ...buildPluginInstallReplacements(t, s, a),
+  ];
+}
+
+/** The install-doc rows, the write side of {@link buildPluginInstallProbes}. */
+function buildPluginInstallReplacements(t: number, s: number, a: number): Replacement[] {
+  return [
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /- \d+ MCP tools \(/,
+      replacement: `- ${String(t)} MCP tools (`,
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /- \d+ skills \(research-and-vote/,
+      replacement: `- ${String(s)} skills (research-and-vote`,
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /- \d+ agent mirrors \(/,
+      replacement: `- ${String(a)} agent mirrors (`,
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /After install, confirm the \d+ MCP tools/,
+      replacement: `After install, confirm the ${String(t)} MCP tools`,
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /The \d+ skills appear in `\/skills`, and the \d+ agents/,
+      replacement: `The ${String(s)} skills appear in \`/skills\`, and the ${String(a)} agents`,
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /\| Skills \(canonical\)  \| `skills\/<name>\/SKILL\.md` \(\d+\) \|/,
+      replacement: `| Skills (canonical)  | \`skills/<name>/SKILL.md\` (${String(s)}) |`,
+    },
+    {
+      path: PLUGIN_INSTALL_PATH,
+      pattern: /\| Agents             \| `agents\/\*\.md` \(\d+\) \|/,
+      replacement: `| Agents             | \`agents/*.md\` (${String(a)}) |`,
+    },
+  ];
+}
+
+function injectAncillaryCounts(counts: AncillaryCounts): void {
+  for (const { path, pattern, replacement } of buildAncillaryReplacements(counts)) {
+    if (!existsSync(path)) continue;
+    const current = readFileSync(path, 'utf-8');
+    const updated = current.replace(pattern, replacement);
+    if (updated !== current) writeFileSync(path, updated);
+  }
+}
+
+/**
+ * CI drift probe for plugin manifest version (#1839).
+ * Fails if .claude-plugin/plugin.json `version` !== package.json `version`.
+ */
+function checkPluginVersion(): boolean {
+  // Same shape as `runProbe` had, and the same fix (#5882): a missing manifest
+  // used to return a silent pass, so losing either file disabled the
+  // version-sync check with no output at all.
+  const absent = [PACKAGE_JSON_PATH, PLUGIN_JSON_PATH].filter((p) => !existsSync(p));
+  if (absent.length > 0) {
+    console.error(`❌ Plugin version check: missing ${absent.join(', ')} — check not run`);
+    return false;
+  }
+  const pkg = JSON.parse(readFileSync(PACKAGE_JSON_PATH, 'utf-8')) as { version?: string };
+  const plugin = JSON.parse(readFileSync(PLUGIN_JSON_PATH, 'utf-8')) as { version?: string };
+  if (pkg.version === plugin.version) return true;
+  console.error(
+    `❌ Plugin manifest version: plugin.json has ${String(plugin.version)}, package.json has ${String(pkg.version)}`
+  );
+  return false;
+}
+
+/**
+ * Keep .claude-plugin/plugin.json `version` aligned with
+ * packages/nexus-agents/package.json (#1839 marketplace submission prep).
+ * The plugin manifest is what Anthropic's marketplace listing reads.
+ */
+function syncPluginVersion(): void {
+  if (!existsSync(PACKAGE_JSON_PATH) || !existsSync(PLUGIN_JSON_PATH)) return;
+  const pkgVersion = (JSON.parse(readFileSync(PACKAGE_JSON_PATH, 'utf-8')) as { version?: string })
+    .version;
+  if (typeof pkgVersion !== 'string' || pkgVersion.length === 0) return;
+
+  const plugin = JSON.parse(readFileSync(PLUGIN_JSON_PATH, 'utf-8')) as Record<string, unknown>;
+  if (plugin['version'] === pkgVersion) return;
+
+  plugin['version'] = pkgVersion;
+  writeFileSync(PLUGIN_JSON_PATH, JSON.stringify(plugin, null, 2) + '\n');
+}
+
+/**
+ * Keep packages/nexus-agents/server.json aligned with package.json (#2327).
+ * The MCP-spec server.json carries TWO version fields (top-level + per-package
+ * entry) and an inline "N MCP tools" count in `description`. All three drift
+ * silently — the file was 10 minor versions behind when this sync was added.
+ */
+interface ServerJsonShape {
+  version?: string;
+  description?: string;
+  packages?: Array<Record<string, unknown>>;
+  tools?: string[];
+  [k: string]: unknown;
+}
+
+function syncServerVersionFields(server: ServerJsonShape, pkgVersion: string): boolean {
+  let dirty = false;
+  if (server.version !== pkgVersion) {
+    server.version = pkgVersion;
+    dirty = true;
+  }
+  if (Array.isArray(server.packages)) {
+    for (const pkgEntry of server.packages) {
+      if (pkgEntry['version'] !== pkgVersion) {
+        pkgEntry['version'] = pkgVersion;
+        dirty = true;
+      }
+    }
+  }
+  return dirty;
+}
+
+function syncServerToolCount(server: ServerJsonShape, toolCount: number): boolean {
+  if (typeof server.description !== 'string') return false;
+  const updated = server.description.replace(/(\d+) MCP tools/, `${String(toolCount)} MCP tools`);
+  if (updated === server.description) return false;
+  server.description = updated;
+  return true;
+}
+
+/**
+ * Sync the `tools[]` array from the authoritative `STANDALONE_TOOLS` list
+ * (#2295 follow-up). Preserves source order — the registration order in
+ * `mcp/tools/index.ts` is meaningful for help-text and matches consumer
+ * expectations.
+ */
+function syncServerToolList(server: ServerJsonShape, toolNames: readonly string[]): boolean {
+  if (Array.isArray(server.tools)) {
+    const same =
+      server.tools.length === toolNames.length && server.tools.every((t, i) => t === toolNames[i]);
+    if (same) return false;
+  }
+  server.tools = [...toolNames];
+  return true;
+}
+
+function syncServerJson(toolNames: readonly string[]): void {
+  if (!existsSync(PACKAGE_JSON_PATH) || !existsSync(SERVER_JSON_PATH)) return;
+  const pkgVersion = (JSON.parse(readFileSync(PACKAGE_JSON_PATH, 'utf-8')) as { version?: string })
+    .version;
+  if (typeof pkgVersion !== 'string' || pkgVersion.length === 0) return;
+
+  const server = JSON.parse(readFileSync(SERVER_JSON_PATH, 'utf-8')) as ServerJsonShape;
+  const versionDirty = syncServerVersionFields(server, pkgVersion);
+  const countDirty = syncServerToolCount(server, toolNames.length);
+  const listDirty = syncServerToolList(server, toolNames);
+  if (versionDirty || countDirty || listDirty) {
+    writeFileSync(SERVER_JSON_PATH, JSON.stringify(server, null, 2) + '\n');
+  }
+}
+
+const SITE_DATA_PATH = join(ROOT, 'website/src/data/site-data.ts');
+const COMPONENTS_DOC_PATH = join(ROOT, 'docs/design/components.md');
+
+/** Website counts use the same registry readers as the governance surfaces. */
+function buildWebsiteCountProbes(registries: GovernanceRegistries): Probe[] {
+  const counts: readonly [string, number][] = [
+    ['MCP_TOOL_COUNT', registries.tools.length],
+    ['EXPERT_TYPE_COUNT', registries.experts.length],
+    ['SKILL_COUNT', registries.skills.length],
+    ['STRATEGY_COUNT', STRATEGY_MANIFEST_REGISTRY.manifests.length],
+  ];
+  return counts.map(([name, expected]) => ({
+    path: SITE_DATA_PATH,
+    pattern: new RegExp(`^export const ${name}\\s*=\\s*(\\d+)(?=\\s*;)`, 'm'),
+    expected,
+    label: `website ${name}`,
+  }));
+}
+
+/** Empty canonical registries are missing measurements, not healthy zero counts. */
+function checkWebsiteCapabilityCounts(registries: GovernanceRegistries): boolean {
+  const results = buildWebsiteCountProbes(registries).map((probe) => {
+    if (probe.expected === 0) {
+      console.error(`❌ ${probe.label}: canonical registry is empty`);
+      return false;
+    }
+    return runProbe(probe);
+  });
+  // The four declared capabilities above always produce four measurements.
+  return results.every(Boolean);
+}
+
+/**
+ * Regenerate only the website capability constants (#7200). Exported so callers
+ * can refresh this surface without writing governance documents.
+ */
+export function syncWebsiteCapabilityCounts(
+  registries: GovernanceRegistries = loadAllRegistries()
+): void {
+  if (!existsSync(SITE_DATA_PATH)) return;
+  let content = readFileSync(SITE_DATA_PATH, 'utf-8');
+  for (const probe of buildWebsiteCountProbes(registries)) {
+    if (probe.expected === 0) throw new Error(`${probe.label}: canonical registry is empty`);
+    if (!probe.pattern.test(content)) throw new Error(`${probe.label}: count declaration missing`);
+    content = content.replace(probe.pattern, (match) =>
+      match.replace(/\d+$/, String(probe.expected))
+    );
+  }
+  if (content !== readFileSync(SITE_DATA_PATH, 'utf-8')) writeFileSync(SITE_DATA_PATH, content);
+}
+
+/**
+ * Update the three "N tool" / "N MCP tools" / "N registered tools" inline
+ * mentions in docs/design/components.md (#2295 follow-up). Each was a manual
+ * edit on every tool addition; the docs-content-drift gate (#2107) caught
+ * them at release time.
+ */
+function syncDesignDocsToolCount(toolCount: number): void {
+  if (!existsSync(COMPONENTS_DOC_PATH)) return;
+  const content = readFileSync(COMPONENTS_DOC_PATH, 'utf-8');
+  let updated = content.replace(
+    /(MCP server, )(\d+)( tool handlers, gateway)/,
+    `$1${String(toolCount)}$3`
+  );
+  updated = updated.replace(
+    /(against )(\d+)( registered tools and \d+ expert roles)/,
+    `$1${String(toolCount)}$3`
+  );
+  updated = updated.replace(
+    /(`registerTools\(\)` — )(\d+)( tools total)/,
+    `$1${String(toolCount)}$3`
+  );
+  if (updated !== content) writeFileSync(COMPONENTS_DOC_PATH, updated);
+}
+
+/**
+ * Update the two `N MCP tools` mentions in the root README.md (#2295
+ * follow-up). One in the architecture diagram, one in the capabilities
+ * table. The capabilities-table cell uses a special `**N MCP Tools**`
+ * pattern that won't false-match other prose.
+ */
+function syncReadmeToolCount(toolCount: number): void {
+  if (!existsSync(README_PATH)) return;
+  const content = readFileSync(README_PATH, 'utf-8');
+  let updated = content.replace(
+    /(│\s+)(\d+)( MCP tools · multi-stage CompositeRouter)/,
+    `$1${String(toolCount)}$3`
+  );
+  updated = updated.replace(/(\*\*)(\d+)( MCP Tools\*\*)/, `$1${String(toolCount)}$3`);
+  if (updated !== content) writeFileSync(README_PATH, updated);
+}
+
+/**
+ * CI drift probe for server.json (#2327). Mirrors checkPluginVersion: fails
+ * when version OR description's tool count is stale. The two `packages[].version`
+ * fields aren't separately probed — they're written by the same syncServerJson
+ * step, so a drift there indicates the sync didn't run, which the top-level
+ * version check already catches.
+ */
+function checkServerJson(toolCount: number): boolean {
+  if (!existsSync(PACKAGE_JSON_PATH) || !existsSync(SERVER_JSON_PATH)) return true;
+  const pkgVersion = (JSON.parse(readFileSync(PACKAGE_JSON_PATH, 'utf-8')) as { version?: string })
+    .version;
+  const server = JSON.parse(readFileSync(SERVER_JSON_PATH, 'utf-8')) as ServerJsonShape;
+
+  let ok = true;
+  if (server.version !== pkgVersion) {
+    console.error(
+      `❌ server.json version: server.json has ${String(server.version)}, package.json has ${String(pkgVersion)}`
+    );
+    ok = false;
+  }
+  if (typeof server.description === 'string') {
+    const match = /(\d+) MCP tools/.exec(server.description);
+    if (match !== null && match[1] !== String(toolCount)) {
+      console.error(
+        `❌ server.json description: claims "${String(match[1])} MCP tools", canonical count is ${String(toolCount)}`
+      );
+      ok = false;
+    }
+  }
+  return ok;
+}
+
+// CLI interface. Guarded so importing this module (the #3954 in-process tests
+// import `checkGovernance` / `injectGovernance` directly) does NOT run a command
+// or call `process.exit`. Only fires when the file is the process entrypoint.
+const invokedPath = process.argv[1];
+const isMain = invokedPath !== undefined && import.meta.url === pathToFileURL(invokedPath).href;
+
+if (isMain) {
+  const args = process.argv.slice(2);
+  const command = args[0];
+
+  switch (command) {
+    case 'check':
+      process.exit((await checkGovernance()) ? 0 : 1);
+      break;
+    case 'inject':
+    default:
+      await injectGovernance();
+      break;
+  }
+}

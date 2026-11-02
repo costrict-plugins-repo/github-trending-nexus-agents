@@ -1,0 +1,563 @@
+/**
+ * Unified memory cross-ranker (#3236).
+ *
+ * `getContextForTask` fans out across ~6 memory backends and returns parallel,
+ * independently-ranked lists on incomparable scales — a belief's `confidence`
+ * enum, an adaptive entry's priority score, an experience pattern's success
+ * rate. A consumer (a voter, a planning step) that wants "the single most
+ * relevant thing we know" has no way to compare across those lists.
+ *
+ * This module lexically cross-ranks every per-backend item into ONE comparable,
+ * sorted `RankedMemoryItem[]`. It reuses the keyword-coverage relevance pattern
+ * from `research-discover.computeRelevanceScore` (a deliberate, cheap lexical
+ * score — no embeddings) and combines it with temporal decay and a per-source
+ * confidence weight. The aggregate `outcomes` summary is excluded: it is a
+ * rollup, not a per-item memory, so it has nothing to cross-rank against.
+ *
+ * Pure and synchronous: no I/O, no throws. Missing/invalid timestamps degrade
+ * to neutral recency rather than failing (fail-soft, #3236 vote condition 5).
+ *
+ * @module context/context-retriever-helpers
+ * (Source: #3236)
+ */
+
+import type { UnifiedContext } from './context-retriever.js';
+import type { Belief } from './belief-core-types.js';
+import type { AgenticMemoryEntry } from './agentic-memory-types.js';
+import type { ScoredMemoryEntry } from './adaptive-memory-types.js';
+import type { ExperienceEntry } from './mobimem-types.js';
+import type { DistilledRule } from '../learning/strategy-distiller-types.js';
+import type { TechniqueStatusSummary } from '../cli/research-types.js';
+import { beliefTrustTier, memoryEntryTrustTier, trustTierLabel } from './memory-trust-tier.js';
+
+/** The discriminated set of cross-rankable backends (the aggregate `outcomes` is excluded). */
+export type RankedMemorySource =
+  'belief' | 'agentic' | 'adaptive' | 'experience' | 'strategy' | 'research';
+
+/** A backend item lifted onto a single comparable scale. */
+export interface RankedMemoryItem {
+  /** Which backend the item came from. */
+  readonly source: RankedMemorySource;
+  /** Combined cross-source score in [0, 1]; higher is more relevant. */
+  readonly relevanceScore: number;
+  /** The original backend item, untouched, so consumers can still render its native shape. */
+  readonly item:
+    | Belief
+    | AgenticMemoryEntry
+    | ScoredMemoryEntry
+    | ExperienceEntry
+    | DistilledRule
+    | TechniqueStatusSummary
+    | string;
+  /** Normalized free-text used for lexical scoring + rendering (already a single line). */
+  readonly text: string;
+  /** Age of the item in milliseconds at ranking time (0 when no timestamp). */
+  readonly ageMs: number;
+  /** Per-item confidence in [0, 1] (belief enum, rule confidence, success rate, …). */
+  readonly sourceConfidence: number;
+}
+
+/** Options for {@link rankMemories}. */
+export interface RankMemoriesOptions {
+  /** Injectable clock for deterministic recency tests. Defaults to `Date.now()`. */
+  readonly now?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Scoring weights — PROVISIONAL (#3236).
+//
+// These three weights sum to 1.0 and combine the lexical relevance, temporal
+// decay, and per-source confidence into the final cross-source score. They are
+// a first cut chosen to make text relevance dominate (the consumer is asking
+// "what's relevant to THIS task") while letting recency and source confidence
+// break ties and rescue strong-but-older signal. Tune against the ranked-render
+// flag's outcome telemetry before promoting any of these.
+// See https://github.com/nexus-substrate/nexus-agents/issues/3236
+// ---------------------------------------------------------------------------
+/** Weight on lexical text relevance. PROVISIONAL — see #3236. */
+const W_TEXT = 0.6;
+/** Weight on temporal recency (exponential decay). PROVISIONAL — see #3236. */
+const W_RECENCY = 0.25;
+/** Weight on per-source confidence. PROVISIONAL — see #3236. */
+const W_SOURCE = 0.15;
+
+/**
+ * Per-source baseline trust applied when an item carries no intrinsic
+ * confidence (e.g. an agentic note). PROVISIONAL — see #3236. Beliefs and
+ * distilled strategies are the most curated; raw agentic notes the least.
+ */
+const SOURCE_WEIGHT: Readonly<Record<RankedMemorySource, number>> = {
+  belief: 0.9,
+  strategy: 0.85,
+  research: 0.8,
+  experience: 0.75,
+  adaptive: 0.65,
+  agentic: 0.55,
+};
+
+/** Recency half-life: signal older than this contributes ~half its recency score. PROVISIONAL — see #3236. */
+const RECENCY_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+/** Distinct keywords ≥ this many chars are discriminating enough to score against. */
+const MIN_KEYWORD_LEN = 3;
+
+/** Rough chars-per-token used to budget the rendered prefix (matches token-counter ~4). */
+const CHARS_PER_TOKEN = 4;
+
+/**
+ * Cross-rank every per-backend list in `ctx` into one comparable, sorted list.
+ *
+ * Score = W_TEXT·textRelevance + W_RECENCY·decay(ageMs) + W_SOURCE·sourceWeight,
+ * where `sourceWeight` blends the per-item confidence with the source baseline.
+ * Higher score first; ties fall back to source baseline then text length so the
+ * order is deterministic. The aggregate `outcomes` summary is intentionally
+ * never included.
+ */
+export function rankMemories(
+  ctx: UnifiedContext,
+  task: string,
+  options: RankMemoriesOptions = {}
+): readonly RankedMemoryItem[] {
+  const now = options.now ?? Date.now();
+  const keywords = extractKeywords(task);
+
+  const normalized: RankedMemoryItem[] = [
+    ...ctx.beliefs.map((b) => normalizeBelief(b, now)),
+    ...ctx.similarMemories.map((m) => normalizeAgentic(m, now)),
+    ...ctx.recentLearnings.map((s) => normalizeAdaptive(s, now)),
+    ...ctx.experiencePatterns.map((e) => normalizeExperience(e, now)),
+    ...ctx.priorStrategies.map((r) => normalizeStrategy(r, now)),
+    ...ctx.researchInsights.map((t) => normalizeResearch(t, now)),
+  ];
+
+  const scored = normalized.map((n) => ({
+    ...n,
+    relevanceScore: combinedScore(n, keywords),
+  }));
+
+  return scored.sort((a, b) => {
+    if (b.relevanceScore !== a.relevanceScore) return b.relevanceScore - a.relevanceScore;
+    const sw = SOURCE_WEIGHT[b.source] - SOURCE_WEIGHT[a.source];
+    if (sw !== 0) return sw;
+    return b.text.length - a.text.length;
+  });
+}
+
+/**
+ * What a ranked block kept, and how much it had to leave behind.
+ *
+ * The count is the point: this cut happens before the outer clamp and so
+ * never trips its notice, which left the rendered block indistinguishable
+ * from a complete one (#5851).
+ */
+export interface RankedBudgetFit {
+  readonly kept: readonly RankedMemoryItem[];
+  readonly omitted: number;
+}
+
+/**
+ * Take items off the front of an already-ranked list until adding the next one
+ * would exceed `maxTokens` (estimated). Order-preserving; never throws. A
+ * zero/negative budget keeps nothing and reports every item as omitted.
+ */
+export function topRankedWithinBudget(
+  items: readonly RankedMemoryItem[],
+  maxTokens: number
+): RankedBudgetFit {
+  if (maxTokens <= 0) return { kept: [], omitted: items.length };
+  const kept: RankedMemoryItem[] = [];
+  let used = 0;
+  for (const item of items) {
+    const cost = estimateTokens(item.text);
+    if (used + cost > maxTokens) break;
+    used += cost;
+    kept.push(item);
+  }
+  return { kept, omitted: items.length - kept.length };
+}
+
+/** Default item count cap per legacy context section (#5497). */
+const DEFAULT_SECTION_MAX_ITEMS = 5;
+
+/**
+ * Default token budget per legacy context section (#5497).
+ * Bounded so that all potential sections stay well within the default 2,500 token budget.
+ */
+const DEFAULT_SECTION_TOKEN_BUDGET = 400;
+
+/** Options for section slicing. */
+interface SliceContextOptions {
+  /** Maximum items to include in this section (default: 5). */
+  readonly maxItems?: number;
+  /** Maximum cumulative tokens for this section (default: 400). */
+  readonly maxTokens?: number;
+}
+
+/** Disclosure returned beside each legacy context slice. */
+interface ContextSlice {
+  readonly lines: readonly string[];
+  readonly included: number;
+  readonly dropped: number;
+  readonly droppedTokens: number;
+}
+
+/**
+ * Select rendered items by cumulative token budget and item count (#5497).
+ *
+ * Scans estimated items in priority order. When an item exceeds the remaining
+ * token budget, it is skipped so smaller subsequent items can still be included
+ * within the budget. Discloses included count, dropped count, and dropped tokens.
+ */
+function sliceContextLines(
+  lines: readonly string[],
+  counter: { readonly estimate: (text: string) => number },
+  options: SliceContextOptions = {}
+): ContextSlice {
+  const maxItems = options.maxItems ?? DEFAULT_SECTION_MAX_ITEMS;
+  const maxTokens = options.maxTokens ?? DEFAULT_SECTION_TOKEN_BUDGET;
+
+  const estimated = lines.map((line) => ({ line, tokens: counter.estimate(line) }));
+  const included: string[] = [];
+  const dropped: { line: string; tokens: number }[] = [];
+  let remainingTokens = maxTokens;
+
+  for (const item of estimated) {
+    if (included.length < maxItems && item.tokens <= remainingTokens) {
+      included.push(item.line);
+      remainingTokens -= item.tokens;
+    } else {
+      dropped.push(item);
+    }
+  }
+
+  const droppedTokens = dropped.reduce((sum, item) => sum + item.tokens, 0);
+  return {
+    lines: included,
+    included: included.length,
+    dropped: dropped.length,
+    droppedTokens,
+  };
+}
+
+/** Format a section heading with its slice disclosure. */
+function disclosedHeading(label: string, slice: ContextSlice): string {
+  return `${label} (${String(slice.included)} included, ${String(slice.dropped)} dropped, ${String(slice.droppedTokens)} dropped tokens)`;
+}
+
+/**
+ * Render one legacy section under a heading that states its own cut.
+ *
+ * Every section in the legacy block goes through here, so a heading without
+ * counts is not a thing the block can emit (#5850).
+ */
+export function renderDisclosedSection(
+  heading: string,
+  lines: readonly string[],
+  counter: { readonly estimate: (text: string) => number },
+  options: SliceContextOptions = {}
+): string {
+  const slice = sliceContextLines(lines, counter, options);
+  return `${disclosedHeading(heading, slice)}\n${slice.lines.join('\n')}`;
+}
+
+/**
+ * Render the prior-research section for the legacy prompt path.
+ *
+ * Returns an empty list when there is nothing to say, so the caller can spread
+ * it unconditionally alongside the other section renderers.
+ */
+export function renderLegacyResearchSection(
+  ctx: UnifiedContext,
+  counter: { readonly estimate: (text: string) => number },
+  sanitize: (value: string) => string
+): readonly string[] {
+  if (ctx.researchInsights.length === 0) return [];
+
+  const lines = ctx.researchInsights.map((r) => {
+    // Evidence tier (#4287) is appended only when the papers.yaml join
+    // resolved; absent ⇒ the line is byte-identical to the pre-#4287 render.
+    // Wrap in sanitize() like every other rendered field so an untrusted
+    // papers.yaml value can't escape the `- ` framing with embedded newlines.
+    const evidence = r.evidenceTier !== undefined ? `, evidence: ${sanitize(r.evidenceTier)}` : '';
+    return `- ${sanitize(r.name)} (${sanitize(r.status)}${evidence}) — ${sanitize(r.topic)}`;
+  });
+
+  return [renderDisclosedSection('### Prior research on this topic', lines, counter)];
+}
+
+/**
+ * Render the belief and similar-work sections for the legacy prompt path. Each
+ * line carries its recorded trust tier (#6751); unlabelled entries render as
+ * before.
+ */
+export function renderLegacyMemorySections(
+  ctx: UnifiedContext,
+  counter: { readonly estimate: (text: string) => number },
+  sanitize: (value: string) => string
+): readonly string[] {
+  const sections: string[] = [];
+  if (ctx.beliefs.length > 0) {
+    const lines = ctx.beliefs.map(
+      (b) =>
+        `- ${trustTierLabel(beliefTrustTier(b))}${sanitize(b.subject)} ${sanitize(b.predicate)} ${sanitize(b.object)} (confidence: ${b.confidence})`
+    );
+    sections.push(renderDisclosedSection('### Beliefs', lines, counter));
+  }
+  // #5850: this was `.slice(0, 3)` under a bare heading while its siblings
+  // disclosed their cut, so a heading without counts read as "nothing was
+  // dropped". Every section goes through the same renderer so they cannot
+  // drift apart again.
+  if (ctx.similarMemories.length > 0) {
+    const lines = ctx.similarMemories.map(
+      (m) =>
+        `- ${trustTierLabel(memoryEntryTrustTier(m))}${sanitize(m.attributes.contextDescription)}`
+    );
+    sections.push(renderDisclosedSection('### Similar prior work', lines, counter));
+  }
+  return sections;
+}
+
+/** Render adaptive-memory and distilled-strategy sections for the legacy prompt path. */
+export function renderLegacyLearningSections(
+  ctx: UnifiedContext,
+  counter: { readonly estimate: (text: string) => number },
+  sanitize: (value: string) => string
+): readonly string[] {
+  const sections: string[] = [];
+  if (ctx.recentLearnings.length > 0) {
+    const lines = ctx.recentLearnings.map(({ entry }) => {
+      const value = typeof entry.value === 'string' ? entry.value : entry.key;
+      return `- ${trustTierLabel(memoryEntryTrustTier(entry))}${sanitize(value)}`;
+    });
+    sections.push(renderDisclosedSection('### Recent learnings', lines, counter));
+  }
+  if (ctx.priorStrategies.length > 0) {
+    const lines = ctx.priorStrategies.map(
+      (rule) => `- ${sanitize(`${rule.category} ${rule.patternType} ${rule.action} ${rule.cli}`)}`
+    );
+    sections.push(renderDisclosedSection('### Prior strategies', lines, counter));
+  }
+  return sections;
+}
+
+// ---------------------------------------------------------------------------
+// Scoring internals
+// ---------------------------------------------------------------------------
+
+function combinedScore(item: RankedMemoryItem, keywords: readonly string[]): number {
+  const text = textRelevance(item.text, keywords);
+  const recency = recencyDecay(item.ageMs);
+  const source = 0.5 * item.sourceConfidence + 0.5 * SOURCE_WEIGHT[item.source];
+  const score = W_TEXT * text + W_RECENCY * recency + W_SOURCE * source;
+  return Number.isFinite(score) ? Math.min(1, Math.max(0, score)) : 0;
+}
+
+/**
+ * Keyword-coverage relevance in [0, 1], reusing the
+ * `research-discover.computeRelevanceScore` pattern: fraction of distinct task
+ * keywords present in the item text. No keywords → neutral 0 (recency + source
+ * still rank the item).
+ */
+function textRelevance(text: string, keywords: readonly string[]): number {
+  if (keywords.length === 0) return 0;
+  const lower = text.toLowerCase();
+  let matched = 0;
+  for (const kw of keywords) {
+    if (lower.includes(kw)) matched++;
+  }
+  return matched / keywords.length;
+}
+
+/** Exponential decay on age; fail-soft to neutral 0.5 for non-finite ages. */
+function recencyDecay(ageMs: number): number {
+  if (!Number.isFinite(ageMs) || ageMs < 0) return 0.5;
+  return Math.pow(2, -ageMs / RECENCY_HALF_LIFE_MS);
+}
+
+function extractKeywords(task: string): readonly string[] {
+  return [
+    ...new Set(
+      task
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((w) => w.length >= MIN_KEYWORD_LEN)
+    ),
+  ];
+}
+
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / CHARS_PER_TOKEN);
+}
+
+/** Result of {@link clampToTokenBudget}. */
+export interface TokenBudgetClampResult {
+  /** The (possibly truncated) text, always a prefix of the input. */
+  readonly text: string;
+  /** Whether truncation occurred. */
+  readonly clipped: boolean;
+  /** Chars removed from the input (0 when not clipped). */
+  readonly omittedChars: number;
+}
+
+/**
+ * Clamp `text` to an estimated `maxTokens` budget using the same char/4
+ * heuristic as {@link topRankedWithinBudget} (#4253 — per-call context budget
+ * guard). Order-preserving prefix cut; never throws, never grows the input.
+ */
+export function clampToTokenBudget(text: string, maxTokens: number): TokenBudgetClampResult {
+  if (maxTokens <= 0) {
+    return { text: '', clipped: text.length > 0, omittedChars: text.length };
+  }
+  const maxChars = maxTokens * CHARS_PER_TOKEN;
+  if (text.length <= maxChars) {
+    return { text, clipped: false, omittedChars: 0 };
+  }
+  const kept = text.slice(0, maxChars);
+  return { text: kept, clipped: true, omittedChars: text.length - kept.length };
+}
+
+/** Assemble, clamp once, and partition the emitted text by its source. */
+export function assembleClampedContext(
+  memoryBlock: string,
+  repoMap: string,
+  budgetTokens: number,
+  clipNoticeReserveTokens: number
+): { readonly text: string; readonly memory: string; readonly repoMap: string } {
+  const rendered =
+    repoMap === '' ? memoryBlock : memoryBlock === '' ? repoMap : `${memoryBlock}\n\n${repoMap}`;
+  if (rendered === '') return { text: '', memory: '', repoMap: '' };
+  const contentBudget = Math.max(0, budgetTokens - clipNoticeReserveTokens);
+  const { text: retained, clipped, omittedChars } = clampToTokenBudget(rendered, contentBudget);
+  const notice = clipped
+    ? `\n\n_(context clipped to fit the ~${String(budgetTokens)}-token budget; ~${String(omittedChars)} chars omitted — #4253)_`
+    : '';
+  const mapStart = memoryBlock === '' ? 0 : memoryBlock.length;
+  const retainedMap = retained.slice(mapStart);
+  const mapOwnsNotice = repoMap !== '' && (memoryBlock === '' || retainedMap !== '');
+  const memory =
+    retained.slice(0, Math.min(memoryBlock.length, retained.length)) +
+    (mapOwnsNotice ? '' : notice);
+  const emittedMap = retainedMap + (mapOwnsNotice ? notice : '');
+  return { text: `${retained}${notice}`, memory, repoMap: emittedMap };
+}
+
+/** Age in ms from a possibly-invalid Date; non-finite timestamps → neutral 0. */
+function ageFrom(date: Date | undefined, now: number): number {
+  const t = date?.getTime();
+  if (t === undefined || !Number.isFinite(t)) return 0;
+  return Math.max(0, now - t);
+}
+
+/** Collapse whitespace + cap length so every normalized text is a single bounded line. */
+const MAX_TEXT_LEN = 200;
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().slice(0, MAX_TEXT_LEN);
+}
+
+// ---------------------------------------------------------------------------
+// Per-source normalization → {text, ageMs, sourceConfidence}
+// ---------------------------------------------------------------------------
+
+const BELIEF_CONFIDENCE: Readonly<Record<string, number>> = {
+  high: 0.9,
+  medium: 0.6,
+  low: 0.35,
+  speculative: 0.15,
+};
+
+/**
+ * Shared evidence-tier rank for legacy selection and ranked confidence
+ * (#4287, #4296): high > medium > low > absent. Without joined tiers the
+ * legacy stable sort preserves insertion order.
+ *
+ * Explicit branches guarantee a finite rank for undefined and unexpected
+ * out-of-enum values from unvalidated papers.yaml (both default to 0).
+ */
+export function evidenceRank(t: TechniqueStatusSummary): number {
+  switch (t.evidenceTier) {
+    case 'high':
+      return 3;
+    case 'medium':
+      return 2;
+    case 'low':
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function normalizeBelief(b: Belief, now: number): RankedMemoryItem {
+  return {
+    source: 'belief',
+    relevanceScore: 0,
+    item: b,
+    text: oneLine(`${b.subject} ${b.predicate} ${b.object}`),
+    ageMs: ageFrom(b.updatedAt, now),
+    sourceConfidence: BELIEF_CONFIDENCE[b.confidence] ?? 0.5,
+  };
+}
+
+function normalizeAgentic(m: AgenticMemoryEntry, now: number): RankedMemoryItem {
+  return {
+    source: 'agentic',
+    relevanceScore: 0,
+    item: m,
+    text: oneLine(m.attributes.contextDescription),
+    ageMs: ageFrom(m.createdAt, now),
+    sourceConfidence: 0.5,
+  };
+}
+
+function normalizeAdaptive(s: ScoredMemoryEntry, now: number): RankedMemoryItem {
+  const value = typeof s.entry.value === 'string' ? s.entry.value : s.entry.key;
+  return {
+    source: 'adaptive',
+    relevanceScore: 0,
+    item: s,
+    text: oneLine(value),
+    ageMs: ageFrom(s.entry.createdAt, now),
+    sourceConfidence: clamp01(s.priority.components.relevance),
+  };
+}
+
+function normalizeExperience(e: ExperienceEntry, now: number): RankedMemoryItem {
+  return {
+    source: 'experience',
+    relevanceScore: 0,
+    item: e,
+    text: oneLine(e.taskType),
+    ageMs: ageFrom(e.lastUsedAt, now),
+    sourceConfidence: clamp01(e.successRate),
+  };
+}
+
+function normalizeStrategy(r: DistilledRule, now: number): RankedMemoryItem {
+  return {
+    source: 'strategy',
+    relevanceScore: 0,
+    item: r,
+    text: oneLine(`${r.category} ${r.patternType} ${r.action} ${r.cli}`),
+    ageMs: ageFrom(new Date(r.updatedAt), now),
+    sourceConfidence: clamp01(r.confidence),
+  };
+}
+
+function normalizeResearch(t: TechniqueStatusSummary, now: number): RankedMemoryItem {
+  const evidence = t.evidenceTier !== undefined ? `, evidence: ${t.evidenceTier}` : '';
+  return {
+    source: 'research',
+    relevanceScore: 0,
+    item: t,
+    // Research summaries carry no timestamp; treat as neutral-recency (ageMs 0).
+    text: oneLine(`${t.name} ${t.topic} ${t.status}${evidence}`),
+    ageMs: ageFrom(undefined, now),
+    // (6 + rank) / 10: high 0.9, medium 0.8, low 0.7, absent/unknown 0.6.
+    // Preserve the legacy tier order and the pre-#4296 no-tier baseline.
+    sourceConfidence: (6 + evidenceRank(t)) / 10,
+  };
+}
+
+function clamp01(n: number): number {
+  if (!Number.isFinite(n)) return 0.5;
+  return Math.min(1, Math.max(0, n));
+}

@@ -1,0 +1,525 @@
+/**
+ * Type definitions for task outcome tracking.
+ *
+ * Records the result of each model delegation or consensus vote
+ * to enable performance measurement across CLIs and task categories.
+ *
+ * @module orchestration/outcomes/outcome-types
+ * (Source: Issue #861 — Task outcome tracking)
+ */
+
+import { z } from 'zod';
+import { CliNameSchema } from '../../config/model-capabilities-types.js';
+import { EndpointArmIdSchema } from '../../cli-adapters/types-core.js';
+import { TaskCategorySchema } from '../../config/task-specialization-types.js';
+import type { TaskCategory } from '../../config/task-specialization-types.js';
+import { createLogger } from '../../core/logger.js';
+import type { ExecutionAccessMode } from '../../core/index.js';
+import { PriceBasisSchema } from '../../core/price-basis.js';
+
+const logger = createLogger({ component: 'outcome-error-taxonomy' });
+
+// ============================================================================
+// Schemas
+// ============================================================================
+
+// CliNameSchema imported from config/model-capabilities-types.ts (canonical source)
+
+/** Source of the task outcome. */
+const OutcomeSourceSchema = z.enum(['delegate', 'consensus', 'manual']);
+
+/** Failure category for failed task outcomes (Issue #1025). */
+export const OutcomeFailureCategorySchema = z.enum([
+  'timeout',
+  'authentication',
+  'rate_limit',
+  'connection',
+  'crash',
+  'adapter_unavailable',
+  'validation',
+  'parse',
+  'execution',
+  'generic',
+  'unknown',
+]);
+
+/**
+ * Routing-arm attribution for an outcome.
+ *
+ * Widened beyond {@link CliNameSchema} for the following attribution cases:
+ *
+ * - an explicit `'unknown'` (#3624) — for outcomes (e.g. expert executions)
+ *   whose real executing CLI can't be resolved from the model. `'unknown'` is
+ *   excluded from CLI-quality signals (detectCliPerformanceFloor) so it can't
+ *   skew a real CLI, but is retained for category/failure analysis rather than
+ *   fabricated.
+ * - `api:*` routing arms (#4400). The router genuinely registers
+ *   `api:anthropic`, `api:openai`, `api:google` and `api:custom-openai` as arms
+ *   under `NEXUS_BILLING_MODE=api`, but this schema could not represent them —
+ *   so no outcome could be recorded under an API arm's own id.
+ *   `LinUCBBandit.warmStart` matches arms BY NAME, so those arms could never
+ *   warm-start: every process began cold no matter how much history existed,
+ *   and the skip was silent.
+ *
+ * - Validated gateway endpoint arms (#6291, 10.0), using the same identity
+ *   schema as endpoint registration. URL/userinfo and malformed ids fail closed.
+ *
+ * This additive widening retains all existing JSONL values and their arm
+ * attribution unchanged. No schema version, migration or file rewrite is needed;
+ * legacy CLI/API histories still replay into LinUCB by their original names.
+ */
+export const OutcomeCliSchema = z.union([CliNameSchema, EndpointArmIdSchema, z.literal('unknown')]);
+export type OutcomeCli = z.infer<typeof OutcomeCliSchema>;
+
+/** Provenance for the CLI attributed to an outcome. */
+const OutcomeCliSourceSchema = z.enum(['executed', 'category-default']);
+
+/**
+ * Which selector chose the CLI for this outcome (#6521). `'composite-router'`
+ * means `CompositeRouter` routed THIS task and the outcome is the result of
+ * running the arm it picked. An additive field, not a new `source` value:
+ * `source` is a published union, and a writer that did not route leaves this
+ * absent rather than claiming a routing decision it never made.
+ */
+const OutcomeRoutedBySchema = z.enum(['composite-router']);
+
+/**
+ * How `category` was obtained (#6549). `'defaulted'` means no category was
+ * detected and `category` holds {@link UNDETECTED_CATEGORY_FALLBACK} only
+ * because the published field is required. An additive field, not a new
+ * `TaskCategory` value: that union is published, and widening it is a
+ * semver decision. Absent on legacy rows, which cannot be told apart and are
+ * read as before.
+ */
+const OutcomeCategorySourceSchema = z.enum(['detected', 'defaulted']);
+
+/** Longest `traceId` a persisted outcome row accepts; a longer id fails the row on reload. */
+export const TRACE_ID_MAX_LENGTH = 128;
+
+/** Schema for a single recorded task outcome. */
+export const TaskOutcomeSchema = z.object({
+  id: z.string().min(1),
+  cli: OutcomeCliSchema,
+  /** How the CLI attribution was obtained. Absent on legacy, unmeasured records. */
+  cliSource: OutcomeCliSourceSchema.optional(),
+  /** Set only when `CompositeRouter` selected the CLI for this task (#6521). */
+  routedBy: OutcomeRoutedBySchema.optional(),
+  category: TaskCategorySchema,
+  /** Whether `category` was detected or defaulted (#6549). Absent on legacy rows. */
+  categorySource: OutcomeCategorySourceSchema.optional(),
+  model: z.string().min(1),
+  success: z.boolean(),
+  durationMs: z.number().nonnegative(),
+  timestamp: z.string().min(1),
+  qualitySignals: z.array(z.string()).optional(),
+  failureCategory: OutcomeFailureCategorySchema.optional(),
+  errorMessage: z.string().max(500).optional(),
+  source: OutcomeSourceSchema,
+  /** Whether this outcome came from a triage-initiated retry (#1506). */
+  wasRetried: z.boolean().optional(),
+  /** Triage action taken on the failure (#1506). */
+  triageAction: z.string().max(30).optional(),
+  /** Routing stage that selected this CLI (#1785). */
+  routingStage: z.string().max(50).optional(),
+  /** Number of retry attempts before this outcome (#1785). */
+  retryCount: z.number().int().nonnegative().optional(),
+  /** Vendor resolved from `model` via ModelRegistry at write time (#2548). */
+  vendor: z.string().min(1).max(40).optional(),
+  /** Family resolved from `model` via ModelRegistry at write time (#2548). */
+  family: z.string().min(1).max(80).optional(),
+  /**
+   * Voter role for `source: 'consensus'` outcomes (#2662) — `architect`,
+   * `security`, etc. Absent on non-consensus outcomes. Lets the
+   * stratified outcome report break results down by voter role.
+   */
+  voterRole: z.string().min(1).max(40).optional(),
+  /**
+   * Baseline this outcome forked from (#2697 / Epic F follow-up to #2665).
+   * Set on outcomes recorded inside a fork-then-merge graph branch so
+   * `query({ baselineId: 'B' })` returns every branch outcome forked
+   * from baseline B — letting later analysis compare branches as a
+   * cohort. Free-form string (caller-assigned); typically the parent
+   * node's `executionId` or `taskId`.
+   */
+  baselineId: z.string().min(1).max(64).optional(),
+  /**
+   * Distributed trace id correlating this outcome across the pipeline (#3146).
+   * Consensus rows carry the decision ID shared by cost and vote records (#6857).
+   * Optional + backward-compatible: older JSONL records without it hydrate fine.
+   */
+  traceId: z.string().min(1).max(TRACE_ID_MAX_LENGTH).optional(),
+  /** Request id correlating this outcome to its originating invocation (#3146). */
+  requestId: z.string().min(1).max(128).optional(),
+  /**
+   * The model id the adapter reported serving the call (#6624). `model` stays
+   * what the writer has always put there: some writers store a role or
+   * aggregate marker in it (`pipeline`, `worker-<role>`, `consensus`) and
+   * readers group on that marker. Absent when the writer had no served model:
+   * the call failed, or the adapter reported none.
+   */
+  servedModel: z.string().min(1).max(200).optional(),
+  /**
+   * USD cost of the call (#6624), from the ledger's cost wrappers: the gateway
+   * arm's declaration when a gateway served it, else the registry rate for
+   * `servedModel`. Present ONLY when a price was found. Absent means the cost
+   * is unknown — never read an absent cost as $0.
+   */
+  costUsd: z.number().nonnegative().optional(),
+  /**
+   * What `costUsd` rests on (#6624): `'list'` for an assumed published
+   * registry-chain rate, `'declared'` for a manifest-overlay price (user or
+   * operator tier) or an explicit gateway rate (including free/local), and
+   * `'unknown'` when pricing was attempted but none resolved. Absent when no
+   * lookup was made because the adapter reported no token usage.
+   */
+  priceBasis: PriceBasisSchema.optional(),
+  /**
+   * Gateway endpoint arm that served the call (#7082), when a gateway served
+   * it. Carries the arm id (e.g. `api:anthropic`, `api:openrouter`, `api:custom-openai`)
+   * enabling shadow route evaluation (#7071) and LinUCB warm-start attribution.
+   * Absent when the call was served directly by a local CLI or when the
+   * adapter reported no gateway arm.
+   */
+  gatewayArm: EndpointArmIdSchema.optional(),
+});
+
+/** Schema for filtering outcomes. */
+export const OutcomeQuerySchema = z.object({
+  cli: OutcomeCliSchema.optional(),
+  category: TaskCategorySchema.optional(),
+  source: OutcomeSourceSchema.optional(),
+  success: z.boolean().optional(),
+  failureCategory: OutcomeFailureCategorySchema.optional(),
+  since: z.string().optional(),
+  limit: z.number().int().positive().optional(),
+  /** Exclude outcomes with any of these quality signals (#1680). */
+  excludeQualitySignals: z.array(z.string()).optional(),
+  /** Restrict to outcomes recorded against a specific baseline (#2697). */
+  baselineId: z.string().min(1).max(64).optional(),
+  /** Restrict to outcomes served by a specific gateway arm (#7082). */
+  gatewayArm: EndpointArmIdSchema.optional(),
+});
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/** A single recorded task execution outcome. */
+export type TaskOutcome = z.infer<typeof TaskOutcomeSchema>;
+
+/** Filter for querying stored outcomes. */
+export type OutcomeQuery = z.infer<typeof OutcomeQuerySchema>;
+
+/** Source of the outcome record. */
+export type OutcomeSource = z.infer<typeof OutcomeSourceSchema>;
+
+/** Selector that chose the CLI for a routed outcome (#6521). */
+export type OutcomeRoutedBy = z.infer<typeof OutcomeRoutedBySchema>;
+
+/** Category of failure for failed outcomes (Issue #1025). */
+export type OutcomeFailureCategory = z.infer<typeof OutcomeFailureCategorySchema>;
+
+/** Provenance of an outcome's `category` (#6549). */
+export type OutcomeCategorySource = z.infer<typeof OutcomeCategorySourceSchema>;
+
+// ============================================================================
+// Undetected category (#6549)
+// ============================================================================
+
+/**
+ * The value an outcome writer stores in the required `category` field when no
+ * category was detected. It is a placeholder, not a measurement: the row is
+ * marked `categorySource: 'defaulted'` and per-category readers skip it.
+ */
+const UNDETECTED_CATEGORY_FALLBACK: TaskCategory = 'exploration';
+
+/**
+ * The `category` and `categorySource` fields for an outcome row, given the
+ * detected category (`undefined` when detection found none).
+ */
+export function resolveOutcomeCategory(detected: TaskCategory | undefined): {
+  readonly category: TaskCategory;
+  readonly categorySource: OutcomeCategorySource;
+} {
+  if (detected === undefined) {
+    return { category: UNDETECTED_CATEGORY_FALLBACK, categorySource: 'defaulted' };
+  }
+  return { category: detected, categorySource: 'detected' };
+}
+
+/**
+ * Whether an outcome's `category` may be read as a measured category. False
+ * only for a row marked `'defaulted'`; a legacy row with no marker is read as
+ * it always was, since nothing on it says otherwise. Per-category readers
+ * (group-bys, category filters, cli×category keys) must skip rows for which
+ * this is false; whole-population totals still count them.
+ */
+export function hasMeasuredCategory(outcome: Pick<TaskOutcome, 'categorySource'>): boolean {
+  return outcome.categorySource !== 'defaulted';
+}
+
+// ============================================================================
+// Error Classification (Issue #1025)
+// ============================================================================
+
+const TIMEOUT_PATTERNS = ['timeout', 'timed out', 'deadline exceeded', 'socket hang up', 'aborted'];
+const AUTH_PATTERNS = [
+  'auth',
+  'unauthorized',
+  'forbidden',
+  'oauth',
+  'permission denied',
+  '401',
+  '403',
+];
+const RATE_LIMIT_PATTERNS = [
+  'rate limit',
+  'too many requests',
+  '429',
+  'throttl',
+  'quota exceeded',
+  'max retries',
+  'retry limit',
+];
+const CONNECTION_PATTERNS = [
+  'connection',
+  'connect',
+  'econnrefused',
+  'enotfound',
+  'econnreset',
+  'dns',
+  'network',
+  'getaddrinfo',
+  'certificate',
+  'ssl',
+  'tls',
+  'proxy',
+  'epipe',
+  'etimedout',
+  // HTTP 5xx — transient server errors, not execution failures (#1530)
+  '500',
+  '502',
+  '503',
+  '504',
+  'internal server error',
+  'bad gateway',
+  'service unavailable',
+  // Port binding failures — transient, not execution errors (#subprocess-adapter parity)
+  'eaddrinuse',
+  'address already in use',
+];
+const CRASH_PATTERNS = [
+  'crash',
+  'exited',
+  'killed',
+  'sigterm',
+  'sigkill',
+  'spawn error',
+  'out of memory',
+  'oom',
+  'enomem',
+  'fatal',
+  'segfault',
+  'heap',
+];
+const ADAPTER_PATTERNS = [
+  'no model adapter',
+  'adapter unavailable',
+  'no adapter',
+  'model not found',
+  'no model',
+  'unknown model',
+  'model does not exist',
+];
+const VALIDATION_PATTERNS = [
+  'validation',
+  'invalid input',
+  'parse error',
+  'zod',
+  'schema',
+  'unknown workflow',
+  'unknown template',
+  'unknown type',
+  'not recognized',
+  'available:',
+];
+const PARSE_PATTERNS = [
+  'json parse',
+  'unexpected token',
+  'unexpected end of json',
+  'syntax error',
+  'failed to parse',
+  'cannot parse',
+  'ndjson',
+  'malformed',
+  // Model output issues — not execution failures (#1530)
+  'empty response',
+  'no output',
+  'no content',
+  'truncated',
+  'incomplete',
+];
+const EXECUTION_PATTERNS = [
+  'api error',
+  'apierror',
+  'sdk error',
+  'failed to',
+  'cannot',
+  'typeerror',
+  'referenceerror',
+  'assertion',
+  'expect',
+  'undefined is not',
+  'null is not',
+  'is not a function',
+  'unhandled',
+  'rejected',
+  'enoent',
+  'permission denied',
+  'eperm',
+  'eacces',
+  'command failed',
+  'non-zero exit',
+  'exit code',
+];
+// Generic catch-all patterns — separated from execution for observability (#1457)
+const GENERIC_PATTERNS = [
+  'error:',
+  'error occurred',
+  'failed',
+  'failure',
+  'exception',
+  'not found',
+  'not supported',
+  'not implemented',
+  'not available',
+  'invalid',
+  'unable to',
+  'could not',
+  'unexpected',
+  'missing',
+  'unsupported',
+];
+
+function matchesAny(text: string, patterns: string[]): boolean {
+  return patterns.some((p) => text.includes(p));
+}
+
+/** Classify execution vs generic catch-all patterns (#1457). */
+function classifyExecutionOrGeneric(text: string): OutcomeFailureCategory {
+  if (matchesAny(text, EXECUTION_PATTERNS)) return 'execution';
+  if (matchesAny(text, GENERIC_PATTERNS)) return 'generic';
+  // Log unknown classifications for pattern analysis (#1499 diagnostics)
+  logger.debug('Unclassified error string', { sample: text.slice(0, 200) });
+  return 'unknown';
+}
+
+/**
+ * Classifies a lowercase text string against all known failure patterns.
+ * Order: most-specific categories first, broad execution/generic last (#1461).
+ * Empty/whitespace-only strings default to 'execution' (#1475).
+ */
+function classifyText(text: string): OutcomeFailureCategory {
+  if (text.trim() === '') return 'execution';
+  if (matchesAny(text, ADAPTER_PATTERNS)) return 'adapter_unavailable';
+  if (matchesAny(text, AUTH_PATTERNS)) return 'authentication';
+  if (matchesAny(text, RATE_LIMIT_PATTERNS)) return 'rate_limit';
+  if (matchesAny(text, TIMEOUT_PATTERNS)) return 'timeout';
+  if (matchesAny(text, CONNECTION_PATTERNS)) return 'connection';
+  if (matchesAny(text, CRASH_PATTERNS)) return 'crash';
+  if (matchesAny(text, VALIDATION_PATTERNS)) return 'validation';
+  if (matchesAny(text, PARSE_PATTERNS)) return 'parse';
+  return classifyExecutionOrGeneric(text);
+}
+
+/** Maximum length for extracted error messages to prevent unbounded strings. */
+const MAX_ERROR_MESSAGE_LENGTH = 500;
+
+/**
+ * Extracts a classifiable message string from a non-Error value.
+ * Returns undefined if the value is truly unclassifiable (#1466).
+ */
+export function extractNonErrorMessage(error: unknown): string | undefined {
+  if (error === null || error === undefined) return undefined;
+  if (typeof error === 'string') {
+    return error.slice(0, MAX_ERROR_MESSAGE_LENGTH);
+  }
+  if (typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    if (typeof record['message'] === 'string') {
+      return record['message'].slice(0, MAX_ERROR_MESSAGE_LENGTH);
+    }
+    try {
+      const json = JSON.stringify(error);
+      return json.slice(0, MAX_ERROR_MESSAGE_LENGTH);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+/** Classifies an error into an OutcomeFailureCategory for recording. */
+export function categorizeOutcomeError(error: unknown): OutcomeFailureCategory {
+  if (error instanceof Error) {
+    const text = `${error.message.toLowerCase()} ${error.name.toLowerCase()}`;
+    return classifyText(text);
+  }
+  const extracted = extractNonErrorMessage(error);
+  // Null/undefined/unserializable errors default to 'execution' (#1494).
+  // Consistent with #1475 (empty strings → execution, not unknown).
+  if (extracted === undefined) return 'execution';
+  return classifyText(extracted.toLowerCase());
+}
+
+/** Classifies an error message string into an OutcomeFailureCategory. */
+export function categorizeOutcomeErrorMessage(msg: string): OutcomeFailureCategory {
+  return classifyText(msg.toLowerCase());
+}
+
+/**
+ * `failureCategory` + `errorMessage` for a failed outcome row, so no failure
+ * is written unclassified (#6521). Empty for a success or an absent message.
+ */
+export function outcomeFailureFields(
+  success: boolean,
+  error: string | undefined
+): { failureCategory?: OutcomeFailureCategory; errorMessage?: string } {
+  if (success || error === undefined || error.length === 0) return {};
+  return {
+    failureCategory: categorizeOutcomeErrorMessage(error),
+    errorMessage: error.slice(0, 500),
+  };
+}
+
+/**
+ * The quality signal that records an outcome's access mode (#6792). One
+ * spelling for every writer, so a reader can filter on it:
+ * - `access-mode:<mode>` (`'enforced'`): the mode the arm that served the call
+ *   reported enforcing;
+ * - `access-mode-requested:<mode>` (`'requested'`): only what the caller asked
+ *   for, when no served arm reported a mode (the call failed before an arm
+ *   ran, or the path cannot observe enforcement).
+ */
+export function accessModeSignal(
+  mode: ExecutionAccessMode,
+  kind: 'enforced' | 'requested'
+): string {
+  return kind === 'enforced' ? `access-mode:${mode}` : `access-mode-requested:${mode}`;
+}
+
+/** Aggregated stats for a group of outcomes. */
+export interface GroupStats {
+  readonly count: number;
+  readonly successRate: number;
+  readonly avgDurationMs: number;
+}
+
+/** Aggregated performance summary from recorded outcomes. */
+export interface PerformanceSummary {
+  readonly totalTasks: number;
+  readonly successRate: number;
+  readonly avgDurationMs: number;
+  readonly byCli: ReadonlyMap<string, GroupStats>;
+  readonly byCategory: ReadonlyMap<string, GroupStats>;
+}

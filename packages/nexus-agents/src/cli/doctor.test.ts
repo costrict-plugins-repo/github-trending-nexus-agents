@@ -1,0 +1,2246 @@
+/**
+ * Tests for Doctor Command
+ *
+ * Verifies health check functionality for CLI adapters, Node.js version,
+ * API keys, configuration files, and MCP server readiness.
+ *
+ * (Source: Issue #422 - Doctor command validations)
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { runDoctor, printDoctorResults, doctorCommand, DATA_SUBDIRECTORIES } from './doctor.js';
+import { DATA_SUBDIRECTORIES as CANONICAL_DATA_SUBDIRECTORIES } from '../config/nexus-data-dir.js';
+import type { CliCheckResult, DoctorResult } from './doctor.js';
+import { GeminiCliAdapter } from '../cli-adapters/adapters/gemini-adapter.js';
+import * as authEvidence from '../cli-adapters/auth-evidence.js';
+import type { AuthProbeResult } from './cli-auth-probe.js';
+
+// Healthy-path checks use a supported runtime even when the host is on Node 22.
+beforeEach(() => vi.spyOn(process, 'version', 'get').mockReturnValue('v24.0.0'));
+
+const { TEST_VERSION } = vi.hoisted(() => ({ TEST_VERSION: '1.0.0' }));
+
+vi.mock('../version.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../version.js')>();
+  return { ...actual, VERSION: TEST_VERSION };
+});
+
+// Keep freshness measured and aligned by default so healthy-path tests do not
+// depend on whether this test host has a global nexus-agents install.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, execFileSync: vi.fn() };
+});
+
+// Mock the factory module
+vi.mock('../cli-adapters/factory.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../cli-adapters/factory.js')>();
+  return { ...actual, createAllAdapters: vi.fn() };
+});
+
+// #6119: the client-mode verdict is measured by `codex mcp-server --help`.
+// Default to a codex that still serves it; the unavailable case is a test.
+vi.mock('../cli-adapters/codex-mcp-server-probe.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../cli-adapters/codex-mcp-server-probe.js')>();
+  return { ...actual, codexMcpServerAvailable: vi.fn(() => true) };
+});
+
+// The sandbox preflight is model-free, but unit tests must not spawn Codex.
+vi.mock('../cli-adapters/codex-sandbox-preflight.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../cli-adapters/codex-sandbox-preflight.js')>();
+  return {
+    ...actual,
+    codexSandboxPreflight: vi.fn(() => Promise.resolve({ status: 'ok' as const })),
+  };
+});
+
+// The pinned-model probe (#6120) spends a real claude call; stub it here and
+// keep the formatter real. doctor.ts imports the probe directly, so the spread
+// form intercepts it (no internal sibling indirection).
+vi.mock('./doctor-claude-model.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./doctor-claude-model.js')>();
+  return {
+    ...actual,
+    probeClaudePinnedModel: vi.fn((deps: { installed: boolean }) =>
+      Promise.resolve({
+        alias: 'fable',
+        status: deps.installed ? ('available' as const) : ('not-probed' as const),
+        reason: deps.installed ? null : 'claude CLI not installed',
+      })
+    ),
+  };
+});
+
+// Mock the MCP server module
+vi.mock('../mcp/server.js', () => ({
+  createServer: vi.fn(() => ({ ok: true })),
+}));
+
+// Mock fs.existsSync for config file checks
+vi.mock('node:fs', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:fs')>()),
+  existsSync: vi.fn(() => false),
+  // #4488: the scratch-space check reads statfs. A roomy reading keeps these
+  // tests about CLI/auth health rather than disk state.
+  statfsSync: vi.fn(() => ({
+    bsize: 4096,
+    blocks: (32 * 1024 ** 3) / 4096,
+    bfree: (20 * 1024 ** 3) / 4096,
+    bavail: (20 * 1024 ** 3) / 4096,
+    files: 0,
+    ffree: 0,
+  })),
+}));
+
+// Mock the auth probe — by default, every CLI is authenticated. Individual
+// tests override this when they're testing not-authed paths. (#2447)
+vi.mock('./cli-auth-probe.js', () => ({
+  probeCli: vi.fn((cli: string) =>
+    Promise.resolve({
+      cli,
+      state: 'authenticated' as const,
+      via: 'cli-credentials' as const,
+    })
+  ),
+}));
+
+// #6609: the gateway measurement makes network calls; stub it, keep the rest real.
+vi.mock('./doctor-gateway.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./doctor-gateway.js')>();
+  return {
+    ...actual,
+    checkGatewayHealth: vi.fn(() => Promise.resolve({ state: 'not_configured' as const })),
+  };
+});
+
+import { createAllAdapters } from '../cli-adapters/factory.js';
+import { probeCli } from './cli-auth-probe.js';
+import { checkGatewayHealth, type GatewayHealth } from './doctor-gateway.js';
+import { codexMcpServerAvailable } from '../cli-adapters/codex-mcp-server-probe.js';
+import { probeClaudePinnedModel } from './doctor-claude-model.js';
+import { createServer } from '../mcp/server.js';
+import { existsSync } from 'node:fs';
+import * as fs from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
+import { execFileSync } from 'node:child_process';
+
+describe('doctor inventory compatibility (#5129)', () => {
+  it('re-exports the canonical initialization tuple without copying it', () => {
+    expect(DATA_SUBDIRECTORIES).toBe(CANONICAL_DATA_SUBDIRECTORIES);
+  });
+});
+
+/**
+ * Helper to create a complete DoctorResult for print tests.
+ */
+function createMockDoctorResult(overrides: Partial<DoctorResult> = {}): DoctorResult {
+  return {
+    clis: [
+      {
+        name: 'claude',
+        installed: true,
+        version: '2.0.76',
+        versionStatus: 'supported',
+        authenticated: true,
+        authState: 'authenticated',
+        routerAdmits: true,
+        authMethod: 'CLI auth',
+      },
+      {
+        name: 'gemini',
+        installed: true,
+        version: '0.22.5',
+        versionStatus: 'supported',
+        authenticated: true,
+        authState: 'authenticated',
+        routerAdmits: true,
+        authMethod: 'ADC/CLI auth',
+      },
+      {
+        name: 'codex',
+        installed: true,
+        version: '0.77.0',
+        versionStatus: 'supported',
+        authenticated: true,
+        authState: 'authenticated',
+        routerAdmits: true,
+        authMethod: 'CLI auth',
+      },
+    ],
+    nodeVersion: {
+      version: 'v24.0.0',
+      major: 24,
+      supported: true,
+    },
+    apiKeys: [
+      { name: 'ANTHROPIC_API_KEY', configured: true },
+      { name: 'OPENAI_API_KEY', configured: false },
+      { name: 'GOOGLE_AI_API_KEY', configured: false },
+    ],
+    configFile: { found: false, path: null },
+    mcpServerReady: true,
+    mcpClientReady: true,
+    disabledClis: [],
+    registryAdvisory: {
+      totalModels: 11,
+      availableModels: 11,
+      unavailableModels: 0,
+      models: [],
+      registryAgeDays: 1,
+      registryStale: false,
+    },
+    learningPersistence: {
+      enabled: false,
+      dirExists: false,
+      dirWritable: false,
+      outcomeCount: 0,
+      fileEligibleOutcomeCount: 0,
+      routedOutcomes: { total: 0, last7Days: 0 },
+      ruleCount: 0,
+      activeRuleCount: 0,
+      trainedOnEligible: null,
+      rulesLastSaved: null,
+      error: null,
+    },
+    sqliteCheck: {
+      available: true,
+      error: null,
+    },
+    dataDirectory: {
+      rootExists: true,
+      rootPath: '/home/test/.nexus-agents',
+      repoRoot: null,
+      subdirectories: [],
+    },
+    sandbox: {
+      active: false,
+      flavor: undefined,
+      root: undefined,
+      heuristicMatch: 'unknown' as const,
+      mismatch: false,
+      dataDirInsideRepo: false,
+    },
+    installFreshness: { state: 'aligned' as const, version: '1.0.0' },
+    harnessAlignment: {
+      inProject: true,
+      agentsMdExists: true,
+      files: [],
+      alignedCount: 0,
+      driftCount: 0,
+      missingCount: 0,
+    },
+    voterTransport: { configured: false },
+    gateway: { state: 'not_configured' },
+    claudeModel: { alias: 'fable', status: 'available' as const, reason: null },
+    scratchSpace: [
+      {
+        label: 'nexus' as const,
+        root: '/tmp/nexus-test',
+        available: true,
+        freeBytes: 20 * 1024 ** 3,
+        totalBytes: 32 * 1024 ** 3,
+        percentUsed: 38,
+        severity: 'ok' as const,
+        message: '20.0 GiB free of 32.0 GiB (38% used)',
+      },
+    ],
+    allHealthy: true,
+    timestamp: new Date(),
+    ...overrides,
+  };
+}
+
+/** Keep the real doctor and formatter; replace only process-facing probes. */
+function mockAuthEvidenceCli(probe: AuthProbeResult): void {
+  const adapter = {
+    name: probe.cli,
+    healthCheck: vi.fn().mockResolvedValue({
+      healthy: true,
+      version: '1.0.0',
+      versionStatus: 'supported',
+      lastChecked: new Date(),
+    }),
+    getCapacity: vi.fn().mockResolvedValue(undefined),
+  };
+  vi.mocked(createAllAdapters).mockReturnValue(new Map([[probe.cli, adapter]]) as never);
+  vi.mocked(probeCli).mockResolvedValueOnce(probe);
+}
+
+describe('Doctor Command', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(execFileSync).mockReturnValue(
+      JSON.stringify({ dependencies: { 'nexus-agents': { version: TEST_VERSION } } })
+    );
+    // Default mock for MCP server
+    vi.mocked(createServer).mockReturnValue({ ok: true } as never);
+    // Default mock for config file
+    vi.mocked(existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  describe('runDoctor()', () => {
+    it.each([
+      [
+        { cli: 'claude', state: 'authenticated', via: 'cli-credentials' },
+        'artifact',
+        'artifact',
+        'claude credentials file',
+      ],
+      [
+        { cli: 'codex', state: 'authenticated', via: 'cli-credentials' },
+        'probe',
+        'cli',
+        'codex login status',
+      ],
+      [
+        { cli: 'gemini', state: 'unknown', reason: 'No non-interactive auth check' },
+        'none',
+        'none',
+        'agy probe unknown',
+      ],
+      [
+        { cli: 'opencode', state: 'authenticated', via: 'cli-credentials' },
+        'probe',
+        'cli',
+        'opencode auth list',
+      ],
+      [
+        { cli: 'claude', state: 'authenticated', via: 'env-var' },
+        'artifact',
+        'artifact',
+        'ANTHROPIC_API_KEY environment variable',
+      ],
+      [
+        { cli: 'codex', state: 'authenticated', via: 'env-var' },
+        'artifact',
+        'artifact',
+        'OPENAI_API_KEY environment variable',
+      ],
+      [
+        {
+          cli: 'claude',
+          state: 'needs-login',
+          reason: 'Expired credentials',
+          fixCommand: 'claude /login',
+        },
+        'none',
+        'artifact',
+        'claude credentials file',
+      ],
+      [
+        { cli: 'codex', state: 'error', reason: 'Probe timed out' },
+        'none',
+        'cli',
+        'codex login status',
+      ],
+    ] satisfies ReadonlyArray<readonly [AuthProbeResult, string, string, string]>)(
+      'reports auth evidence for %j in structured and per-CLI output',
+      async (probe, rung, source, description) => {
+        mockAuthEvidenceCli(probe);
+        const result = await runDoctor();
+        const row = result.clis.find((cli) => cli.name === probe.cli);
+        expect(row?.authEvidence).toEqual({
+          rung,
+          source,
+          description,
+          probeState: probe.state,
+          passed: probe.state === 'authenticated',
+          blocks: probe.state === 'needs-login',
+        });
+        const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+        printDoctorResults(result);
+        expect(writeSpy.mock.calls.map((call) => call[0]).join('')).toContain(
+          `Auth evidence: ${rung} (${description})`
+        );
+      }
+    );
+
+    it('renders the resolver measurement rather than grading auth independently', async () => {
+      mockAuthEvidenceCli({ cli: 'codex', state: 'authenticated', via: 'cli-credentials' });
+      const measurement = {
+        rung: 'none' as const,
+        source: 'none' as const,
+        probeState: 'unknown' as const,
+        passed: false,
+        blocks: false,
+      };
+      vi.spyOn(authEvidence, 'resolveAuthEvidence').mockReturnValue(measurement);
+      const result = await runDoctor();
+      expect(result.clis.find((cli) => cli.name === 'codex')?.authEvidence).toMatchObject(
+        measurement
+      );
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      printDoctorResults(result);
+      expect(writeSpy.mock.calls.map((call) => call[0]).join('')).toContain(
+        'Auth evidence: none (codex probe unknown)'
+      );
+    });
+
+    it('prints no auth evidence line for a CLI that was never probed (#4661)', async () => {
+      vi.mocked(createAllAdapters).mockReturnValue(new Map());
+      const result = await runDoctor();
+      // An uninstalled CLI gets no auth line (#4661): no probe ran, so there is no evidence to grade.
+      const claude = result.clis.find((cli) => cli.name === 'claude');
+      expect(claude).toBeDefined();
+      expect(claude?.installed).toBe(false);
+      expect(claude?.authEvidence).toBeUndefined();
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      printDoctorResults(result);
+      expect(writeSpy.mock.calls.map((call) => call[0]).join('')).not.toContain('Auth evidence:');
+    });
+
+    it('uses raw adapter metadata when the routing arm is absent (#4389)', async () => {
+      vi.spyOn(GeminiCliAdapter.prototype, 'binaryName', 'get').mockReturnValue('missing-cli');
+      vi.mocked(createAllAdapters).mockReturnValue(new Map());
+
+      const result = await runDoctor();
+
+      expect(result.clis.find((cli) => cli.name === 'gemini')?.fix).toBe(
+        'Install missing-cli and ensure it is on PATH'
+      );
+    });
+
+    it.each([undefined, 'alternate-cli'])(
+      'offers installation help for the adapter binary with override %s (#4389)',
+      async (override) => {
+        const adapter = new GeminiCliAdapter();
+        if (override !== undefined) {
+          vi.spyOn(adapter, 'binaryName', 'get').mockReturnValue(override);
+        }
+        vi.spyOn(adapter, 'healthCheck').mockRejectedValue(new Error('ENOENT'));
+        vi.mocked(createAllAdapters).mockReturnValue(new Map([['gemini', adapter]]));
+
+        const result = await runDoctor();
+        const row = result.clis.find((cli) => cli.name === 'gemini');
+
+        expect(row?.installed).toBe(false);
+        expect(row?.fix).toBe(`Install ${adapter.binaryName} and ensure it is on PATH`);
+      }
+    );
+
+    it.each([undefined, 'alternate-cli'])(
+      'offers upgrade help for the adapter binary with override %s (#4389)',
+      async (override) => {
+        const adapter = new GeminiCliAdapter();
+        if (override !== undefined) {
+          vi.spyOn(adapter, 'binaryName', 'get').mockReturnValue(override);
+        }
+        vi.spyOn(adapter, 'healthCheck').mockResolvedValue({
+          healthy: true,
+          version: '1.0.0',
+          versionStatus: 'outdated',
+          lastChecked: new Date(0),
+        });
+        vi.spyOn(adapter, 'getCapacity').mockRejectedValue(new Error('not supported'));
+        vi.mocked(createAllAdapters).mockReturnValue(new Map([['gemini', adapter]]));
+
+        const result = await runDoctor();
+
+        expect(result.clis.find((cli) => cli.name === 'gemini')?.fix).toBe(
+          `Update ${adapter.binaryName} to the latest version`
+        );
+      }
+    );
+
+    it.each([
+      { status: 'ok' as const },
+      { status: 'broken' as const, reason: 'bubblewrap cannot isolate app-server sockets' },
+      { status: 'unknown' as const, reason: 'Codex sandbox probe timed out' },
+    ])('records the Codex sandbox preflight: $status (#6841)', async (measurement) => {
+      vi.mocked(createAllAdapters).mockReturnValue(
+        new Map([
+          [
+            'codex',
+            {
+              healthCheck: vi.fn().mockResolvedValue({
+                healthy: true,
+                version: '0.159.2',
+                versionStatus: 'supported',
+                lastChecked: new Date(),
+              }),
+              getCapacity: vi.fn().mockRejectedValue(new Error('n/a')),
+            },
+          ],
+        ]) as never
+      );
+      const probeCodexSandbox = vi.fn(() => Promise.resolve(measurement));
+
+      const result = await runDoctor({ probeCodexSandbox });
+
+      expect(probeCodexSandbox).toHaveBeenCalledOnce();
+      expect(result.codexSandbox).toEqual(measurement);
+    });
+
+    it.each(['missing', 'disabled'] as const)(
+      'does not probe the Codex sandbox when Codex is %s (#6841)',
+      async (state) => {
+        const saved = process.env['NEXUS_DISABLED_CLIS'];
+        if (state === 'disabled') process.env['NEXUS_DISABLED_CLIS'] = 'codex';
+        else delete process.env['NEXUS_DISABLED_CLIS'];
+        try {
+          vi.mocked(createAllAdapters).mockReturnValue(new Map() as never);
+          const probeCodexSandbox = vi.fn(() => Promise.resolve({ status: 'ok' as const }));
+
+          const result = await runDoctor({ probeCodexSandbox });
+
+          expect(probeCodexSandbox).not.toHaveBeenCalled();
+          expect(result.codexSandbox).toBeUndefined();
+        } finally {
+          if (saved === undefined) delete process.env['NEXUS_DISABLED_CLIS'];
+          else process.env['NEXUS_DISABLED_CLIS'] = saved;
+        }
+      }
+    );
+
+    it('should return healthy result when all CLIs are available', async () => {
+      const mockAdapter = {
+        name: 'claude',
+        healthCheck: vi.fn().mockResolvedValue({
+          healthy: true,
+          version: '2.0.76',
+          versionStatus: 'supported',
+          lastChecked: new Date(),
+        }),
+        getCapacity: vi.fn().mockResolvedValue({
+          remainingTokens: 100000,
+          remainingRequests: 100,
+          resetTime: new Date(),
+          utilizationPercent: 15,
+          rateLimited: false,
+          exhausted: false,
+          quotaExhausted: false,
+          observed: true,
+        }),
+      };
+
+      const mockAdapters = new Map([
+        ['claude', { ...mockAdapter, name: 'claude' }],
+        ['gemini', { ...mockAdapter, name: 'gemini' }],
+        ['codex', { ...mockAdapter, name: 'codex' }],
+        ['opencode', { ...mockAdapter, name: 'opencode' }],
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      const prefix =
+        process.platform === 'win32'
+          ? dirname(process.execPath)
+          : dirname(dirname(process.execPath));
+      expect(result.installFreshness).toEqual({ state: 'aligned', version: TEST_VERSION, prefix });
+      expect(result.allHealthy).toBe(true);
+      expect(result.mcpServerReady).toBe(true);
+      expect(result.mcpClientReady).toBe(true);
+      expect(result.clis).toHaveLength(4);
+      expect(result.nodeVersion).toBeDefined();
+      expect(result.apiKeys).toHaveLength(3);
+      expect(result.configFile).toBeDefined();
+    });
+
+    it('reports CLIs disabled by NEXUS_DISABLED_CLIS and does not probe them (#6590)', async () => {
+      const saved = process.env['NEXUS_DISABLED_CLIS'];
+      process.env['NEXUS_DISABLED_CLIS'] = 'gemini,codex';
+      try {
+        const healthCheck = vi.fn().mockResolvedValue({
+          healthy: true,
+          version: '1.0.0',
+          versionStatus: 'supported',
+          lastChecked: new Date(),
+        });
+        const adapter = { healthCheck, getCapacity: vi.fn().mockRejectedValue(new Error('n/a')) };
+        // All four slots present: doctor itself must skip the disabled ones.
+        vi.mocked(createAllAdapters).mockReturnValue(
+          new Map([
+            ['claude', adapter],
+            ['gemini', adapter],
+            ['codex', adapter],
+            ['opencode', adapter],
+          ]) as never
+        );
+
+        const result = await runDoctor();
+
+        expect(result.disabledClis).toEqual(['gemini', 'codex']);
+        expect(result.clis.map((c) => c.name)).toEqual(['claude', 'opencode']);
+      } finally {
+        if (saved === undefined) delete process.env['NEXUS_DISABLED_CLIS'];
+        else process.env['NEXUS_DISABLED_CLIS'] = saved;
+      }
+    });
+
+    it('reports no disabled CLIs when NEXUS_DISABLED_CLIS is unset (#6590)', async () => {
+      const saved = process.env['NEXUS_DISABLED_CLIS'];
+      delete process.env['NEXUS_DISABLED_CLIS'];
+      try {
+        vi.mocked(createAllAdapters).mockReturnValue(new Map() as never);
+        const result = await runDoctor();
+        expect(result.disabledClis).toEqual([]);
+        expect(result.clis.map((c) => c.name)).toEqual(['claude', 'gemini', 'codex', 'opencode']);
+      } finally {
+        if (saved !== undefined) process.env['NEXUS_DISABLED_CLIS'] = saved;
+      }
+    });
+
+    it('should include Node.js version check', async () => {
+      const mockAdapters = new Map();
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.nodeVersion).toBeDefined();
+      expect(result.nodeVersion.version).toBe(process.version);
+      expect(typeof result.nodeVersion.major).toBe('number');
+      expect(typeof result.nodeVersion.supported).toBe('boolean');
+    });
+
+    it('probes the pinned claude model with the claude install state and reports it (#6120)', async () => {
+      vi.mocked(createAllAdapters).mockReturnValue(new Map() as never);
+      const probe = vi.fn((installed: boolean) =>
+        Promise.resolve({
+          alias: 'fable',
+          status: installed ? ('available' as const) : ('not-probed' as const),
+          reason: installed ? null : 'claude CLI not installed',
+        })
+      );
+
+      const result = await runDoctor({ live: true, probeClaudeModel: probe });
+
+      // No adapters → claude is not installed → the probe is told so, and its
+      // verdict (not an inferred one) is what the report carries.
+      expect(probe).toHaveBeenCalledWith(false);
+      expect(result.claudeModel).toEqual({
+        alias: 'fable',
+        status: 'not-probed',
+        reason: 'claude CLI not installed',
+      });
+    });
+
+    it('suppresses the duplicate pinned call when the live adapter ladder will measure serving', async () => {
+      const probe = vi
+        .fn()
+        .mockResolvedValue({ alias: 'fable', status: 'available', reason: null });
+      const deps = { live: true, skipClaudeModelProbe: true, probeClaudeModel: probe };
+      const result = await runDoctor(deps);
+      expect(probe).not.toHaveBeenCalled();
+      expect(result.claudeModel.status).toBe('not-probed');
+      expect(result.claudeModel.reason).toContain('live readiness');
+    });
+
+    it('leaves the pinned Claude model unmeasured without --live (#6814)', async () => {
+      vi.mocked(createAllAdapters).mockReturnValue(
+        new Map([
+          [
+            'claude',
+            {
+              healthCheck: vi.fn().mockResolvedValue({
+                healthy: true,
+                version: '2.0.76',
+                versionStatus: 'supported',
+                lastChecked: new Date(),
+              }),
+              getCapacity: vi.fn().mockResolvedValue(undefined),
+            },
+          ],
+        ]) as never
+      );
+
+      const result = await runDoctor();
+
+      expect(result.clis.find((cli) => cli.name === 'claude')?.installed).toBe(true);
+      expect(probeClaudePinnedModel).not.toHaveBeenCalled();
+      expect(result.claudeModel).toEqual({
+        alias: 'fable',
+        status: 'not-probed',
+        reason: 'pass --live to test the pinned model',
+      });
+    });
+
+    it('reaches the real probe when --live is supplied (#6120, #6814)', async () => {
+      vi.mocked(createAllAdapters).mockReturnValue(
+        new Map([
+          [
+            'claude',
+            {
+              healthCheck: vi.fn().mockResolvedValue({
+                healthy: true,
+                version: '2.0.76',
+                versionStatus: 'supported',
+                lastChecked: new Date(),
+              }),
+              getCapacity: vi.fn().mockResolvedValue(undefined),
+            },
+          ],
+        ]) as never
+      );
+
+      const result = await runDoctor({ live: true });
+
+      expect(probeClaudePinnedModel).toHaveBeenCalledWith({ installed: true });
+      expect(result.claudeModel.status).toBe('available');
+    });
+
+    it('should include API key checks without exposing values', async () => {
+      const mockAdapters = new Map();
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.apiKeys).toHaveLength(3);
+      expect(result.apiKeys[0]?.name).toBe('ANTHROPIC_API_KEY');
+      expect(result.apiKeys[1]?.name).toBe('OPENAI_API_KEY');
+      expect(result.apiKeys[2]?.name).toBe('GOOGLE_AI_API_KEY');
+      // Should not contain actual key values
+      result.apiKeys.forEach((key) => {
+        expect(typeof key.configured).toBe('boolean');
+      });
+    });
+
+    it('should detect configuration file when present', async () => {
+      vi.mocked(existsSync).mockImplementation((path) => {
+        return path === './nexus-agents.yaml' || path === resolve('nexus-agents.yaml');
+      });
+      vi.spyOn(fs, 'readFileSync').mockReturnValue('security:\n  auth:\n    method: token\n');
+      const mockAdapters = new Map();
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.configFile.found).toBe(true);
+      expect(result.configFile.path).toBe(resolve('nexus-agents.yaml'));
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      printDoctorResults(result);
+      expect(stripVTControlCharacters(writeSpy.mock.calls.map((c) => c[0]).join(''))).toContain(
+        '✓ Configuration loaded'
+      );
+    });
+
+    it.each([
+      [
+        'oauth2 migration',
+        'security:\n  auth:\n    method: oauth2\n',
+        "Set security.auth.method to 'token'",
+      ],
+      ['malformed YAML', 'security: [\n', 'YAML parse error'],
+    ])('fails doctor with the loader message for %s', async (_name, content, message) => {
+      vi.mocked(existsSync).mockImplementation(
+        (path) =>
+          path === './.nexus-agents/nexus-agents.yaml' ||
+          path === resolve('.nexus-agents/nexus-agents.yaml')
+      );
+      const readSpy = vi.spyOn(fs, 'readFileSync').mockReturnValue('{}');
+      const clis = ['claude', 'gemini', 'codex', 'opencode'] as const;
+      vi.mocked(createAllAdapters).mockReturnValue(
+        new Map(
+          clis.map((name) => [
+            name,
+            {
+              name,
+              healthCheck: vi.fn().mockResolvedValue({
+                healthy: true,
+                version: '1.0.0',
+                versionStatus: 'supported',
+                lastChecked: new Date(),
+              }),
+              getCapacity: vi.fn().mockResolvedValue(undefined),
+            },
+          ])
+        ) as never
+      );
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      // Establish that configuration is the only failing check.
+      expect(await doctorCommand()).toBe(0);
+      writeSpy.mockClear();
+      readSpy.mockReturnValue(content);
+
+      const exitCode = await doctorCommand();
+
+      const output = stripVTControlCharacters(writeSpy.mock.calls.map((c) => c[0]).join(''));
+      expect(output).toContain('✗ Configuration');
+      expect(output).toContain(message);
+      expect(output).not.toContain('✓ Configuration loaded');
+      expect(exitCode).toBe(1);
+    });
+
+    it('should report config not found when missing', async () => {
+      vi.mocked(existsSync).mockReturnValue(false);
+      const mockAdapters = new Map();
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.configFile.found).toBe(false);
+      expect(result.configFile.path).toBeNull();
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      printDoctorResults(result);
+      expect(writeSpy.mock.calls.map((c) => c[0]).join('')).toContain(
+        'Configuration file: Not found'
+      );
+      expect(writeSpy.mock.calls.map((c) => c[0]).join('')).toContain(
+        'Run: nexus-agents config init'
+      );
+    });
+
+    it('should validate MCP server can be created', async () => {
+      vi.mocked(createServer).mockReturnValue({ ok: true } as never);
+      const mockAdapters = new Map();
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.mcpServerReady).toBe(true);
+      expect(createServer).toHaveBeenCalledWith({ name: 'nexus-agents-doctor-check' });
+    });
+
+    it('should report MCP server not ready when creation fails', async () => {
+      vi.mocked(createServer).mockReturnValue({ ok: false, error: {} } as never);
+      const mockAdapters = new Map();
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.mcpServerReady).toBe(false);
+    });
+
+    it('should mark CLI as not installed when adapter throws ENOENT', async () => {
+      const mockAdapters = new Map([
+        [
+          'claude',
+          {
+            name: 'claude',
+            healthCheck: vi.fn().mockRejectedValue(new Error('spawn claude ENOENT')),
+            getCapacity: vi.fn(),
+          },
+        ],
+        [
+          'gemini',
+          {
+            name: 'gemini',
+            healthCheck: vi.fn().mockRejectedValue(new Error('not found')),
+            getCapacity: vi.fn(),
+          },
+        ],
+        [
+          'codex',
+          {
+            name: 'codex',
+            healthCheck: vi.fn().mockRejectedValue(new Error('some other error')),
+            getCapacity: vi.fn(),
+          },
+        ],
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.allHealthy).toBe(false);
+      expect(result.clis[0]?.installed).toBe(false);
+      expect(result.clis[0]?.error).toBe('Not found in PATH');
+      expect(result.clis[1]?.installed).toBe(false);
+      expect(result.clis[1]?.error).toBe('Not found in PATH');
+      expect(result.clis[2]?.installed).toBe(false);
+      expect(result.clis[2]?.error).toBe('some other error');
+    });
+
+    it('should handle missing adapter gracefully', async () => {
+      const mockAdapters = new Map([
+        [
+          'claude',
+          {
+            name: 'claude',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '2.0.76',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+        // gemini and codex are missing
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      // #7234: Claude is installed and authenticated, which is sufficient;
+      // missing adapters are downgraded to warnings.
+      expect(result.allHealthy).toBe(true);
+      const geminiResult = result.clis.find((c) => c.name === 'gemini');
+      expect(geminiResult?.installed).toBe(false);
+      expect(geminiResult?.error).toBe('Adapter not available');
+    });
+
+    it('should mark outdated versions correctly', async () => {
+      const mockAdapters = new Map([
+        [
+          'claude',
+          {
+            name: 'claude',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '2.0.1',
+              versionStatus: 'outdated',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+        [
+          'gemini',
+          {
+            name: 'gemini',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '0.22.5',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+        [
+          'codex',
+          {
+            name: 'codex',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '0.77.0',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      const claudeResult = result.clis.find((c) => c.name === 'claude');
+      expect(claudeResult?.versionStatus).toBe('outdated');
+      expect(claudeResult?.fix).toBeDefined();
+      expect(claudeResult?.fix).toContain('npm update');
+    });
+
+    it('should handle capacity check failures gracefully', async () => {
+      const mockAdapters = new Map([
+        [
+          'claude',
+          {
+            name: 'claude',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '2.0.76',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockRejectedValue(new Error('Capacity unavailable')),
+          },
+        ],
+        [
+          'gemini',
+          {
+            name: 'gemini',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '0.22.5',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockRejectedValue(new Error('Capacity unavailable')),
+          },
+        ],
+        [
+          'codex',
+          {
+            name: 'codex',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '0.77.0',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockRejectedValue(new Error('Capacity unavailable')),
+          },
+        ],
+        [
+          'opencode',
+          {
+            name: 'opencode',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '1.2.10',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockRejectedValue(new Error('Capacity unavailable')),
+          },
+        ],
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.allHealthy).toBe(true);
+      expect(result.clis[0]?.capacity).toBeUndefined();
+    });
+
+    it('should set mcpClientReady based on Codex installation', async () => {
+      const mockAdapters = new Map([
+        [
+          'claude',
+          {
+            name: 'claude',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '2.0.76',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+        [
+          'gemini',
+          {
+            name: 'gemini',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '0.22.5',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+        [
+          'codex',
+          {
+            name: 'codex',
+            healthCheck: vi.fn().mockRejectedValue(new Error('ENOENT')),
+            getCapacity: vi.fn(),
+          },
+        ],
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.mcpClientReady).toBe(false);
+    });
+
+    it('should report mcpClientReady=false when codex is installed but has no mcp-server (#6119)', async () => {
+      const healthy = {
+        healthy: true,
+        version: '0.154.0',
+        versionStatus: 'supported',
+        lastChecked: new Date(),
+      };
+      const mockAdapters = new Map([
+        [
+          'codex',
+          {
+            name: 'codex',
+            healthCheck: vi.fn().mockResolvedValue(healthy),
+            getCapacity: vi.fn().mockRejectedValue(new Error('n/a')),
+          },
+        ],
+      ]);
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+      vi.mocked(codexMcpServerAvailable).mockReturnValueOnce(false);
+
+      const result = await runDoctor();
+
+      expect(result.clis.find((c) => c.name === 'codex')?.installed).toBe(true);
+      expect(result.mcpClientReady).toBe(false);
+    });
+
+    it('reports routerAdmits from the router predicate, not the printed fields (#6720)', async () => {
+      // Unhealthy with unknown auth: installed, supported, auth "unverified" —
+      // fields that read as usable — yet the router does not admit it.
+      const mockAdapters = new Map([
+        [
+          'claude',
+          {
+            name: 'claude',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: false,
+              version: '2.0.76',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockRejectedValue(new Error('n/a')),
+          },
+        ],
+      ]);
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+      vi.mocked(probeCli).mockResolvedValueOnce({ cli: 'claude', state: 'unknown' } as never);
+
+      const claude = (await runDoctor()).clis.find((c) => c.name === 'claude');
+
+      expect(claude?.installed).toBe(true);
+      expect(claude?.authState).toBe('unverified');
+      expect(claude?.routerAdmits).toBe(false);
+    });
+
+    it('should use CLI auth method instead of hardcoded OAuth', async () => {
+      const mockAdapters = new Map([
+        [
+          'claude',
+          {
+            name: 'claude',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '2.0.76',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+        [
+          'gemini',
+          {
+            name: 'gemini',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '0.22.5',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+        [
+          'codex',
+          {
+            name: 'codex',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '0.77.0',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      // Should not use hardcoded 'OAuth'
+      const claudeResult = result.clis.find((c) => c.name === 'claude');
+      expect(claudeResult?.authMethod).toBe('CLI auth');
+      const geminiResult = result.clis.find((c) => c.name === 'gemini');
+      expect(geminiResult?.authMethod).toBe('ADC/CLI auth');
+    });
+  });
+
+  describe('registryAdvisory', () => {
+    it('should include registry advisory in results', async () => {
+      const mockAdapter = {
+        healthCheck: vi.fn().mockResolvedValue({
+          healthy: true,
+          version: '2.0.76',
+          versionStatus: 'supported',
+          lastChecked: new Date(),
+        }),
+        getCapacity: vi.fn().mockResolvedValue({
+          remainingTokens: 100000,
+          remainingRequests: 100,
+          resetTime: new Date(),
+          utilizationPercent: 15,
+          rateLimited: false,
+          exhausted: false,
+          quotaExhausted: false,
+          observed: true,
+        }),
+      };
+      const mockAdapters = new Map([
+        ['claude', { ...mockAdapter, name: 'claude' }],
+        ['gemini', { ...mockAdapter, name: 'gemini' }],
+        ['codex', { ...mockAdapter, name: 'codex' }],
+        ['opencode', { ...mockAdapter, name: 'opencode' }],
+      ]);
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.registryAdvisory).toBeDefined();
+      expect(result.registryAdvisory.totalModels).toBeGreaterThan(0);
+      expect(result.registryAdvisory.availableModels).toBe(result.registryAdvisory.totalModels);
+      expect(result.registryAdvisory.unavailableModels).toBe(0);
+    });
+
+    it('should mark models unavailable when CLI missing', async () => {
+      const mockAdapters = new Map([
+        [
+          'claude',
+          {
+            name: 'claude',
+            healthCheck: vi.fn().mockResolvedValue({
+              healthy: true,
+              version: '2.0.76',
+              versionStatus: 'supported',
+              lastChecked: new Date(),
+            }),
+            getCapacity: vi.fn().mockResolvedValue({
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            }),
+          },
+        ],
+      ]);
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+      const advisory = result.registryAdvisory;
+
+      expect(advisory.unavailableModels).toBeGreaterThan(0);
+      const unavailableModels = advisory.models.filter((m) => !m.available);
+      expect(unavailableModels.length).toBe(advisory.unavailableModels);
+      // All unavailable should be gemini/codex/opencode
+      for (const m of unavailableModels) {
+        expect(['gemini', 'codex', 'opencode']).toContain(m.cliName);
+        expect(m.reason).toContain('not installed');
+      }
+    });
+
+    it('should report all models available when all CLIs installed', async () => {
+      const mockAdapter = {
+        healthCheck: vi.fn().mockResolvedValue({
+          healthy: true,
+          version: '1.0.0',
+          versionStatus: 'supported',
+          lastChecked: new Date(),
+        }),
+        getCapacity: vi.fn().mockResolvedValue({
+          remainingTokens: 100000,
+          remainingRequests: 100,
+          resetTime: new Date(),
+          utilizationPercent: 15,
+          rateLimited: false,
+          exhausted: false,
+          quotaExhausted: false,
+          observed: true,
+        }),
+      };
+      const mockAdapters = new Map([
+        ['claude', { ...mockAdapter, name: 'claude' }],
+        ['gemini', { ...mockAdapter, name: 'gemini' }],
+        ['codex', { ...mockAdapter, name: 'codex' }],
+        ['opencode', { ...mockAdapter, name: 'opencode' }],
+      ]);
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+
+      const result = await runDoctor();
+
+      expect(result.registryAdvisory.availableModels).toBe(result.registryAdvisory.totalModels);
+      expect(result.registryAdvisory.unavailableModels).toBe(0);
+    });
+  });
+
+  describe('printDoctorResults()', () => {
+    it('counts invalid configuration in the summary (#7158)', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      printDoctorResults(
+        createMockDoctorResult({
+          configFile: { found: true, path: null, error: 'Config validation failed' },
+          allHealthy: false,
+        })
+      );
+
+      const output = stripVTControlCharacters(writeSpy.mock.calls.map((c) => c[0]).join(''));
+      expect(output).toContain('Summary: 1 issue(s) found (configuration)');
+    });
+
+    it('should write output to stdout', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult();
+
+      printDoctorResults(result);
+
+      expect(writeSpy).toHaveBeenCalled();
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('Nexus Agents Doctor');
+      expect(output).toContain('Claude CLI');
+      expect(output).toContain('2.0.76');
+      expect(output).toContain('Status: Ready');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show Node.js version check', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult();
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('Node.js version');
+      expect(output).toContain('v24.0.0');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show warning for unsupported Node.js version', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({
+        nodeVersion: { version: 'v18.0.0', major: 18, supported: false },
+        allHealthy: false,
+      });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('Node.js version');
+      expect(output).toContain('v18.0.0');
+      expect(output).toContain('Warning');
+      expect(output).toContain('>=24');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show API key configuration status', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({
+        apiKeys: [
+          { name: 'ANTHROPIC_API_KEY', configured: true },
+          { name: 'OPENAI_API_KEY', configured: true },
+          { name: 'GOOGLE_AI_API_KEY', configured: false },
+        ],
+      });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('API keys configured');
+      expect(output).toContain('2 of 3');
+      expect(output).toContain('ANTHROPIC_API_KEY');
+      expect(output).toContain('OPENAI_API_KEY');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show hint when no API keys configured', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({
+        apiKeys: [
+          { name: 'ANTHROPIC_API_KEY', configured: false },
+          { name: 'OPENAI_API_KEY', configured: false },
+          { name: 'GOOGLE_AI_API_KEY', configured: false },
+        ],
+      });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('API keys configured');
+      expect(output).toContain('0 of 3');
+      expect(output).toContain('Set ANTHROPIC_API_KEY');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show voter transport as CLI subprocess when no gateway is configured', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({ voterTransport: { configured: false } });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('Voter transport');
+      expect(output).toContain('CLI subprocess');
+      expect(output).toContain('NEXUS_OPENAI_COMPAT_URL');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show voter transport as in-process gateway when configured', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({ voterTransport: { configured: true } });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('Voter transport');
+      expect(output).toContain('In-process gateway');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show configuration file status', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({
+        configFile: { found: true, path: './nexus-agents.yaml' },
+      });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('Configuration loaded');
+      expect(output).toContain('./nexus-agents.yaml');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show hint when config file not found', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({
+        configFile: { found: false, path: null },
+      });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('Configuration file');
+      expect(output).toContain('Not found');
+      expect(output).toContain('nexus-agents config init');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show error message for uninstalled CLI', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({
+        clis: [
+          {
+            name: 'claude',
+            installed: false,
+            version: 'N/A',
+            versionStatus: 'unsupported',
+            authenticated: false,
+            authState: 'not-authenticated',
+            routerAdmits: false,
+            error: 'Not found in PATH',
+            fix: 'npm install -g @anthropic-ai/claude-code',
+          },
+          {
+            name: 'gemini',
+            installed: true,
+            version: '0.22.5',
+            versionStatus: 'supported',
+            authenticated: true,
+            authState: 'authenticated',
+            routerAdmits: true,
+          },
+          {
+            name: 'codex',
+            installed: true,
+            version: '0.77.0',
+            versionStatus: 'supported',
+            authenticated: true,
+            authState: 'authenticated',
+            routerAdmits: true,
+          },
+        ],
+        allHealthy: false,
+      });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('Not found in PATH');
+      expect(output).toContain('npm install -g');
+      expect(output).toContain('issue(s) found');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show capacity information when available', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({
+        clis: [
+          {
+            name: 'claude',
+            installed: true,
+            version: '2.0.76',
+            versionStatus: 'supported',
+            authenticated: true,
+            authState: 'authenticated',
+            routerAdmits: true,
+            capacity: {
+              remainingTokens: 100000,
+              remainingRequests: 100,
+              resetTime: new Date(),
+              utilizationPercent: 15,
+              rateLimited: false,
+              // eslint-disable-next-line @typescript-eslint/no-deprecated -- fixture supplies the required public compatibility alias
+              exhausted: false,
+              quotaExhausted: false,
+              observed: true,
+            },
+          },
+          {
+            name: 'gemini',
+            installed: true,
+            version: '0.22.5',
+            versionStatus: 'supported',
+            authenticated: true,
+            authState: 'authenticated',
+            routerAdmits: true,
+          },
+          {
+            name: 'codex',
+            installed: true,
+            version: '0.77.0',
+            versionStatus: 'supported',
+            authenticated: true,
+            authState: 'authenticated',
+            routerAdmits: true,
+          },
+        ],
+      });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('remaining');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should handle no installed CLIs gracefully', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({
+        clis: [
+          {
+            name: 'claude',
+            installed: false,
+            version: 'N/A',
+            versionStatus: 'unsupported',
+            authenticated: false,
+            authState: 'not-authenticated',
+            routerAdmits: false,
+            error: 'Not found',
+          },
+          {
+            name: 'gemini',
+            installed: false,
+            version: 'N/A',
+            versionStatus: 'unsupported',
+            authenticated: false,
+            authState: 'not-authenticated',
+            routerAdmits: false,
+            error: 'Not found',
+          },
+          {
+            name: 'codex',
+            installed: false,
+            version: 'N/A',
+            versionStatus: 'unsupported',
+            authenticated: false,
+            authState: 'not-authenticated',
+            routerAdmits: false,
+            error: 'Not found',
+          },
+        ],
+        mcpClientReady: false,
+        allHealthy: false,
+      });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('No CLIs installed');
+      expect(output).toContain('issue(s) found');
+
+      writeSpy.mockRestore();
+    });
+
+    it('should show MCP server not ready when creation fails', () => {
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const result = createMockDoctorResult({
+        mcpServerReady: false,
+        allHealthy: false,
+      });
+
+      printDoctorResults(result);
+
+      const output = writeSpy.mock.calls.map((c) => c[0]).join('');
+      expect(output).toContain('MCP Server mode');
+      expect(output).toContain('Not ready');
+
+      writeSpy.mockRestore();
+    });
+  });
+
+  describe('doctorCommand()', () => {
+    it('should return 0 when all healthy', async () => {
+      const mockAdapter = {
+        healthCheck: vi.fn().mockResolvedValue({
+          healthy: true,
+          version: '2.0.76',
+          versionStatus: 'supported',
+          lastChecked: new Date(),
+        }),
+        getCapacity: vi.fn().mockResolvedValue({
+          remainingTokens: 100000,
+          remainingRequests: 100,
+          resetTime: new Date(),
+          utilizationPercent: 15,
+          rateLimited: false,
+          exhausted: false,
+          quotaExhausted: false,
+          observed: true,
+        }),
+      };
+
+      const mockAdapters = new Map([
+        ['claude', { ...mockAdapter, name: 'claude' }],
+        ['gemini', { ...mockAdapter, name: 'gemini' }],
+        ['codex', { ...mockAdapter, name: 'codex' }],
+        ['opencode', { ...mockAdapter, name: 'opencode' }],
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+      vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const exitCode = await doctorCommand();
+
+      expect(exitCode).toBe(0);
+    });
+
+    it('hands the measured CLI list to onResult (#6781)', async () => {
+      const healthy = {
+        healthCheck: vi.fn().mockResolvedValue({
+          healthy: true,
+          version: '2.0.76',
+          versionStatus: 'supported',
+          lastChecked: new Date(),
+        }),
+        getCapacity: vi.fn().mockRejectedValue(new Error('unsupported')),
+      };
+      vi.mocked(createAllAdapters).mockReturnValue(
+        new Map([['claude', { ...healthy, name: 'claude' }]]) as never
+      );
+      vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const seen: Array<readonly CliCheckResult[]> = [];
+      await doctorCommand({ onResult: (result) => seen.push(result.clis) });
+
+      expect(seen).toHaveLength(1);
+      const claude = seen[0]?.find((c) => c.name === 'claude');
+      expect(claude?.routerAdmits).toBe(true);
+    });
+
+    it('should return 1 when issues found', async () => {
+      const mockAdapters = new Map([
+        [
+          'claude',
+          {
+            name: 'claude',
+            healthCheck: vi.fn().mockRejectedValue(new Error('ENOENT')),
+            getCapacity: vi.fn(),
+          },
+        ],
+        [
+          'gemini',
+          {
+            name: 'gemini',
+            healthCheck: vi.fn().mockRejectedValue(new Error('ENOENT')),
+            getCapacity: vi.fn(),
+          },
+        ],
+        [
+          'codex',
+          {
+            name: 'codex',
+            healthCheck: vi.fn().mockRejectedValue(new Error('ENOENT')),
+            getCapacity: vi.fn(),
+          },
+        ],
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+      vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const exitCode = await doctorCommand();
+
+      expect(exitCode).toBe(1);
+    });
+
+    it('should return 1 when MCP server creation fails', async () => {
+      vi.mocked(createServer).mockReturnValue({ ok: false, error: {} } as never);
+
+      const mockAdapter = {
+        healthCheck: vi.fn().mockResolvedValue({
+          healthy: true,
+          version: '2.0.76',
+          versionStatus: 'supported',
+          lastChecked: new Date(),
+        }),
+        getCapacity: vi.fn().mockResolvedValue({
+          remainingTokens: 100000,
+          remainingRequests: 100,
+          resetTime: new Date(),
+          utilizationPercent: 15,
+          rateLimited: false,
+          exhausted: false,
+          quotaExhausted: false,
+          observed: true,
+        }),
+      };
+
+      const mockAdapters = new Map([
+        ['claude', { ...mockAdapter, name: 'claude' }],
+        ['gemini', { ...mockAdapter, name: 'gemini' }],
+        ['codex', { ...mockAdapter, name: 'codex' }],
+        ['opencode', { ...mockAdapter, name: 'opencode' }],
+      ]);
+
+      vi.mocked(createAllAdapters).mockReturnValue(mockAdapters as never);
+      vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+      const exitCode = await doctorCommand();
+
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  // #2501: sandbox-awareness derivations (dataDirInsideRepo + mismatch)
+  describe('checkSandbox()', () => {
+    let originalSandbox: string | undefined;
+    let originalRoot: string | undefined;
+    let originalDataDir: string | undefined;
+
+    beforeEach(() => {
+      originalSandbox = process.env['NEXUS_SANDBOX'];
+      originalRoot = process.env['NEXUS_SANDBOX_ROOT'];
+      originalDataDir = process.env['NEXUS_DATA_DIR'];
+      delete process.env['NEXUS_SANDBOX'];
+      delete process.env['NEXUS_SANDBOX_ROOT'];
+      delete process.env['NEXUS_DATA_DIR'];
+    });
+
+    afterEach(() => {
+      if (originalSandbox === undefined) delete process.env['NEXUS_SANDBOX'];
+      else process.env['NEXUS_SANDBOX'] = originalSandbox;
+      if (originalRoot === undefined) delete process.env['NEXUS_SANDBOX_ROOT'];
+      else process.env['NEXUS_SANDBOX_ROOT'] = originalRoot;
+      if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+      else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    });
+
+    it('returns inactive defaults when NEXUS_SANDBOX is unset', async () => {
+      const { checkSandbox } = await import('./doctor.js');
+      const result = checkSandbox();
+      expect(result.active).toBe(false);
+      expect(result.flavor).toBeUndefined();
+      expect(result.dataDirInsideRepo).toBe(false);
+    });
+
+    it('detects dataDirInsideRepo when NEXUS_DATA_DIR is inside a single repo subfolder', async () => {
+      process.env['NEXUS_SANDBOX'] = 'docker-opencode';
+      process.env['NEXUS_SANDBOX_ROOT'] = '/projects';
+      process.env['NEXUS_DATA_DIR'] = '/projects/repo1/.nexus-agents';
+      const { checkSandbox } = await import('./doctor.js');
+      const result = checkSandbox();
+      expect(result.active).toBe(true);
+      expect(result.dataDirInsideRepo).toBe(true);
+    });
+
+    it('does NOT flag dataDirInsideRepo when NEXUS_DATA_DIR is at the multi-repo root', async () => {
+      process.env['NEXUS_SANDBOX'] = 'docker-opencode';
+      process.env['NEXUS_SANDBOX_ROOT'] = '/projects';
+      process.env['NEXUS_DATA_DIR'] = '/projects/.nexus-agents';
+      const { checkSandbox } = await import('./doctor.js');
+      const result = checkSandbox();
+      expect(result.dataDirInsideRepo).toBe(false);
+    });
+
+    it('does NOT flag dataDirInsideRepo when NEXUS_DATA_DIR is outside the sandbox root entirely', async () => {
+      process.env['NEXUS_SANDBOX'] = 'docker-opencode';
+      process.env['NEXUS_SANDBOX_ROOT'] = '/projects';
+      process.env['NEXUS_DATA_DIR'] = '/var/nexus-state';
+      const { checkSandbox } = await import('./doctor.js');
+      const result = checkSandbox();
+      expect(result.dataDirInsideRepo).toBe(false);
+    });
+  });
+
+  describe('checkVoterTransport() (#4255)', () => {
+    let originalUrl: string | undefined;
+    let originalKey: string | undefined;
+    let originalOpencodeConfig: string | undefined;
+
+    beforeEach(() => {
+      originalUrl = process.env['NEXUS_OPENAI_COMPAT_URL'];
+      originalKey = process.env['NEXUS_OPENAI_COMPAT_KEY'];
+      originalOpencodeConfig = process.env['NEXUS_OPENCODE_CONFIG'];
+      delete process.env['NEXUS_OPENAI_COMPAT_URL'];
+      delete process.env['NEXUS_OPENAI_COMPAT_KEY'];
+      delete process.env['NEXUS_OPENCODE_CONFIG'];
+    });
+
+    afterEach(() => {
+      if (originalUrl === undefined) delete process.env['NEXUS_OPENAI_COMPAT_URL'];
+      else process.env['NEXUS_OPENAI_COMPAT_URL'] = originalUrl;
+      if (originalKey === undefined) delete process.env['NEXUS_OPENAI_COMPAT_KEY'];
+      else process.env['NEXUS_OPENAI_COMPAT_KEY'] = originalKey;
+      if (originalOpencodeConfig === undefined) delete process.env['NEXUS_OPENCODE_CONFIG'];
+      else process.env['NEXUS_OPENCODE_CONFIG'] = originalOpencodeConfig;
+    });
+
+    it('reports not configured when neither env var is set', async () => {
+      const { checkVoterTransport } = await import('./doctor.js');
+      expect(checkVoterTransport()).toEqual({ configured: false });
+    });
+
+    it('reports configured when both gateway env vars are set', async () => {
+      process.env['NEXUS_OPENAI_COMPAT_URL'] = 'https://gateway.example/v1';
+      process.env['NEXUS_OPENAI_COMPAT_KEY'] = 'sk-test';
+      const { checkVoterTransport } = await import('./doctor.js');
+      // Previously `toEqual({ configured: true })`; a configured gateway now
+      // also carries `cost` (#4392 inc 2), asserted in the describe below.
+      expect(checkVoterTransport()).toMatchObject({ configured: true });
+    });
+
+    it('reports not configured when only one of the two env vars is set', async () => {
+      process.env['NEXUS_OPENAI_COMPAT_URL'] = 'https://gateway.example/v1';
+      const { checkVoterTransport } = await import('./doctor.js');
+      expect(checkVoterTransport()).toEqual({ configured: false });
+    });
+
+    describe('gateway cost declaration (#4392 inc 2)', () => {
+      let originalCost: string | undefined;
+
+      beforeEach(() => {
+        originalCost = process.env['NEXUS_GATEWAY_COST'];
+        delete process.env['NEXUS_GATEWAY_COST'];
+        process.env['NEXUS_OPENAI_COMPAT_URL'] = 'https://gateway.example/v1';
+        process.env['NEXUS_OPENAI_COMPAT_KEY'] = 'sk-test';
+      });
+
+      afterEach(() => {
+        if (originalCost === undefined) delete process.env['NEXUS_GATEWAY_COST'];
+        else process.env['NEXUS_GATEWAY_COST'] = originalCost;
+      });
+
+      it('reports cost UNSET when the gateway is configured and the variable is absent', async () => {
+        const { checkVoterTransport } = await import('./doctor.js');
+        expect(checkVoterTransport()).toEqual({ configured: true, cost: 'unset' });
+      });
+
+      it('reports the bare declaration when set', async () => {
+        process.env['NEXUS_GATEWAY_COST'] = 'priced:2,10';
+        const { checkVoterTransport } = await import('./doctor.js');
+        expect(checkVoterTransport()).toEqual({
+          configured: true,
+          cost: { kind: 'priced', inputPer1M: 2, outputPer1M: 10 },
+        });
+      });
+
+      it('reports INVALID, not unset, for an unparsable value', async () => {
+        process.env['NEXUS_GATEWAY_COST'] = 'priced:1';
+        const { checkVoterTransport } = await import('./doctor.js');
+        expect(checkVoterTransport()).toEqual({ configured: true, cost: 'invalid' });
+      });
+
+      it('reports no-default when the value names neither a bare declaration nor this gateway', async () => {
+        // Since step 2 the voter gateway IS an arm (`api:openai-compat` by
+        // default); an entry for some OTHER endpoint still leaves it undeclared.
+        process.env['NEXUS_GATEWAY_COST'] = 'corp-proxy=free';
+        const { checkVoterTransport } = await import('./doctor.js');
+        expect(checkVoterTransport()).toEqual({ configured: true, cost: 'no-default' });
+      });
+
+      it("reads an entry scoped to the gateway's default endpoint as declared (#4392 step 2)", async () => {
+        process.env['NEXUS_GATEWAY_COST'] = 'openai-compat=free';
+        const { checkVoterTransport } = await import('./doctor.js');
+        expect(checkVoterTransport()).toEqual({ configured: true, cost: { kind: 'free' } });
+      });
+
+      it('resolves the scoped entry through NEXUS_OPENAI_COMPAT_ENDPOINT', async () => {
+        process.env['NEXUS_OPENAI_COMPAT_ENDPOINT'] = 'corp-proxy';
+        process.env['NEXUS_GATEWAY_COST'] = 'corp-proxy=priced:2,10';
+        try {
+          const { checkVoterTransport } = await import('./doctor.js');
+          expect(checkVoterTransport()).toEqual({
+            configured: true,
+            cost: { kind: 'priced', inputPer1M: 2, outputPer1M: 10 },
+          });
+        } finally {
+          delete process.env['NEXUS_OPENAI_COMPAT_ENDPOINT'];
+        }
+      });
+
+      it('prefers the scoped entry over the bare default', async () => {
+        process.env['NEXUS_GATEWAY_COST'] = 'priced;openai-compat=local';
+        const { checkVoterTransport } = await import('./doctor.js');
+        expect(checkVoterTransport()).toEqual({ configured: true, cost: { kind: 'local' } });
+      });
+
+      it('carries no cost field when no gateway is configured', async () => {
+        delete process.env['NEXUS_OPENAI_COMPAT_URL'];
+        process.env['NEXUS_GATEWAY_COST'] = 'free';
+        const { checkVoterTransport } = await import('./doctor.js');
+        expect(checkVoterTransport()).toEqual({ configured: false });
+        expect('cost' in checkVoterTransport()).toBe(false);
+      });
+    });
+
+    describe('removed env aliases (#6291 B1)', () => {
+      const LEGACY = ['NEXUS_CUSTOM_API_BASE_URL', 'NEXUS_CUSTOM_API_KEY'] as const;
+      const savedLegacy = new Map<string, string | undefined>();
+
+      beforeEach(() => {
+        for (const name of LEGACY) {
+          savedLegacy.set(name, process.env[name]);
+          Reflect.deleteProperty(process.env, name);
+        }
+      });
+
+      afterEach(() => {
+        for (const name of LEGACY) {
+          const prev = savedLegacy.get(name);
+          if (prev === undefined) Reflect.deleteProperty(process.env, name);
+          else process.env[name] = prev;
+        }
+      });
+
+      it('ignores the removed pair without configuring voter transport', async () => {
+        process.env['NEXUS_CUSTOM_API_BASE_URL'] = 'https://gateway.example/v1';
+        process.env['NEXUS_CUSTOM_API_KEY'] = 'sk-TESTFAKE-NOT-REAL-0000';
+        const { checkVoterTransport } = await import('./doctor.js');
+        expect(checkVoterTransport()).toEqual({ configured: false });
+      });
+
+      it('reports canonical transport without legacy alias metadata', async () => {
+        process.env['NEXUS_OPENAI_COMPAT_URL'] = 'https://gateway.example/v1';
+        process.env['NEXUS_OPENAI_COMPAT_KEY'] = 'sk-TESTFAKE-NOT-REAL-0000';
+        process.env['NEXUS_CUSTOM_API_KEY'] = 'sk-TESTFAKE-old-NOT-REAL-0000';
+        const { checkVoterTransport } = await import('./doctor.js');
+        const check = checkVoterTransport();
+        expect(check.configured).toBe(true);
+        expect('deprecatedEnv' in check).toBe(false);
+      });
+    });
+  });
+});
+
+describe('doctor with a gateway (#6609)', () => {
+  const HEALTHY: GatewayHealth = {
+    state: 'healthy',
+    host: 'gw.example',
+    listedCount: 24,
+    chatCount: 12,
+    allowlistActive: false,
+    census: { anthropic: 4, openai: 5, google: 3, unknown: 0 },
+    slots: { claude: 'claude_4_5_opus', codex: 'gpt-5.2', gemini: 'gemini-3-pro-preview' },
+    proxy: { kind: 'direct' },
+    probes: 'skipped',
+  };
+  const DOWN: GatewayHealth = {
+    state: 'discovery_failed',
+    host: 'gw.example',
+    error: 'Failed to discover models from gw.example: Connection error.',
+    proxy: { kind: 'direct' },
+  };
+
+  let output: string[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(execFileSync).mockReturnValue(
+      JSON.stringify({ dependencies: { 'nexus-agents': { version: TEST_VERSION } } })
+    );
+    vi.mocked(createServer).mockReturnValue({ ok: true } as never);
+    vi.mocked(existsSync).mockReturnValue(false);
+    // A gateway-only host: no CLI adapter at all, no vendor API key.
+    vi.mocked(createAllAdapters).mockReturnValue(new Map() as never);
+    for (const name of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_AI_API_KEY']) {
+      vi.stubEnv(name, undefined);
+    }
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_URL', 'https://gw.example/v1');
+    vi.stubEnv('NEXUS_OPENAI_COMPAT_KEY', 'doctor-test-key-6609');
+    output = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      output.push(String(chunk));
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('PASSES a gateway-only host whose gateway is healthy', async () => {
+    vi.mocked(checkGatewayHealth).mockResolvedValue(HEALTHY);
+
+    const result = await runDoctor();
+
+    expect(result.clis.every((c) => !c.installed)).toBe(true);
+    expect(result.apiKeys.every((k) => !k.configured)).toBe(true);
+    expect(result.allHealthy).toBe(true);
+    expect(await doctorCommand()).toBe(0);
+  });
+
+  it('FAILS when the gateway is unreachable, naming the host in the verdict and transport line', async () => {
+    vi.mocked(checkGatewayHealth).mockResolvedValue(DOWN);
+
+    const exitCode = await doctorCommand();
+
+    expect(exitCode).toBe(1);
+    const text = output.join('');
+    expect(text).toMatch(/Voter transport: In-process gateway at gw\.example FAILED/);
+    expect(text).toContain('gateway gw.example');
+    expect(text).not.toContain('doctor-test-key-6609');
+  });
+
+  it('the transport line reports the measurement, not the env vars', async () => {
+    vi.mocked(checkGatewayHealth).mockResolvedValue(HEALTHY);
+
+    await doctorCommand();
+
+    expect(output.join('')).toContain(
+      'Voter transport: In-process gateway (gw.example: 12 chat models answered /models)'
+    );
+  });
+
+  it('never asks for a completion probe unless --probe is passed', async () => {
+    vi.mocked(checkGatewayHealth).mockResolvedValue(HEALTHY);
+
+    await doctorCommand();
+    await doctorCommand({ gateway: true });
+    await doctorCommand({ gateway: true, probe: true });
+
+    expect(vi.mocked(checkGatewayHealth).mock.calls.map(([o]) => o?.probe)).toEqual([
+      false,
+      false,
+      true,
+    ]);
+  });
+
+  it('prints the gateway section only for --gateway or --probe', async () => {
+    vi.mocked(checkGatewayHealth).mockResolvedValue(HEALTHY);
+
+    await doctorCommand();
+    expect(output.join('')).not.toContain('Checking gateway (doctor --gateway)');
+
+    await doctorCommand({ gateway: true });
+    const text = output.join('');
+    expect(text).toContain('Checking gateway (doctor --gateway)');
+    expect(text).toContain('Models: 24 listed, 12 chat models after the chat filter');
+    // No CLI is installed here, so the gateway serves every family slot.
+    expect(text).toContain('claude → claude_4_5_opus (gateway; CLI not available)');
+    expect(text).toContain('codex → gpt-5.2 (gateway; CLI not available)');
+    expect(text).toContain('gemini → gemini-3-pro-preview (gateway; CLI not available)');
+  });
+});
+
+describe('doctor with CLIs disabled by NEXUS_DISABLED_CLIS (#6728)', () => {
+  const GATEWAY: GatewayHealth = {
+    state: 'healthy',
+    host: 'gw.example',
+    listedCount: 2,
+    chatCount: 2,
+    allowlistActive: false,
+    census: { anthropic: 0, openai: 1, google: 0, unknown: 0 },
+    slots: { claude: 'unavailable', codex: 'gpt-5.2', gemini: 'unavailable' },
+    proxy: { kind: 'direct' },
+    probes: 'skipped',
+  };
+
+  let output: string[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(execFileSync).mockReturnValue(
+      JSON.stringify({ dependencies: { 'nexus-agents': { version: TEST_VERSION } } })
+    );
+    vi.mocked(createServer).mockReturnValue({ ok: true } as never);
+    vi.mocked(existsSync).mockReturnValue(false);
+    vi.mocked(createAllAdapters).mockReturnValue(new Map() as never);
+    vi.mocked(checkGatewayHealth).mockResolvedValue({ state: 'not_configured' });
+    output = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      output.push(String(chunk));
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  /** The advisory reasons for the models a CLI serves. */
+  function reasonsFor(result: DoctorResult, cli: string): string[] {
+    return result.registryAdvisory.models.filter((m) => m.cliName === cli).map((m) => m.reason);
+  }
+
+  it('reads a disabled CLI model as disabled, not uninstalled', async () => {
+    vi.stubEnv('NEXUS_DISABLED_CLIS', 'gemini,codex,opencode');
+
+    const result = await runDoctor();
+
+    for (const cli of ['gemini', 'codex', 'opencode']) {
+      const reasons = reasonsFor(result, cli);
+      expect(reasons.length).toBeGreaterThan(0);
+      for (const reason of reasons) {
+        expect(reason).toBe(`${cli} CLI is disabled by NEXUS_DISABLED_CLIS`);
+      }
+    }
+  });
+
+  it('says the MCP Client is disabled, not that codex is missing', async () => {
+    vi.stubEnv('NEXUS_DISABLED_CLIS', 'codex');
+
+    await doctorCommand();
+
+    const text = output.join('');
+    expect(text).toContain('MCP Client mode: Disabled (codex disabled by NEXUS_DISABLED_CLIS)');
+    expect(text).not.toContain('Codex not installed');
+    expect(text).toContain('GPT-5.6 Sol — codex CLI is disabled by NEXUS_DISABLED_CLIS');
+  });
+
+  it('names the gateway model that serves a disabled CLI family', async () => {
+    vi.stubEnv('NEXUS_DISABLED_CLIS', 'codex,gemini');
+    vi.mocked(checkGatewayHealth).mockResolvedValue(GATEWAY);
+
+    const result = await runDoctor();
+
+    expect(reasonsFor(result, 'codex').length).toBeGreaterThan(0);
+    for (const reason of reasonsFor(result, 'codex')) {
+      expect(reason).toBe(
+        'codex CLI is disabled by NEXUS_DISABLED_CLIS; the gateway serves its slot with gpt-5.2'
+      );
+    }
+    expect(reasonsFor(result, 'gemini').length).toBeGreaterThan(0);
+    for (const reason of reasonsFor(result, 'gemini')) {
+      expect(reason).toBe(
+        'gemini CLI is disabled by NEXUS_DISABLED_CLIS; the gateway has no google model'
+      );
+    }
+  });
+
+  it('empty case: NEXUS_DISABLED_CLIS unset leaves a missing CLI reading as not installed', async () => {
+    vi.stubEnv('NEXUS_DISABLED_CLIS', undefined);
+
+    const result = await runDoctor();
+    await doctorCommand();
+
+    expect(result.disabledClis).toEqual([]);
+    const reasons = result.registryAdvisory.models.map((m) => m.reason);
+    expect(reasons.filter((r) => r.includes('NEXUS_DISABLED_CLIS'))).toEqual([]);
+    expect(reasonsFor(result, 'codex')).toContain('codex CLI is not installed');
+    expect(output.join('')).toContain('MCP Client mode: Not ready (Codex not installed)');
+  });
+});

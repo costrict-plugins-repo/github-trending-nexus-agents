@@ -1,0 +1,393 @@
+/**
+ * nexus-agents/consensus - Core Type Definitions
+ *
+ * Core type definitions and Zod schemas for the consensus engine.
+ * Supports multiple voting strategies for multi-agent decisions.
+ */
+
+import { z } from 'zod';
+import { DEFAULT_MIN_VOTERS_FOR_QUORUM } from './decision/quorum.js';
+
+/** Migration error for callers selecting the retired live strategy (#5234). */
+export const RETIRED_CONSENSUS_STRATEGY_MESSAGE =
+  'proof_of_learning was retired in 9.0 (#5234); use simple_majority or higher_order for contrarian escalation.';
+
+/**
+ * Consensus algorithm types.
+ * - simple_majority: >50% of votes required
+ * - supermajority: >=67% of votes required
+ * - unanimous: 100% approval required
+ * - opinion_wise: higher-order voting with correlation awareness (Issue #333)
+ * - higher_order: alias for opinion_wise (Issue #514)
+ */
+export const ConsensusAlgorithmSchema = z.enum(
+  ['simple_majority', 'supermajority', 'unanimous', 'opinion_wise', 'higher_order'],
+  {
+    error: (issue) =>
+      issue.input === 'proof_of_learning' ? RETIRED_CONSENSUS_STRATEGY_MESSAGE : undefined,
+  }
+);
+export type ConsensusAlgorithm = z.infer<typeof ConsensusAlgorithmSchema>;
+
+/**
+ * Vote decision options.
+ */
+export const VoteDecisionSchema = z.enum(['approve', 'reject', 'abstain']);
+export type VoteDecision = z.infer<typeof VoteDecisionSchema>;
+
+/**
+ * Proposal status in the lifecycle.
+ */
+export const ProposalStatusSchema = z.enum([
+  'pending',
+  'voting',
+  'approved',
+  'rejected',
+  'timeout',
+  'closed',
+]);
+export type ProposalStatus = z.infer<typeof ProposalStatusSchema>;
+
+/**
+ * Structured rejection feedback categories (Issue #1213).
+ * Enables reject→refine→re-vote feedback loops by classifying rejection reasons.
+ */
+export const RejectionCategorySchema = z.enum([
+  'YAGNI',
+  'DRY_VIOLATION',
+  'OVER_ENGINEERING',
+  'SCOPE_CREEP',
+  'SECURITY_RISK',
+  'MISALIGNED',
+  'INSUFFICIENT_EVIDENCE',
+]);
+export type RejectionCategory = z.infer<typeof RejectionCategorySchema>;
+
+/**
+ * All valid rejection category values, for runtime reference.
+ */
+export const REJECTION_CATEGORIES = RejectionCategorySchema.options;
+
+/**
+ * Pre-verified finding emitted by a voter (#2245 v4 follow-up).
+ * Mirrors `cli/voter-response.ts:RawFindingSchema` — kept inline here to
+ * avoid a circular cli→consensus import. Downstream code in mcp/tools
+ * adds the derived `verified` flag based on the gate fields.
+ */
+const FindingShapeSchema = z.object({
+  summary: z.string().min(1).max(500),
+  location: z.string().min(1).max(200),
+  severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).default('medium'),
+  gate: z.object({
+    reread_cited_line: z.enum(['passed', 'failed', 'skipped']).default('skipped'),
+    traced_call_path: z.enum(['passed', 'failed', 'skipped']).default('skipped'),
+    named_assertion: z.string().default(''),
+    ruled_out_language_non_issue: z.enum(['passed', 'failed', 'skipped']).default('skipped'),
+  }),
+  claim: z.string().min(1).max(2000),
+});
+
+/**
+ * A vote cast by an agent.
+ */
+export const VoteSchema = z.object({
+  decision: VoteDecisionSchema,
+  reasoning: z.string().min(1).describe('Explanation for the vote'),
+  confidence: z.number().min(0).max(1).describe('Confidence level 0-1'),
+  conditions: z.array(z.string()).optional().describe('Conditions for approval'),
+  /** Structured rejection categories for reject→refine→re-vote loops (Issue #1213). */
+  rejectionCategories: z
+    .array(RejectionCategorySchema)
+    .optional()
+    .describe('Rejection reason categories when decision is reject'),
+  /** Pre-verified PR-review findings (#2245 v4 follow-up). Optional;
+   * populated only when the voter emits the structured top-level array. */
+  findings: z.array(FindingShapeSchema).optional().describe('PR-review findings (pre-verified)'),
+  /** Which declared option this voter chose, when the proposal declared
+   * `options` (#4472). Absent when the proposal declared none, or when the
+   * voter's selection matched no declared option — an unmatched selection is
+   * recorded as absent, never coerced onto a default. */
+  selectedOption: z
+    .string()
+    .optional()
+    .describe('Chosen option when the proposal declares options'),
+  /** Bound SHA-256 digest of reviewed artifact (#M1 connected autonomy). */
+  boundArtifactDigest: z
+    .string()
+    .optional()
+    .describe('SHA-256 digest of the bound artifact reviewed'),
+  /** Worker readiness status for the required artifact. */
+  artifactReadiness: z
+    .enum(['ready', 'artifact_starved', 'unverifiable'])
+    .optional()
+    .describe('Readiness status of the voter for the artifact'),
+  timestamp: z.iso.datetime().optional(),
+});
+export type Vote = z.infer<typeof VoteSchema>;
+
+/**
+ * A proposal submitted for consensus.
+ */
+export const ProposalSchema = z.object({
+  id: z.string().optional().describe('Auto-generated if not provided'),
+  title: z.string().min(1).max(200).describe('Short proposal title'),
+  description: z.string().min(1).describe('Detailed proposal description'),
+  algorithm: ConsensusAlgorithmSchema,
+  timeout: z.number().int().positive().optional().describe('Timeout in milliseconds'),
+  requiredVoters: z.array(z.string()).optional().describe('Agent IDs that must vote'),
+  /** SHA-256 digest of required artifact fixture (#M1 connected autonomy). */
+  artifactDigest: z.string().optional().describe('SHA-256 digest of required artifact'),
+  /** Whether artifact inspection is mandatory for eligible votes. */
+  requireArtifact: z
+    .boolean()
+    .optional()
+    .describe('Whether artifact inspection is mandatory for eligible votes'),
+  /** Total panel size for artifact inspection floor calculations (#M1). */
+  totalRoles: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe('Total panel size for artifact inspection floor'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional context'),
+  createdAt: z.iso.datetime().optional(),
+});
+export type Proposal = z.infer<typeof ProposalSchema>;
+
+/**
+ * Unique identifier for a proposal.
+ */
+export type ProposalId = string;
+
+/**
+ * Vote counts summary.
+ */
+export interface VoteCounts {
+  approve: number;
+  reject: number;
+  abstain: number;
+  total: number;
+}
+
+/** Historical weighted-tally provenance retained for persisted vote records (#5117, #5234). */
+export type WeightBasis = 'performance' | 'partial' | 'unweighted';
+
+export interface WeightedVoteCounts {
+  approve: number;
+  reject: number;
+  abstain: number;
+  totalWeight: number;
+}
+
+/**
+ * Result of a consensus decision.
+ */
+export interface ConsensusResult {
+  proposalId: ProposalId;
+  proposal: Proposal;
+  outcome: ProposalStatus;
+  votes: Map<string, Vote>;
+  voteCounts: VoteCounts;
+  weightedCounts?: WeightedVoteCounts | undefined;
+  /**
+   * What the weights in `weightedCounts` were derived from (#5117).
+   *
+   * Carried on the RESULT, not just computed inside the strategy, because the
+   * result is what a reviewer reads. A tally reported as weighted when every
+   * weight was structurally 1.0 invites the reader to believe voter track
+   * record moved the number. Absent for strategies that do not weight at all.
+   */
+  weightBasis?: WeightBasis | undefined;
+  approvalPercentage: number;
+  quorumReached: boolean;
+  startedAt: string;
+  closedAt: string;
+  durationMs: number;
+  /** Explanation for outcome when applicable (e.g. unmet artifact floor). */
+  reason?: string | undefined;
+  /** Whether artifact inspection floor was unmet (#M1 connected autonomy). */
+  artifactFloorUnmet?: boolean | undefined;
+}
+
+/**
+ * Consensus result schema for validation.
+ */
+export const ConsensusResultSchema = z.object({
+  proposalId: z.string(),
+  proposal: ProposalSchema,
+  outcome: ProposalStatusSchema,
+  votes: z.map(z.string(), VoteSchema),
+  voteCounts: z.object({
+    approve: z.number().int().nonnegative(),
+    reject: z.number().int().nonnegative(),
+    abstain: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+  }),
+  weightedCounts: z
+    .object({
+      approve: z.number().nonnegative(),
+      reject: z.number().nonnegative(),
+      abstain: z.number().nonnegative(),
+      totalWeight: z.number().nonnegative(),
+    })
+    .optional(),
+  approvalPercentage: z.number().min(0).max(100),
+  quorumReached: z.boolean(),
+  startedAt: z.iso.datetime(),
+  closedAt: z.iso.datetime(),
+  durationMs: z.number().int().nonnegative(),
+  reason: z.string().optional().describe('Explanation for outcome when applicable'),
+  artifactFloorUnmet: z
+    .boolean()
+    .optional()
+    .describe('Whether artifact inspection floor was unmet'),
+});
+
+/**
+ * Proposal content caching configuration for determinism. (Issue #589)
+ */
+export interface ProposalCacheConfig {
+  /** Enable content-based caching for repeated proposals */
+  enabled: boolean;
+  /** TTL in milliseconds (default: 1 hour) */
+  ttlMs: number;
+  /** Maximum cached entries (default: 500) */
+  maxEntries: number;
+}
+
+/**
+ * Incremental quorum configuration (Issue #1408).
+ * When enabled, ambiguous votes trigger voter pool expansion.
+ */
+export interface IncrementalQuorumConfig {
+  /** Enable incremental quorum expansion. Default: false */
+  enabled: boolean;
+  /** Maximum expansion rounds (5→7→9). Default: 2 */
+  maxExpansionRounds: number;
+  /** Voters to add per expansion round. Default: 2 */
+  votersPerExpansion: number;
+  /** Minimum average confidence to avoid expansion. Default: 0.6 */
+  confidenceThreshold: number;
+  /** Ambiguity band: if approval rate is within this of threshold, expand. Default: 0.15 */
+  ambiguityBand: number;
+}
+
+/**
+ * Default incremental quorum configuration.
+ */
+export const DEFAULT_INCREMENTAL_QUORUM_CONFIG: IncrementalQuorumConfig = {
+  enabled: false,
+  maxExpansionRounds: 2,
+  votersPerExpansion: 2,
+  confidenceThreshold: 0.6,
+  ambiguityBand: 0.15,
+};
+
+/**
+ * Callback to request additional voters for incremental quorum.
+ * Returns the IDs of newly added voters.
+ */
+export type VoterExpansionCallback = (
+  proposalId: ProposalId,
+  currentVoterCount: number,
+  requestedCount: number
+) => Promise<readonly string[]>;
+
+/**
+ * Consensus engine configuration.
+ */
+export interface ConsensusEngineConfig {
+  defaultTimeout: number;
+  minVotersForQuorum: number;
+  maxActiveProposals: number;
+  /** Maximum number of closed proposals to retain. Oldest are evicted when exceeded. (Issue #549) */
+  maxClosedProposals: number;
+  /** Content-based proposal caching for determinism (Issue #589) */
+  proposalCache?: ProposalCacheConfig;
+  /** Incremental quorum configuration (Issue #1408) */
+  incrementalQuorum?: IncrementalQuorumConfig;
+}
+
+/**
+ * Proposal cache configuration schema. (Issue #589)
+ */
+export const ProposalCacheConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  ttlMs: z.number().int().positive().default(3600000), // 1 hour
+  maxEntries: z.number().int().positive().default(500),
+});
+
+/**
+ * Consensus engine configuration schema.
+ */
+export const ConsensusEngineConfigSchema = z.object({
+  defaultTimeout: z.number().int().positive().default(300000), // 5 minutes
+  minVotersForQuorum: z.number().int().positive().default(DEFAULT_MIN_VOTERS_FOR_QUORUM),
+  maxActiveProposals: z.number().int().positive().default(100),
+  maxClosedProposals: z.number().int().positive().default(1000), // Issue #549
+  proposalCache: ProposalCacheConfigSchema.optional(), // Issue #589
+});
+
+/**
+ * Default configuration values.
+ */
+export const DEFAULT_CONSENSUS_CONFIG: ConsensusEngineConfig = {
+  defaultTimeout: 300000, // 5 minutes
+  minVotersForQuorum: DEFAULT_MIN_VOTERS_FOR_QUORUM, // governed: decision/quorum.ts (#6180)
+  maxActiveProposals: 100,
+  maxClosedProposals: 1000, // Issue #549: Prevent unbounded memory growth
+};
+
+/**
+ * `SUPERMAJORITY_THRESHOLD` and `VOTING_THRESHOLDS` moved to
+ * `decision/thresholds.ts` (#6000 step 1) so the bars a tally is measured
+ * against can be governed on their own path. Re-exported here so every
+ * existing import keeps resolving.
+ */
+export { SUPERMAJORITY_THRESHOLD, VOTING_THRESHOLDS } from './decision/thresholds.js';
+
+/**
+ * Internal proposal state managed by the engine.
+ */
+export interface ProposalState {
+  proposal: Proposal;
+  status: ProposalStatus;
+  votes: Map<string, Vote>;
+  startedAt: Date;
+  timeoutId?: ReturnType<typeof setTimeout>;
+  /** Number of incremental quorum expansions applied (Issue #1408). */
+  expansionRounds?: number;
+  /**
+   * True while a quorum expansion is awaiting its callback for this
+   * proposal. Concurrent `vote()` calls check this to avoid double-
+   * expanding across the `await` gap (Issue #2861). Per-proposal so
+   * independent proposals never block each other.
+   */
+  expansionInFlight?: boolean;
+}
+
+/**
+ * Consensus metrics for monitoring.
+ */
+export interface ConsensusMetrics {
+  totalProposals: number;
+  approvedProposals: number;
+  rejectedProposals: number;
+  timedOutProposals: number;
+  averageDurationMs: number;
+  averageVotesPerProposal: number;
+  algorithmUsage: Record<ConsensusAlgorithm, number>;
+}
+
+/**
+ * Consensus metrics schema.
+ */
+export const ConsensusMetricsSchema = z.object({
+  totalProposals: z.number().int().nonnegative(),
+  approvedProposals: z.number().int().nonnegative(),
+  rejectedProposals: z.number().int().nonnegative(),
+  timedOutProposals: z.number().int().nonnegative(),
+  averageDurationMs: z.number().nonnegative(),
+  averageVotesPerProposal: z.number().nonnegative(),
+  algorithmUsage: z.record(ConsensusAlgorithmSchema, z.number().int().nonnegative()),
+});

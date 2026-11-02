@@ -1,0 +1,312 @@
+/**
+ * decision-cost-recording — attach a per-decision cost rollup to the EXISTING
+ * consensus_vote / pr_review result + persist it.
+ *
+ * Source: Issue #3855 (epic #3854 child, M4).
+ *
+ * This is the consumer that rides the existing decision surfaces (#3855
+ * explicitly forbids a new MCP tool — the 47-tool ceiling). It bridges a
+ * panel's per-voter results into {@link VoterCostInput}s, reads the live billing
+ * mode from `NEXUS_BILLING_MODE`, rolls them up via the pure
+ * {@link rollupDecisionCost}, persists the summary to the {@link DecisionCostStore},
+ * and returns the summary so the tool can attach it to its response.
+ *
+ * Per-voter token/cost is propagated where the adapter layer reported it; voters
+ * with no usage — or whose model has no pricing anywhere in the registry chain
+ * (#4165) — are folded in as UNMEASURED (not a measured $0) — see
+ * {@link module:observability/decision-cost}. Record + measure ONLY — no routing
+ * or weighting change.
+ *
+ * @module mcp/tools/decision-cost-recording
+ */
+
+import type { AgentVoteResult } from '../../cli/vote-types.js';
+import { createLogger, getTimeProvider, getErrorMessage, type ILogger } from '../../core/index.js';
+import { detectUndeclaredOptions } from './consensus-vote-option-detection.js';
+import { servedCostDetail } from '../../cli-adapters/budget-arm-cost.js';
+import { priceBasisOf, type CostDetail } from '../../learning/usage-log.js';
+import { DecisionCostStore, type DecisionGate } from '../../observability/decision-cost-store.js';
+import {
+  UNKNOWN_MODEL,
+  type DecisionBillingMode,
+  type DecisionCostSummary,
+  type UndeclaredOptionsDetectorRecord,
+  type VoterCostInput,
+} from '../../observability/decision-cost.js';
+
+/** Resolve the active billing mode from env (default 'plan'). */
+export function resolveBillingMode(): DecisionBillingMode {
+  return process.env['NEXUS_BILLING_MODE'] === 'api' ? 'api' : 'plan';
+}
+
+/**
+ * Bridge a panel's per-voter results into per-voter cost inputs.
+ *
+ * The vote result carries the model the adapter reported serving (#6663) and,
+ * where the adapter reported them, token counts. When tokens are present we derive the api-mode cost via the
+ * same registry-backed {@link computeCostDetail} the per-call usage log uses, so
+ * a per-decision rollup and the per-call usage log price identically. When no
+ * usage was reported the voter is left with no tokens/cost ⇒ unmeasured. A
+ * seat carrying `gatewayArm` is priced by the gateway's declaration instead
+ * ({@link voteCostDetail}, #4392 step 4).
+ *
+ * When the model resolves WITHOUT pricing anywhere in the registry chain
+ * (#4165), `costUsd` is OMITTED — tokens are kept — so the rollup counts the
+ * voter as UNMEASURED (#3855: missing cost is unmeasured, never a measured $0).
+ *
+ * Whenever a price WAS looked up, the resulting {@link PriceBasis} rides along
+ * (#4406): an assumed published registry-chain rate is `'list'`, a
+ * manifest-overlay price (user or operator tier) or an explicit gateway rate
+ * is `'declared'`, and unresolved pricing is `'unknown'`. A declared rate is
+ * the operator's statement; neither priced basis certifies the operator's bill.
+ */
+/**
+ * Copy only the token counters the adapter actually reported. Every field is
+ * spread conditionally so an absent counter stays absent — a fabricated 0
+ * would read as a measurement (#4439).
+ *
+ * The cache figures ride along for visibility only: cost is still priced on
+ * uncached input, because the registry carries no cache-read rate and pricing
+ * the cached portion at the input rate would overstate spend (#4435).
+ */
+function reportedTokenFields(v: AgentVoteResult): Partial<VoterCostInput> {
+  return {
+    ...(v.inputTokens !== undefined ? { inputTokens: v.inputTokens } : {}),
+    ...(v.outputTokens !== undefined ? { outputTokens: v.outputTokens } : {}),
+    ...(v.cachedInputTokens !== undefined ? { cachedInputTokens: v.cachedInputTokens } : {}),
+    ...(v.cacheCreationInputTokens !== undefined
+      ? { cacheCreationInputTokens: v.cacheCreationInputTokens }
+      : {}),
+  };
+}
+
+/**
+ * The seat's cost detail, or `undefined` when nothing was looked up (no usage
+ * reported). A seat that answered through a gateway (#4392 step 4,
+ * `gatewayArm`) is priced by the arm's `NEXUS_GATEWAY_COST` declaration —
+ * UNKNOWN when undeclared — never by the model id alone: a `claude-*` id a
+ * gateway served used to roll up at Anthropic's list price as `'list'`.
+ *
+ * Priced by `servedModel`, the model the adapter reported answering, never by
+ * `model`, the alias the seat requested (#6663): a seat that fell back to
+ * another model was priced at the rate of the one it asked for. A seat that
+ * reported usage but no served model has a cost nobody can price, so it reads
+ * as unpriced (`'unknown'`, no `costUsd`) — never the requested alias's rate,
+ * and never a measured $0.
+ */
+function voteCostDetail(v: AgentVoteResult): CostDetail | undefined {
+  const hasTokens = v.inputTokens !== undefined || v.outputTokens !== undefined;
+  if (!hasTokens) return undefined;
+  if (v.servedModel === undefined) return { costUsd: 0, priced: false, resolvedId: UNKNOWN_MODEL };
+  return servedCostDetail(v.gatewayArm, v.servedModel, v.inputTokens ?? 0, v.outputTokens ?? 0);
+}
+
+export function votesToCostInputs(votes: readonly AgentVoteResult[]): VoterCostInput[] {
+  return votes.map((v) => {
+    const detail = voteCostDetail(v);
+    const input: VoterCostInput = {
+      role: v.role,
+      // #6663: the model that answered, the one the cost is priced at.
+      model: v.servedModel,
+      // #6115: the assignment beside the model that answered.
+      ...(v.assignedCli !== undefined ? { assignedCli: v.assignedCli } : {}),
+      ...reportedTokenFields(v),
+      // #6821: every settled completion, beside the answering one's counters.
+      ...(v.attemptUsage !== undefined ? { attemptUsage: v.attemptUsage } : {}),
+      ...(v.attemptTelemetry !== undefined ? { attemptTelemetry: v.attemptTelemetry } : {}),
+      ...(detail?.priced === true ? { costUsd: detail.costUsd } : {}),
+      ...(detail?.pricingProvenance !== undefined
+        ? { pricingProvenance: detail.pricingProvenance }
+        : {}),
+      // #4406 — state what kind of rate the cost rests on, but only when we
+      // actually consulted the registry. No lookup ⇒ no claim (absent), which
+      // is distinct from 'unknown' ("we looked and there is no price").
+      ...(detail !== undefined ? { priceBasis: priceBasisOf(detail) } : {}),
+    };
+    return input;
+  });
+}
+
+export interface RecordDecisionCostOptions {
+  /** Actual async job id; omitted for synchronous decisions. */
+  readonly jobId?: string;
+  /** Stable decision correlation id, independent of the async job id. */
+  readonly decisionId: string;
+  /** Which gate type incurred the cost. */
+  readonly gate: DecisionGate;
+  /** The panel's per-voter results. */
+  readonly votes: readonly AgentVoteResult[];
+  /** Override the store (testing). */
+  readonly store?: DecisionCostStore;
+  /** Override the billing mode (testing); defaults to the env-resolved mode. */
+  readonly billingMode?: DecisionBillingMode;
+  /** Override the logger (testing); defaults to a module logger. */
+  readonly logger?: ILogger;
+  /**
+   * The undeclared-options detector's verdict on this vote (#5422). Passed
+   * through to the store on every `consensus_vote`, fired or not; omitted by
+   * `pr_review`, which runs no such detector.
+   */
+  readonly undeclaredOptionsDetector?: UndeclaredOptionsDetectorRecord;
+}
+
+interface RecordVoteDecisionCostOptions extends Omit<
+  RecordDecisionCostOptions,
+  'undeclaredOptionsDetector'
+> {
+  readonly proposal: string;
+  readonly declaredOptions: readonly string[] | undefined;
+  readonly source?: 'cli' | 'mcp';
+}
+
+/** Record live detector telemetry from the full proposal, best effort for both vote entry points. */
+export function recordVoteDecisionCost(
+  options: RecordVoteDecisionCostOptions
+): DecisionCostSummary | undefined {
+  // Empty and all-simulated panels provide no live detector measurement.
+  if (options.votes.length === 0 || options.votes.every((v) => v.source === 'simulation'))
+    return undefined;
+  try {
+    return recordDecisionCost({
+      ...options,
+      undeclaredOptionsDetector: {
+        ...detectUndeclaredOptions(options.proposal, options.declaredOptions),
+        declaredOptionCount: options.declaredOptions?.length ?? 0,
+        ...(options.source !== undefined ? { source: options.source } : {}),
+      },
+    });
+  } catch (error) {
+    (options.logger ?? defaultLogger).warn('Per-decision cost rollup failed (non-fatal)', {
+      error: getErrorMessage(error),
+    });
+    return undefined;
+  }
+}
+
+const defaultLogger = createLogger({ component: 'decision-cost-recording' });
+
+/**
+ * Process-lifetime count of decision-cost rollups that FAILED to persist (#3910).
+ *
+ * The store is best-effort and never throws, so a dropped rollup is otherwise
+ * invisible. Incrementing a counter (and logging — see {@link recordDecisionCost})
+ * makes missing cost telemetry observable rather than silently swallowed. Reset
+ * is test-only.
+ */
+let droppedCostRecordCount = 0;
+
+/** Read the count of decision-cost rollups dropped at persist time (#3910). */
+export function getDroppedCostRecordCount(): number {
+  return droppedCostRecordCount;
+}
+
+/**
+ * Warn rate-limiter for dropped cost rollups (#3916).
+ *
+ * If the store goes unwritable (disk full / perms / I/O), a per-decision warn
+ * would flood the logs and could degrade the main decision path — ironically
+ * risking the never-fail invariant the warn exists to protect. So the warn is
+ * rate-limited: emit it for the first {@link WARN_BURST} consecutive drops, then
+ * at most once per {@link WARN_PERIOD} further drops. The COUNTER still
+ * increments on EVERY drop (it stays exact regardless of suppression), and the
+ * decision still never fails. The emitted warn carries `suppressedSinceLastWarn`
+ * so a reader can see how many drops a single line stands in for.
+ */
+const WARN_BURST = 5;
+const WARN_PERIOD = 1000;
+// Never stay silent longer than this on a SLOW leak (#3916): pure count-based
+// suppression (every 1000th) would hide ~999 drops for ~41 days at 1/hr. A
+// time escape surfaces a persistent low-rate failure within the window.
+const WARN_MAX_SILENCE_MS = 60_000;
+let warnCountSinceReset = 0;
+let lastWarnAtMs = 0;
+let warnClockOverrideMs: number | null = null;
+
+/** Testing seam: pin the warn-limiter clock (#3916). Pass null to use real time. */
+export function _setWarnClockForTests(ms: number | null): void {
+  warnClockOverrideMs = ms;
+}
+
+function warnNowMs(): number {
+  return warnClockOverrideMs ?? Date.now();
+}
+
+/**
+ * Whether this drop should emit a warn: the first {@link WARN_BURST} consecutive
+ * drops, then every {@link WARN_PERIOD}-th, OR after {@link WARN_MAX_SILENCE_MS}
+ * of silence (so a slow leak still surfaces rather than being suppressed for
+ * thousands of drops). Side effect: anchors the silence timer on each emitted warn.
+ */
+function shouldWarnForDrop(dropIndex: number): boolean {
+  const now = warnNowMs();
+  const countTrigger = dropIndex <= WARN_BURST || (dropIndex - WARN_BURST) % WARN_PERIOD === 0;
+  const timeTrigger = dropIndex > WARN_BURST && now - lastWarnAtMs >= WARN_MAX_SILENCE_MS;
+  if (countTrigger || timeTrigger) {
+    lastWarnAtMs = now;
+    return true;
+  }
+  return false;
+}
+
+/** Reset the dropped-cost-record counter and warn limiter (testing only, #3910/#3916). */
+export function resetDroppedCostRecordCount(): void {
+  droppedCostRecordCount = 0;
+  warnCountSinceReset = 0;
+  lastWarnAtMs = 0;
+  warnClockOverrideMs = null;
+}
+
+/** Read how many dropped-cost warns have actually been emitted (testing, #3916). */
+export function getDroppedCostWarnCount(): number {
+  return warnCountSinceReset;
+}
+
+/**
+ * Roll up + persist a decision's cost and return the summary for the response.
+ *
+ * Best-effort persistence: the store never throws into the caller (an
+ * observability sink must not break the decision it observes), so on any
+ * failure the rollup is still returned for the response. Riding the existing
+ * surface — the caller attaches the returned `summary` to its result object.
+ *
+ * Non-silent drops (#3910): when the rollup fails to persist (fs error / schema
+ * reject) the store reports `persisted: false`; we log a warning AND increment a
+ * counter so dropped billing telemetry is visible, instead of vanishing. The
+ * decision still proceeds — the summary is always returned.
+ */
+export function recordDecisionCost(options: RecordDecisionCostOptions): DecisionCostSummary {
+  const billingMode = options.billingMode ?? resolveBillingMode();
+  const voters = votesToCostInputs(options.votes);
+  const store = options.store ?? new DecisionCostStore();
+  const logger = options.logger ?? defaultLogger;
+  const timestamp = new Date(getTimeProvider().now()).toISOString();
+  const { record, persisted } = store.record({
+    decisionId: options.decisionId,
+    ...(options.jobId !== undefined ? { jobId: options.jobId } : {}),
+    gate: options.gate,
+    voters,
+    billingMode,
+    timestamp,
+    ...(options.undeclaredOptionsDetector !== undefined
+      ? { undeclaredOptionsDetector: options.undeclaredOptionsDetector }
+      : {}),
+  });
+  if (!persisted) {
+    // Count EVERY drop (stays exact); rate-limit only the warn so an unwritable
+    // store can't flood the log per-decision and degrade the main path (#3916).
+    droppedCostRecordCount += 1;
+    if (shouldWarnForDrop(droppedCostRecordCount)) {
+      const suppressedSinceLastWarn = droppedCostRecordCount - warnCountSinceReset - 1;
+      warnCountSinceReset += 1;
+      logger.warn('Decision-cost rollup dropped (failed to persist) — billing telemetry lost', {
+        decisionId: options.decisionId,
+        gate: options.gate,
+        totalCostUsd: record.summary.totalCostUsd,
+        totalTokens: record.summary.totalTokens,
+        droppedCostRecordCount,
+        suppressedSinceLastWarn,
+      });
+    }
+  }
+  return record.summary;
+}

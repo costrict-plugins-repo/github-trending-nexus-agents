@@ -1,0 +1,129 @@
+/**
+ * nexus-agents/orchestration - Workflow Pattern Router Types
+ *
+ * Type definitions for the intelligent workflow pattern selection system.
+ * The router maps task characteristics to the optimal orchestration pattern.
+ *
+ * @module orchestration/workflow-router-types
+ * (Source: Issue #844 — Intelligent Workflow Pattern Router)
+ */
+
+import type { TaskAnalysisResult } from '../core/task-analysis/shared-task-analyzer.js';
+import type { CapabilityGapReport } from '../core/task-analysis/capability-gap-detector.js';
+
+/**
+ * Orchestration patterns available in nexus-agents.
+ * Each maps to a concrete execution module.
+ */
+export type WorkflowPattern = 'sequential' | 'wave' | 'graph' | 'consensus' | 'aflow' | 'puppeteer';
+
+/**
+ * Dependency structure classification for a task.
+ */
+export type DependencyStructure = 'linear' | 'dag' | 'independent' | 'unknown';
+
+/**
+ * Time constraint urgency level.
+ *
+ * `'relaxed'` is accepted as a caller hint but no inference path produces it:
+ * `enrichSignals` in `workflow-router.ts` emits only `'urgent'` or `'normal'`,
+ * and the sole consumer (`ruleNovelTask`) tests only for `'urgent'`, so
+ * `'relaxed'` and `'normal'` route identically. Pinned by
+ * `workflow-router.test.ts` (#5097).
+ */
+export type TimeConstraint = 'urgent' | 'normal' | 'relaxed';
+
+/**
+ * Input signals for workflow routing decisions.
+ * Combines explicit caller hints with SharedTaskAnalyzer output.
+ */
+export interface TaskSignals {
+  /** Natural language task description */
+  readonly description: string;
+  /** Estimated number of subtasks (optional hint) */
+  readonly subtaskCount?: number | undefined;
+  /** Whether subtasks depend on each other (optional hint) */
+  readonly hasDependencies?: boolean | undefined;
+  /** Dependency structure classification (optional hint) */
+  readonly dependencyStructure?: DependencyStructure | undefined;
+  /** Whether multi-perspective consensus is needed */
+  readonly requiresConsensus?: boolean | undefined;
+  /** Whether this task type has been seen before */
+  readonly isNovel?: boolean | undefined;
+  /** Time urgency */
+  readonly timeConstraint?: TimeConstraint | undefined;
+  /** Force a specific pattern (escape hatch per DevEx feedback) */
+  readonly forcePattern?: WorkflowPattern | undefined;
+}
+
+/**
+ * Workflow routing decision with explanation and pattern selection.
+ * (Source: Issue #5129 Item 3, #4440 disambiguation precedent)
+ */
+export interface WorkflowRoutingDecision {
+  /** Selected workflow pattern */
+  readonly pattern: WorkflowPattern;
+  /** Human-readable explanation of why this pattern was selected */
+  readonly reasoning: string;
+  /**
+   * The rule's PRIOR for this pattern (0-1) — NOT a measurement of this task
+   * (#5957, same call as #5119). Every rule returns an authored literal, so
+   * two tasks claimed by the same rule report the same number however much
+   * the analyzer's own signals differ. Read it as "how much this repo trusts
+   * this rule", never as "how well this task fits".
+   */
+  readonly confidence: number;
+  /** Which rules matched during selection */
+  readonly matchedRules: readonly string[];
+  /** Alternative patterns that were considered */
+  readonly alternatives: readonly WorkflowPattern[];
+  /** Analysis result from SharedTaskAnalyzer */
+  readonly analysis: TaskAnalysisResult;
+  /** Whether the task should be clarified before execution (Issue #904) */
+  readonly needsClarification?: boolean;
+  /** Suggested clarification questions when needsClarification is true */
+  readonly suggestedQuestions?: readonly string[];
+  /** Capability gap report — what's available vs what's needed (Issue #906) */
+  readonly capabilityGaps?: CapabilityGapReport;
+}
+
+/**
+ * Legacy alias for {@link WorkflowRoutingDecision}. Renamed per #5129 Item 3 to prevent naming collisions.
+ */
+export type RoutingDecision = WorkflowRoutingDecision;
+
+/**
+ * Options for the workflow router.
+ */
+export interface WorkflowRouterOptions {
+  /** Dry run mode — return decision without executing (per DevEx feedback) */
+  readonly dryRun?: boolean | undefined;
+}
+
+/**
+ * Recorded outcome for pattern performance tracking.
+ */
+export interface PatternOutcome {
+  /** Pattern that was used */
+  readonly pattern: WorkflowPattern;
+  /** Task type from analyzer */
+  readonly taskType: string;
+  /** Whether execution succeeded */
+  readonly success: boolean;
+  /** Duration in milliseconds */
+  readonly durationMs: number;
+  /** Timestamp of recording */
+  readonly timestamp: number;
+}
+
+/**
+ * Aggregated performance metrics for a pattern-task combination.
+ */
+export interface PatternMetrics {
+  readonly pattern: WorkflowPattern;
+  readonly taskType: string;
+  readonly totalExecutions: number;
+  readonly successCount: number;
+  readonly successRate: number;
+  readonly avgDurationMs: number;
+}

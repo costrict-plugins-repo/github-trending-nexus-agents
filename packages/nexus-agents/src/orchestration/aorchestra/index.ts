@@ -1,0 +1,103 @@
+/**
+ * AOrchestra — Dynamic Sub-Agent Creation
+ *
+ * Task-adaptive expert team composition based on SharedTaskAnalyzer output.
+ * Selects optimal experts from 9 built-in types based on task characteristics.
+ *
+ * (Source: arXiv:2602.03786 — AOrchestra)
+ * @module orchestration/aorchestra
+ */
+
+export {
+  planAgentTeam,
+  MAX_WORKERS_PER_WAVE,
+  EXPERT_DEPENDENCIES,
+  computeOptimalWaveSize,
+} from './agent-planner.js';
+export type { AgentPlan, AgentPlanEntry, PlanAgentTeamOptions } from './agent-planner.js';
+export {
+  dispatchWorkers,
+  groupByWave,
+  applyDependencyWaves,
+  WORKER_TIMEOUT_MS,
+  DEFAULT_STAGGER_DELAY_MS,
+  RoleFailureTracker,
+} from './worker-dispatcher.js';
+export type { WorkerResult, WorkerDispatchOptions, WorkerErrorType } from './worker-dispatcher.js';
+export { composeWorkerPrompt, buildLearningsBlock } from './compose-worker-prompt.js';
+export type { ComposeWorkerPromptInput, WorkerLearning } from './compose-worker-prompt.js';
+export { detectConflicts } from './conflict-detector.js';
+export type { WorkerConflict } from './conflict-detector.js';
+export { matchTriggers, DEFAULT_TRIGGER_TABLE } from './trigger-table.js';
+export type { TriggerRule } from './trigger-table.js';
+export {
+  sanitizeWorkerOutput,
+  buildPriorWaveContextBlock,
+  shadowDistillPriorWave,
+  MAX_PRIOR_CONTEXT_CHARS,
+  MAX_CHARS_PER_WORKER,
+  DISTILLATION_SHADOW_LOG_MESSAGE,
+} from './cross-wave-context.js';
+export type {
+  ShadowInput,
+  DistillationShadowEntry,
+  PriorWaveDistillationShadow,
+} from './cross-wave-context.js';
+// Context distillation (#1607), shadow-wired into the prior-wave path in #5974.
+export {
+  distillPhaseOutput,
+  formatDistillation,
+  compressionRatio,
+  PhaseDistillationSchema,
+} from './context-distillation.js';
+export type { PhaseDistillation } from './context-distillation.js';
+export {
+  synthesizeResults,
+  buildSynthesisPrompt,
+  MAX_SYNTHESIS_INPUT_CHARS,
+  SYNTHESIS_MAX_TOKENS,
+} from './result-synthesizer.js';
+export type {
+  SynthesizeResultsInput,
+  SynthesisResult,
+  SynthesisPromptInput,
+  SynthesisSource,
+} from './result-synthesizer.js';
+export { applyQualityGate } from './quality-gate.js';
+export type { QualityGateFn, AsyncQualityGateFn } from './quality-gate.js';
+export { createQaGate } from './quality-gate.js';
+export {
+  evaluateState,
+  withWatchdog,
+  WATCHDOG_THRESHOLDS,
+  WATCHDOG_CHECK_INTERVAL_MS,
+} from './watchdog.js';
+export type { WatchdogState, WatchdogEntry } from './watchdog.js';
+export { analyzeDispatch, OUTLIER_RATIO_THRESHOLD } from './dispatch-insights.js';
+export {
+  getRoleCapability,
+  buildToolRestrictionBlock,
+  ROLE_CAPABILITIES,
+} from './role-capabilities.js';
+export type { CapabilityTier, RoleCapability } from './role-capabilities.js';
+export { evaluateExitTriggers } from './exit-triggers.js';
+export type { ExitTriggerConfig, ExitTriggerState, ExitTriggerResult } from './exit-triggers.js';
+export type {
+  DispatchInsights,
+  RoleProfile,
+  ErrorCluster,
+  DurationOutlier,
+  TriageSummary,
+} from './dispatch-insights.js';
+export {
+  WorkerCheckpointStore,
+  createCheckpoint,
+  MAX_PARTIAL_OUTPUT_CHARS,
+  MAX_CHECKPOINTS,
+} from './worker-checkpoint.js';
+export type { WorkerCheckpoint } from './worker-checkpoint.js';
+export { triageWorkerFailure } from './worker-triage.js';
+export type { TriageAction, TriageResult } from './worker-triage.js';
+// DAG dependency resolution (#2034).
+export { topologicalWaveAssign, CycleError, MissingDependencyError } from './topological-wave.js';
+export type { WaveEntry } from './topological-wave.js';

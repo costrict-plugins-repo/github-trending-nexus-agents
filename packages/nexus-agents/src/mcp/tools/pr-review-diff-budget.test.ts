@@ -1,0 +1,640 @@
+/**
+ * Tests for the #4140 large-diff budget packer (pure module).
+ *
+ * @module mcp/tools/pr-review-diff-budget.test
+ */
+
+import { describe, it, expect } from 'vitest';
+import {
+  SENSITIVE_PATH_PATTERNS,
+  applyPartialCoverageGate,
+  hasFileBoundaries,
+  looksLikeUnifiedDiff,
+  packDiffForPanelAndBinding,
+  packDiffForReview,
+  securityFirstPack,
+  splitByFile,
+  type BindingMeasurement,
+  type DiffFile,
+  type PrReviewBindingCoverage,
+  type ReviewBudgets,
+} from './pr-review-diff-budget.js';
+import type { PrReviewAggregate } from './pr-review-tool.js';
+import {
+  MAX_REVIEWED_DIFF_BYTES,
+  computeReviewedDiffHash,
+  reviewedDiffWasTruncated,
+} from '../../audit/reviewed-diff-hash.js';
+
+/** Build a normal file diff segment with `bodyLines` added lines. */
+function fileDiff(path: string, bodyLines: number): string {
+  const lines = Array.from({ length: bodyLines }, (_, i) => `+line ${String(i)}`).join('\n');
+  return (
+    `diff --git a/${path} b/${path}\n` +
+    `index 0000000..1111111 100644\n` +
+    `--- a/${path}\n` +
+    `+++ b/${path}\n` +
+    `@@ -0,0 +1,${String(bodyLines)} @@\n` +
+    `${lines}\n`
+  );
+}
+
+function totalBytes(files: readonly DiffFile[]): number {
+  return files.reduce((n, f) => n + f.bytes, 0);
+}
+
+describe('pr-review-diff-budget', () => {
+  describe('splitByFile', () => {
+    it('splits a multi-file diff into one segment per file, round-trip lossless', () => {
+      const diff = fileDiff('src/a.ts', 3) + fileDiff('src/b.ts', 2) + fileDiff('src/c.ts', 4);
+      const files = splitByFile(diff);
+      expect(files).toHaveLength(3);
+      expect(files.map((f) => f.path)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+      // Fragment safety: concatenating the segments in order reproduces the input
+      // byte-for-byte — no file was corrupted, split mid-hunk, or dropped.
+      expect(files.map((f) => f.text).join('')).toBe(diff);
+      for (const f of files) expect(f.text.startsWith('diff --git ')).toBe(true);
+    });
+
+    it('extracts the destination path from a rename-only entry', () => {
+      const diff =
+        'diff --git a/old-name.ts b/new-name.ts\n' +
+        'similarity index 100%\n' +
+        'rename from old-name.ts\n' +
+        'rename to new-name.ts\n';
+      const files = splitByFile(diff);
+      expect(files).toHaveLength(1);
+      expect(files[0]?.path).toBe('new-name.ts');
+      expect(files[0]?.text).toBe(diff);
+    });
+
+    it('keeps a Binary files differ entry whole', () => {
+      const diff =
+        'diff --git a/logo.png b/logo.png\n' +
+        'index 1111111..2222222 100644\n' +
+        'Binary files a/logo.png and b/logo.png differ\n';
+      const files = splitByFile(diff);
+      expect(files).toHaveLength(1);
+      expect(files[0]?.path).toBe('logo.png');
+      expect(files[0]?.text).toContain('Binary files');
+    });
+
+    it('preserves "\\ No newline at end of file" markers within a file segment', () => {
+      const diff =
+        'diff --git a/c.ts b/c.ts\n' +
+        '--- a/c.ts\n' +
+        '+++ b/c.ts\n' +
+        '@@ -1 +1 @@\n' +
+        '-a\n' +
+        '\\ No newline at end of file\n' +
+        '+b\n' +
+        '\\ No newline at end of file\n';
+      const files = splitByFile(diff);
+      expect(files).toHaveLength(1);
+      expect(files[0]?.text).toContain('\\ No newline at end of file');
+      expect(files[0]?.text).toBe(diff);
+    });
+
+    it('mixed multi-file diff (normal + rename + binary + no-newline) round-trips whole', () => {
+      const diff =
+        fileDiff('src/normal.ts', 3) +
+        'diff --git a/old.ts b/renamed.ts\nsimilarity index 100%\nrename from old.ts\nrename to renamed.ts\n' +
+        'diff --git a/pic.png b/pic.png\nindex 111..222 100644\nBinary files a/pic.png and b/pic.png differ\n' +
+        'diff --git a/tail.ts b/tail.ts\n--- a/tail.ts\n+++ b/tail.ts\n@@ -1 +1 @@\n-x\n\\ No newline at end of file\n+y\n';
+      const files = splitByFile(diff);
+      expect(files).toHaveLength(4);
+      expect(files.map((f) => f.path)).toEqual([
+        'src/normal.ts',
+        'renamed.ts',
+        'pic.png',
+        'tail.ts',
+      ]);
+      expect(files.map((f) => f.text).join('')).toBe(diff);
+    });
+
+    it('handles content before the first header as a (preamble) segment', () => {
+      const diff = 'commit abc\nAuthor: x\n\n' + fileDiff('a.ts', 2);
+      const files = splitByFile(diff);
+      expect(files).toHaveLength(2);
+      expect(files[0]?.path).toBe('(preamble)');
+      expect(files.map((f) => f.text).join('')).toBe(diff);
+    });
+
+    it('returns a single (unstructured) segment for a diff with no file header', () => {
+      const files = splitByFile('some non-diff text\nwith lines\n');
+      expect(files).toHaveLength(1);
+      expect(files[0]?.path).toBe('(unstructured)');
+    });
+
+    it('returns [] for empty input', () => {
+      expect(splitByFile('')).toEqual([]);
+    });
+  });
+
+  describe('securityFirstPack', () => {
+    it('reviews a sensitive-path file even when it is LAST in the diff (security-first)', () => {
+      // auth file is the LAST file in original order; it must survive a tight budget.
+      const diff =
+        fileDiff('src/util.ts', 4) + fileDiff('README.md', 4) + fileDiff('src/auth-handler.ts', 4);
+      const files = splitByFile(diff);
+      const budget = totalBytes(files) - 1; // forces at least one drop
+      const res = securityFirstPack(files, budget);
+
+      expect(res.reviewedFiles).toContain('src/auth-handler.ts');
+      expect(res.partial).toBe(true);
+      expect(res.totalFiles).toBe(3);
+      expect(res.droppedFiles.length).toBeGreaterThan(0);
+      // packed contains the sensitive file's content.
+      expect(res.packed).toContain('src/auth-handler.ts');
+    });
+
+    it('handles a real >50000-char diff with the sensitive file near the END', () => {
+      // Two large filler files then a sensitive file — total > 50000, budget 50000.
+      const filler = fileDiff('src/big-a.ts', 3000);
+      const filler2 = fileDiff('src/big-b.ts', 3000);
+      const sensitive = fileDiff('src/security-token.ts', 400);
+      const diff = filler + filler2 + sensitive;
+      expect(diff.length).toBeGreaterThan(50_000);
+
+      const res = securityFirstPack(splitByFile(diff), 50_000);
+      // Security-first ordering pulls the sensitive file ahead of the fillers, so it
+      // is reviewed while a lower-priority filler is dropped.
+      expect(res.reviewedFiles).toContain('src/security-token.ts');
+      expect(res.partial).toBe(true);
+      expect(res.reviewedFiles.length + res.droppedFiles.length).toBe(res.totalFiles);
+    });
+
+    it('non-partial when everything fits (partial:false, no drops)', () => {
+      const diff = fileDiff('a.ts', 2) + fileDiff('b.ts', 2);
+      const files = splitByFile(diff);
+      const res = securityFirstPack(files, totalBytes(files));
+      expect(res.partial).toBe(false);
+      expect(res.droppedFiles).toEqual([]);
+      expect(res.reviewedFiles).toEqual(['a.ts', 'b.ts']);
+    });
+
+    it('a single file larger than budget is included TRUNCATED and listed as partially-seen', () => {
+      const diff = fileDiff('src/huge.ts', 500);
+      const files = splitByFile(diff);
+      const budget = 200; // far below the single file's size
+      const res = securityFirstPack(files, budget);
+
+      expect(res.reviewedFiles).toEqual(['src/huge.ts']);
+      expect(res.droppedFiles).toContain('src/huge.ts'); // honest: partially seen
+      expect(res.partial).toBe(true);
+      expect(res.packed).toContain('TRUNCATED');
+      expect(Buffer.byteLength(res.packed, 'utf-8')).toBeLessThanOrEqual(budget);
+    });
+
+    it('stable ordering: two sensitive files keep original relative order', () => {
+      const diff =
+        fileDiff('src/authz.ts', 2) + fileDiff('src/plain.ts', 2) + fileDiff('src/crypto.ts', 2);
+      const files = splitByFile(diff);
+      const res = securityFirstPack(files, totalBytes(files));
+      // Both sensitive files come first, in their original relative order.
+      expect(res.reviewedFiles).toEqual(['src/authz.ts', 'src/crypto.ts', 'src/plain.ts']);
+    });
+
+    it('SENSITIVE_PATH_PATTERNS is a documented substring list (no scored weights)', () => {
+      expect(SENSITIVE_PATH_PATTERNS).toContain('auth');
+      expect(SENSITIVE_PATH_PATTERNS).toContain('.env');
+      expect(SENSITIVE_PATH_PATTERNS.every((p) => typeof p === 'string')).toBe(true);
+    });
+  });
+});
+
+// ============================================================================
+// looksLikeUnifiedDiff (#4451)
+// ============================================================================
+
+describe('looksLikeUnifiedDiff', () => {
+  it('accepts a git-style diff', () => {
+    expect(looksLikeUnifiedDiff('diff --git a/x.ts b/x.ts\n+line\n')).toBe(true);
+  });
+
+  it('accepts a unified diff with no `diff --git` header', () => {
+    // Output of `diff -u`, `svn diff`, or a plain patch file. The tool's own
+    // fixture at pr-review-tool.test.ts:374 is this shape, so a
+    // `diff --git`-only check would reject a legitimate diff.
+    expect(looksLikeUnifiedDiff('--- a/foo.ts\n+++ b/foo.ts\n@@ -1 +1 @@\n-old\n+new')).toBe(true);
+  });
+
+  it('accepts a bare hunk header', () => {
+    expect(looksLikeUnifiedDiff('@@ -1,3 +1,4 @@\n context\n+added\n')).toBe(true);
+  });
+
+  it('rejects prose', () => {
+    // The actual #4451 payload shape: a English-language summary of a change,
+    // which produced a `verified: true` governance record.
+    const prose =
+      'This PR deletes packages/nexus-agents/src/context/work-balancer.ts (388 lines), ' +
+      'removes the barrel exports, and updates two test mocks. Verified: tsc clean.';
+    expect(looksLikeUnifiedDiff(prose)).toBe(false);
+  });
+
+  it('rejects filler with no diff structure', () => {
+    expect(looksLikeUnifiedDiff('a'.repeat(50_001))).toBe(false);
+  });
+
+  it('rejects the empty string', () => {
+    expect(looksLikeUnifiedDiff('')).toBe(false);
+  });
+
+  it('rejects prose containing a lone dashed rule or section header', () => {
+    // A bare `^--- ` is too weak on its own — changelogs and notes use dashed
+    // rules routinely, and accepting them reopens the hole this gate closes.
+    // A real unified diff always pairs `---` with `+++`.
+    expect(looksLikeUnifiedDiff('Summary\n--- Section header ---\nWe deleted the balancer.')).toBe(
+      false
+    );
+    expect(looksLikeUnifiedDiff('--- Release notes ---\nfixed a bug')).toBe(false);
+    expect(looksLikeUnifiedDiff('Notes:\n+++ added thoughts\nnothing else')).toBe(false);
+  });
+
+  it('accepts the ---/+++ pair with no hunk header', () => {
+    expect(looksLikeUnifiedDiff('--- a/foo.ts\n+++ b/foo.ts\n')).toBe(true);
+  });
+
+  it('accepts real git shapes that carry no hunk header', () => {
+    // rename-only, binary, and mode-only diffs have no @@ hunk at all.
+    expect(
+      looksLikeUnifiedDiff(
+        'diff --git a/o b/n\nsimilarity index 100%\nrename from o\nrename to n\n'
+      )
+    ).toBe(true);
+    expect(
+      looksLikeUnifiedDiff('diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n')
+    ).toBe(true);
+    expect(looksLikeUnifiedDiff('diff --git a/s b/s\nold mode 100644\nnew mode 100755\n')).toBe(
+      true
+    );
+  });
+
+  it('accepts CRLF line endings', () => {
+    expect(looksLikeUnifiedDiff('diff --git a/x b/x\r\n@@ -1 +1 @@\r\n-a\r\n+b\r\n')).toBe(true);
+  });
+
+  it('accepts a hunk header carrying trailing context', () => {
+    expect(looksLikeUnifiedDiff('@@ -1,3 +1,4 @@ function foo()\n ctx\n+add\n')).toBe(true);
+  });
+
+  it('rejects prose wearing a hunk header as a hat', () => {
+    // A hunk header alone proves nothing: prepend one line to a paragraph and
+    // the gate would otherwise pass, reproducing #4451 end to end. A real hunk
+    // is always backed by +/- body lines.
+    expect(looksLikeUnifiedDiff('@@ -1 +1 @@\nThis PR deletes work-balancer.ts (388 lines).')).toBe(
+      false
+    );
+  });
+
+  it('requires the marker at the start of a line, not merely present', () => {
+    // Prose that merely mentions the tokens must not pass.
+    expect(looksLikeUnifiedDiff('I ran diff --git and saw @@ markers in the output.')).toBe(false);
+  });
+});
+
+describe('hasFileBoundaries (#4459)', () => {
+  it('is true for a git diff whose segments are real files', () => {
+    expect(hasFileBoundaries(fileDiff('src/a.ts', 2) + fileDiff('src/b.ts', 2))).toBe(true);
+  });
+
+  it('is true when a preamble precedes the first file header', () => {
+    expect(hasFileBoundaries('From 1234 Mon Sep 17\n\n' + fileDiff('src/a.ts', 1))).toBe(true);
+  });
+
+  /**
+   * The one genuinely non-derivable signal (#4459). `looksLikeUnifiedDiff`
+   * deliberately ACCEPTS plain `diff -u` output, which carries no `diff --git`
+   * headers — so a record can be bound to a real diff that `splitByFile` cannot
+   * attribute to files. The consumer needs to know that.
+   */
+  it('is false for plain `diff -u` output that passes the unified-diff gate', () => {
+    const plain = '--- a/x.ts\n+++ b/x.ts\n@@ -1 +1 @@\n-a\n+b\n';
+    expect(looksLikeUnifiedDiff(plain)).toBe(true);
+    expect(hasFileBoundaries(plain)).toBe(false);
+  });
+
+  it('is false for an empty diff', () => {
+    expect(hasFileBoundaries('')).toBe(false);
+  });
+
+  it('agrees with the real split result, not a re-derivation', () => {
+    const diff = fileDiff('src/a.ts', 1);
+    expect(hasFileBoundaries(diff)).toBe(
+      splitByFile(diff).every((f) => f.path !== '(unstructured)')
+    );
+  });
+});
+
+describe('the review budget and the hash cap measure the same unit (#5818)', () => {
+  // A diff whose UTF-16 length is far UNDER the budget while its UTF-8 byte
+  // length is far OVER it. Multibyte content is ordinary in this repo (56 of 60
+  // recent diffs contain non-ASCII), and a PR author controls these bytes.
+  const overCapByBytesOnly =
+    'diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1,1 +1,1 @@\n' +
+    `+// ${'→'.repeat(20_000)}\n`;
+
+  it('pins the premise: under the budget by UTF-16 units, over it by UTF-8 bytes', () => {
+    expect(overCapByBytesOnly.length).toBeLessThan(MAX_REVIEWED_DIFF_BYTES);
+    expect(Buffer.byteLength(overCapByBytesOnly, 'utf-8')).toBeGreaterThan(MAX_REVIEWED_DIFF_BYTES);
+    // The hash therefore binds only a PREFIX of this diff.
+    expect(reviewedDiffWasTruncated(overCapByBytesOnly)).toBe(true);
+  });
+
+  it('reports partial coverage whenever the hash would truncate', () => {
+    // Before #5818 this returned `undefined`: the packer compared UTF-16 units
+    // against a budget the rest of the module spends in UTF-8 bytes, so the
+    // review was recorded as COMPLETE while content past the cap went unbound.
+    const { coverage } = packDiffForReview(overCapByBytesOnly, MAX_REVIEWED_DIFF_BYTES);
+    expect(coverage).toBeDefined();
+    expect(coverage?.partial).toBe(true);
+  });
+
+  it('leaves content past the cap unbound, which is why coverage must fire', () => {
+    // The observable failure the disclosure exists to catch: a whole extra file
+    // appended past the byte cap does not change the binding at all.
+    const withAppendedFile = `${overCapByBytesOnly}diff --git a/evil.ts b/evil.ts\n+process.exit(0)\n`;
+    expect(computeReviewedDiffHash(withAppendedFile)).toBe(
+      computeReviewedDiffHash(overCapByBytesOnly)
+    );
+    // ...so the packer must flag BOTH as partial rather than silently complete.
+    expect(packDiffForReview(withAppendedFile, MAX_REVIEWED_DIFF_BYTES).coverage?.partial).toBe(
+      true
+    );
+  });
+
+  it('still returns a byte-identical proposal for a genuinely within-budget diff', () => {
+    // Guards the benign population: an ASCII diff under the cap must be
+    // untouched (no pack, no note), exactly as before.
+    const small = 'diff --git a/a.ts b/a.ts\n@@ -1 +1 @@\n+const a = 1;\n';
+    const packing = packDiffForReview(small, MAX_REVIEWED_DIFF_BYTES);
+    expect(packing.coverage).toBeUndefined();
+    expect(packing.packedDiff).toBe(small);
+    expect(packing.note).toBe('');
+  });
+  // Drift guard: the packer's budget and the hash's cap must stay the SAME unit.
+  // If they diverge again, one of these boundary cases reports a review as
+  // complete while the binding is partial — the #5818 window.
+  it.each([
+    ['one byte under the cap', MAX_REVIEWED_DIFF_BYTES - 1],
+    ['exactly at the cap', MAX_REVIEWED_DIFF_BYTES],
+    ['one byte over the cap', MAX_REVIEWED_DIFF_BYTES + 1],
+  ])('agrees with reviewedDiffWasTruncated: %s', (_label, targetBytes) => {
+    // Build a multibyte diff of EXACTLY targetBytes (3-byte chars + ASCII pad).
+    const header = 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n+// ';
+    const tail = '\n';
+    const budgetForBody = targetBytes - Buffer.byteLength(header + tail, 'utf-8');
+    const multibyteCount = Math.floor(budgetForBody / 3);
+    const padding = '.'.repeat(budgetForBody - multibyteCount * 3);
+    const diff = `${header}${'→'.repeat(multibyteCount)}${padding}${tail}`;
+    expect(Buffer.byteLength(diff, 'utf-8')).toBe(targetBytes);
+
+    const truncated = reviewedDiffWasTruncated(diff);
+    const partial = packDiffForReview(diff, MAX_REVIEWED_DIFF_BYTES).coverage !== undefined;
+    expect(partial).toBe(truncated);
+  });
+});
+
+/** The no-sanitizer measurement: the diff as handed IS the bytes the hash covers. */
+function asHanded(prDiff: string): BindingMeasurement {
+  const totalBytes = Buffer.byteLength(prDiff, 'utf-8');
+  return { totalBytes, truncated: totalBytes > MAX_REVIEWED_DIFF_BYTES, source: 'input' };
+}
+
+describe('packDiffForPanelAndBinding — the panel read and the binding are two decisions (#6003)', () => {
+  const CAP = 1_000;
+  /** Budgets with a registry-derived panel read of `panelReadBudgetBytes`. */
+  const budgets = (panelReadBudgetBytes: number): ReviewBudgets => ({
+    bindingCapBytes: CAP,
+    panelReadBudgetBytes,
+    source: 'registry',
+    detail: 'test budget',
+  });
+  // Two whole files, ~1,300 bytes: over the 1,000-byte binding cap, under a
+  // 4,000-byte panel budget. `fileDiff` is ASCII, so bytes == length here.
+  const twoFiles = fileDiff('src/a.ts', 60) + fileDiff('src/b.ts', 60);
+
+  it('pins the fixture: the diff is over the binding cap and under the panel budget', () => {
+    const bytes = Buffer.byteLength(twoFiles, 'utf-8');
+    expect(bytes).toBeGreaterThan(CAP);
+    expect(bytes).toBeLessThanOrEqual(4_000);
+  });
+
+  it('panel reads FULL, binding is a PREFIX: the whole diff goes to the panel', () => {
+    // Before #6003 one comparison decided both, so this diff was packed down
+    // and the panel read less than it could have.
+    const { coverage, packedDiff, note } = packDiffForPanelAndBinding(
+      twoFiles,
+      budgets(4_000),
+      asHanded(twoFiles)
+    );
+    expect(packedDiff).toBe(twoFiles);
+    expect(note).toBe('');
+    const total = Buffer.byteLength(twoFiles, 'utf-8');
+    const expected: PrReviewBindingCoverage = {
+      reviewedFiles: 2,
+      totalFiles: 2,
+      droppedFiles: [],
+      partial: false,
+      strategy: 'budget',
+      panelRead: 'full',
+      binding: 'prefix',
+      bindingSource: 'input',
+      reviewedBytes: total,
+      boundBytes: CAP,
+      totalBytes: total,
+      budgetSource: 'registry',
+      budgetDetail: 'test budget',
+    };
+    expect(coverage).toEqual(expected);
+  });
+
+  it('panel reads PARTIAL, binding is FULL: a small window packs a diff the hash covers whole', () => {
+    // The registry can put the panel budget UNDER the hash cap. The panel then
+    // reads a packed subset while the binding covers every byte.
+    const oneFile = fileDiff('src/a.ts', 60);
+    const oneFileBytes = Buffer.byteLength(oneFile, 'utf-8');
+    expect(oneFileBytes).toBeLessThanOrEqual(CAP);
+    const { coverage, packedDiff } = packDiffForPanelAndBinding(
+      oneFile,
+      budgets(oneFileBytes - 1),
+      asHanded(oneFile)
+    );
+    expect(coverage?.panelRead).toBe('partial');
+    expect(coverage?.binding).toBe('full');
+    expect(coverage?.partial).toBe(true);
+    expect(coverage?.boundBytes).toBe(oneFileBytes);
+    expect(coverage?.reviewedBytes).toBe(Buffer.byteLength(packedDiff, 'utf-8'));
+    expect(coverage?.reviewedBytes).toBeLessThan(coverage?.totalBytes ?? 0);
+  });
+
+  it('BOTH partial: over the panel budget and over the binding cap', () => {
+    const { coverage, note } = packDiffForPanelAndBinding(
+      twoFiles,
+      budgets(CAP),
+      asHanded(twoFiles)
+    );
+    expect(coverage?.panelRead).toBe('partial');
+    expect(coverage?.binding).toBe('prefix');
+    expect(coverage?.partial).toBe(true);
+    expect(coverage?.droppedFiles).toEqual(['src/b.ts']);
+    expect(coverage?.boundBytes).toBe(CAP);
+    expect(note).toContain('partial review');
+  });
+
+  it('BOTH full: a diff under both budgets is byte-identical with NO coverage (pre-#4140 contract)', () => {
+    const small = fileDiff('src/a.ts', 3);
+    const packing = packDiffForPanelAndBinding(small, budgets(4_000), asHanded(small));
+    expect(packing.coverage).toBeUndefined();
+    expect(packing.packedDiff).toBe(small);
+    expect(packing.note).toBe('');
+  });
+
+  it('names the empty case: an empty diff is both-full with no coverage', () => {
+    const packing = packDiffForPanelAndBinding('', budgets(4_000), asHanded(''));
+    expect(packing.coverage).toBeUndefined();
+    expect(packing.packedDiff).toBe('');
+  });
+
+  it('measures every byte field in UTF-8, not UTF-16 code units', () => {
+    // 20 three-byte arrows: 20 code units, 60 bytes. Cap the binding between
+    // the two so a code-unit measurement reads "full" where bytes read "prefix".
+    const multibyte = 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n+// ' + '→'.repeat(20) + '\n';
+    const units = multibyte.length;
+    const bytes = Buffer.byteLength(multibyte, 'utf-8');
+    expect(bytes).toBeGreaterThan(units);
+    const between = { ...budgets(bytes + 100), bindingCapBytes: units + 1 };
+    const { coverage } = packDiffForPanelAndBinding(multibyte, between, asHanded(multibyte));
+    expect(coverage?.binding).toBe('prefix');
+    expect(coverage?.totalBytes).toBe(bytes);
+    expect(coverage?.reviewedBytes).toBe(bytes);
+    expect(coverage?.boundBytes).toBe(units + 1);
+  });
+
+  it('carries the binding-cap fallback source through to the coverage object', () => {
+    const fallback: ReviewBudgets = {
+      bindingCapBytes: CAP,
+      panelReadBudgetBytes: CAP,
+      source: 'binding-cap-fallback',
+      detail: 'context window unknown for "x"',
+    };
+    const { coverage } = packDiffForPanelAndBinding(twoFiles, fallback, asHanded(twoFiles));
+    expect(coverage?.budgetSource).toBe('binding-cap-fallback');
+    expect(coverage?.budgetDetail).toContain('context window unknown');
+    // A fallback budget equals the cap, so the panel read is partial exactly
+    // when the binding is a prefix — the pre-#6003 behaviour, by construction.
+    expect(coverage?.panelRead).toBe('partial');
+    expect(coverage?.binding).toBe('prefix');
+  });
+
+  describe('the binding is decided over the measurement, not over prDiff (#6177)', () => {
+    // On the MCP path `prDiff` is the sanitized text and the hash covers the
+    // raw input. A raw diff over the cap whose sanitized form is under it was
+    // `binding: 'full'` — with `coverage: undefined`, so the record said
+    // nothing at all beside a hash that had truncated.
+    const small = fileDiff('src/a.ts', 5);
+    const rawOverCap: BindingMeasurement = {
+      totalBytes: CAP + 300,
+      truncated: true,
+      source: 'raw',
+    };
+
+    it('raw over the cap, sanitized under it: prefix, bound to the cap, source raw', () => {
+      expect(Buffer.byteLength(small, 'utf-8')).toBeLessThanOrEqual(CAP);
+      const { coverage, packedDiff, note } = packDiffForPanelAndBinding(
+        small,
+        budgets(4_000),
+        rawOverCap
+      );
+      expect(coverage?.binding).toBe('prefix');
+      expect(coverage?.boundBytes).toBe(CAP);
+      expect(coverage?.bindingSource).toBe('raw');
+      // The panel side is still over the text the panel is sent.
+      expect(coverage?.panelRead).toBe('full');
+      expect(coverage?.totalBytes).toBe(Buffer.byteLength(small, 'utf-8'));
+      expect(coverage?.reviewedBytes).toBe(Buffer.byteLength(small, 'utf-8'));
+      expect(packedDiff).toBe(small);
+      expect(note).toBe('');
+    });
+
+    it('the pair: raw under the cap with the same sanitized text is both-full, no coverage', () => {
+      const rawUnderCap: BindingMeasurement = {
+        totalBytes: CAP - 1,
+        truncated: false,
+        source: 'raw',
+      };
+      expect(
+        packDiffForPanelAndBinding(small, budgets(4_000), rawUnderCap).coverage
+      ).toBeUndefined();
+    });
+
+    it('a full binding reports the RAW byte count as bound, not the sanitized one', () => {
+      // Sanitized text over the panel budget (so coverage exists) while the raw
+      // diff is under the cap: `boundBytes` is what the hash covers — every raw
+      // byte — which is not `totalBytes` (the sanitized panel denominator).
+      const rawBytes = Buffer.byteLength(twoFiles, 'utf-8') + 40;
+      expect(rawBytes).toBeLessThanOrEqual(4_000);
+      const wide = { ...budgets(CAP), bindingCapBytes: 4_000 };
+      const { coverage } = packDiffForPanelAndBinding(twoFiles, wide, {
+        totalBytes: rawBytes,
+        truncated: false,
+        source: 'raw',
+      });
+      expect(coverage?.panelRead).toBe('partial');
+      expect(coverage?.binding).toBe('full');
+      expect(coverage?.boundBytes).toBe(rawBytes);
+      expect(coverage?.totalBytes).toBe(Buffer.byteLength(twoFiles, 'utf-8'));
+    });
+
+    it('the fallback source travels onto the coverage object', () => {
+      const { coverage } = packDiffForPanelAndBinding(twoFiles, budgets(4_000), {
+        ...asHanded(twoFiles),
+        source: 'sanitized-fallback',
+      });
+      expect(coverage?.bindingSource).toBe('sanitized-fallback');
+    });
+  });
+});
+
+describe('applyPartialCoverageGate over the four #6003 rows', () => {
+  const approve: PrReviewAggregate = { decision: 'approve', verified: true };
+  const row = (
+    panelRead: 'full' | 'partial',
+    binding: 'full' | 'prefix'
+  ): PrReviewBindingCoverage => ({
+    reviewedFiles: panelRead === 'full' ? 2 : 1,
+    totalFiles: 2,
+    droppedFiles: panelRead === 'full' ? [] : ['src/b.ts'],
+    partial: panelRead === 'partial',
+    strategy: 'budget',
+    panelRead,
+    binding,
+    bindingSource: 'input',
+    reviewedBytes: panelRead === 'full' ? 1_100 : 550,
+    boundBytes: binding === 'full' ? 1_100 : 1_000,
+    totalBytes: 1_100,
+    budgetSource: 'registry',
+    budgetDetail: 'test',
+  });
+
+  it('panel full + binding prefix: the verified approve STANDS (the record discloses the prefix)', () => {
+    expect(applyPartialCoverageGate(approve, row('full', 'prefix'))).toEqual(approve);
+  });
+
+  it('panel partial + binding full: the verified approve is DEGRADED — the panel did not read it all', () => {
+    const out = applyPartialCoverageGate(approve, row('partial', 'full'));
+    expect(out.decision).toBe('abstain');
+    expect(out.verified).toBe(false);
+    expect(out.reason).toContain('partial diff');
+  });
+
+  it('both partial: degraded', () => {
+    const out = applyPartialCoverageGate(approve, row('partial', 'prefix'));
+    expect(out.decision).toBe('abstain');
+    expect(out.verified).toBe(false);
+  });
+
+  it('both full: unchanged', () => {
+    expect(applyPartialCoverageGate(approve, row('full', 'full'))).toEqual(approve);
+  });
+});

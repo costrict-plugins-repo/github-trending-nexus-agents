@@ -1,0 +1,957 @@
+/**
+ * Tests for voter response parsing utilities
+ */
+
+import { describe, it, expect } from 'vitest';
+import { z } from 'zod';
+import {
+  SyntheticVoteError,
+  VoteResponseSchema,
+  RawFindingSchema,
+  VOTE_JSON_SCHEMA,
+  buildVotePrompt,
+  extractJsonFromResponse,
+  parseVoteResponse,
+  type VoteResponse,
+} from './voter-response.js';
+import type { VoterRole } from './vote-types.js';
+
+// ============================================================================
+// VOTE_JSON_SCHEMA drift contract (#3433 Phase 0)
+// ============================================================================
+
+/**
+ * Reads the `properties` map of VOTE_JSON_SCHEMA with a type guard so the
+ * contract test never unsafe-casts the hand-authored schema.
+ */
+function schemaProperties(): Record<string, unknown> {
+  const props = (VOTE_JSON_SCHEMA as { properties?: unknown }).properties;
+  if (props === undefined || typeof props !== 'object' || props === null) {
+    throw new Error('VOTE_JSON_SCHEMA.properties is missing or not an object');
+  }
+  return props as Record<string, unknown>;
+}
+
+/** Reads the `required` array of VOTE_JSON_SCHEMA with a type guard. */
+function schemaRequired(): string[] {
+  const required = (VOTE_JSON_SCHEMA as { required?: unknown }).required;
+  if (!Array.isArray(required)) {
+    throw new Error('VOTE_JSON_SCHEMA.required is missing or not an array');
+  }
+  return required.filter((r): r is string => typeof r === 'string');
+}
+
+describe('VOTE_JSON_SCHEMA drift contract', () => {
+  // Zod field names, derived from the schema's shape so adding a Zod field
+  // without updating VOTE_JSON_SCHEMA fails this test.
+  const zodKeys = Object.keys(VoteResponseSchema.shape).sort();
+
+  it('declares an object schema with additionalProperties:false', () => {
+    expect((VOTE_JSON_SCHEMA as { type?: unknown }).type).toBe('object');
+    expect((VOTE_JSON_SCHEMA as { additionalProperties?: unknown }).additionalProperties).toBe(
+      false
+    );
+  });
+
+  it('has exactly the same property keys as the Zod schema', () => {
+    const jsonKeys = Object.keys(schemaProperties()).sort();
+    expect(jsonKeys).toEqual(zodKeys);
+  });
+
+  it('lists every non-optional Zod field as required (and no optional ones)', () => {
+    // Derive which Zod fields are optional by probing safeParse with the
+    // field absent. Required fields are the ones whose omission fails parse.
+    const baseline: Record<string, unknown> = {
+      decision: 'approve',
+      reasoning: 'This is a sufficiently long reasoning string',
+      confidence: 0.8,
+      conditions: ['c'],
+      rejectionCategories: ['YAGNI'],
+      findings: [],
+    };
+    const requiredZodKeys = zodKeys
+      .filter((key) => {
+        const probe = Object.fromEntries(Object.entries(baseline).filter(([k]) => k !== key));
+        return !VoteResponseSchema.safeParse(probe).success;
+      })
+      .sort();
+
+    expect([...schemaRequired()].sort()).toEqual(requiredZodKeys);
+  });
+
+  it('accepts a valid fixture under both the Zod schema and the property keys', () => {
+    const fixture = {
+      decision: 'approve',
+      reasoning: 'This is a sufficiently long reasoning string',
+      confidence: 0.8,
+    };
+
+    const parsed = VoteResponseSchema.safeParse(fixture);
+    expect(parsed.success).toBe(true);
+
+    const propertyKeys = new Set(Object.keys(schemaProperties()));
+    for (const key of Object.keys(fixture)) {
+      expect(propertyKeys.has(key)).toBe(true);
+    }
+  });
+
+  // #3433 QA: the top-level check above stops at `findings`; guard the NESTED
+  // RawFindingSchema (findings.items + gate) so a sub-field can't drift silently.
+  it('mirrors the nested RawFindingSchema (findings.items + gate)', () => {
+    const findings = schemaProperties()['findings'];
+    const itemProps = (
+      (findings as { items?: { properties?: unknown } }).items as { properties?: unknown }
+    ).properties;
+    if (typeof itemProps !== 'object' || itemProps === null) {
+      throw new Error('VOTE_JSON_SCHEMA.findings.items.properties missing');
+    }
+    expect(Object.keys(itemProps).sort()).toEqual(Object.keys(RawFindingSchema.shape).sort());
+
+    // Nested `gate` object.
+    const gateShape = (RawFindingSchema.shape.gate as z.ZodObject<z.ZodRawShape>).shape;
+    const gateProps = (itemProps as { gate?: { properties?: unknown } }).gate?.properties;
+    if (typeof gateProps !== 'object' || gateProps === null) {
+      throw new Error('VOTE_JSON_SCHEMA.findings.items.properties.gate.properties missing');
+    }
+    expect(Object.keys(gateProps).sort()).toEqual(Object.keys(gateShape).sort());
+  });
+});
+
+// ============================================================================
+// SyntheticVoteError Tests
+// ============================================================================
+
+describe('SyntheticVoteError', () => {
+  it('should create error with correct message', () => {
+    const error = new SyntheticVoteError('Invalid JSON', 'raw output');
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).toBe('SyntheticVoteError');
+    expect(error.message).toContain('Invalid JSON');
+    expect(error.rawOutput).toBe('raw output');
+  });
+
+  it('should preserve rawOutput property', () => {
+    const rawOutput = 'some malformed response';
+    const error = new SyntheticVoteError('test reason', rawOutput);
+
+    expect(error.rawOutput).toBe(rawOutput);
+  });
+});
+
+// ============================================================================
+// VoteResponseSchema Tests
+// ============================================================================
+
+describe('VoteResponseSchema', () => {
+  it('should validate correct approve vote', () => {
+    const valid: VoteResponse = {
+      decision: 'approve',
+      reasoning: 'This looks good to me',
+      confidence: 0.9,
+    };
+
+    const result = VoteResponseSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  it('should validate correct reject vote', () => {
+    const valid: VoteResponse = {
+      decision: 'reject',
+      reasoning: 'This needs more work',
+      confidence: 0.7,
+    };
+
+    const result = VoteResponseSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  it('should validate correct abstain vote', () => {
+    const valid: VoteResponse = {
+      decision: 'abstain',
+      reasoning: 'Not enough context to decide',
+      confidence: 0.5,
+    };
+
+    const result = VoteResponseSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  it('should validate vote with conditions', () => {
+    const valid: VoteResponse = {
+      decision: 'approve',
+      reasoning: 'Good with conditions',
+      confidence: 0.8,
+      conditions: ['Add unit tests', 'Update documentation'],
+    };
+
+    const result = VoteResponseSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.conditions).toEqual(['Add unit tests', 'Update documentation']);
+    }
+  });
+
+  it('should reject invalid decision value', () => {
+    const invalid = {
+      decision: 'maybe',
+      reasoning: 'Not sure about this',
+      confidence: 0.5,
+    };
+
+    const result = VoteResponseSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject reasoning too short', () => {
+    const invalid = {
+      decision: 'approve',
+      reasoning: 'Too short',
+      confidence: 0.8,
+    };
+
+    const result = VoteResponseSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject reasoning too long', () => {
+    const invalid = {
+      decision: 'approve',
+      reasoning: 'x'.repeat(4001),
+      confidence: 0.8,
+    };
+
+    const result = VoteResponseSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject confidence below 0', () => {
+    const invalid = {
+      decision: 'approve',
+      reasoning: 'This looks good',
+      confidence: -0.1,
+    };
+
+    const result = VoteResponseSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject confidence above 1', () => {
+    const invalid = {
+      decision: 'approve',
+      reasoning: 'This looks good',
+      confidence: 1.1,
+    };
+
+    const result = VoteResponseSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should accept confidence exactly 0', () => {
+    const valid = {
+      decision: 'abstain',
+      reasoning: 'Completely uncertain',
+      confidence: 0,
+    };
+
+    const result = VoteResponseSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  it('should accept confidence exactly 1', () => {
+    const valid = {
+      decision: 'approve',
+      reasoning: 'Absolutely certain',
+      confidence: 1,
+    };
+
+    const result = VoteResponseSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+
+  it('should reject missing required fields', () => {
+    const invalid = {
+      decision: 'approve',
+      confidence: 0.8,
+    };
+
+    const result = VoteResponseSchema.safeParse(invalid);
+    expect(result.success).toBe(false);
+  });
+
+  it('should accept empty conditions array', () => {
+    const valid = {
+      decision: 'approve',
+      reasoning: 'Looks good with no conditions',
+      confidence: 0.9,
+      conditions: [],
+    };
+
+    const result = VoteResponseSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+  });
+});
+
+// ============================================================================
+// buildVotePrompt Tests
+// ============================================================================
+
+describe('buildVotePrompt', () => {
+  it('should include proposal text', () => {
+    const proposal = 'Implement new feature X';
+    const prompt = buildVotePrompt(proposal);
+
+    expect(prompt).toContain(proposal);
+    expect(prompt).toContain('PROPOSAL:');
+  });
+
+  it('should include decision options', () => {
+    const prompt = buildVotePrompt('test');
+
+    expect(prompt).toContain('approve');
+    expect(prompt).toContain('reject');
+    expect(prompt).toContain('abstain');
+  });
+
+  it('should include field descriptions', () => {
+    const prompt = buildVotePrompt('test');
+
+    expect(prompt).toContain('decision');
+    expect(prompt).toContain('reasoning');
+    expect(prompt).toContain('confidence');
+    expect(prompt).toContain('conditions');
+  });
+
+  it('should include example responses', () => {
+    const prompt = buildVotePrompt('test');
+
+    expect(prompt).toContain('Example approve response');
+    expect(prompt).toContain('Example reject response');
+    expect(prompt).toContain('{');
+    expect(prompt).toContain('}');
+  });
+
+  it('should specify reasoning length constraints', () => {
+    const prompt = buildVotePrompt('test');
+
+    expect(prompt).toContain('10-4000 characters');
+  });
+
+  it('should specify confidence range', () => {
+    const prompt = buildVotePrompt('test');
+
+    expect(prompt).toContain('0 and 1');
+  });
+
+  it('should handle empty proposal', () => {
+    const prompt = buildVotePrompt('');
+
+    expect(prompt).toContain('PROPOSAL:');
+    expect(prompt.length).toBeGreaterThan(100);
+  });
+
+  it('should handle multiline proposal', () => {
+    const proposal = 'Line 1\nLine 2\nLine 3';
+    const prompt = buildVotePrompt(proposal);
+
+    expect(prompt).toContain('Line 1');
+    expect(prompt).toContain('Line 2');
+    expect(prompt).toContain('Line 3');
+  });
+});
+
+describe('buildVotePrompt names the repository the seat can read (#6254)', () => {
+  // On governor panels a gemini seat abstained UNVERIFIABLE with "no repository
+  // or accessible sandbox was provided": nothing in the prompt said where the
+  // tree was or that reading it was expected. The block names the working
+  // directory the seats' tools run in and says the proposal text is not the
+  // artifact — without weakening the UNVERIFIABLE rule for a seat that truly
+  // cannot read.
+  const WORKSPACE = '/srv/checkouts/widgets';
+
+  it('pins the plain workspace block byte-for-byte', () => {
+    const prompt = buildVotePrompt('p', undefined, WORKSPACE);
+    const block = prompt.slice(prompt.indexOf('REPOSITORY ACCESS:'), prompt.indexOf('In addition'));
+    expect(block).toBe(`REPOSITORY ACCESS:
+The repository under review is the working directory of this panel: ${WORKSPACE}
+Every seat's file and shell tools run there, and reading it is expected. When the proposal refers to something in that repository — a PR head, a diff, the files it touches — read it there before you vote: the proposal text describes the artifact and is not a substitute for it. If your tools cannot read that directory, follow the UNVERIFIABLE rule in your instructions.
+
+`);
+  });
+
+  it('names the ratified head and forbids mutation of its scratch checkout', () => {
+    const sha = 'a'.repeat(40);
+    const prompt = buildVotePrompt('p', undefined, WORKSPACE, sha);
+    expect(prompt).toContain(
+      `detached scratch checkout of the ratified head ${sha} at ${WORKSPACE}`
+    );
+    expect(prompt).toContain(
+      'It is already at that commit — do NOT run git checkout/switch/reset/pull or modify files; read only.'
+    );
+    expect(prompt).toContain('UNVERIFIABLE');
+  });
+
+  it('states the working directory and that reading it is expected', () => {
+    const prompt = buildVotePrompt('Ratify PR #1 at head abc123', undefined, WORKSPACE);
+
+    expect(prompt).toContain('REPOSITORY ACCESS:');
+    expect(prompt).toContain(WORKSPACE);
+    expect(prompt).toMatch(/reading it is expected/i);
+    expect(prompt).toMatch(/proposal text .* not .* the artifact|not a substitute/i);
+  });
+
+  it('keeps the UNVERIFIABLE rule for a seat whose tools cannot read the tree', () => {
+    const prompt = buildVotePrompt('Ratify PR #1', undefined, WORKSPACE);
+
+    expect(prompt).toContain('UNVERIFIABLE');
+  });
+
+  it('places the block after the proposal and before the response schema', () => {
+    const prompt = buildVotePrompt('The proposal body', undefined, WORKSPACE);
+
+    expect(prompt.indexOf('The proposal body')).toBeLessThan(prompt.indexOf('REPOSITORY ACCESS:'));
+    expect(prompt.indexOf('REPOSITORY ACCESS:')).toBeLessThan(
+      prompt.indexOf('Respond with a JSON')
+    );
+  });
+
+  it('without a workspace the prompt is byte-identical to the two-argument form — the empty case', () => {
+    // A caller that has no tree to offer (a unit test, a direct
+    // `executeAgentVote`) must not claim one exists.
+    expect(buildVotePrompt('p', undefined, undefined)).toBe(buildVotePrompt('p'));
+    expect(buildVotePrompt('p')).not.toContain('REPOSITORY ACCESS:');
+  });
+
+  it('coexists with declared options — the OPTIONS block comes first', () => {
+    const prompt = buildVotePrompt('p', ['a', 'b'], WORKSPACE);
+
+    expect(prompt.indexOf('OPTIONS')).toBeLessThan(prompt.indexOf('REPOSITORY ACCESS:'));
+    expect(prompt).toContain('- a\n- b');
+  });
+});
+
+// ============================================================================
+// extractJsonFromResponse Tests
+// ============================================================================
+
+describe('extractJsonFromResponse', () => {
+  it('should extract JSON from markdown code block', () => {
+    const text = '```json\n{"decision": "approve"}\n```';
+    const result = extractJsonFromResponse(text);
+
+    expect(result).toBe('{"decision": "approve"}');
+  });
+
+  it('should extract JSON from code block without json marker', () => {
+    const text = '```\n{"decision": "approve"}\n```';
+    const result = extractJsonFromResponse(text);
+
+    expect(result).toBe('{"decision": "approve"}');
+  });
+
+  it('should extract JSON from mixed text', () => {
+    const text = 'Here is my vote: {"decision": "approve"} end';
+    const result = extractJsonFromResponse(text);
+
+    expect(result).toBe('{"decision": "approve"}');
+  });
+
+  it('should prefer code block over inline JSON', () => {
+    const text = 'Wrong: {"decision": "reject"}\n```json\n{"decision": "approve"}\n```';
+    const result = extractJsonFromResponse(text);
+
+    expect(result).toBe('{"decision": "approve"}');
+  });
+
+  it('should handle multiline JSON in code block', () => {
+    const text = '```json\n{\n  "decision": "approve",\n  "reasoning": "test"\n}\n```';
+    const result = extractJsonFromResponse(text);
+
+    expect(result).toContain('"decision": "approve"');
+    expect(result).toContain('"reasoning": "test"');
+  });
+
+  it('should handle JSON with nested objects', () => {
+    const text = '{"outer": {"inner": "value"}}';
+    const result = extractJsonFromResponse(text);
+
+    expect(result).toBe('{"outer": {"inner": "value"}}');
+  });
+
+  it('should return trimmed text when no JSON found', () => {
+    const text = '  just plain text  ';
+    const result = extractJsonFromResponse(text);
+
+    expect(result).toBe('just plain text');
+  });
+
+  it('should handle empty string', () => {
+    const result = extractJsonFromResponse('');
+
+    expect(result).toBe('');
+  });
+
+  it('should handle whitespace only', () => {
+    const result = extractJsonFromResponse('   \n\t  ');
+
+    expect(result).toBe('');
+  });
+
+  it('should handle case-insensitive json marker', () => {
+    const text = '```JSON\n{"decision": "approve"}\n```';
+    const result = extractJsonFromResponse(text);
+
+    expect(result).toBe('{"decision": "approve"}');
+  });
+
+  it('should handle JSON with arrays', () => {
+    const text = '{"conditions": ["test1", "test2"]}';
+    const result = extractJsonFromResponse(text);
+
+    expect(result).toBe('{"conditions": ["test1", "test2"]}');
+  });
+});
+
+// ============================================================================
+// parseVoteResponse Tests
+// ============================================================================
+
+describe('parseVoteResponse', () => {
+  const role: VoterRole = 'architect';
+
+  describe('successful parsing', () => {
+    it('should parse valid JSON vote', () => {
+      const output = JSON.stringify({
+        decision: 'approve',
+        reasoning: 'This looks good to me',
+        confidence: 0.9,
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.decision).toBe('approve');
+      expect(result.reasoning).toBe('This looks good to me');
+      expect(result.confidence).toBe(0.9);
+      expect(result.source).toBe('parsed');
+    });
+
+    it('should parse vote with conditions', () => {
+      const output = JSON.stringify({
+        decision: 'approve',
+        reasoning: 'Good with conditions',
+        confidence: 0.8,
+        conditions: ['Add tests', 'Update docs'],
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.conditions).toEqual(['Add tests', 'Update docs']);
+      expect(result.source).toBe('parsed');
+    });
+
+    it('should parse vote from markdown code block', () => {
+      const output =
+        '```json\n' +
+        JSON.stringify({
+          decision: 'reject',
+          reasoning: 'Needs more work',
+          confidence: 0.6,
+        }) +
+        '\n```';
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.decision).toBe('reject');
+      expect(result.source).toBe('parsed');
+    });
+
+    it('should parse vote from mixed text', () => {
+      const output =
+        'My analysis:\n' +
+        JSON.stringify({
+          decision: 'abstain',
+          reasoning: 'Not enough context',
+          confidence: 0.5,
+        }) +
+        '\nThat is my vote.';
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.decision).toBe('abstain');
+      expect(result.source).toBe('parsed');
+    });
+  });
+
+  describe('fail-closed error handling', () => {
+    it('should throw SyntheticVoteError for invalid JSON', () => {
+      const output = 'not valid json';
+
+      expect(() => parseVoteResponse(output, role)).toThrow(SyntheticVoteError);
+    });
+
+    it('should throw SyntheticVoteError for validation failure', () => {
+      const output = JSON.stringify({
+        decision: 'maybe',
+        reasoning: 'test',
+        confidence: 0.5,
+      });
+
+      expect(() => parseVoteResponse(output, role)).toThrow(SyntheticVoteError);
+    });
+
+    it('should include raw output in error', () => {
+      const output = 'invalid response';
+
+      try {
+        parseVoteResponse(output, role);
+        expect.fail('Should have thrown');
+      } catch (error) {
+        expect(error).toBeInstanceOf(SyntheticVoteError);
+        if (error instanceof SyntheticVoteError) {
+          expect(error.rawOutput).toBe(output);
+        }
+      }
+    });
+
+    it('should throw for missing required fields', () => {
+      const output = JSON.stringify({
+        decision: 'approve',
+        confidence: 0.8,
+      });
+
+      expect(() => parseVoteResponse(output, role)).toThrow(SyntheticVoteError);
+    });
+
+    it('should throw for reasoning too short', () => {
+      const output = JSON.stringify({
+        decision: 'approve',
+        reasoning: 'short',
+        confidence: 0.8,
+      });
+
+      expect(() => parseVoteResponse(output, role)).toThrow(SyntheticVoteError);
+    });
+
+    it('should throw for confidence out of range', () => {
+      const output = JSON.stringify({
+        decision: 'approve',
+        reasoning: 'This is valid reasoning',
+        confidence: 1.5,
+      });
+
+      expect(() => parseVoteResponse(output, role)).toThrow(SyntheticVoteError);
+    });
+  });
+
+  describe('boundary conditions', () => {
+    it('should handle empty string', () => {
+      expect(() => parseVoteResponse('', role)).toThrow(SyntheticVoteError);
+    });
+
+    it('should handle whitespace only', () => {
+      expect(() => parseVoteResponse('   \n\t  ', role)).toThrow(SyntheticVoteError);
+    });
+
+    it('should handle reasoning at min length', () => {
+      const output = JSON.stringify({
+        decision: 'approve',
+        reasoning: '1234567890',
+        confidence: 0.8,
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.source).toBe('parsed');
+      expect(result.reasoning).toBe('1234567890');
+    });
+
+    it('should handle reasoning at max length', () => {
+      const output = JSON.stringify({
+        decision: 'approve',
+        reasoning: 'x'.repeat(4000),
+        confidence: 0.8,
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.source).toBe('parsed');
+      expect(result.reasoning.length).toBe(4000);
+    });
+
+    it('should handle confidence at 0', () => {
+      const output = JSON.stringify({
+        decision: 'abstain',
+        reasoning: 'Completely uncertain',
+        confidence: 0,
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.confidence).toBe(0);
+      expect(result.source).toBe('parsed');
+    });
+
+    it('should handle confidence at 1', () => {
+      const output = JSON.stringify({
+        decision: 'approve',
+        reasoning: 'Absolutely certain',
+        confidence: 1,
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.confidence).toBe(1);
+      expect(result.source).toBe('parsed');
+    });
+  });
+
+  describe('different voter roles', () => {
+    const roles: VoterRole[] = ['architect', 'security', 'devex', 'ai_ml', 'pm', 'catfish'];
+
+    roles.forEach((testRole) => {
+      it(`should parse vote for ${testRole} role`, () => {
+        const output = JSON.stringify({
+          decision: 'approve',
+          reasoning: 'Valid vote response',
+          confidence: 0.8,
+        });
+
+        const result = parseVoteResponse(output, testRole);
+
+        expect(result.source).toBe('parsed');
+      });
+    });
+  });
+
+  // Issue #1213: Structured rejection feedback categories
+  describe('rejectionCategories parsing', () => {
+    it('should parse vote with rejection categories', () => {
+      const output = JSON.stringify({
+        decision: 'reject',
+        reasoning: 'This adds speculative abstractions not needed yet',
+        confidence: 0.8,
+        rejectionCategories: ['YAGNI', 'OVER_ENGINEERING'],
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.decision).toBe('reject');
+      expect(result.rejectionCategories).toEqual(['YAGNI', 'OVER_ENGINEERING']);
+      expect(result.source).toBe('parsed');
+    });
+
+    it('should parse vote with single rejection category', () => {
+      const output = JSON.stringify({
+        decision: 'reject',
+        reasoning: 'This duplicates existing functionality',
+        confidence: 0.75,
+        rejectionCategories: ['DRY_VIOLATION'],
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.rejectionCategories).toEqual(['DRY_VIOLATION']);
+    });
+
+    it('should accept all valid rejection categories', () => {
+      const allCategories = [
+        'YAGNI',
+        'DRY_VIOLATION',
+        'OVER_ENGINEERING',
+        'SCOPE_CREEP',
+        'SECURITY_RISK',
+        'MISALIGNED',
+        'INSUFFICIENT_EVIDENCE',
+      ];
+
+      const output = JSON.stringify({
+        decision: 'reject',
+        reasoning: 'Multiple concerns found in this proposal',
+        confidence: 0.9,
+        rejectionCategories: allCategories,
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.rejectionCategories).toEqual(allCategories);
+    });
+
+    it('should reject invalid rejection category values', () => {
+      const output = JSON.stringify({
+        decision: 'reject',
+        reasoning: 'Invalid category test',
+        confidence: 0.7,
+        rejectionCategories: ['INVALID_CATEGORY'],
+      });
+
+      expect(() => parseVoteResponse(output, role)).toThrow(SyntheticVoteError);
+    });
+
+    it('should accept approve vote without rejection categories', () => {
+      const output = JSON.stringify({
+        decision: 'approve',
+        reasoning: 'This looks good to me',
+        confidence: 0.85,
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.rejectionCategories).toBeUndefined();
+    });
+
+    it('should accept reject vote without rejection categories (optional field)', () => {
+      const output = JSON.stringify({
+        decision: 'reject',
+        reasoning: 'Needs more work for various reasons',
+        confidence: 0.6,
+      });
+
+      const result = parseVoteResponse(output, role);
+
+      expect(result.decision).toBe('reject');
+      expect(result.rejectionCategories).toBeUndefined();
+    });
+  });
+});
+
+// ============================================================================
+// Issue #1212: Workflow-test evaluation criteria in vote prompt
+// ============================================================================
+
+describe('buildVotePrompt workflow-test criteria', () => {
+  it('should include testability dimension', () => {
+    const prompt = buildVotePrompt('test proposal');
+
+    expect(prompt).toContain('Testability');
+    expect(prompt).toContain('automated tests');
+  });
+
+  it('should include workflow integration dimension', () => {
+    const prompt = buildVotePrompt('test proposal');
+
+    expect(prompt).toContain('Workflow integration');
+    expect(prompt).toContain('CI');
+  });
+
+  it('should include incremental verifiability dimension', () => {
+    const prompt = buildVotePrompt('test proposal');
+
+    expect(prompt).toContain('Incremental verifiability');
+    expect(prompt).toContain('measured');
+  });
+
+  it('should include rejection categories in prompt', () => {
+    const prompt = buildVotePrompt('test proposal');
+
+    expect(prompt).toContain('rejectionCategories');
+    expect(prompt).toContain('YAGNI');
+    expect(prompt).toContain('DRY_VIOLATION');
+    expect(prompt).toContain('OVER_ENGINEERING');
+    expect(prompt).toContain('SCOPE_CREEP');
+    expect(prompt).toContain('SECURITY_RISK');
+    expect(prompt).toContain('MISALIGNED');
+    expect(prompt).toContain('INSUFFICIENT_EVIDENCE');
+  });
+
+  it('should include both approve and reject examples', () => {
+    const prompt = buildVotePrompt('test proposal');
+
+    expect(prompt).toContain('Example approve response');
+    expect(prompt).toContain('Example reject response');
+  });
+});
+
+// ============================================================================
+// #4131 — voter-output resilience: stop dropping voters on output shape
+// ============================================================================
+
+describe('#4131 voter-output resilience', () => {
+  const role: VoterRole = 'catfish'; // the contrarian — most affected by shape drops
+
+  describe('extractJsonFromResponse — shape-aware', () => {
+    it('prefers a ```json fence', () => {
+      const text = 'Here is my vote:\n```json\n{"decision":"approve","confidence":0.9}\n```';
+      expect(JSON.parse(extractJsonFromResponse(text))).toMatchObject({ decision: 'approve' });
+    });
+
+    it('takes the JSON verdict and IGNORES a trailing ```yaml findings block', () => {
+      const text =
+        '{"decision":"reject","reasoning":"see findings","confidence":0.8}\n\n```yaml findings\n- severity: high\n  claim: bad\n```';
+      const parsed = JSON.parse(extractJsonFromResponse(text)) as { decision: string };
+      expect(parsed.decision).toBe('reject');
+    });
+
+    it('finds the JSON verdict even when a ```yaml findings block leads (repro: Unexpected token y)', () => {
+      const text =
+        '```yaml findings\n- severity: high\n  claim: something\n```\n{"decision":"approve","reasoning":"ok enough","confidence":0.7}';
+      // Previously extractJsonFromResponse returned the yaml block → JSON.parse threw
+      // "Unexpected token 'y', \"yaml findi\"...". Now it returns the JSON object.
+      expect(() => {
+        JSON.parse(extractJsonFromResponse(text));
+      }).not.toThrow();
+      expect(JSON.parse(extractJsonFromResponse(text))).toMatchObject({ decision: 'approve' });
+    });
+
+    it('does not miscount braces/brackets inside string values', () => {
+      const text =
+        '{"decision":"approve","reasoning":"uses { and } and ] in prose","confidence":0.5}';
+      expect(JSON.parse(extractJsonFromResponse(text))).toMatchObject({
+        reasoning: 'uses { and } and ] in prose',
+      });
+    });
+
+    // #6957: live pr_review raw output (claude-fable-5, architect seat) on a
+    // diff that touched ```yaml findings parsing. The reasoning QUOTES the old
+    // regex, so a ``` sits inside a JSON string. The lazy ```json fence match
+    // ended there, the truncation repair closed the object after "reasoning",
+    // and the seat was rejected for a missing confidence on all 3 attempts.
+    const FENCE_IN_REASONING =
+      '```json\n{\n  "decision": "approve",\n  "reasoning": "The old pattern /```yaml findings\\\\n([\\\\s\\\\S]*?)\\\\n```/ captured from the first opener to the first close; indexOf computes the same span.",\n  "confidence": 0.88\n}\n```';
+
+    it('keeps a ``` inside a JSON string inside a ```json fence (#6957)', () => {
+      const parsed = parseVoteResponse(FENCE_IN_REASONING, 'architect');
+      expect(parsed.confidence).toBe(0.88);
+      expect(parsed.reasoning).toContain('```yaml findings');
+    });
+
+    it('keeps a ``` inside a JSON string inside an unlabelled fence (#6957)', () => {
+      const text = FENCE_IN_REASONING.replace('```json', '```');
+      expect(parseVoteResponse(text, 'architect').confidence).toBe(0.88);
+    });
+
+    it('repairs a truncated object (repro: position 7181 mid-JSON cut)', () => {
+      // decision/reasoning/confidence emitted before a findings array cut off mid-value.
+      const truncated =
+        '{"decision":"reject","reasoning":"blockers found","confidence":0.9,"findings":[{"severity":"high","claim":"this was cut of';
+      const repaired = extractJsonFromResponse(truncated);
+      const parsed = JSON.parse(repaired) as { decision: string; findings: unknown[] };
+      expect(parsed.decision).toBe('reject');
+      expect(Array.isArray(parsed.findings)).toBe(true);
+    });
+  });
+
+  describe('parseVoteResponse — no silent drop on shape', () => {
+    it('clamps oversize reasoning with a marker instead of erroring (repro: >4000 char drop)', () => {
+      const huge = 'x'.repeat(5000);
+      const output = JSON.stringify({ decision: 'reject', reasoning: huge, confidence: 0.9 });
+      const vote = parseVoteResponse(output, role);
+      expect(vote.source).toBe('parsed'); // NOT 'error' / dropped
+      expect(vote.decision).toBe('reject');
+      expect(vote.reasoning.length).toBeLessThanOrEqual(4000);
+      expect(vote.reasoning.endsWith('…[truncated]')).toBe(true);
+    });
+
+    it('parses a pr-review-style output (JSON verdict + trailing yaml findings block)', () => {
+      const output =
+        '{"decision":"approve","reasoning":"looks fine overall","confidence":0.8}\n```yaml findings\n- claim: nit\n```';
+      const vote = parseVoteResponse(output, role);
+      expect(vote.source).toBe('parsed');
+      expect(vote.decision).toBe('approve');
+    });
+
+    it('still throws on a genuinely malformed vote (missing decision) — behavior preserved', () => {
+      const output = '{"reasoning":"no decision field here","confidence":0.5}';
+      expect(() => parseVoteResponse(output, role)).toThrow(SyntheticVoteError);
+    });
+  });
+});

@@ -1,0 +1,653 @@
+/**
+ * nexus-agents/cli-adapters - CompositeRouter Helper Functions
+ *
+ * Pure helper functions extracted from CompositeRouter to reduce file size.
+ *
+ * @module cli-adapters/composite-router-helpers
+ * (Source: Issue #275, Epic #164, Issue #347)
+ */
+
+import { profileForArm, selectTopsisRouter } from './composite-router-profiles.js';
+import {
+  adjustKeyedProfileForTask,
+  rankTopsisProfiles,
+  type KeyedTopsisProfile,
+} from './topsis-helpers.js';
+export { adjustProfileForTask } from './topsis-helpers.js';
+import type { Task } from '../core/types/agent.js';
+import { getTimeProvider, type TaskProfile } from '../core/index.js';
+import type { CliName, RoutingArmId, CliTask, ICliAdapter } from './types.js';
+import { routingArmCliSlot } from './types.js';
+import { NEUTRAL_BANDIT_FEATURE, type BanditContext } from './budget-router-types.js';
+import type { TopsisModelProfile } from './topsis-types.js';
+import type { BillingMode } from '../mcp/tools/delegate-to-model-types.js';
+import type { BudgetRouter } from './budget-router.js';
+import { TopsisRouter } from './topsis-router.js';
+import {
+  toBudgetConstraint,
+  budgetUtilizationOf,
+  budgetUtilizationForTask,
+} from './composite-router-budget-feature.js';
+import type { CompositeRouterConfig } from './composite-router-types.js';
+import type { IZeroRouter } from './zero-router.js';
+import type { DifficultyEstimate, DifficultyOutcome, ModelTier } from './zero-router-types.js';
+import { hashTaskContent } from './zero-router-calibration.js';
+import { deriveStrongClis, deriveWeakClis, deriveTierToClis } from './derive-tier-tables.js';
+
+/**
+ * Converts a task profile to LinUCB bandit context.
+ *
+ * `budgetUtilization` was hardcoded to 0.5 on every call, so the bandit's
+ * budget feature was constant and carried no information — a dead input to a
+ * learned model, and the actual reason the feature never varied (#4834). It
+ * now takes the figure the pipeline computes, falling back to neutral when no
+ * cost ceiling is configured and there is nothing to measure.
+ *
+ * Neutral rather than zero: zero would read as "budget untouched" and is a
+ * claim; 0.5 is the same value `warmStart` replays historical outcomes at, so
+ * an unknown budget matches the context the weights were reconstructed
+ * against.
+ *
+ * `timePressure` stays the neutral constant by decision (#4875, option C): no
+ * producer computes a deadline, and with no bias column in `contextToFeatures`
+ * the constant is the bandit's per-arm intercept. See `contextToFeatures` for
+ * the unblock trigger.
+ */
+export function taskProfileToBanditContext(
+  profile: TaskProfile,
+  budgetUtilization?: number
+): BanditContext {
+  return {
+    taskComplexity: profile.reasoningComplexity / 10,
+    contextLengthNormalized: Math.min(profile.contextRequired / 100000, 1),
+    isCodeTask: profile.codeGeneration ? 1 : 0,
+    isReasoningTask: profile.taskType === 'architecture' || profile.reasoningComplexity > 5 ? 1 : 0,
+    budgetUtilization: budgetUtilization ?? NEUTRAL_BANDIT_FEATURE,
+    // #4875: still a constant — nothing in the tree computes time pressure, and
+    // inventing a producer is a design question, not a wiring fix. What changed
+    // is WHICH constant: this path used 0.3 while `LinUCBStage` used 0.5 and
+    // `warmStart`/`seedPriors` replay at 0.5. A constant feature carries no
+    // information, but two DIFFERENT constants across live paths let the bandit
+    // use the value as a path indicator — accidental signal rather than none.
+    // Neutral, and equal to what the replay paths use, is the honest default.
+    // Being constant, it is the per-arm intercept (no bias column exists), so
+    // it must stay equal across builders (`time-pressure-agreement.test.ts`).
+    timePressure: NEUTRAL_BANDIT_FEATURE,
+  };
+}
+
+/**
+ * Calculates routing confidence from multiple scores.
+ */
+export function calculateConfidence(
+  topsisScore: number | undefined,
+  ucbScore: number | undefined,
+  candidateCount: number
+): number {
+  const scores: number[] = [];
+  if (topsisScore !== undefined) scores.push(topsisScore);
+  if (ucbScore !== undefined) scores.push(Math.min(ucbScore / 10, 1));
+  const baseConfidence = Math.min(0.5 + candidateCount * 0.1, 0.8);
+  if (scores.length === 0) return baseConfidence;
+  const avgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
+  return 0.3 * baseConfidence + 0.7 * avgScore;
+}
+
+/**
+ * BINDING plan-mode annotation (#4196): when billing mode is 'plan' the
+ * difficulty-conditional cost weighting and the per-task-class cost ceiling
+ * are no-ops — the routing decision must SAY so explicitly (never silent),
+ * so downstream evals don't misread plan-mode routing as cost-aware.
+ */
+export const PLAN_MODE_COST_ANNOTATION = 'cost weighting disabled: plan mode';
+
+/**
+ * Options for building routing reason.
+ */
+export interface BuildReasonOptions {
+  selectedCli: RoutingArmId;
+  stages: string[];
+  topsisScore?: number;
+  ucbScore?: number;
+  preferenceScore?: number;
+  difficultyTier?: ModelTier;
+  difficultyScore?: number;
+  /** Billing mode in effect; 'plan' appends {@link PLAN_MODE_COST_ANNOTATION} (#4196). */
+  billingMode?: BillingMode;
+}
+
+/**
+ * Builds a human-readable routing reason.
+ */
+export function buildReason(options: BuildReasonOptions): string {
+  const { selectedCli, stages, topsisScore, ucbScore, preferenceScore, difficultyTier } = options;
+  const difficultyScore = options.difficultyScore;
+  const parts: string[] = ['Selected ' + selectedCli];
+  if (stages.includes('budget-filter')) parts.push('within budget');
+  if (difficultyTier !== undefined && difficultyScore !== undefined) {
+    parts.push('difficulty ' + difficultyTier + ' (' + difficultyScore.toFixed(2) + ')');
+  }
+  if (preferenceScore !== undefined) parts.push('preference ' + preferenceScore.toFixed(2));
+  if (topsisScore !== undefined) parts.push('TOPSIS score ' + topsisScore.toFixed(2));
+  if (ucbScore !== undefined) parts.push('UCB score ' + ucbScore.toFixed(2));
+  if (options.billingMode === 'plan') parts.push(PLAN_MODE_COST_ANNOTATION);
+  return parts.join(', ');
+}
+
+/**
+ * Filters CLI candidates based on preference tier.
+ */
+export function filterByPreferenceTier(
+  candidates: RoutingArmId[],
+  tier: 'strong' | 'weak'
+): RoutingArmId[] {
+  // Strong = the premium tier (most-expensive frontier default); weak = the
+  // budget CLIs. DERIVED from real registry pricing + qualityScores (#4195) —
+  // a $0/unscored default can never be "strong". Built-in vendor API arms
+  // retain their existing slot tiers; discovered endpoint models have none.
+  const strongModels: CliName[] = deriveStrongClis();
+  const weakModels: CliName[] = deriveWeakClis();
+
+  const preferred = tier === 'strong' ? strongModels : weakModels;
+  // Endpoint models have no CLI preference tier; bypass this slot-only filter.
+  const filtered = candidates.filter((c) => {
+    const slot = routingArmCliSlot(c);
+    return slot === undefined || preferred.includes(slot);
+  });
+
+  // Return filtered if any match, otherwise return all candidates
+  return filtered.length > 0 ? filtered : candidates;
+}
+
+/**
+ * Converts a CliTask to internal Task format.
+ */
+export function cliTaskToTask(cliTask: CliTask): Task {
+  return {
+    id: 'task-' + String(getTimeProvider().now()),
+    description: cliTask.content,
+    context: {},
+  };
+}
+
+/**
+ * Budget filter result.
+ */
+export interface BudgetFilterResult {
+  eligible: RoutingArmId[];
+  withinBudget: boolean;
+  /**
+   * Projected spend as a fraction of the configured cost ceiling (#4866).
+   *
+   * `undefined` when no `maxCostUsd` is configured — there is then no ceiling
+   * to be a fraction of, and an unknown budget must not be rendered as a
+   * known one. `ResourceStrategyStage` consumes this; it previously looked
+   * for a `budget:utilization=` signal that nothing on this path emitted.
+   */
+  budgetUtilization?: number;
+}
+
+/**
+ * Applies budget filtering to candidate CLIs.
+ */
+export function applyBudgetFilter(
+  task: CliTask,
+  candidates: RoutingArmId[],
+  budgetRouter: BudgetRouter | undefined,
+  config: CompositeRouterConfig
+): BudgetFilterResult {
+  if (budgetRouter === undefined) return { eligible: candidates, withinBudget: true };
+
+  const constraint = toBudgetConstraint(config.budgetConstraints);
+
+  const result = budgetRouter.checkBudget(task, constraint);
+  if (!result.withinBudget) return { eligible: [], withinBudget: false };
+
+  const share = budgetUtilizationOf(result.estimatedCostUsd, constraint.maxCostUsd);
+  const utilization = share === undefined ? {} : { budgetUtilization: share };
+
+  if (config.billingMode !== 'api')
+    return { eligible: candidates, withinBudget: true, ...utilization };
+  return {
+    eligible: budgetRouter.filterByTaskClassCeiling(task, candidates),
+    withinBudget: true,
+    ...utilization,
+  };
+}
+
+/**
+ * TOPSIS ranking result.
+ */
+export interface TopsisRankingResult {
+  ranking: RoutingArmId[];
+  topScore: number;
+  /** Number of candidates within the tolerance band of the top score. */
+  toleranceBandSize?: number;
+  /**
+   * Closeness score per ranked arm (#5269).
+   *
+   * These are computed here and were then discarded — only `topScore`
+   * survived. Downstream, `delegate_to_model` needed a per-alternative score,
+   * found none, and filled every alternative with the WINNER's score, so a
+   * caller saw three alternatives all scoring alike and read them as
+   * equivalent. Carrying the map costs nothing: it is the same object the
+   * ranking sort already builds.
+   *
+   * Absent when no TOPSIS router ran, which is distinct from "all scores are
+   * zero" — the caller must not read absence as a measurement.
+   */
+  scoresByArm?: ReadonlyMap<RoutingArmId, number>;
+}
+
+/**
+ * Tolerance band percentage for TOPSIS scoring.
+ * Candidates within this % of the top score are considered quality-equivalent.
+ * Among equivalent candidates, the original ranking is preserved (TOPSIS tiebreak).
+ * This prevents over-concentration on a single CLI and improves diversity.
+ * (Source: Issue #1401 — tolerance-routing technique)
+ */
+export const TOPSIS_TOLERANCE_BAND_PERCENT = 0.05;
+
+// ---------------------------------------------------------------------------
+// Performance Floor Gate (Issue #1401 — consensus-approved Option A)
+// ---------------------------------------------------------------------------
+
+/** Minimum observed success rate before quality penalty applies. */
+const PERFORMANCE_FLOOR_THRESHOLD = 0.5;
+
+/** Minimum sample count required before the floor gate activates. */
+const PERFORMANCE_FLOOR_MIN_SAMPLES = 20;
+
+/** Quality score penalty applied to underperforming CLI+category pairs. */
+const PERFORMANCE_FLOOR_PENALTY = 3.0;
+
+/**
+ * Performance data for a CLI on a specific task category.
+ */
+export interface PerformanceFloorEntry {
+  successRate: number;
+  sampleCount: number;
+}
+
+/**
+ * Applies a quality penalty to CLI profiles whose observed success rate
+ * for the current task category falls below PERFORMANCE_FLOOR_THRESHOLD.
+ *
+ * Only activates when sufficient samples exist (>= PERFORMANCE_FLOOR_MIN_SAMPLES)
+ * to avoid penalizing CLIs with noisy small-sample data.
+ *
+ * This is a pre-TOPSIS adjustment that nudges routing away from
+ * empirically underperforming CLI+category pairs. (#1401)
+ */
+export function applyPerformanceFloorPenalty(
+  profiles: readonly TopsisModelProfile[],
+  performanceData: ReadonlyMap<CliName, PerformanceFloorEntry>
+): TopsisModelProfile[] {
+  if (performanceData.size === 0) return [...profiles];
+
+  return profiles.map((p) => {
+    const perf = performanceData.get(p.cliName);
+    if (perf === undefined) return p;
+    if (perf.sampleCount < PERFORMANCE_FLOOR_MIN_SAMPLES) return p;
+    if (perf.successRate >= PERFORMANCE_FLOOR_THRESHOLD) return p;
+
+    const penalized = Math.max(p.qualityScore - PERFORMANCE_FLOOR_PENALTY, 0);
+    return { ...p, qualityScore: penalized };
+  });
+}
+
+/** Max quality boost from stage scores: +15%. */
+const STAGE_SCORE_MAX_BOOST = 0.15;
+
+/** Max quality penalty from stage scores: -10%. */
+const STAGE_SCORE_MAX_PENALTY = 0.1;
+
+/**
+ * Adjusts TOPSIS model profiles based on aggregated stage scores.
+ * CLIs with above-average stage affinity get quality boosted (up to +15%),
+ * below-average get quality reduced (down to -10%). (#1354)
+ */
+export function adjustProfileWithStageScores(
+  profiles: readonly TopsisModelProfile[],
+  stageScores: ReadonlyMap<CliName, number>
+): TopsisModelProfile[] {
+  return adjustBoundProfileWithStageScores(profiles, stageScores, (key) => key);
+}
+
+function adjustBoundProfileWithStageScores<Key extends string>(
+  profiles: readonly KeyedTopsisProfile<Key>[],
+  stageScores: ReadonlyMap<CliName, number>,
+  slotOf: (key: Key) => CliName | undefined
+): KeyedTopsisProfile<Key>[] {
+  if (stageScores.size === 0) return [...profiles];
+
+  // Calculate the mean score across all CLIs that have scores
+  const scoreValues = [...stageScores.values()];
+  const mean = scoreValues.reduce((a, b) => a + b, 0) / scoreValues.length;
+  // Range for normalization: max deviation from mean
+  const maxDev = Math.max(
+    ...scoreValues.map((v) => Math.abs(v - mean)),
+    0.001 // prevent division by zero
+  );
+
+  return profiles.map((p) => {
+    const slot = slotOf(p.cliName);
+    const score = slot === undefined ? undefined : stageScores.get(slot);
+    if (score === undefined) return p;
+
+    const deviation = score - mean;
+    // Normalize to [-1, 1] range
+    const normalized = deviation / maxDev;
+    // Map to boost/penalty: positive → boost, negative → penalty
+    const multiplier =
+      normalized >= 0
+        ? 1 + normalized * STAGE_SCORE_MAX_BOOST
+        : 1 + normalized * STAGE_SCORE_MAX_PENALTY;
+    const adjustedQuality = Math.min(p.qualityScore * multiplier, 10);
+
+    return { ...p, qualityScore: adjustedQuality };
+  });
+}
+
+/** Options for TOPSIS ranking beyond the core required params. */
+export interface TopsisRankingOptions {
+  billingMode?: BillingMode;
+  /** Actual adapter instances, before any display-slot projection. */
+  adapters?: ReadonlyMap<RoutingArmId, ICliAdapter>;
+  stageScores?: ReadonlyMap<CliName, number>;
+  performanceData?: ReadonlyMap<CliName, PerformanceFloorEntry>;
+}
+
+/** Builds adjusted TOPSIS profiles from task, stage scores, and performance data. */
+function buildAdjustedProfiles(
+  taskProfile: TaskProfile,
+  candidates: RoutingArmId[],
+  options?: TopsisRankingOptions
+): KeyedTopsisProfile<RoutingArmId>[] {
+  let adjusted = candidates.flatMap((arm) => {
+    const profile = profileForArm(arm, options?.adapters?.get(arm));
+    return profile === undefined ? [] : [adjustKeyedProfileForTask(profile, taskProfile)];
+  });
+  if (options?.stageScores !== undefined)
+    adjusted = adjustBoundProfileWithStageScores(adjusted, options.stageScores, routingArmCliSlot);
+  const performanceData = options?.performanceData;
+  if (performanceData !== undefined) {
+    adjusted = adjusted.map((profile) => {
+      const slot = routingArmCliSlot(profile.cliName);
+      if (slot === undefined) return profile;
+      const penalized = applyPerformanceFloorPenalty(
+        [{ ...profile, cliName: slot }],
+        performanceData
+      )[0];
+      return penalized === undefined ? profile : { ...penalized, cliName: profile.cliName };
+    });
+  }
+  return adjusted;
+}
+
+/**
+ * Applies TOPSIS ranking to candidate CLIs.
+ * Uses task-category-aware criteria weights when taskProfile.taskType is available (#1491).
+ * When stageScores are provided, adjusts quality profiles before evaluation. (#1354)
+ */
+export function applyTopsisRanking(
+  taskProfile: TaskProfile,
+  candidates: RoutingArmId[],
+  topsisRouter: TopsisRouter | undefined,
+  options?: TopsisRankingOptions
+): TopsisRankingResult {
+  if (topsisRouter === undefined) {
+    return { ranking: candidates, topScore: 1.0 };
+  }
+
+  const billingMode = options?.billingMode ?? 'api';
+  const router = selectTopsisRouter(
+    topsisRouter,
+    billingMode,
+    taskProfile.taskType,
+    taskProfile.reasoningComplexity
+  );
+  const adjustedProfiles = buildAdjustedProfiles(taskProfile, candidates, options);
+  if (adjustedProfiles.length === 0) return { ranking: candidates, topScore: 1.0 };
+  const result = rankTopsisProfiles(router.getConfig(), adjustedProfiles);
+
+  // Scores retain actual arm identity. Only measured profiles are ranked;
+  // discovered endpoints remain unmeasured by TOPSIS.
+  const scoreOf = (arm: RoutingArmId): number =>
+    result.scores.find((score) => score.cliName === arm)?.closenessScore ?? 0;
+  const ranking = [...candidates].sort((a, b) => scoreOf(b) - scoreOf(a));
+  const topArm = ranking[0];
+  const topScore = topArm !== undefined ? scoreOf(topArm) : 1.0;
+  // Keyed by actual arm, so API and native candidates keep distinct scores.
+  const scoresByArm = new Map(
+    candidates
+      .filter((arm) => result.scores.some((score) => score.cliName === arm))
+      .map((arm) => [arm, scoreOf(arm)])
+  );
+
+  // Tolerance band: count how many candidates are within TOLERANCE_BAND_PERCENT of top
+  const threshold = topScore * (1 - TOPSIS_TOLERANCE_BAND_PERCENT);
+  const toleranceBandSize = [...scoresByArm.values()].filter((score) => score >= threshold).length;
+
+  return { ranking, topScore, toleranceBandSize, scoresByArm };
+}
+
+/**
+ * Preference stage result.
+ */
+export interface PreferenceStageResult {
+  preferenceScore: number | undefined;
+  preferenceTier: 'strong' | 'weak' | undefined;
+  preferredCandidates: RoutingArmId[];
+}
+
+/**
+ * Default preference stage result when preference routing is disabled.
+ */
+export function defaultPreferenceStageResult(candidates: RoutingArmId[]): PreferenceStageResult {
+  return {
+    preferenceScore: undefined,
+    preferenceTier: undefined,
+    preferredCandidates: candidates,
+  };
+}
+
+/**
+ * ZeroRouter stage result.
+ */
+export interface ZeroRouterStageResult {
+  difficultyEstimate: DifficultyEstimate | undefined;
+  difficultyTier: ModelTier | undefined;
+  filteredCandidates: RoutingArmId[];
+}
+
+/**
+ * Default ZeroRouter stage result when ZeroRouter is disabled.
+ */
+export function defaultZeroRouterStageResult(candidates: RoutingArmId[]): ZeroRouterStageResult {
+  return {
+    difficultyEstimate: undefined,
+    difficultyTier: undefined,
+    filteredCandidates: candidates,
+  };
+}
+
+/**
+ * Maps model tier to preferred CLI order.
+ * Fast tier prefers gemini/codex, Powerful tier prefers claude.
+ */
+export function filterByDifficultyTier(
+  candidates: RoutingArmId[],
+  tier: ModelTier
+): RoutingArmId[] {
+  // Single source with ZeroRouter's DEFAULT_TIER_TO_CLIS: the same
+  // registry-derived tier→CLI ordering (#4195), no longer a parallel literal.
+  const preferred = deriveTierToClis()[tier];
+  // Sort candidates by tier preference order. Tier preference is slot-level;
+  // an api:* arm sorts by its display slot's position (#3422).
+  const sortedCandidates = [...candidates].sort((a, b) => {
+    // A gateway endpoint has no CLI tier membership.
+    const aIndex = preferred.findIndex((slot) => slot === routingArmCliSlot(a));
+    const bIndex = preferred.findIndex((slot) => slot === routingArmCliSlot(b));
+    // If not in preference list, put at end
+    const aPos = aIndex === -1 ? preferred.length : aIndex;
+    const bPos = bIndex === -1 ? preferred.length : bIndex;
+    return aPos - bPos;
+  });
+
+  return sortedCandidates;
+}
+
+/**
+ * Applies ZeroRouter difficulty-based filtering to candidate CLIs.
+ */
+export function applyZeroRouterFilter(
+  task: CliTask,
+  candidates: RoutingArmId[],
+  zeroRouter: IZeroRouter | undefined
+): ZeroRouterStageResult {
+  if (zeroRouter === undefined || candidates.length === 0) {
+    return defaultZeroRouterStageResult(candidates);
+  }
+
+  // Difficulty estimation is slot-level; collapse arms to their display slot
+  // for the ZeroRouter call (we only read difficulty + tier back) (#3422).
+  // ZeroRouter calibration is CLI-only; no endpoint may inherit a CLI slot.
+  const slots = candidates
+    .map(routingArmCliSlot)
+    .filter((slot): slot is CliName => slot !== undefined);
+  if (slots.length === 0) return defaultZeroRouterStageResult(candidates);
+  const decision = zeroRouter.routeByDifficulty(task, slots);
+  const difficultyEstimate = decision.difficulty;
+  const difficultyTier = decision.tier;
+
+  // Sort candidates by tier preference
+  const filteredCandidates = filterByDifficultyTier(candidates, difficultyTier);
+
+  return {
+    difficultyEstimate,
+    difficultyTier,
+    filteredCandidates,
+  };
+}
+
+/**
+ * Builds a DifficultyOutcome object for calibration.
+ */
+export function buildDifficultyOutcome(
+  taskContent: string,
+  difficulty: number,
+  selectedCli: CliName,
+  success: boolean,
+  qualityScore?: number
+): DifficultyOutcome {
+  const base = {
+    taskHash: hashTaskContent(taskContent),
+    estimatedDifficulty: difficulty,
+    selectedCli,
+    success,
+    timestamp: getTimeProvider().now(),
+  };
+  return qualityScore !== undefined ? { ...base, qualityScore } : base;
+}
+
+/**
+ * Creates the routing decision result object.
+ */
+export interface BuildDecisionContext {
+  selectedCli: RoutingArmId;
+  candidates: RoutingArmId[];
+  topsisRanking: RoutingArmId[];
+  /** #5269: per-arm closeness from the ranking, when one ran. */
+  topsisScoresByArm?: ReadonlyMap<RoutingArmId, number> | undefined;
+  stagesExecuted: string[];
+  decisionTimeMs: number;
+  withinBudget: boolean | undefined;
+  difficultyEstimate: DifficultyEstimate | undefined;
+  difficultyTier: ModelTier | undefined;
+  preferenceScore: number | undefined;
+  preferenceTier: 'strong' | 'weak' | undefined;
+  topsisScore: number | undefined;
+  ucbScore: number | undefined;
+  taskProfile: TaskProfile;
+  /** Billing mode in effect; 'plan' surfaces the explicit annotation (#4196). */
+  billingMode?: BillingMode | undefined;
+}
+
+/**
+ * Builds the routing decision fields (excluding adapter which requires Map lookup).
+ */
+export function buildDecisionFields(ctx: BuildDecisionContext): {
+  confidence: number;
+  reason: string;
+  alternatives: RoutingArmId[];
+  /** #5269: score per alternative, absent when no ranking produced one. */
+  alternativeScores?: ReadonlyMap<RoutingArmId, number>;
+} {
+  const confidence = calculateConfidence(ctx.topsisScore, ctx.ucbScore, ctx.candidates.length);
+  const reason = buildReason({
+    selectedCli: ctx.selectedCli,
+    stages: ctx.stagesExecuted,
+    ...(ctx.billingMode !== undefined ? { billingMode: ctx.billingMode } : {}),
+    ...(ctx.topsisScore !== undefined ? { topsisScore: ctx.topsisScore } : {}),
+    ...(ctx.ucbScore !== undefined ? { ucbScore: ctx.ucbScore } : {}),
+    ...(ctx.preferenceScore !== undefined ? { preferenceScore: ctx.preferenceScore } : {}),
+    ...(ctx.difficultyTier !== undefined ? { difficultyTier: ctx.difficultyTier } : {}),
+    ...(ctx.difficultyEstimate?.aggregateScore !== undefined
+      ? { difficultyScore: ctx.difficultyEstimate.aggregateScore }
+      : {}),
+  });
+  const alternatives = ctx.topsisRanking.filter((c) => c !== ctx.selectedCli);
+  if (ctx.topsisScoresByArm === undefined) return { confidence, reason, alternatives };
+  // Narrowed to the alternatives themselves: the winner's score already rides
+  // on `topsisScore`, and a map that also carried it invites the very
+  // substitution this fixes. Unranked alternatives carry no score.
+  const alternativeScores = new Map(
+    alternatives
+      .filter((arm) => ctx.topsisScoresByArm?.has(arm) === true)
+      .map((arm) => [arm, ctx.topsisScoresByArm?.get(arm) ?? 0])
+  );
+  return { confidence, reason, alternatives, alternativeScores };
+}
+
+/**
+ * Builds preference stats for CompositeRouter stats output.
+ */
+export function buildPreferenceStats(
+  enablePreferenceRouting: boolean,
+  preferenceRouter:
+    | {
+        getStats: () => { totalDataPoints: number; strongModelPreferenceRate: number };
+        hasMinimumData: () => boolean;
+      }
+    | undefined
+):
+  | {
+      enabled: boolean;
+      hasSufficientData: boolean;
+      dataPointCount: number;
+      strongModelPreferenceRate: number;
+    }
+  | undefined {
+  if (!enablePreferenceRouting || preferenceRouter === undefined) {
+    return undefined;
+  }
+  const stats = preferenceRouter.getStats();
+  return {
+    enabled: true,
+    hasSufficientData: preferenceRouter.hasMinimumData(),
+    dataPointCount: stats.totalDataPoints,
+    strongModelPreferenceRate: stats.strongModelPreferenceRate,
+  };
+}
+
+// `fetchCapacityData` was removed with #4378. Its only caller was
+// `CompositeRouter.getCapacityDashboard`, itself a read-only surface with no
+// production consumer (its only references were two test mocks), so it was
+// orphaned by that deletion rather than being independently useful.
+//
+// #4373 will reintroduce capacity reads as a routing *exclusion predicate*
+// inside the stage chain — a decision input, not a dashboard. Adapter capacity
+// is still available directly via `ICliAdapter.getCapacity()`.
+
+export { budgetUtilizationOf, budgetUtilizationForTask };

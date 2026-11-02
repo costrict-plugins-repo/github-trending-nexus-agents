@@ -1,0 +1,21 @@
+---
+title: 'MCP Tool: list_experts'
+description: 'Inventory of expert ROLES for `create_expert`'
+diataxis: reference
+audience: user
+tier: 2
+keywords: [mcp, tool, reference, list_experts]
+---
+
+# `list_experts`
+
+> Auto-generated from the registered MCP tool descriptions and input
+> schemas. Do not edit by hand — run `pnpm docs:tools` to regenerate.
+
+Inventory of expert ROLES available to `create_expert` (architect, security, devex, etc.). Use this BEFORE create_expert to pick a role; returns role name and capability summary.
+
+## Parameters
+
+| Parameter | Type | Required | Constraints | Description |
+| --------- | ---- | -------- | ----------- | ----------- |
+| `format` | enum | no | one of: full \| names; default full | Output format: full (detailed metadata) or names (compact objects with role, name, a one-sentence description, and an empty capabilities array) |

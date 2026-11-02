@@ -1,0 +1,606 @@
+/**
+ * nexus-agents/mcp - `run` tool (unified adaptive entry point)
+ *
+ * THE default way to ask nexus-agents to do work: give a goal, and the
+ * MetaOrchestrator (epic #3548) selects the right strategy among the existing
+ * specialized pipelines and tells you which to run — routing handled
+ * automatically. The other pipeline tools (`run_dev_pipeline`, `run_pipeline`,
+ * `run_graph_workflow`, `orchestrate`, …) remain available as advanced
+ * "force-this-strategy" paths.
+ *
+ * Default (execute:false) is read-only: returns the routing decision plus the
+ * concrete strategy tool to invoke. With `execute:true` it dispatches the
+ * selected strategy through the MetaDispatcher to a real engine executor and
+ * returns the result (increment B; wired so far: dev-pipeline, pipeline,
+ * research, consensus — others fail closed with a typed error). Executors live
+ * here at the MCP-tool layer and are injected into the dispatcher so the
+ * orchestration core stays cycle-free.
+ *
+ * @module mcp/tools/run-tool
+ * (Source: epic #3548 — unified adaptive MetaOrchestrator entry point)
+ */
+
+import { z } from 'zod';
+import { asyncDispatchInput } from './async-dispatch-input.js';
+import { randomUUID } from 'node:crypto';
+import type { McpServer } from '../sdk-types.js';
+import type { IModelAdapter } from '../../core/index.js';
+
+import { createLogger, formatZodError, getErrorMessage, type ILogger } from '../../core/index.js';
+import {
+  resolveConsensusEnforcementMode,
+  type ConsensusEnforcementMode,
+} from '../../orchestration/consensus-enforcement-mode.js';
+import { getConsensusEnforcement, type ConsensusEnforcement } from './run-tool-consensus.js';
+import { parseBoolEnv } from '../../config/defaults-env.js';
+import { assertDryRunSupported, classifyDispatchError } from './run-tool-dry-run.js';
+import { detectEngineFailure } from './run-tool-incomplete.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { measuredTrustTier, type RequestContext } from '../middleware/request-context.js';
+import {
+  assertExecutePolicy,
+  RunPolicyDeniedError,
+  type RunBodyOptions,
+} from './run-tool-policy.js';
+import {
+  toolStructuredError,
+  toolSuccess,
+  type BaseMcpToolDeps,
+  type ToolResult,
+} from './tool-result.js';
+import { getMcpAnnotations } from './tool-annotations.js';
+import {
+  createMetaOrchestrator,
+  type ExecutionStrategy,
+  type MetaDecision,
+} from '../../orchestration/meta-orchestrator.js';
+import {
+  getShadowSelector,
+  getShadowSink,
+  persistMetaOutcome,
+} from '../../orchestration/meta-shadow-selector.js';
+import { evaluateMetaStrategy } from '../../orchestration/meta-strategy-eval.js';
+import { META_STRATEGY_CORPUS } from '../../orchestration/meta-strategy-corpus.js';
+import { evaluateMetaStrategyReadiness } from '../../orchestration/meta-strategy-readiness.js';
+import { isPersistenceEnabled } from '../../config/learning-persistence.js';
+import {
+  classifyEngineResult,
+  createMetaDispatcher,
+  type StrategyExecutorMap,
+  type MetaOutcomeSink,
+  type MetaOutcomeObserver,
+} from '../../orchestration/meta-dispatcher.js';
+import type { MetaResultClassifier } from '../../orchestration/meta-dispatcher.js';
+import { entrypointToolFor } from '../../orchestration/strategy-manifest-registry.js';
+import {
+  dispatchActionClass,
+  type DispatchMode,
+} from '../../orchestration/authority-tier-guard.js';
+import { assertDispatchNotCancelled, buildDefaultExecutors } from './run-tool-executors.js';
+import { TaskSourceTrustTierSchema } from './task-source-trust-tier.js';
+// #3732 / epic #2631: async-mode dispatch via the shared `runAsJob` helper.
+import { runAsJob } from '../jobs/run-as-job.js';
+import { heartbeatJob } from '../jobs/job-result-store.js';
+
+/** Input schema for the `run` tool. */
+export const RunInputSchema = z.object({
+  goal: z
+    .string()
+    .min(1)
+    .describe('Natural-language goal. nexus-agents selects how to execute it.'),
+  forceStrategy: z
+    .enum([
+      'single-shot',
+      'dev-pipeline',
+      'pipeline',
+      'graph-workflow',
+      'orchestrate',
+      'consensus',
+      'spec',
+      'research',
+    ])
+    .optional()
+    .describe(
+      'Power-user override: force a specific strategy instead of letting the router choose.'
+    ),
+  requiresConsensus: z
+    .boolean()
+    .optional()
+    .describe('Hint: the task needs a multi-perspective consensus decision.'),
+  dependencyStructure: z
+    .enum(['linear', 'dag', 'independent', 'unknown'])
+    .optional()
+    .describe('Hint: the dependency structure of the work.'),
+  isNovel: z.boolean().optional().describe('Hint: this kind of task has not been seen before.'),
+  execute: z
+    .boolean()
+    .optional()
+    .describe(
+      'When true, actually run the selected strategy (if an executor is wired) and return ' +
+        'its result; otherwise return the routing decision only (default false, read-only).'
+    ),
+  /**
+   * Plan and vote without implementing (#4806).
+   *
+   * `run` is the documented default entry point, but until now it could not
+   * express the cautious caller's first request — "show me the plan, don't
+   * build it". `execute: false` is not a substitute: that returns the SELECTED
+   * STRATEGY, having done no planning and no voting.
+   *
+   * Only the dev-pipeline strategy can honour it. When the router selects any
+   * other, the call is REFUSED rather than executed: silently ignoring a
+   * do-not-act flag is the one outcome a governance substrate cannot allow.
+   */
+  dryRun: z
+    .boolean()
+    .optional()
+    .describe(
+      'Plan and vote only, no implementation (#4806). Requires the dev-pipeline strategy — ' +
+        'refused (never silently executed) when the router selects another.'
+    ),
+  /**
+   * Dispatch mode (#3732). Only meaningful with `execute: true` — `run`
+   * dispatches the heaviest engines (dev-pipeline/pipeline), which can exceed
+   * the MCP request timeout even with the 1800s class guard (#3734). `sync`
+   * (default) runs inline; `async` returns a `{ status: 'pending', jobId }`
+   * envelope immediately and runs in the background; poll
+   * `get_job_result({ jobId })`. Ignored for read-only routing (execute:false).
+   */
+  ...asyncDispatchInput('Only with execute:true.'),
+  /**
+   * Declared provenance of the goal text (#6795). Read only when the
+   * dev-pipeline strategy runs: that is the one strategy whose
+   * consensus→execute gate consumes a content tier. Omitted means '3'.
+   */
+  sourceTrustTier: TaskSourceTrustTierSchema,
+});
+
+export type RunInput = z.infer<typeof RunInputSchema>;
+
+/** The dispatch plan returned to the caller. */
+export interface RunResponse {
+  readonly strategy: ExecutionStrategy;
+  readonly reasoning: string;
+  /**
+   * A PRIOR, not a measurement of this goal (#5957). Forwarded verbatim from
+   * `MetaDecision.confidence`, which is a routing rule's authored literal in
+   * the structural-match case. Callers rendering it as a percentage are
+   * rendering how much this repo trusts the rule, not how well the goal fits.
+   */
+  readonly confidence: number;
+  readonly alternatives: readonly ExecutionStrategy[];
+  readonly needsShaping: boolean;
+  readonly shapingQuestions?: readonly string[];
+  /** The strategy tool the caller can invoke to execute this selection. */
+  readonly recommendedTool: string;
+  /** Decision id — correlates to the selection record / future outcome. */
+  readonly decisionId: string;
+  readonly note: string;
+}
+
+// #4655: the previous wording told callers to "wait for inline execution
+// (run execute: true) in a later release". It shipped — `execute: true`
+// dispatches the real engine (see runWithExecution below). This NOTE is
+// returned on the ROUTE path, so it describes that path and points at the
+// executing one rather than describing it as unavailable.
+const NOTE =
+  'Routing decision only (read-only). Invoke the recommendedTool to execute, or ' +
+  're-run with execute: true for inline execution. The other pipeline tools ' +
+  'remain available as advanced force-strategy paths.';
+
+/**
+ * Maps validated input to the MetaOrchestrator input shape.
+ *
+ * Threads `requiredAuthority` derived from the DISPATCH MODE (#3920, ADR-0017) —
+ * this is the production writer that was missing, which left the authority-ladder
+ * router refusal as dead code. The router (meta-orchestrator `select`) refuses
+ * fail-closed when the selected/forced strategy would act ABOVE its declared
+ * tier; `dispatchActionClass` floors both modes at `suggest` so every live
+ * strategy passes and the guard fires only on a genuine above-tier action (an
+ * `observe`/undeclared strategy reaching dispatch). See {@link dispatchActionClass}.
+ */
+function toMetaInput(
+  input: RunInput,
+  mode: DispatchMode
+): Parameters<ReturnType<typeof createMetaOrchestrator>['select']>[0] {
+  const signals: Record<string, unknown> = {};
+  if (input.requiresConsensus !== undefined) signals.requiresConsensus = input.requiresConsensus;
+  if (input.dependencyStructure !== undefined)
+    signals.dependencyStructure = input.dependencyStructure;
+  if (input.isNovel !== undefined) signals.isNovel = input.isNovel;
+  return {
+    goal: input.goal,
+    requiredAuthority: dispatchActionClass(mode),
+    // #4655: an executing dispatch must also clear the envelope precondition.
+    requiresExecuteEnvelope: mode === 'execute',
+    ...(Object.keys(signals).length > 0 ? { signals } : {}),
+    ...(input.forceStrategy !== undefined ? { forceStrategy: input.forceStrategy } : {}),
+  };
+}
+
+/**
+ * Whether the learned-selector readiness signal has already been logged this
+ * process. The verdict is a deterministic function of the STATIC labeled corpus, so
+ * it never changes within a run — compute + log it exactly once at first shadow-enable
+ * (not per decision), matching the shadow selector's own one-time hydrate log.
+ */
+let readinessLogged = false;
+
+/**
+ * Compute the learned-selector promotion readiness verdict once and SURFACE it for
+ * operators (#4094). AUDIT-MODE ONLY — this is a non-routing observer of the offline
+ * eval: it logs whether the learned arm has crossed the promotion bar so the #3552
+ * shadow→route flip has a falsifiable signal to gate on. It NEVER touches the routed
+ * decision. Best-effort: an eval failure is swallowed so selection never breaks.
+ */
+function logMetaStrategyReadinessOnce(logger: ILogger): void {
+  if (readinessLogged) return;
+  readinessLogged = true;
+  try {
+    const evalResult = evaluateMetaStrategy(META_STRATEGY_CORPUS);
+    const verdict = evaluateMetaStrategyReadiness(evalResult);
+    logger.info('meta-strategy learned-selector readiness', {
+      ready: verdict.ready,
+      delta: evalResult.delta,
+      learnedAccuracy: evalResult.learnedAccuracy,
+      rulesAccuracy: evalResult.rulesAccuracy,
+      testCount: evalResult.testCount,
+      blockers: verdict.blockers,
+    });
+  } catch (err) {
+    logger.warn('meta-strategy readiness signal failed (non-fatal)', {
+      error: getErrorMessage(err),
+    });
+  }
+}
+
+/**
+ * Selects a strategy for a goal via the MetaOrchestrator. `mode` is the dispatch
+ * mode the selection feeds (#3920): it sets the `requiredAuthority` the
+ * authority-ladder router enforces, so `select` can refuse an above-tier action
+ * fail-closed at the router rather than after the fact.
+ */
+function selectDecision(input: RunInput, mode: DispatchMode, logger?: ILogger): MetaDecision {
+  // Shadow-mode learned selection (#3551): the process-scoped selector + sink
+  // log a would-be learned choice alongside the executed rule-based choice.
+  // Never alters what runs; builds the comparison surface for offline eval.
+  const meta = createMetaOrchestrator({
+    ...(logger !== undefined ? { logger } : {}),
+    shadowSelector: getShadowSelector(),
+    shadowSink: getShadowSink(),
+  });
+  // Non-routing audit signal (#4094): surface the learned-selector readiness verdict
+  // alongside shadow enablement. Observed, never acted on — the routed decision below
+  // is untouched by it.
+  logMetaStrategyReadinessOnce(logger ?? createLogger({ component: 'RunTool' }));
+  return meta.select(toMetaInput(input, mode));
+}
+
+/**
+ * Core routing logic: select a strategy for a goal and build the dispatch plan
+ * (read-only — no execution). Exported for testing.
+ */
+export function routeGoal(input: RunInput, logger?: ILogger): RunResponse {
+  const decision = selectDecision(input, 'route', logger);
+  return {
+    strategy: decision.strategy,
+    reasoning: decision.reasoning,
+    confidence: decision.confidence,
+    alternatives: decision.alternatives,
+    needsShaping: decision.needsShaping,
+    ...(decision.shapingQuestions !== undefined
+      ? { shapingQuestions: decision.shapingQuestions }
+      : {}),
+    recommendedTool: entrypointToolFor(decision.strategy),
+    decisionId: decision.decisionId,
+    note: NOTE,
+  };
+}
+
+// #6305: the default executors live in `run-tool-executors.ts` for the line cap;
+// re-exported so existing importers keep their path.
+export { buildDefaultExecutors };
+
+/** Result of an inline `execute: true` run. */
+export interface RunExecuteResponse {
+  readonly strategy: ExecutionStrategy;
+  readonly decisionId: string;
+  readonly reasoning: string;
+  readonly executed: true;
+  readonly durationMs: number;
+  readonly result: unknown;
+  readonly enforcement?: ConsensusEnforcement | undefined;
+}
+
+/**
+ * Select a strategy and execute it via the MetaDispatcher. Resolves with the
+ * engine result; rejects with {@link MetaDispatchError} for strategies without a
+ * wired executor (fail closed). Executors are injectable for testing.
+ */
+/**
+ * Whether to feed live dispatch outcomes into the shadow selector + persist them
+ * (#3593). Gated behind BOTH `NEXUS_META_SHADOW_TRAIN=1` (default OFF) AND
+ * learning persistence being enabled. Stays SHADOW: training never alters what
+ * runs and never feeds the enforce path (#3552) — it only moves the selector
+ * whose choice is logged for offline comparison.
+ */
+export function isShadowTrainEnabled(): boolean {
+  return parseBoolEnv('NEXUS_META_SHADOW_TRAIN', false) && isPersistenceEnabled();
+}
+
+/**
+ * Builds the train edge: on each dispatch outcome (success OR failure), update
+ * the process-scoped shadow selector and append a sanitized record to disk.
+ * `record.success` is the STRATEGY verdict: an enforced consensus refusal of a
+ * delivered "rejected" verdict trains as a success (#7127).
+ * Returns undefined when training is disabled — no selector update, no write.
+ */
+function buildShadowTrainObserver(logger?: ILogger): MetaOutcomeObserver | undefined {
+  if (!isShadowTrainEnabled()) return undefined;
+  return (record, decision) => {
+    getShadowSelector().recordOutcome(decision.strategy, decision, record.success);
+    persistMetaOutcome(decision.strategy, decision, record.success);
+    if (logger !== undefined) {
+      logger.debug('meta-shadow-train: recorded outcome', {
+        decisionId: decision.decisionId,
+        strategy: decision.strategy,
+        success: record.success,
+        ...(record.gateRefusal !== undefined ? { gateRefusal: record.gateRefusal } : {}),
+        armStats: getShadowSelector().stats(),
+      });
+    }
+  };
+}
+
+export async function executeGoal(
+  input: RunInput,
+  opts: {
+    readonly logger?: ILogger | undefined;
+    readonly executors?: StrategyExecutorMap | undefined;
+    readonly outcomeSink?: MetaOutcomeSink | undefined;
+    readonly onOutcome?: MetaOutcomeObserver | undefined;
+    /**
+     * Caller's content-provenance trust tier (#3712), threaded into the default
+     * dev-pipeline executor so the consensus→execute seam sees the real tier
+     * instead of fail-closing. Ignored when `executors` is supplied explicitly.
+     */
+    readonly trustTier?: string | undefined;
+    /** In-process gateway model adapters routed to consensus voters (#4042). */
+    readonly gatewayAdapters?: readonly IModelAdapter[] | undefined;
+    readonly classifyResult?: MetaResultClassifier | undefined;
+    readonly consensusEnforcementMode?: ConsensusEnforcementMode | undefined;
+    /**
+     * The caller's request context (#6431 review): the policy check for the
+     * selected strategy tool records under it. A direct caller with none gets
+     * a fresh `run` context — the check itself is not optional.
+     */
+    readonly requestContext?: RequestContext | undefined;
+    /** Async-job heartbeat (#6162); see {@link buildDefaultExecutors}. */
+    readonly onProgress?: (() => void) | undefined;
+    /**
+     * `cancel_job`'s signal (#6305): checked before dispatch and handed to the
+     * default executors. An injected `executors` map receives none.
+     */
+    readonly signal?: AbortSignal | undefined;
+  } = {}
+): Promise<RunExecuteResponse> {
+  // The authority-ladder guard fires inside `select` (#3920): an above-tier
+  // dispatch is refused fail-closed (AuthorityRefusalError) here, BEFORE any
+  // executor runs.
+  const mode =
+    opts.consensusEnforcementMode ??
+    resolveConsensusEnforcementMode(process.env['NEXUS_CONSENSUS_ENFORCE']);
+  const { dryRun, sourceTrustTier } = input;
+  const decision = selectDecision(input, 'execute', opts.logger);
+  // #4806: fail closed BEFORE any executor runs. Only the dev pipeline stops
+  // after plan+vote; every other strategy would execute for real, so honouring
+  // the request is impossible and ignoring it would act against an explicit
+  // instruction not to.
+  assertDryRunSupported(input.dryRun, decision.strategy);
+  // #6431 review: the read-only lock and the path rules see this call as the
+  // strategy tool it is about to run, BEFORE any executor runs.
+  assertExecutePolicy(decision.strategy, input, opts.logger, opts.requestContext);
+  const onOutcome = opts.onOutcome ?? buildShadowTrainObserver(opts.logger);
+  const dispatcher = createMetaDispatcher({
+    executors:
+      opts.executors ??
+      buildDefaultExecutors(
+        opts.trustTier,
+        opts.gatewayAdapters,
+        { consensusEnforcementMode: mode, logger: opts.logger, dryRun, sourceTrustTier },
+        opts.onProgress,
+        opts.signal
+      ),
+    ...(opts.logger !== undefined ? { logger: opts.logger } : {}),
+    ...(opts.outcomeSink !== undefined ? { outcomeSink: opts.outcomeSink } : {}),
+    ...(onOutcome !== undefined ? { onOutcome } : {}),
+    classifyResult: opts.classifyResult ?? ((result) => classifyEngineResult(result, mode)),
+  });
+  assertDispatchNotCancelled(opts.signal, decision.strategy);
+  const dispatch = await dispatcher.dispatch(decision, toMetaInput(input, 'execute'));
+  return {
+    ...dispatch,
+    reasoning: decision.reasoning,
+    executed: true,
+    ...(dispatch.strategy === 'consensus'
+      ? { enforcement: getConsensusEnforcement(dispatch.result) }
+      : {}),
+  };
+}
+
+/**
+ * Run the `execute: true` body — dispatch the selected strategy via the
+ * MetaDispatcher and shape the `ToolResult`. The sync path awaits this inline;
+ * the async dispatcher backgrounds it via {@link runAsJob} (#3732). Catches the
+ * dispatch error here so a backgrounded failure records the same structured
+ * envelope a sync caller would have seen.
+ */
+async function executeRunBody(
+  input: RunInput,
+  logger: ILogger,
+  body: RunBodyOptions = {}
+): Promise<ToolResult> {
+  const mode = resolveConsensusEnforcementMode(process.env['NEXUS_CONSENSUS_ENFORCE']);
+  try {
+    // #3712: thread the caller's real RequestContext.trustTier into the
+    // dev-pipeline executor's consensus→execute seam. undefined ⇒ seam
+    // fail-closes to untrusted (4); never infer trust from absence.
+    const exec = await executeGoal(input, { logger, ...body, consensusEnforcementMode: mode });
+    logger.info('run: executed goal', {
+      decisionId: exec.decisionId,
+      strategy: exec.strategy,
+      durationMs: exec.durationMs,
+    });
+    // #4362: a dispatch that RESOLVED used to be an unconditional success, so an
+    // engine reporting its own failure was handed back as `toolSuccess` — and,
+    // backgrounded, recorded as a `complete` job. Only a throw was surfaced.
+    const engineFailure = detectEngineFailure(exec.result, mode);
+    if (engineFailure !== null) {
+      logger.warn('run: engine reported failure', {
+        decisionId: exec.decisionId,
+        strategy: exec.strategy,
+      });
+      // #4789: carry the engine's own result through. The message names the
+      // reason; `detail` keeps the verdict a caller can act on.
+      return toolStructuredError({
+        errorCategory: 'business',
+        message: engineFailure.message,
+        ...(engineFailure.detail !== undefined ? { detail: engineFailure.detail } : {}),
+      });
+    }
+    return toolSuccess(JSON.stringify(exec, null, 2));
+  } catch (err) {
+    // The policy denial is already the envelope the target tool would return.
+    if (err instanceof RunPolicyDeniedError) return err.toolResult;
+    return toolStructuredError({
+      errorCategory: classifyDispatchError(err),
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Async-path wrapper around {@link executeRunBody} that rejects on an error
+ * envelope (#4362): `runAsJob` records `complete` whenever `run` RESOLVES, so
+ * a returned error envelope would land a `complete` job the caller never
+ * reads. Rejecting routes it through `writeJobFailed` (#4363 generalises).
+ */
+async function executeRunBodyOrThrow(
+  input: RunInput,
+  logger: ILogger,
+  body: RunBodyOptions = {}
+): Promise<ToolResult> {
+  const result = await executeRunBody(input, logger, body);
+  if (result.isError === true) throw new Error(result.content[0]?.text ?? 'run failed');
+  return result;
+}
+
+async function runHandler(
+  args: unknown,
+  logger: ILogger,
+  trustTier?: string,
+  gatewayAdapters?: readonly IModelAdapter[],
+  requestContext?: RequestContext
+): Promise<ToolResult> {
+  const parsed = RunInputSchema.safeParse(args);
+  if (!parsed.success) {
+    return toolStructuredError({
+      errorCategory: 'validation',
+      message: `Validation error: ${formatZodError(parsed.error)}`,
+    });
+  }
+
+  if (parsed.data.execute === true) {
+    const input = parsed.data;
+    const body: RunBodyOptions = { trustTier, gatewayAdapters, requestContext };
+    // #3732: async dispatch — execute:true routes to the heaviest engines,
+    // which can exceed the MCP request timeout even with the class guard
+    // (#3734). `run` has no sessionId: a fresh `rn-<uuid>` jobId is minted.
+    if (input.dispatch === 'async') {
+      return runAsJob<RunInput, ToolResult>({
+        toolName: 'run',
+        input,
+        freshJobId: () => `rn-${randomUUID()}`,
+        // #5393 / #6305: arity 3 — every wired strategy executor hands the
+        // signal to its engine. #6162: heartbeats by jobId.
+        run: (jobId, _input, signal) =>
+          executeRunBodyOrThrow(input, logger, {
+            ...body,
+            signal,
+            onProgress: () => {
+              heartbeatJob(jobId);
+            },
+          }),
+        logger,
+      });
+    }
+    return executeRunBody(input, logger, body);
+  }
+
+  const response = routeGoal(parsed.data, logger);
+  logger.info('run: routed goal', {
+    decisionId: response.decisionId,
+    strategy: response.strategy,
+    recommendedTool: response.recommendedTool,
+  });
+  return toolSuccess(JSON.stringify(response, null, 2));
+}
+
+const DESCRIPTION =
+  'DEFAULT ENTRY POINT: give a goal and nexus-agents picks the right strategy ' +
+  '(single-shot / dev-pipeline / pipeline / graph-workflow / orchestrate / consensus / ' +
+  'spec / research) via the MetaOrchestrator. Default (execute:false) is read-only — ' +
+  'returns the routing decision + recommendedTool. With execute:true it runs the selected ' +
+  'strategy inline (currently wired: dev-pipeline, pipeline, research, consensus; others fail closed ' +
+  'with a typed error) and returns the engine result, recording the outcome. Use forceStrategy to override. ' +
+  'Prefer this over choosing a pipeline tool by hand — the specialized tools remain ' +
+  'available as advanced force-strategy paths.';
+
+/** Deps for the `run` tool — adds the in-process gateway adapters (#4042). */
+export interface RunToolDeps extends BaseMcpToolDeps {
+  gatewayAdapters?: readonly IModelAdapter[] | undefined;
+}
+
+/** @category MCP */
+export function registerRunTool(server: McpServer, deps: RunToolDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'run' });
+
+  // 2-arg context-aware form (mirrors delegate-to-model.ts / run_dev_pipeline):
+  // thread the caller's real RequestContext.trustTier so the run→dev-pipeline
+  // consensus→execute seam sees the real tier (#3712) — this closes the hole
+  // where a possibly-untrusted goal ran a real research stage with no tier.
+  const secureHandler = createSecureHandler(
+    (args: unknown, ctx: HandlerContext) =>
+      runHandler(
+        args,
+        logger,
+        // #6795: the MEASURED caller tier. The raw field is a '3' fallback when
+        // nothing was measured, which the gate record would report as a tier;
+        // undefined keeps it unmeasured and the seam fail-closes to 4.
+        measuredTrustTier(ctx.requestContext),
+        deps.gatewayAdapters,
+        ctx.requestContext
+      ),
+    {
+      toolName: 'run',
+      rateLimiter: deps.rateLimiter,
+      logger,
+    }
+  );
+
+  const timeoutMs = getToolTimeout('run', deps.security);
+  const wrappedHandler = wrapToolWithTimeout('run', secureHandler, { timeoutMs, logger });
+
+  const annotations = getMcpAnnotations('run');
+  server.registerTool(
+    'run',
+    {
+      description: DESCRIPTION,
+      inputSchema: RunInputSchema.shape,
+      ...(annotations !== undefined ? { annotations } : {}),
+    },
+    toSdkCallback(wrappedHandler)
+  );
+  logger.info('Registered run tool (unified adaptive entry point)');
+}
