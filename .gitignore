@@ -1,0 +1,135 @@
+# Security discovery log (private, never committed)
+.security-discoveries.jsonl
+.security-discoveries.jsonl.*
+
+# Dependencies
+node_modules
+.pnpm-store/
+
+# Build outputs
+dist/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.local.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Turbo
+.turbo/
+
+# Generated docs - now committed for CI drift detection (Epic #261)
+# docs/api/ - TypeDoc output committed
+# **/docs/api/ - removed to allow package-level TypeDoc
+
+# Cache
+.cache/
+.eslintcache
+
+# OS
+Thumbs.db
+
+# Secrets (never commit)
+*.pem
+*.key
+
+# Consensus vote artifacts (ephemeral — outcomes recorded to store)
+.claude/vote-results/
+vote_result.json
+credentials.json
+secrets.json
+.claude-flow/
+.swarm/
+packages/nexus-agents/coverage.json
+
+# User-specific configuration
+.mcp.json
+# Browser-tool console logs (15 files / 1.6MB and growing). Untracked and
+# unignored, so a `git add -A` sweeps them into a commit — which has already
+# happened once in this repo with stray scratch files, caught only by the
+# Orphan Detection gate.
+.playwright-mcp/
+nexus-agents.yaml
+opencode.json
+.claude/settings.local.json
+
+# Generated artifacts
+repomix-output.xml
+report.html
+predictions.jsonl
+
+# Runtime outputs (execution traces, delegation logs)
+runs/
+
+# Local development configs (not project config)
+docker-compose.opencode.yml
+opencode.json
+nexus-agents.yaml
+
+# Separate projects cloned into root (not part of this repo)
+adversary-lab/
+cap-citation-pipeline/
+repo-health-report/
+tsundoku/
+.doc-review-cursor
+.claude/scheduled_tasks.lock
+
+# Ephemeral worktrees from agent runs
+.claude/worktrees/
+.nexus-agents/
+
+# Per-machine generated research reports (#2893 / 4bf99884dd) — local
+# diagnostic outputs from #2631 telemetry scripts, not project research.
+# Pinned by name so legitimate docs/research/ entries stay tracked.
+docs/research/timeout-mismatch-v1.md
+docs/research/nexus-agents-multi-harness-alignment-audit.md
+release-stall-body.md
+
+# Generated TypeDoc output — derived from source, produced at build/publish time (#4449)
+docs/api/
+packages/nexus-agents/docs/api/
+
+# Ad-hoc probe scripts. A subagent wrote scratch.js/scratch2.js into the repo
+# root during a verification run and `git add -A` committed them (#4770); the
+# Orphan Detection gate caught it. Temp files belong in the scratchpad dir, but
+# ignoring the pattern removes the trap.
+scratch*.js
+scratch*.ts
+
+# Regenerated on demand by `nexus-agents index generate|diagram` (#4790).
+# Not tracked: an 88k-line snapshot with no consumer drifted 6 months unnoticed,
+# and `index diagram` writes it as a side effect — untracked it would otherwise
+# dirty every working tree that runs the command.
+**/docs/codebase-index.yaml
+
+# Regenerated on demand by `nexus-agents index entrypoints` (#4810, same
+# disposition as codebase-index.yaml above). Two committed manifests of the
+# same fact disagreed by an order of magnitude — entrypoints.json reported 4
+# MCP tools and 9 CLI commands (last generated 2026-01-13), entrypoints.yaml
+# reported 45 and 52, against ~47 real tools — and NOTHING read either. The
+# only in-tree reference was the generator's own output path.
+docs/.generated/entrypoints.json
+docs/.generated/entrypoints.yaml
+# The generator's cwd-relative default. This repo's canonical, docs-linked graph
+# is docs/architecture/dependency-graph.md, produced with an explicit --output
+# (#4799); anything written to the default path here is a stray local run.
+**/packages/nexus-agents/docs/dependency-graph.md
+
+# Publish staging directory with bundled dependencies (#6481, scripts/stage-publish.ts)
+packages/nexus-agents/.publish-stage/

@@ -1,0 +1,129 @@
+/**
+ * Tests for learning-metrics-logic.ts
+ *
+ * Covers aggregateModelStats, computeBanditProgress, computeRewardTrend,
+ * computeFeedbackLoopStats, computeSummary, and gatherLearningMetrics.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { gatherLearningMetrics } from './learning-metrics-logic.js';
+import { FixedTimeProvider, setTimeProvider, resetTimeProvider } from '../core/index.js';
+
+// ============================================================================
+// Setup
+// ============================================================================
+
+const FIXED_TIME = 1700000000000;
+
+beforeEach(() => {
+  setTimeProvider(new FixedTimeProvider(FIXED_TIME));
+});
+
+afterEach(() => {
+  resetTimeProvider();
+});
+
+// ============================================================================
+// gatherLearningMetrics - with no data sources
+// ============================================================================
+
+describe('gatherLearningMetrics', () => {
+  it('returns valid result with all undefined sources', () => {
+    const result = gatherLearningMetrics(undefined, undefined, undefined, {
+      period: 24,
+      format: 'ascii',
+      banditStats: false,
+      showTrends: true,
+    });
+    expect(result.periodHours).toBe(24);
+    expect(result.timestamp).toBeDefined();
+    expect(result.models).toEqual([]);
+    expect(result.banditProgress.totalPulls).toBe(0);
+    expect(result.feedbackLoop.totalDecisions).toBe(0);
+  });
+
+  it('marks legacy reward trend placeholders as unmeasured with no metrics', () => {
+    const result = gatherLearningMetrics(undefined, undefined, undefined, {
+      period: 1,
+      format: 'ascii',
+      banditStats: false,
+      showTrends: true,
+    });
+    // Previously asserted 'stable' over no observations (#7242).
+    expect(result.rewardTrend).toMatchObject({ sampleCount: 0, measurementStatus: 'unmeasured' });
+  });
+
+  it('summary reports unmeasured when no bandit is supplied', () => {
+    // Was named "shows exploring status for high exploration ratio" and
+    // asserted 'exploiting', with a comment explaining the mechanism:
+    // "When all sources undefined, exploration ratio is 0 → exploiting".
+    // That documented the #5267 defect and pinned it as intended behaviour —
+    // a green ✓ asserting convergence over a bandit never consulted.
+    const result = gatherLearningMetrics(undefined, undefined, undefined, {
+      period: 24,
+      format: 'ascii',
+      banditStats: false,
+      showTrends: true,
+    });
+    expect(result.summary.learningStatus).toBe('unmeasured');
+  });
+
+  // #5267: this asserted exactly the fabrication — five entries, the first at
+  // importance 0 — as the specified behaviour for "no bandit stats". Five green
+  // ↑ arrows over an unconsulted bandit is what it was protecting.
+  it('reports no feature importance when there are no bandit stats', () => {
+    const result = gatherLearningMetrics(undefined, undefined, undefined, {
+      period: 24,
+      format: 'ascii',
+      banditStats: false,
+      showTrends: true,
+    });
+    expect(result.banditProgress.topFeatures).toEqual([]);
+  });
+
+  // #4875: a sibling flag, so a --json consumer can tell the intercept weight
+  // from a signal without the existing `topFeatures` shape changing.
+  it('flags timePressure as an intercept feature for JSON consumers', () => {
+    const result = gatherLearningMetrics(undefined, undefined, undefined, {
+      period: 24,
+      format: 'json',
+      banditStats: false,
+      showTrends: true,
+    });
+    expect(result.banditProgress.interceptFeatures).toEqual(['timePressure']);
+  });
+
+  it('computes correlation rate as 0 when no decisions', () => {
+    const result = gatherLearningMetrics(undefined, undefined, undefined, {
+      period: 24,
+      format: 'ascii',
+      banditStats: false,
+      showTrends: true,
+    });
+    expect(result.feedbackLoop.correlationRate).toBe(0);
+  });
+
+  it('uses period from options', () => {
+    const result = gatherLearningMetrics(undefined, undefined, undefined, {
+      period: 168,
+      format: 'ascii',
+      banditStats: false,
+      showTrends: true,
+    });
+    expect(result.periodHours).toBe(168);
+  });
+
+  it('returns zero outcome distribution with no feedback', () => {
+    const result = gatherLearningMetrics(undefined, undefined, undefined, {
+      period: 24,
+      format: 'ascii',
+      banditStats: false,
+      showTrends: true,
+    });
+    expect(result.feedbackLoop.outcomeDistribution).toEqual({
+      success: 0,
+      partial: 0,
+      failure: 0,
+    });
+  });
+});

@@ -1,0 +1,987 @@
+/**
+ * nexus-agents/mcp - Orchestrate Tool Tests
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { resetNexusDataDirCache } from '../../config/nexus-data-dir.js';
+import type { Result, ILogger, Task, TaskResult } from '../../core/index.js';
+import { ok, err, AgentError } from '../../core/index.js';
+import { RateLimiter } from '../middleware/index.js';
+import {
+  OrchestrateInputSchema,
+  OrchestrateOutputSchema,
+  OrchestrationError,
+  createMockOrchestrator,
+  createTaskFromInput,
+  mapPatternToOrchestratorType,
+  registerOrchestrateTool,
+  type OrchestrateDeps,
+  type OrchestrateInput,
+} from './orchestrate.js';
+
+/** Minimal mock-orchestrator type used within this test file. */
+interface MockOrchestrator {
+  execute: (
+    task: Task
+  ) => Promise<Result<{ taskId: string; output: unknown; metadata: unknown }, AgentError>>;
+}
+
+/**
+ * Creates a permissive rate limiter for tests.
+ */
+function createTestRateLimiter(): RateLimiter {
+  return new RateLimiter({
+    capacity: 1000,
+    refillRate: 1000,
+    refillIntervalMs: 1000,
+  });
+}
+
+/**
+ * Mock logger for testing.
+ */
+interface MockLogger extends ILogger {
+  debug: Mock;
+  info: Mock;
+  warn: Mock;
+  error: Mock;
+  child: Mock;
+  setLevel: Mock;
+}
+
+function createMockLogger(): MockLogger {
+  const mock: MockLogger = {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    child: vi.fn(),
+    setLevel: vi.fn(),
+  };
+  mock.child.mockReturnThis();
+  return mock;
+}
+
+/**
+ * Creates a mock Orchestrator that returns a custom result.
+ */
+function createCustomMockOrchestrator(
+  executeResult: Result<{ taskId: string; output: unknown; metadata: unknown }, AgentError>
+): MockOrchestrator {
+  return {
+    execute: vi.fn().mockResolvedValue(executeResult),
+  };
+}
+
+/**
+ * Creates successful execution result.
+ */
+function createSuccessResult(taskId: string): Result<TaskResult, AgentError> {
+  return ok({
+    taskId,
+    output: {
+      taskId,
+      analysis: {
+        taskId,
+        complexity: 5,
+        taskType: 'implementation',
+        requirements: ['Build feature X'],
+        risks: ['May take longer'],
+        needsDecomposition: true,
+        approach: 'Iterative development',
+        estimatedEffort: 8,
+      },
+      subtasks: [
+        {
+          id: 'sub-1',
+          parentTaskId: taskId,
+          description: 'Step 1',
+          expectedOutput: 'Output 1',
+          dependencies: [],
+          priority: 'high',
+          status: 'pending',
+          complexity: 3,
+          requiredCapabilities: ['code_generation'],
+        },
+        {
+          id: 'sub-2',
+          parentTaskId: taskId,
+          description: 'Step 2',
+          expectedOutput: 'Output 2',
+          dependencies: ['sub-1'],
+          priority: 'medium',
+          status: 'pending',
+          complexity: 4,
+          requiredCapabilities: ['testing'],
+        },
+      ],
+      assignments: [
+        {
+          subtaskId: 'sub-1',
+          expertRole: 'code_expert',
+          selectionReason: 'Best match for code generation',
+          confidence: 0.9,
+        },
+        {
+          subtaskId: 'sub-2',
+          expertRole: 'testing_expert',
+          selectionReason: 'Best match for testing',
+          confidence: 0.85,
+        },
+      ],
+      parallelGroups: [['sub-1'], ['sub-2']],
+      estimatedDuration: 120,
+    },
+    metadata: {
+      durationMs: 150,
+      tokensUsed: 500,
+      toolsUsed: [],
+      model: 'test-model',
+    },
+  });
+}
+
+describe('OrchestrateInputSchema', () => {
+  it('should validate valid input with all fields', () => {
+    const input = {
+      task: 'Implement user authentication',
+      context: { framework: 'express', language: 'typescript' },
+      maxIterations: 20,
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.task).toBe('Implement user authentication');
+      expect(result.data.context).toEqual({ framework: 'express', language: 'typescript' });
+      expect(result.data.maxIterations).toBe(20);
+    }
+  });
+
+  it('should validate input with only required fields', () => {
+    const input = {
+      task: 'Simple task',
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.task).toBe('Simple task');
+      expect(result.data.maxIterations).toBe(10); // default
+    }
+  });
+
+  it('should reject empty task', () => {
+    const input = {
+      task: '',
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.path).toContain('task');
+    }
+  });
+
+  // #3042 / epic #2631: async-mode dispatch.
+  it('accepts dispatch: "async" (#3042)', () => {
+    const result = OrchestrateInputSchema.safeParse({
+      task: 'long-running task',
+      dispatch: 'async',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.dispatch).toBe('async');
+    }
+  });
+
+  it('accepts dispatch: "sync" (#3042)', () => {
+    const result = OrchestrateInputSchema.safeParse({ task: 'quick task', dispatch: 'sync' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.dispatch).toBe('sync');
+    }
+  });
+
+  it('leaves dispatch undefined when omitted — backward-compat invariant (#3042)', () => {
+    const result = OrchestrateInputSchema.safeParse({ task: 'legacy caller' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      // The handler treats undefined as 'sync', but the SCHEMA itself
+      // doesn't apply a default — that would change the inferred type
+      // and force `dispatch: 'sync'` on every existing test fixture.
+      expect(result.data.dispatch).toBeUndefined();
+    }
+  });
+
+  it('rejects unknown dispatch value (#3042)', () => {
+    const result = OrchestrateInputSchema.safeParse({ task: 'x', dispatch: 'fire-and-forget' });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject maxIterations below minimum', () => {
+    const input = {
+      task: 'Valid task',
+      maxIterations: 0,
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.path).toContain('maxIterations');
+    }
+  });
+
+  it('should reject maxIterations above maximum', () => {
+    const input = {
+      task: 'Valid task',
+      maxIterations: 51,
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.path).toContain('maxIterations');
+    }
+  });
+
+  it('should accept maxIterations at boundaries', () => {
+    const inputMin = { task: 'Task', maxIterations: 1 };
+    const inputMax = { task: 'Task', maxIterations: 50 };
+
+    expect(OrchestrateInputSchema.safeParse(inputMin).success).toBe(true);
+    expect(OrchestrateInputSchema.safeParse(inputMax).success).toBe(true);
+  });
+
+  it('should allow undefined context', () => {
+    const input = {
+      task: 'Task without context',
+      maxIterations: 5,
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.context).toBeUndefined();
+    }
+  });
+
+  it('should accept complex context objects', () => {
+    const input = {
+      task: 'Complex task',
+      context: {
+        nested: { deep: { value: 123 } },
+        array: [1, 2, 3],
+        mixed: ['string', 42, { key: 'value' }],
+      },
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('OrchestrateOutputSchema', () => {
+  it('should validate valid output', () => {
+    const output = {
+      taskId: 'orch-abc123',
+      analysis: {
+        taskId: 'orch-abc123',
+        complexity: 5,
+        taskType: 'implementation',
+        requirements: ['Req 1', 'Req 2'],
+        risks: ['Risk 1'],
+        needsDecomposition: true,
+        approach: 'Iterative',
+        estimatedEffort: 8,
+      },
+      result: { data: 'test' },
+      stepsCompleted: 3,
+      metadata: {
+        durationMs: 1500,
+        tokensUsed: 500,
+        expertsUsed: ['code_expert', 'testing_expert'],
+      },
+    };
+
+    const result = OrchestrateOutputSchema.safeParse(output);
+
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts tokensMeasured so an uncounted run is distinguishable (#4829)', () => {
+    // The orchestrator adapters hardcode 0 because no usage metadata reaches
+    // that seam. Without this field a client cannot tell "spent nothing" from
+    // "nobody counted", and 0 under-counts in the dangerous direction for
+    // anything cap-shaped.
+    const output = {
+      taskId: 'orch-abc123',
+      analysis: {
+        taskId: 'orch-abc123',
+        complexity: 5,
+        taskType: 'implementation',
+        requirements: [],
+        risks: [],
+        needsDecomposition: false,
+        approach: 'Direct',
+        estimatedEffort: 1,
+      },
+      result: null,
+      stepsCompleted: 1,
+      metadata: { durationMs: 100, tokensUsed: 0, tokensMeasured: false, expertsUsed: [] },
+    };
+
+    const parsed = OrchestrateOutputSchema.safeParse(output);
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.metadata.tokensMeasured).toBe(false);
+    }
+  });
+
+  it('should reject invalid complexity range', () => {
+    const output = {
+      taskId: 'orch-abc123',
+      analysis: {
+        taskId: 'orch-abc123',
+        complexity: 15, // Invalid: > 10
+        taskType: 'implementation',
+        requirements: [],
+        risks: [],
+        needsDecomposition: false,
+        approach: 'Direct',
+        estimatedEffort: 1,
+      },
+      result: null,
+      stepsCompleted: 0,
+      metadata: {
+        durationMs: 100,
+        tokensUsed: 0,
+        expertsUsed: [],
+      },
+    };
+
+    const result = OrchestrateOutputSchema.safeParse(output);
+
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('OrchestrationError', () => {
+  it('should create error with message', () => {
+    const error = new OrchestrationError('Test error');
+
+    expect(error.message).toBe('Test error');
+    expect(error.name).toBe('OrchestrationError');
+    expect(error).toBeInstanceOf(AgentError);
+  });
+
+  it('should include cause and context', () => {
+    const cause = new Error('Root cause');
+    const error = new OrchestrationError('Wrapped error', {
+      cause,
+      context: { taskId: 'test-123' },
+    });
+
+    expect(error.cause).toBe(cause);
+    expect(error.context).toEqual({ taskId: 'test-123' });
+  });
+});
+
+describe('createMockOrchestrator', () => {
+  it('should create a functional mock', async () => {
+    const mockOrch = createMockOrchestrator();
+    const task: Task = {
+      id: 'test-task',
+      description: 'Test task description',
+      context: {},
+    };
+
+    const result = await mockOrch.execute({ type: 'task', task }, {});
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.executionId).toBeDefined();
+      expect(result.value.output).toBeDefined();
+      expect(result.value.orchestratorType).toBe('orchestrator');
+    }
+  });
+
+  it('should calculate complexity based on description length', async () => {
+    const mockOrch = createMockOrchestrator();
+
+    const shortTask: Task = {
+      id: 'short',
+      description: 'Short task',
+      context: {},
+    };
+
+    const longTask: Task = {
+      id: 'long',
+      description: 'A'.repeat(500), // Very long description
+      context: {},
+    };
+
+    const shortResult = await mockOrch.execute({ type: 'task', task: shortTask }, {});
+    const longResult = await mockOrch.execute({ type: 'task', task: longTask }, {});
+
+    expect(shortResult.ok && longResult.ok).toBe(true);
+
+    if (shortResult.ok && longResult.ok) {
+      // The mock tech lead output is nested inside the OrchestratorResult.output
+      type MockOutput = { output: { analysis: { complexity: number } } };
+      const shortAnalysis = shortResult.value.output as MockOutput;
+      const longAnalysis = longResult.value.output as MockOutput;
+
+      expect(longAnalysis.output.analysis.complexity).toBeGreaterThanOrEqual(
+        shortAnalysis.output.analysis.complexity
+      );
+    }
+  });
+
+  it('should set needsDecomposition for complex tasks', async () => {
+    const mockOrch = createMockOrchestrator();
+    const complexTask: Task = {
+      id: 'complex',
+      description: 'A'.repeat(300), // Long enough to trigger high complexity
+      context: {},
+    };
+
+    const result = await mockOrch.execute({ type: 'task', task: complexTask }, {});
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // The mock tech lead output is nested inside the OrchestratorResult.output
+      type MockOutput = {
+        output: { analysis: { needsDecomposition: boolean; complexity: number } };
+      };
+      const output = result.value.output as MockOutput;
+
+      // Complexity > 5 should trigger decomposition
+      if (output.output.analysis.complexity > 5) {
+        expect(output.output.analysis.needsDecomposition).toBe(true);
+      }
+    }
+  });
+});
+
+describe('Orchestration Logic', () => {
+  let mockLogger: MockLogger;
+  let mockOrchestrator: MockOrchestrator & { execute: Mock };
+  let deps: OrchestrateDeps;
+
+  beforeEach(() => {
+    mockLogger = createMockLogger();
+    mockOrchestrator = createCustomMockOrchestrator(
+      createSuccessResult('test-task')
+    ) as MockOrchestrator & { execute: Mock };
+    const orchestratorInstance = mockOrchestrator as unknown as NonNullable<
+      OrchestrateDeps['orchestrator']
+    >;
+    deps = {
+      orchestrator: orchestratorInstance,
+      logger: mockLogger,
+      rateLimiter: createTestRateLimiter(),
+    };
+  });
+
+  it('should handle successful orchestration', async () => {
+    const input: OrchestrateInput = {
+      task: 'Implement user authentication',
+      maxIterations: 10,
+    };
+
+    // Execute through the mock
+    const task: Task = {
+      id: 'test-id',
+      description: input.task,
+      context: {},
+    };
+
+    // orchestrator is defined in this test via beforeEach
+    const orchestrator = deps.orchestrator as unknown as MockOrchestrator;
+    expect(orchestrator).toBeDefined();
+    const result = await orchestrator.execute(task);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.taskId).toBeDefined();
+
+      type OutputWithAnalysis = { analysis: { complexity: number; taskType: string } };
+      const output = result.value.output as OutputWithAnalysis;
+
+      expect(output.analysis.complexity).toBe(5);
+      expect(output.analysis.taskType).toBe('implementation');
+    }
+  });
+
+  it('should handle Orchestrator execution failure', async () => {
+    const failingOrchestrator = createCustomMockOrchestrator(
+      err(new AgentError('Model rate limited'))
+    );
+
+    const task: Task = {
+      id: 'failing-task',
+      description: 'This will fail',
+      context: {},
+    };
+
+    const result = await failingOrchestrator.execute(task);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.message).toBe('Model rate limited');
+    }
+  });
+
+  it('should extract experts from assignments', async () => {
+    const result = await mockOrchestrator.execute({
+      id: 'test',
+      description: 'Test',
+      context: {},
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      type OutputWithAssignments = { assignments: Array<{ expertRole: string }> };
+      const output = result.value.output as OutputWithAssignments;
+
+      expect(output.assignments).toHaveLength(2);
+      expect(output.assignments[0]?.expertRole).toBe('code_expert');
+      expect(output.assignments[1]?.expertRole).toBe('testing_expert');
+    }
+  });
+
+  it('should count subtasks as steps completed', async () => {
+    const result = await mockOrchestrator.execute({
+      id: 'test',
+      description: 'Test',
+      context: {},
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      type OutputWithSubtasks = { subtasks: unknown[] };
+      const output = result.value.output as OutputWithSubtasks;
+
+      expect(output.subtasks).toHaveLength(2);
+    }
+  });
+
+  it('should log orchestration start and completion', async () => {
+    await mockOrchestrator.execute({
+      id: 'test',
+      description: 'Test task',
+      context: {},
+    });
+
+    // The mock Orchestrator doesn't log, but we verify it was called
+    expect(mockOrchestrator.execute).toHaveBeenCalled();
+  });
+
+  it('should handle context being passed through', () => {
+    const input: OrchestrateInput = {
+      task: 'Task with context',
+      context: { key: 'value', number: 42 },
+      maxIterations: 5,
+    };
+
+    // When context is defined, it should be set as metadata
+    const contextData = input.context;
+    expect(contextData).toBeDefined();
+    expect(contextData).toEqual({ key: 'value', number: 42 });
+  });
+});
+
+describe('Edge Cases', () => {
+  it('should handle empty output from Orchestrator', async () => {
+    const emptyOrchestrator = createCustomMockOrchestrator(
+      ok({
+        taskId: 'empty-task',
+        output: {},
+        metadata: {},
+      })
+    );
+
+    const result = await emptyOrchestrator.execute({
+      id: 'empty-task',
+      description: 'Empty result task',
+      context: {},
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.output).toEqual({});
+    }
+  });
+
+  it('should handle null values in output', async () => {
+    const nullOrchestrator = createCustomMockOrchestrator(
+      ok({
+        taskId: 'null-task',
+        output: {
+          analysis: null,
+          subtasks: null,
+          assignments: null,
+        },
+        metadata: { tokensUsed: null },
+      })
+    );
+
+    const result = await nullOrchestrator.execute({
+      id: 'null-task',
+      description: 'Null values task',
+      context: {},
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it('should handle very long task descriptions', async () => {
+    const mockOrch = createMockOrchestrator();
+    const longDescription = 'A'.repeat(10000);
+
+    const result = await mockOrch.execute(
+      { type: 'task', task: { id: 'long-task', description: longDescription, context: {} } },
+      {}
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // The mock tech lead output is nested inside the OrchestratorResult.output
+      type MockOutput = { output: { analysis: { complexity: number } } };
+      const output = result.value.output as MockOutput;
+
+      // Complexity should be capped at 10
+      expect(output.output.analysis.complexity).toBeLessThanOrEqual(10);
+    }
+  });
+
+  it('should handle special characters in task description', async () => {
+    const mockOrch = createMockOrchestrator();
+    const specialChars = 'Task with "quotes", <tags>, & ampersands, newlines\n\t and tabs';
+
+    const result = await mockOrch.execute(
+      { type: 'task', task: { id: 'special-task', description: specialChars, context: {} } },
+      {}
+    );
+
+    expect(result.ok).toBe(true);
+  });
+
+  it('should handle unicode characters in context', () => {
+    const input = {
+      task: 'Unicode task',
+      context: {
+        emoji: '12345',
+        chinese: 'Chinese text',
+        arabic: 'Arabic text',
+      },
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('Input Validation Edge Cases', () => {
+  it('should reject non-string task', () => {
+    const input = {
+      task: 123,
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject non-number maxIterations', () => {
+    const input = {
+      task: 'Valid task',
+      maxIterations: 'ten',
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject non-object context', () => {
+    const input = {
+      task: 'Valid task',
+      context: 'not an object',
+    };
+
+    const result = OrchestrateInputSchema.safeParse(input);
+    expect(result.success).toBe(false);
+  });
+
+  it('should accept whitespace-only task (trimming is not enforced)', () => {
+    const input = {
+      task: '   ',
+    };
+
+    // Note: min(1) checks length, not trimmed length
+    const result = OrchestrateInputSchema.safeParse(input);
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('Workflow Routing Integration (Issue #846)', () => {
+  it('maps puppeteer pattern to puppeteer orchestrator type', () => {
+    expect(mapPatternToOrchestratorType('puppeteer')).toBe('puppeteer');
+  });
+
+  it('maps non-puppeteer patterns to tech_lead', () => {
+    expect(mapPatternToOrchestratorType('sequential')).toBe('orchestrator');
+    expect(mapPatternToOrchestratorType('wave')).toBe('orchestrator');
+    expect(mapPatternToOrchestratorType('graph')).toBe('orchestrator');
+    expect(mapPatternToOrchestratorType('consensus')).toBe('orchestrator');
+    expect(mapPatternToOrchestratorType('aflow')).toBe('orchestrator');
+  });
+
+  it('validates output with routing field', () => {
+    const output = {
+      taskId: 'orch-abc123',
+      analysis: {
+        taskId: 'orch-abc123',
+        complexity: 5,
+        taskType: 'implementation',
+        requirements: [],
+        risks: [],
+        needsDecomposition: false,
+        approach: 'Direct',
+        estimatedEffort: 1,
+      },
+      routing: {
+        pattern: 'sequential',
+        reasoning: 'Simple task — sequential execution',
+        confidence: 0.85,
+        orchestratorType: 'orchestrator',
+      },
+      result: null,
+      stepsCompleted: 1,
+      metadata: { durationMs: 100, tokensUsed: 0, expertsUsed: [] },
+    };
+    const result = OrchestrateOutputSchema.safeParse(output);
+    expect(result.success).toBe(true);
+  });
+
+  it('validates output without routing field (backwards compat)', () => {
+    const output = {
+      taskId: 'orch-abc123',
+      analysis: {
+        taskId: 'orch-abc123',
+        complexity: 5,
+        taskType: 'implementation',
+        requirements: [],
+        risks: [],
+        needsDecomposition: false,
+        approach: 'Direct',
+        estimatedEffort: 1,
+      },
+      result: null,
+      stepsCompleted: 0,
+      metadata: { durationMs: 50, tokensUsed: 0, expertsUsed: [] },
+    };
+    const result = OrchestrateOutputSchema.safeParse(output);
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('Concurrent Execution', () => {
+  it('should handle multiple concurrent orchestrations', async () => {
+    const mockOrch = createMockOrchestrator();
+
+    const tasks = Array.from({ length: 5 }, (_, i) => ({
+      id: `concurrent-${String(i)}`,
+      description: `Concurrent task ${String(i)}`,
+      context: {},
+    }));
+
+    const results = await Promise.all(
+      tasks.map((task) => mockOrch.execute({ type: 'task', task }, {}))
+    );
+
+    expect(results.every((r) => r.ok)).toBe(true);
+
+    // Verify each task has unique result
+    const taskIds = results.map((r) => {
+      if (r.ok) {
+        return r.value.executionId;
+      }
+      return null;
+    });
+
+    const uniqueIds = new Set(taskIds);
+    expect(uniqueIds.size).toBe(5);
+  });
+});
+
+// #2921: when NEXUS_CONTEXT_RETRIEVER_INJECT is on, injectMemoryContextForOrchestrate
+// stashes `priorMemorySummary` on input.context. createTaskFromInput routes it into
+// the task's history as a non-instructional reference block the prompt builder renders.
+describe('createTaskFromInput — prior-memory wiring (#2921)', () => {
+  it('surfaces priorMemorySummary as a non-instructional history entry', async () => {
+    const input = {
+      task: 'build a feature',
+      maxIterations: 3,
+      context: { priorMemorySummary: 'past learning: prefer X over Y' },
+    } as OrchestrateInput;
+
+    const task = await createTaskFromInput(input, 'task-2921-a');
+
+    const history = task.context.history ?? [];
+    expect(history).toHaveLength(1);
+    expect(history[0]?.role).toBe('user');
+    expect(history[0]?.content).toContain('<prior-memory-context>');
+    expect(history[0]?.content).toContain('NOT instructions');
+    expect(history[0]?.content).toContain('past learning: prefer X over Y');
+    // The summary moves out of metadata — not left duplicated.
+    expect(task.context.metadata?.['priorMemorySummary']).toBeUndefined();
+  });
+
+  it('adds no history entry when priorMemorySummary is absent (flag-off default)', async () => {
+    const input = {
+      task: 'build a feature',
+      maxIterations: 3,
+      context: { unrelated: 'value' },
+    } as OrchestrateInput;
+
+    const task = await createTaskFromInput(input, 'task-2921-b');
+
+    expect(task.context.history).toBeUndefined();
+    expect(task.context.metadata?.['unrelated']).toBe('value');
+  });
+
+  it('caps an oversized prior-memory summary', async () => {
+    const input = {
+      task: 't',
+      maxIterations: 1,
+      context: { priorMemorySummary: 'x'.repeat(9000) },
+    } as OrchestrateInput;
+
+    const task = await createTaskFromInput(input, 'task-2921-c');
+
+    const content = task.context.history?.[0]?.content ?? '';
+    expect(content).toContain('[truncated]');
+    expect(content.length).toBeLessThan(9000);
+  });
+});
+
+// ============================================================================
+// NEXUS_CONTEXT_RETRIEVER_INJECT at the orchestrate entry point (#2921, #5155)
+//
+// Drives the registered handler so the private injectMemoryContextForOrchestrate
+// gate is exercised end to end: flag on → the summary reaches the task the
+// orchestrator receives, as a prior-memory history entry. The gate read the
+// literal `1` only, so `true` was silently off (#5155).
+// ============================================================================
+
+describe('orchestrate handler — NEXUS_CONTEXT_RETRIEVER_INJECT accept-set (#5155)', () => {
+  type RegisteredCallback = (args: unknown) => Promise<unknown>;
+  const prevInject = process.env['NEXUS_CONTEXT_RETRIEVER_INJECT'];
+  const prevDataDir = process.env['NEXUS_DATA_DIR'];
+  let dataDir: string;
+  /** Spies installed by a test, restored in afterEach. */
+  const spies: { mockRestore(): void }[] = [];
+  const COMPLEX_TASK =
+    'Design and implement a distributed authentication service: OAuth2 login, ' +
+    'refresh-token rotation, per-tenant rate limiting, a tamper-evident audit log, ' +
+    'a zero-downtime migration of the existing user database across three regions, ' +
+    'integration tests for every failure mode, and a security review of the whole design.';
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'orchestrate-inject-'));
+    process.env['NEXUS_DATA_DIR'] = dataDir;
+    resetNexusDataDirCache();
+  });
+
+  afterEach(() => {
+    for (const spy of spies.splice(0)) spy.mockRestore();
+    if (prevInject === undefined) delete process.env['NEXUS_CONTEXT_RETRIEVER_INJECT'];
+    else process.env['NEXUS_CONTEXT_RETRIEVER_INJECT'] = prevInject;
+    if (prevDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = prevDataDir;
+    resetNexusDataDirCache();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  /** Runs the real handler with a stub orchestrator; returns the Task it received. */
+  async function taskSeenByOrchestrator(flagValue: string | undefined): Promise<Task> {
+    const retriever = await import('../../context/context-retriever.js');
+    // Empty-but-shaped: the handler's debug log reads `ctx.beliefs.length` etc.
+    // before the gate, so a bare `{}` would throw into the fail-soft catch and
+    // the flag-on case could never inject — the test would fail for the wrong
+    // reason. The summary itself comes from the mocked summarizer below.
+    spies.push(
+      vi.spyOn(retriever, 'getContextForTask').mockResolvedValue({
+        beliefs: [],
+        similarMemories: [],
+        recentLearnings: [],
+        experiencePatterns: [],
+        outcomes: null,
+        priorStrategies: [],
+        researchInsights: [],
+        rankedMemories: [],
+      }),
+      vi
+        .spyOn(retriever, 'summarizeContextForPrompt')
+        .mockReturnValue('### Beliefs\n- prior: prefer X over Y')
+    );
+    if (flagValue === undefined) delete process.env['NEXUS_CONTEXT_RETRIEVER_INJECT'];
+    else process.env['NEXUS_CONTEXT_RETRIEVER_INJECT'] = flagValue;
+
+    const orchestrator = createCustomMockOrchestrator(createSuccessResult('inject-task'));
+    let captured: RegisteredCallback | undefined;
+    const server = {
+      registerTool: vi.fn((_name: string, _config: unknown, cb: RegisteredCallback) => {
+        captured = cb;
+      }),
+    };
+    const notifier = { info: vi.fn(), debug: vi.fn(), warn: vi.fn() };
+    registerOrchestrateTool(server as never, {
+      orchestrator: orchestrator as unknown as NonNullable<OrchestrateDeps['orchestrator']>,
+      logger: createMockLogger(),
+      rateLimiter: createTestRateLimiter(),
+      notifier,
+    });
+    if (captured === undefined) throw new Error('handler was never registered');
+    // Non-trivial on purpose: a task the router classifies as `simple` takes
+    // the fast path and never reaches the orchestrator, so the injection would
+    // be unobservable (a control that certifies without measuring).
+    await captured({ task: COMPLEX_TASK, maxIterations: 1 });
+
+    const execute = orchestrator.execute as Mock;
+    expect(execute).toHaveBeenCalledTimes(1);
+    // The orchestrator receives an OrchestratorDefinition `{ type: 'task', task }`.
+    return (execute.mock.calls[0]?.[0] as { task: Task }).task;
+  }
+
+  function priorMemoryEntry(task: Task): string | undefined {
+    return task.context.history?.[0]?.content;
+  }
+
+  it('injects the summary when the flag is "true" (was silently off)', async () => {
+    const task = await taskSeenByOrchestrator('true');
+    expect(priorMemoryEntry(task)).toContain('prefer X over Y');
+  });
+
+  it('injects the summary for the original spelling "1"', async () => {
+    const task = await taskSeenByOrchestrator('1');
+    expect(priorMemoryEntry(task)).toContain('prefer X over Y');
+  });
+
+  it('does not inject when the flag is unset (default off)', async () => {
+    const task = await taskSeenByOrchestrator(undefined);
+    expect(priorMemoryEntry(task)).toBeUndefined();
+  });
+});

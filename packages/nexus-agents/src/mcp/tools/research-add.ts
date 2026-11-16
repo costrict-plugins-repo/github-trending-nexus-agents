@@ -1,0 +1,259 @@
+/**
+ * nexus-agents/mcp - Research Add Tool
+ *
+ * MCP tool for adding papers to the research registry.
+ * Wraps existing CLI helpers: addResearchPaper(), fetchArxivMetadataResult().
+ *
+ * @module mcp/tools/research-add
+ * (Source: Research System Enhancement - Phase 1B)
+ */
+
+import { z } from 'zod';
+import type { McpServer } from '../sdk-types.js';
+import type { ILogger } from '../../core/index.js';
+import { createLogger, formatZodError } from '../../core/index.js';
+
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import { withToolError } from '../middleware/tool-error-handler.js';
+import { addResearchPaper, paperExists } from '../../cli/research-helpers.js';
+import {
+  registerStructuredTool,
+  toolStructuredError,
+  structuredToolSuccess,
+  type ToolResult,
+  type BaseMcpToolDeps,
+} from './tool-result.js';
+import type { ErrorCategory } from '../error-envelope.js';
+import { getToolMemory } from './tool-memory.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+
+// Concrete shape returned by executeResearchAdd (#2340).
+const OUTPUT_SCHEMA = {
+  success: z.boolean(),
+  paperId: z.string().optional(),
+  title: z.string().optional(),
+  message: z.string(),
+  dryRun: z.boolean().optional(),
+};
+
+// =============================================================================
+// SCHEMAS
+// =============================================================================
+
+/**
+ * Input schema for research_add tool.
+ */
+export const ResearchAddInputSchema = z.object({
+  arxivId: z
+    .string()
+    .regex(/^\d{4}\.\d{4,5}$/, 'Invalid arXiv ID format (expected XXXX.XXXXX)')
+    .describe('arXiv paper ID (e.g., "2401.12345")'),
+  topic: z.string().optional().describe('Research topic to categorize the paper under'),
+  priority: z.enum(['P1', 'P2', 'P3', 'P4']).optional().describe('Priority level for the paper'),
+  dryRun: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe('Preview what would be added without persisting'),
+});
+
+/**
+ * Type for validated research add input.
+ */
+export type ResearchAddInput = z.infer<typeof ResearchAddInputSchema>;
+
+// =============================================================================
+// DEPS
+// =============================================================================
+
+/**
+ * Dependencies for research_add tool.
+ */
+export type ResearchAddDeps = BaseMcpToolDeps;
+
+// =============================================================================
+// RESPONSE
+// =============================================================================
+
+/**
+ * Response from research_add tool.
+ */
+export interface ResearchAddResponse {
+  /** Whether the operation succeeded */
+  success: boolean;
+  /** Paper ID */
+  paperId: string;
+  /** Paper title (empty on failure) */
+  title: string;
+  /** Human-readable message */
+  message: string;
+  /** Whether this was a dry run */
+  dryRun: boolean;
+  /**
+   * Error category when `success` is false (#2649). `business` for a
+   * dedup hit (paper already in registry); absent otherwise — the MCP
+   * handler treats absent as `internal`.
+   */
+  errorCategory?: ErrorCategory;
+}
+
+// =============================================================================
+// HANDLER
+// =============================================================================
+
+/**
+ * Executes the research add operation.
+ *
+ * Shared core for both the MCP `research_add` tool and the CLI
+ * `research add` subcommand (#2640 Phase 1). Includes:
+ *   - Dedup check via `paperExists`
+ *   - arXiv metadata fetch + registry persist via `addResearchPaper`
+ *   - Session-memory recording on success (best-effort)
+ *   - Quality-tier annotation appended to the message
+ *
+ * Returns a structured `ResearchAddResponse` — callers render it
+ * however suits their context (MCP → `toolSuccessStructured`,
+ * CLI → pretty-printed text).
+ */
+export async function executeResearchAdd(
+  input: ResearchAddInput,
+  logger: ILogger
+): Promise<ResearchAddResponse> {
+  // Check for duplicates first
+  const exists = await paperExists(input.arxivId);
+  if (exists) {
+    return {
+      success: false,
+      paperId: `arxiv-${input.arxivId}`,
+      title: '',
+      message: `Paper arxiv-${input.arxivId} already exists in registry`,
+      dryRun: input.dryRun,
+      errorCategory: 'business',
+    };
+  }
+
+  const result = await addResearchPaper({
+    arxivId: input.arxivId,
+    topic: input.topic,
+    priority: input.priority,
+    dryRun: input.dryRun,
+  });
+
+  // Record learning in session memory on success (auto-catalog hook)
+  if (result.success && !input.dryRun) {
+    try {
+      const memory = getToolMemory(logger);
+      memory.recordLearning({
+        pattern: `Added paper: ${result.title} (${result.paperId})`,
+        context: `topic=${input.topic ?? 'general'}, priority=${input.priority ?? 'unset'}`,
+        confidence: 0.9,
+        source: 'research_add',
+      });
+    } catch {
+      logger.debug('Failed to record learning in session memory');
+    }
+  }
+
+  // Quality gate: warn about evidence tier for new papers
+  const qualityNote =
+    result.success && !input.dryRun
+      ? ' [evidence_tier=low — arXiv preprint, no citation data yet. Run backfill-research-quality.ts to enrich.]'
+      : '';
+
+  return {
+    success: result.success,
+    paperId: result.paperId,
+    title: result.title,
+    message: `${result.message}${qualityNote}`,
+    dryRun: result.dryRun,
+  };
+}
+
+// =============================================================================
+// MCP TOOL
+// =============================================================================
+
+/**
+ * Creates the core handler logic for research_add tool.
+ */
+function createResearchAddHandler(deps: ResearchAddDeps) {
+  return async (args: unknown, ctx: HandlerContext): Promise<ToolResult> => {
+    const validationResult = ResearchAddInputSchema.safeParse(args);
+    if (!validationResult.success) {
+      return toolStructuredError({
+        errorCategory: 'validation',
+        message: `Validation error: ${formatZodError(validationResult.error)}`,
+      });
+    }
+
+    ctx.logger.debug('Adding research paper', { arxivId: validationResult.data.arxivId });
+
+    const logger = deps.logger ?? createLogger({ tool: 'research_add' });
+    return withToolError('Failed to add paper', logger, async () => {
+      const result = await executeResearchAdd(validationResult.data, logger);
+
+      if (!result.success) {
+        return toolStructuredError({
+          errorCategory: result.errorCategory ?? 'internal',
+          message: result.message,
+        });
+      }
+
+      const { errorCategory: _errorCategory, ...data } = result;
+      return structuredToolSuccess(z.object(OUTPUT_SCHEMA), data);
+    });
+  };
+}
+
+/**
+ * Registers the research_add tool with the MCP server.
+ *
+ * @category MCP
+ * @param server - MCP server instance
+ * @param deps - Tool dependencies
+ */
+export function registerResearchAddTool(server: McpServer, deps: ResearchAddDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'research_add' });
+  const toolSchema = {
+    arxivId: z
+      .string()
+      .regex(/^\d{4}\.\d{4,5}$/)
+      .describe('arXiv paper ID (e.g., "2401.12345")'),
+    topic: z.string().optional().describe('Research topic to categorize the paper under'),
+    priority: z.enum(['P1', 'P2', 'P3', 'P4']).optional().describe('Priority level'),
+    dryRun: z.boolean().optional().default(false).describe('Preview without persisting'),
+  };
+
+  const description =
+    'PAPER-only: add an arXiv preprint to the research registry by arXiv ID. ' +
+    'Fetches metadata from arxiv.org and persists to the registry. ' +
+    'For non-paper sources (GitHub repos, tools, blogs) use `research_add_source` instead. ' +
+    'Use dryRun=true to preview without saving.';
+
+  const secureHandler = createSecureHandler(createResearchAddHandler(deps), {
+    toolName: 'research_add',
+    securityTier: 'external',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const timeoutMs = getToolTimeout('research_add', deps.security);
+  const wrappedHandler = wrapToolWithTimeout('research_add', secureHandler, {
+    timeoutMs,
+    logger,
+  });
+
+  registerStructuredTool(
+    server,
+    'research_add',
+    {
+      description,
+      inputSchema: toolSchema,
+      outputSchema: OUTPUT_SCHEMA,
+      annotations: getToolAnnotations('research_add'),
+    },
+    toSdkCallback(wrappedHandler)
+  );
+  logger.info('Registered research_add tool with secure handler and timeout protection');
+}

@@ -1,0 +1,764 @@
+/**
+ * CLI Command Handlers Integration Tests
+ *
+ * Tests for the config command routing in cli-commands-handlers.ts.
+ * (Source: Issue #378)
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
+import type { ParsedCliArgs } from './cli-types.js';
+import type { ServerMode } from './cli/index.js';
+
+// Mock process.exit to prevent actual exit during tests
+const mockExit = vi.fn();
+vi.stubGlobal('process', {
+  ...process,
+  exit: mockExit,
+  stdout: {
+    write: vi.fn(),
+  },
+});
+
+// Mock configCommand and configInitCommand
+vi.mock('./cli/index.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('./cli/index.js')>();
+  return {
+    ...original,
+    configCommand: vi.fn().mockResolvedValue(0),
+    configInitCommand: vi.fn().mockResolvedValue(0),
+    // #3210: stub status-returning commands so we can assert the handler's
+    // CliExitResult maps the underlying 0|non-0 status to SUCCESS|SERVER_START_FAILED.
+    expertListCommand: vi.fn().mockReturnValue(0),
+    helloCommand: vi.fn().mockReturnValue(0),
+    researchCommand: vi.fn().mockResolvedValue({ text: 'ok', exitCode: 0 }),
+    voteCommand: vi.fn().mockResolvedValue(0),
+    doctorCommand: vi.fn().mockResolvedValue(0),
+    learningMetricsCommand: vi.fn().mockReturnValue(0),
+  };
+});
+
+vi.mock('./cli/doctor-live.js', () => ({
+  runLiveReadiness: vi.fn().mockResolvedValue([]),
+  formatLiveReadiness: vi.fn().mockReturnValue('no adapters configured'),
+}));
+
+import {
+  handleConfigCommand,
+  handleDoctorCommand,
+  handleExpertCommand,
+  handleHelloCommand,
+  handleLearningMetricsCommand,
+  handleResearchCommand,
+  handleUnimplementedCommand,
+  handleVoteCommand,
+} from './cli-commands-handlers.js';
+import {
+  configCommand,
+  configInitCommand,
+  doctorCommand,
+  expertListCommand,
+  helloCommand,
+  learningMetricsCommand,
+  researchCommand,
+  voteCommand,
+} from './cli/index.js';
+import { runLiveReadiness } from './cli/doctor-live.js';
+import { buildReadiness } from './cli/cli-readiness.js';
+import { printResearchUsage } from './cli-commands-usage.js';
+
+/**
+ * Creates a ParsedCliArgs object with default values.
+ * Uses omission pattern for optional properties to comply with exactOptionalPropertyTypes.
+ */
+function createMockArgs(overrides: Partial<ParsedCliArgs> = {}): ParsedCliArgs {
+  const baseOptions = {
+    help: false,
+    version: false,
+    verbose: false,
+    interactive: false,
+    all: false,
+    mode: 'server' as ServerMode,
+    force: false,
+    format: 'table',
+    dryRun: false,
+    banditStats: false,
+    setup: false,
+    skipChecks: false,
+    createIssue: false,
+    fix: false,
+    quick: false,
+    resume: false,
+    nonInteractive: false,
+    skipMcp: false,
+    skipRules: false,
+    skipHooks: false,
+    skipConfig: false,
+    skipOpencode: false,
+    skipCodex: false,
+    mock: false,
+    deep: false,
+    live: false,
+    gateway: false,
+    probe: false,
+  };
+
+  return {
+    command: 'config',
+    options: baseOptions,
+    positionals: ['config'],
+    ...overrides,
+  };
+}
+
+describe('handleDoctorCommand probe consent (#6814)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('passes --live to the doctor collector before running live readiness', async () => {
+    await handleDoctorCommand(
+      createMockArgs({
+        command: 'doctor',
+        positionals: ['doctor'],
+        options: { ...createMockArgs().options, live: true },
+      })
+    );
+
+    expect(doctorCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ live: true, skipClaudeModelProbe: true })
+    );
+  });
+});
+
+describe('doctor live exit status (#4376)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('does not run any completion probe for plain doctor', async () => {
+    const result = await handleDoctorCommand(createMockArgs({ command: 'doctor' }));
+    expect(result.exitCode).toBe(0);
+    expect(runLiveReadiness).not.toHaveBeenCalled();
+    expect(doctorCommand).toHaveBeenCalledWith(expect.objectContaining({ live: false }));
+  });
+
+  it('returns nonzero when a configured adapter fails to complete', async () => {
+    vi.mocked(runLiveReadiness).mockResolvedValueOnce([
+      buildReadiness('claude', {
+        installed: { status: 'verified' },
+        authenticated: { status: 'verified' },
+        serves: { status: 'failed', reason: 'Key limit exceeded' },
+      }),
+    ]);
+    const result = await handleDoctorCommand(
+      createMockArgs({ command: 'doctor', options: { ...createMockArgs().options, live: true } })
+    );
+    expect(result.exitCode).toBe(1);
+  });
+
+  it('preserves the local exit status when no adapters were configured', async () => {
+    vi.mocked(runLiveReadiness).mockResolvedValueOnce([]);
+    const result = await handleDoctorCommand(
+      createMockArgs({ command: 'doctor', options: { ...createMockArgs().options, live: true } })
+    );
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+describe('handleConfigCommand routing', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('init subcommand', () => {
+    it('routes to configInitCommand', async () => {
+      const args = createMockArgs({
+        subcommand: 'init',
+        positionals: ['config', 'init'],
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configInitCommand).toHaveBeenCalledWith({
+        force: false,
+      });
+      expect(configCommand).not.toHaveBeenCalled();
+    });
+
+    it('passes force option to configInitCommand', async () => {
+      const args = createMockArgs({
+        subcommand: 'init',
+        positionals: ['config', 'init'],
+        options: {
+          ...createMockArgs().options,
+          force: true,
+        },
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configInitCommand).toHaveBeenCalledWith({
+        force: true,
+      });
+    });
+
+    it('passes output option to configInitCommand', async () => {
+      const args = createMockArgs({
+        subcommand: 'init',
+        positionals: ['config', 'init'],
+        options: {
+          ...createMockArgs().options,
+          output: './custom-config.yaml',
+        },
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configInitCommand).toHaveBeenCalledWith({
+        force: false,
+        output: './custom-config.yaml',
+      });
+    });
+  });
+
+  describe('get subcommand', () => {
+    it('routes to configCommand with get action', async () => {
+      const args = createMockArgs({
+        subcommand: 'get',
+        positionals: ['config', 'get', 'TIMEOUT_DEFAULTS.cliMs'],
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'get',
+          key: 'TIMEOUT_DEFAULTS.cliMs',
+          format: 'json',
+        })
+      );
+    });
+  });
+
+  describe('set subcommand', () => {
+    it('routes to configCommand with set action', async () => {
+      const args = createMockArgs({
+        subcommand: 'set',
+        positionals: ['config', 'set', 'TIMEOUT_DEFAULTS.cliMs', '90000'],
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'set',
+          key: 'TIMEOUT_DEFAULTS.cliMs',
+          value: '90000',
+        })
+      );
+    });
+  });
+
+  describe('list subcommand', () => {
+    it('routes to configCommand with list action', async () => {
+      const args = createMockArgs({
+        subcommand: 'list',
+        positionals: ['config', 'list'],
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'list',
+        })
+      );
+    });
+
+    it('passes verbose option', async () => {
+      const args = createMockArgs({
+        subcommand: 'list',
+        positionals: ['config', 'list'],
+        options: {
+          ...createMockArgs().options,
+          verbose: true,
+        },
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'list',
+          verbose: true,
+        })
+      );
+    });
+  });
+
+  describe('reset subcommand', () => {
+    it('routes to configCommand with reset action for specific key', async () => {
+      const args = createMockArgs({
+        subcommand: 'reset',
+        positionals: ['config', 'reset', 'TIMEOUT_DEFAULTS.cliMs'],
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'reset',
+          key: 'TIMEOUT_DEFAULTS.cliMs',
+        })
+      );
+    });
+
+    it('routes to configCommand with reset action for all keys', async () => {
+      const args = createMockArgs({
+        subcommand: 'reset',
+        positionals: ['config', 'reset'],
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'reset',
+        })
+      );
+    });
+  });
+
+  describe('export subcommand', () => {
+    it('routes to configCommand with export action', async () => {
+      const args = createMockArgs({
+        subcommand: 'export',
+        positionals: ['config', 'export', './my-config.json'],
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'export',
+          file: './my-config.json',
+        })
+      );
+    });
+
+    it('passes yaml format option', async () => {
+      const args = createMockArgs({
+        subcommand: 'export',
+        positionals: ['config', 'export', './my-config.yaml'],
+        options: {
+          ...createMockArgs().options,
+          format: 'yaml',
+        },
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'export',
+          format: 'yaml',
+        })
+      );
+    });
+  });
+
+  describe('import subcommand', () => {
+    it('routes to configCommand with import action', async () => {
+      const args = createMockArgs({
+        subcommand: 'import',
+        positionals: ['config', 'import', './my-config.json'],
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'import',
+          file: './my-config.json',
+        })
+      );
+    });
+
+    it('passes force option', async () => {
+      const args = createMockArgs({
+        subcommand: 'import',
+        positionals: ['config', 'import', './my-config.json'],
+        options: {
+          ...createMockArgs().options,
+          force: true,
+        },
+      });
+
+      await handleConfigCommand(args);
+
+      expect(configCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'import',
+          force: true,
+        })
+      );
+    });
+  });
+
+  describe('unknown subcommand', () => {
+    it('prints error and exits with INVALID_ARGS for unknown subcommand', async () => {
+      const args = createMockArgs({
+        subcommand: 'unknown',
+        positionals: ['config', 'unknown'],
+      });
+
+      const result = await handleConfigCommand(args);
+
+      expect(process.stdout.write).toHaveBeenCalledWith(
+        expect.stringContaining("Unknown config subcommand: 'unknown'")
+      );
+      // #3210: handler RETURNS the exit code; the dispatcher owns process.exit.
+      expect(result).toEqual({ success: false, exitCode: 3 }); // EXIT_CODES.INVALID_ARGS
+      expect(configCommand).not.toHaveBeenCalled();
+    });
+
+    it('prints valid subcommands list', async () => {
+      const args = createMockArgs({
+        subcommand: 'invalid',
+        positionals: ['config', 'invalid'],
+      });
+
+      await handleConfigCommand(args);
+
+      expect(process.stdout.write).toHaveBeenCalledWith(
+        expect.stringContaining('Valid subcommands: init, get, set, list, reset, export, import')
+      );
+    });
+  });
+
+  describe('empty subcommand', () => {
+    it('treats empty subcommand as unknown', async () => {
+      // Omit subcommand entirely (not set to undefined) for exactOptionalPropertyTypes
+      const args = createMockArgs({
+        positionals: ['config'],
+      });
+
+      const result = await handleConfigCommand(args);
+
+      expect(process.stdout.write).toHaveBeenCalledWith(
+        expect.stringContaining("Unknown config subcommand: ''")
+      );
+      expect(result).toEqual({ success: false, exitCode: 3 });
+    });
+  });
+});
+
+// #3210: migrated handlers RETURN a CliExitResult instead of calling
+// process.exit. These tests prove the returned exitCode is identical to the
+// pre-refactor exit code on both a success and a failure path, without
+// asserting on real process.exit.
+describe('CliExitResult return contract (#3210)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('handleExpertCommand', () => {
+    it('returns SUCCESS (0) when expertListCommand reports 0', () => {
+      vi.mocked(expertListCommand).mockReturnValueOnce(0);
+      const args = createMockArgs({ command: 'expert', subcommand: 'list' });
+      expect(handleExpertCommand(args)).toEqual({ success: true, exitCode: 0 });
+    });
+
+    it('returns SERVER_START_FAILED (1) when expertListCommand reports non-zero', () => {
+      vi.mocked(expertListCommand).mockReturnValueOnce(1);
+      const args = createMockArgs({ command: 'expert', subcommand: 'list' });
+      expect(handleExpertCommand(args)).toEqual({ success: false, exitCode: 1 });
+    });
+
+    it('returns NOT_IMPLEMENTED (4) for an unimplemented subcommand', () => {
+      const args = createMockArgs({ command: 'expert', subcommand: 'create' });
+      expect(handleExpertCommand(args)).toEqual({ success: false, exitCode: 4 });
+    });
+  });
+
+  describe('handleHelloCommand', () => {
+    it('returns SUCCESS (0) when helloCommand reports 0', () => {
+      vi.mocked(helloCommand).mockReturnValueOnce(0);
+      expect(handleHelloCommand(createMockArgs({ command: 'hello' }))).toEqual({
+        success: true,
+        exitCode: 0,
+      });
+    });
+
+    it('returns SERVER_START_FAILED (1) when helloCommand reports non-zero', () => {
+      vi.mocked(helloCommand).mockReturnValueOnce(2);
+      expect(handleHelloCommand(createMockArgs({ command: 'hello' }))).toEqual({
+        success: false,
+        exitCode: 1,
+      });
+    });
+  });
+});
+
+// #3207: did-you-mean suggestions + tracking-issue link for unimplemented
+// (recognized-but-not-built) CLI subcommands. Writes to stderr; we spy on it
+// directly since the module-level process stub only mocks stdout.
+describe('handleUnimplementedCommand (#3207)', () => {
+  let stderrSpy: MockInstance;
+
+  beforeEach(() => {
+    stderrSpy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+  });
+
+  function stderrOutput(): string {
+    return stderrSpy.mock.calls.map((call: unknown[]) => String(call[0])).join('');
+  }
+
+  it('always reports the command is not implemented and points at the tracker', () => {
+    handleUnimplementedCommand('workflow bogus');
+    const out = stderrOutput();
+    expect(out).toContain("The 'workflow bogus' CLI subcommand is not yet implemented.");
+    expect(out).toContain('https://github.com/nexus-substrate/nexus-agents/issues');
+  });
+
+  it('suggests the closest implemented subcommand for a near-miss typo', () => {
+    // `lst` is one edit from `list` (an implemented workflow subcommand).
+    handleUnimplementedCommand('workflow lst');
+    expect(stderrOutput()).toContain('Did you mean: workflow list?');
+  });
+
+  it('suggests a workflow run typo', () => {
+    // `runn` is one edit from `run`; short 2-char inputs are intentionally
+    // below the suggester's relative-distance floor, so use a 4-char near-miss.
+    handleUnimplementedCommand('workflow runn');
+    expect(stderrOutput()).toContain('Did you mean: workflow run?');
+  });
+
+  it('does not emit a bogus suggestion when no implemented subcommand is close', () => {
+    // `create` is far from the only implemented expert subcommand (`list`).
+    handleUnimplementedCommand('expert create');
+    expect(stderrOutput()).not.toContain('Did you mean');
+  });
+
+  it('still names the equivalent MCP tool when one exists', () => {
+    handleUnimplementedCommand('expert create');
+    expect(stderrOutput()).toContain('create_expert');
+  });
+
+  it('does not suggest when the subcommand is empty', () => {
+    handleUnimplementedCommand('expert ');
+    expect(stderrOutput()).not.toContain('Did you mean');
+  });
+});
+
+// =============================================================================
+// The vote handler forwards every option it was given (#4963)
+// =============================================================================
+
+describe('handleVoteCommand forwards --option (#4963)', () => {
+  // This handler rebuilds `VoteCommandOptions` field by field, so any field it
+  // does not name is silently dropped. `--option` parsed correctly, reached
+  // `args.options.options`, and died here — with a `parseCliArgs` test on one
+  // side and a `voteCommand` test on the other, both green.
+  //
+  // Verified live before fixing: `nexus-agents vote --option A --option B`
+  // produced a record with `optionTally: null`, and a single `--option` did not
+  // trip the engine's `min(2)` validation, which proved the field never
+  // reached `ConsensusVoteInput`.
+  const voteMock = voteCommand as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    voteMock.mockClear();
+    voteMock.mockResolvedValue(0);
+  });
+
+  it('forwards --artifact-file to voteCommand (#7092)', async () => {
+    const base = createMockArgs();
+    await handleVoteCommand({
+      ...base,
+      command: 'vote',
+      options: { ...base.options, proposal: 'Ratify', artifactFile: 'resolution.diff' },
+      positionals: ['vote'],
+    });
+    expect(voteMock.mock.calls[0]?.[0]).toMatchObject({ artifactFile: 'resolution.diff' });
+  });
+
+  it('passes the declared alternatives to voteCommand', async () => {
+    const base = createMockArgs();
+    await handleVoteCommand({
+      ...base,
+      command: 'vote',
+      options: { ...base.options, proposal: 'pick one', options: ['A', 'B'] },
+      positionals: ['vote'],
+    });
+
+    expect(voteMock.mock.calls[0]?.[0]).toMatchObject({ options: ['A', 'B'] });
+  });
+
+  it('passes --timeout through as timeoutMs', async () => {
+    // #4965: same handler, same shape. Every vote today printed
+    // "timeout: 300s each" — the default — however the operator set it,
+    // because this field was never named here.
+    const base = createMockArgs();
+    await handleVoteCommand({
+      ...base,
+      command: 'vote',
+      options: { ...base.options, proposal: 'p', timeoutMs: 250_000 },
+      positionals: ['vote'],
+    });
+
+    expect(voteMock.mock.calls[0]?.[0]).toMatchObject({ timeoutMs: 250_000 });
+  });
+
+  it('omits timeoutMs when the operator did not set one', async () => {
+    // The pair: forwarding a default here would override the engine's own,
+    // which is the value the help now documents.
+    const base = createMockArgs();
+    await handleVoteCommand({
+      ...base,
+      command: 'vote',
+      options: { ...base.options, proposal: 'p' },
+      positionals: ['vote'],
+    });
+
+    expect(voteMock.mock.calls[0]?.[0]).not.toHaveProperty('timeoutMs');
+  });
+
+  it('omits the field for an ordinary yes/no vote', async () => {
+    // The pair: a present-but-empty array tells the engine this is a
+    // multi-option vote and adds the leading-option bar to a plain vote.
+    const base = createMockArgs();
+    await handleVoteCommand({
+      ...base,
+      command: 'vote',
+      options: { ...base.options, proposal: 'ship it' },
+      positionals: ['vote'],
+    });
+
+    expect(voteMock.mock.calls[0]?.[0]).not.toHaveProperty('options');
+  });
+});
+
+describe('handleResearchCommand forwards advertised flags (#5609)', () => {
+  const researchMock = vi.mocked(researchCommand);
+
+  beforeEach(() => {
+    researchMock.mockClear();
+    researchMock.mockResolvedValue({ text: 'ok', exitCode: 0 });
+  });
+
+  it('forwards every flag rendered by printResearchUsage', async () => {
+    printResearchUsage();
+    const usage = vi
+      .mocked(process.stdout.write)
+      .mock.calls.map((call) => String(call[0]))
+      .join('');
+    const advertisedFlags = [...usage.matchAll(/--([a-z][a-z-]*)/g)]
+      .map((match) => match[1])
+      .filter((flag): flag is string => flag !== undefined);
+    expect(advertisedFlags.length).toBeGreaterThan(0);
+    expect(advertisedFlags).toContain('source');
+    vi.mocked(process.stdout.write).mockClear();
+
+    const base = createMockArgs();
+    const args = createMockArgs({
+      command: 'research',
+      subcommand: 'discover',
+      positionals: ['research', 'discover', 'agents'],
+      options: {
+        ...base.options,
+        format: 'json',
+        output: 'research.json',
+        dryRun: true,
+        source: 'github',
+      },
+    });
+    await handleResearchCommand(args);
+
+    const forwarded = researchMock.mock.calls[0]?.[2];
+    const parsedOptions = Object.fromEntries(Object.entries(args.options));
+    for (const flag of advertisedFlags) {
+      const optionKey = flag.replace(/-([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+      expect(forwarded).toHaveProperty(optionKey, parsedOptions[optionKey]);
+    }
+  });
+
+  it('rejects a source outside the discover schema', async () => {
+    const base = createMockArgs();
+    const result = await handleResearchCommand(
+      createMockArgs({
+        command: 'research',
+        subcommand: 'discover',
+        positionals: ['research', 'discover', 'agents'],
+        options: { ...base.options, source: 'not-a-source' },
+      })
+    );
+
+    expect(result).toEqual(
+      expect.objectContaining({ success: false, exitCode: 3, message: expect.any(String) })
+    );
+    expect(researchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('handleLearningMetricsCommand honours --json (#7180)', () => {
+  // `--json` parses into `options.json`, but the handler read only
+  // `options.format`, so `learning-metrics --json` silently printed ASCII.
+  const lmMock = learningMetricsCommand as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    lmMock.mockClear();
+  });
+
+  it('selects JSON output for --json', () => {
+    const base = createMockArgs();
+    handleLearningMetricsCommand({
+      ...base,
+      command: 'learning-metrics',
+      options: { ...base.options, json: true },
+      positionals: ['learning-metrics'],
+    });
+    expect(lmMock.mock.calls[0]?.[0]).toMatchObject({ format: 'json' });
+  });
+
+  it('still selects JSON output for --format=json', () => {
+    const base = createMockArgs();
+    handleLearningMetricsCommand({
+      ...base,
+      command: 'learning-metrics',
+      options: { ...base.options, format: 'json' },
+      positionals: ['learning-metrics'],
+    });
+    expect(lmMock.mock.calls[0]?.[0]).toMatchObject({ format: 'json' });
+  });
+
+  it('exports JSON, the only format --export documents', () => {
+    const base = createMockArgs();
+    handleLearningMetricsCommand({
+      ...base,
+      command: 'learning-metrics',
+      options: { ...base.options, export: 'metrics.json' },
+      positionals: ['learning-metrics'],
+    });
+    expect(lmMock.mock.calls[0]?.[0]).toMatchObject({
+      format: 'json',
+      exportPath: 'metrics.json',
+    });
+  });
+
+  it('defaults to ASCII with neither flag', () => {
+    const base = createMockArgs();
+    handleLearningMetricsCommand({
+      ...base,
+      command: 'learning-metrics',
+      positionals: ['learning-metrics'],
+    });
+    expect(lmMock.mock.calls[0]?.[0]).toMatchObject({ format: 'ascii' });
+  });
+});

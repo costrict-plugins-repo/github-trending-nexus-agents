@@ -1,0 +1,521 @@
+/**
+ * generate-repo-index.ts - Generate deterministic repository capability index
+ *
+ * Scans the codebase to create a machine-readable index of all CLI commands,
+ * MCP tools, workflow templates, and entry points.
+ *
+ * Usage:
+ *   pnpm exec tsx scripts/generate-repo-index.ts           # Generate index
+ *   pnpm exec tsx scripts/generate-repo-index.ts --check   # Check if in sync (for CI)
+ *   pnpm exec tsx scripts/generate-repo-index.ts --verbose # Verbose output
+ *
+ * Output:
+ *   - artifacts/repo-index.json (machine-readable)
+ *   - docs/reference/capabilities.md (human-readable)
+ *
+ * (Source: Issue #615, Epic #615)
+ */
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { catalogForExtractors } from '../packages/nexus-agents/src/cli-command-catalog.js';
+import { parseRegisteredToolNames } from './parse-tool-manifest.js';
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+const REPO_ROOT = path.resolve(import.meta.dirname, '..');
+const CLI_COMMANDS_FILE = path.join(REPO_ROOT, 'packages/nexus-agents/src/cli-commands.ts');
+// #3566: canonical tool-name list is the leaf TOOL_MANIFEST array.
+const MCP_TOOLS_INDEX = path.join(
+  REPO_ROOT,
+  'packages/nexus-agents/src/mcp/tools/tool-manifest.ts'
+);
+const WORKFLOWS_DIR = path.join(REPO_ROOT, 'packages/nexus-agents/src/workflows/templates');
+const PACKAGE_JSON = path.join(REPO_ROOT, 'packages/nexus-agents/package.json');
+
+const OUTPUT_JSON = path.join(REPO_ROOT, 'artifacts/repo-index.json');
+const OUTPUT_MD = path.join(REPO_ROOT, 'docs/reference/capabilities.md');
+
+// ============================================================================
+// Types
+// ============================================================================
+
+interface CLICommand {
+  name: string;
+  type: 'sync' | 'async';
+  handler: string;
+  file: string;
+  description?: string;
+}
+
+interface MCPTool {
+  name: string;
+  file: string;
+  description?: string;
+}
+
+interface WorkflowTemplate {
+  name: string;
+  file: string;
+  description?: string;
+}
+
+interface RepoIndex {
+  version: string;
+  /**
+   * NO `generated` wall-clock stamp (#5461). It changed exactly when the
+   * content changed — the change detection below stripped it before comparing,
+   * so it never varied on its own — while sitting on a single line that every
+   * regenerating PR rewrote. Two PRs regenerating this artifact for unrelated
+   * reasons therefore conflicted on that line alone, and every
+   * `chore(release): version packages` regenerates it, so open PRs went
+   * CONFLICTING at each release (and a CONFLICTING PR gets zero
+   * `pull_request` runs, which reads as "no checks" rather than "conflict").
+   * `packageVersion` stays: it is content. A "when" is recoverable from the
+   * commit that last touched the file.
+   */
+  generator: string;
+  packageVersion: string;
+  cli: {
+    binary: string;
+    commands: CLICommand[];
+  };
+  mcp: {
+    tools: MCPTool[];
+  };
+  workflows: {
+    templates: WorkflowTemplate[];
+  };
+}
+
+interface PackageJson {
+  version?: string;
+}
+
+// ============================================================================
+// Output Helpers
+// ============================================================================
+
+function log(message: string): void {
+  process.stdout.write(message + '\n');
+}
+
+// ============================================================================
+// Extraction Functions
+// ============================================================================
+
+/**
+ * The module a handler is listed under when the dispatcher's import statements
+ * do not name it. Kept as the fallback only: every dispatch-table handler is
+ * imported by name, so a row that lands here is a parse gap, not a location.
+ */
+const DEFAULT_HANDLER_FILE = 'src/cli-commands-handlers.ts';
+
+/**
+ * Map each imported handler name to the module cli-commands.ts imports it
+ * from, so the `file` column names where the dispatcher really gets the
+ * handler rather than a constant (#6148: the init / setup handlers moved to
+ * `cli-commands-handlers-setup.ts` and the column kept saying otherwise).
+ * A handler re-exported through a barrel is attributed to the barrel — that
+ * is the module the dispatcher imports.
+ */
+function resolveHandlerFiles(content: string): ReadonlyMap<string, string> {
+  const files = new Map<string, string>();
+  const importRegex = /^import\s*\{([^}]*)\}\s*from\s*'\.\/([^']+)\.js';/gm;
+  let match: RegExpExecArray | null;
+  while ((match = importRegex.exec(content)) !== null) {
+    const specifier = match[2] ?? '';
+    for (const rawName of (match[1] ?? '').split(',')) {
+      const name = rawName.replace(/\/\/.*$/gm, '').trim();
+      if (name !== '' && !name.startsWith('type ')) {
+        files.set(name, `src/${specifier}.ts`);
+      }
+    }
+  }
+  return files;
+}
+
+/**
+ * Parse commands from a handler block
+ */
+function parseCommandsFromBlock(
+  blockContent: string,
+  commandType: 'sync' | 'async',
+  handlerPrefix: string,
+  handlerFiles: ReadonlyMap<string, string>
+): CLICommand[] {
+  const commands: CLICommand[] = [];
+  const regex = /(?:'([^']+)'|([a-zA-Z][a-zA-Z0-9-]*))\s*:\s*(\w+)/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(blockContent)) !== null) {
+    const cmdName = match[1] ?? match[2] ?? '';
+    const handler = match[3] ?? '';
+
+    if (cmdName !== '' && handler !== '' && handler.startsWith(handlerPrefix)) {
+      commands.push({
+        name: cmdName,
+        type: commandType,
+        handler,
+        file: handlerFiles.get(handler) ?? DEFAULT_HANDLER_FILE,
+      });
+    }
+  }
+
+  return commands;
+}
+
+/**
+ * Extract CLI commands from cli-commands.ts
+ */
+function extractCLICommands(): CLICommand[] {
+  const content = fs.readFileSync(CLI_COMMANDS_FILE, 'utf-8');
+  const commands: CLICommand[] = [];
+  const handlerFiles = resolveHandlerFiles(content);
+
+  // Extract sync commands from SYNC_COMMAND_HANDLERS
+  const syncMatch = content.match(/const SYNC_COMMAND_HANDLERS[^=]*=[^{]*{([\s\S]*?)};/);
+  const syncBlock = syncMatch?.[1];
+  if (syncBlock !== undefined) {
+    commands.push(...parseCommandsFromBlock(syncBlock, 'sync', 'handle', handlerFiles));
+  }
+
+  // Extract async commands from ASYNC_COMMAND_HANDLERS
+  const asyncMatch = content.match(/const ASYNC_COMMAND_HANDLERS[^=]*=[\s\S]*?{([\s\S]*?)};/);
+  const asyncBlock = asyncMatch?.[1];
+  if (asyncBlock !== undefined) {
+    commands.push(...parseCommandsFromBlock(asyncBlock, 'async', 'handle', handlerFiles));
+  }
+
+  // Cross-check against the catalog single-source-of-truth (#2156). Warn on
+  // drift in either direction — a new dispatch-table entry without a catalog
+  // row, or a catalog row with no dispatch handler. Non-fatal: the index
+  // still emits, but CI sees the message.
+  const catalogNames = new Set(catalogForExtractors().map((e) => e.command));
+  const dispatchNames = new Set(commands.map((c) => c.name));
+  for (const name of dispatchNames) {
+    if (!catalogNames.has(name)) {
+      log(
+        `[warn] dispatch command "${name}" has no entry in cli-command-catalog.ts — add one (#2156)`
+      );
+    }
+  }
+  for (const name of catalogNames) {
+    if (!dispatchNames.has(name)) {
+      log(
+        `[warn] catalog command "${name}" has no handler in SYNC/ASYNC_COMMAND_HANDLERS — check naming drift (#2156)`
+      );
+    }
+  }
+
+  // Sort alphabetically for deterministic output
+  return commands.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Extract MCP tools from mcp/tools/index.ts
+ */
+function extractMCPTools(): MCPTool[] {
+  const content = fs.readFileSync(MCP_TOOLS_INDEX, 'utf-8');
+
+  // AST-parse the canonical `TOOL_MANIFEST` (#3596/#3597). The manifest is now an
+  // object array (`{ name, annotations, sideEffects }`), so a per-line string
+  // regex would also pick up category/description literals — the AST parser reads
+  // each entry's `name` correctly.
+  const toolNames = parseRegisteredToolNames(content);
+  if (toolNames.length === 0) {
+    console.error('Could not parse tools array from MCP tool manifest');
+    return [];
+  }
+
+  return toolNames
+    .map((name) => ({
+      name,
+      file: `src/mcp/tools/${name.replace(/_/g, '-')}.ts`,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Extract workflow templates from workflows/templates directory
+ */
+function extractWorkflowTemplates(): WorkflowTemplate[] {
+  const templates: WorkflowTemplate[] = [];
+
+  if (fs.existsSync(WORKFLOWS_DIR)) {
+    const files = fs
+      .readdirSync(WORKFLOWS_DIR)
+      .filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'));
+
+    for (const file of files) {
+      const name = path.basename(file, path.extname(file));
+      templates.push({
+        name,
+        file: `src/workflows/templates/${file}`,
+      });
+    }
+  }
+
+  return templates.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Get package version
+ */
+function getPackageVersion(): string {
+  const content = fs.readFileSync(PACKAGE_JSON, 'utf-8');
+  const pkg = JSON.parse(content) as PackageJson;
+  return pkg.version ?? '0.0.0';
+}
+
+// ============================================================================
+// Generation Functions
+// ============================================================================
+
+/**
+ * Generate the repo index
+ */
+function generateIndex(): RepoIndex {
+  return {
+    version: '1.0.0',
+    generator: 'scripts/generate-repo-index.ts',
+    packageVersion: getPackageVersion(),
+    cli: {
+      binary: 'nexus-agents',
+      commands: extractCLICommands(),
+    },
+    mcp: {
+      tools: extractMCPTools(),
+    },
+    workflows: {
+      templates: extractWorkflowTemplates(),
+    },
+  };
+}
+
+/**
+ * Generate markdown documentation
+ */
+function generateMarkdown(index: RepoIndex): string {
+  const cmdCount = String(index.cli.commands.length);
+  const toolCount = String(index.mcp.tools.length);
+  const wfCount = String(index.workflows.templates.length);
+
+  // Diataxis type + audience (#7198): a lookup table of CLI commands, MCP tools
+  // and workflows for someone using nexus-agents.
+  let md = `---
+diataxis: reference
+audience: user
+---
+
+# Repository Capabilities Index
+
+**Package Version:** ${index.packageVersion}
+**Generator:** \`${index.generator}\`
+
+> This file is auto-generated. Do not edit manually.
+> Run \`pnpm exec tsx scripts/generate-repo-index.ts\` to regenerate.
+
+---
+
+## CLI Commands (${cmdCount})
+
+Binary: \`${index.cli.binary}\`
+
+| Command | Type | Handler | Source File |
+| --------- | ------ | --------- | ------------- |
+`;
+
+  for (const cmd of index.cli.commands) {
+    md += `| \`${cmd.name}\` | ${cmd.type} | \`${cmd.handler}\` | \`${cmd.file}\` |\n`;
+  }
+
+  md += `
+---
+
+## MCP Tools (${toolCount})
+
+| Tool | Source File |
+| ------ | ------------- |
+`;
+
+  for (const tool of index.mcp.tools) {
+    md += `| \`${tool.name}\` | \`${tool.file}\` |\n`;
+  }
+
+  md += `
+---
+
+## Workflow Templates (${wfCount})
+
+| Template | Source File |
+| ---------- | ------------- |
+`;
+
+  for (const template of index.workflows.templates) {
+    md += `| \`${template.name}\` | \`${template.file}\` |\n`;
+  }
+
+  md += `
+---
+
+## Machine-Readable Index
+
+For programmatic access, see \`artifacts/repo-index.json\`.
+
+---
+
+_This index is deterministic: same input produces same output._
+`;
+
+  return md;
+}
+
+// ============================================================================
+// File Operations
+// ============================================================================
+
+/**
+ * Ensure directory exists
+ */
+function ensureDir(filePath: string): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+/**
+ * Compare content for change detection (JSON files)
+ */
+function hasJsonChanged(filePath: string, newContent: string): boolean {
+  if (!fs.existsSync(filePath)) {
+    return true;
+  }
+  try {
+    const existing = fs.readFileSync(filePath, 'utf-8');
+    const existingObj = JSON.parse(existing) as Record<string, unknown>;
+    const newObj = JSON.parse(newContent) as Record<string, unknown>;
+    // #5461: nothing to strip. The output no longer carries a wall-clock
+    // stamp, so a plain comparison already answers "did the content change".
+    return JSON.stringify(existingObj) !== JSON.stringify(newObj);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Compare content for change detection (Markdown files)
+ */
+function hasMdChanged(filePath: string, newContent: string): boolean {
+  if (!fs.existsSync(filePath)) {
+    return true;
+  }
+  // #5461: no timestamp line to ignore any more.
+  return fs.readFileSync(filePath, 'utf-8') !== newContent;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+function showHelp(): void {
+  log(`
+generate-repo-index.ts - Generate deterministic repository capability index
+
+Usage:
+  pnpm exec tsx scripts/generate-repo-index.ts [options]
+
+Options:
+  --check     Check if index is in sync (exit 1 if not, for CI)
+  --verbose   Show detailed output
+  --help, -h  Show this help message
+
+Output:
+  artifacts/repo-index.json    Machine-readable index
+  docs/reference/capabilities.md  Human-readable documentation
+`);
+}
+
+function runCheckMode(jsonChanged: boolean, mdChanged: boolean): void {
+  if (jsonChanged || mdChanged) {
+    log('✗ Repository index is out of date.');
+    if (jsonChanged) log('  - artifacts/repo-index.json needs update');
+    if (mdChanged) log('  - docs/reference/capabilities.md needs update');
+    log('\nRun "pnpm exec tsx scripts/generate-repo-index.ts" to update.');
+    process.exit(1);
+  }
+  log('✓ Repository index is up to date.');
+  process.exit(0);
+}
+
+function writeOutput(
+  index: RepoIndex,
+  jsonContent: string,
+  mdContent: string,
+  jsonChanged: boolean,
+  mdChanged: boolean
+): void {
+  ensureDir(OUTPUT_JSON);
+  ensureDir(OUTPUT_MD);
+
+  fs.writeFileSync(OUTPUT_JSON, jsonContent);
+  fs.writeFileSync(OUTPUT_MD, mdContent);
+
+  const cmdCount = String(index.cli.commands.length);
+  const toolCount = String(index.mcp.tools.length);
+  const wfCount = String(index.workflows.templates.length);
+
+  log('Summary:');
+  log(
+    `  ${jsonChanged ? '→' : '✓'} artifacts/repo-index.json ${jsonChanged ? '(updated)' : '(up-to-date)'}`
+  );
+  log(
+    `  ${mdChanged ? '→' : '✓'} docs/reference/capabilities.md ${mdChanged ? '(updated)' : '(up-to-date)'}`
+  );
+  log('');
+  log('Index contains:');
+  log(`  - ${cmdCount} CLI commands`);
+  log(`  - ${toolCount} MCP tools`);
+  log(`  - ${wfCount} workflow templates`);
+}
+
+function main(): void {
+  const args = process.argv.slice(2);
+  const check = args.includes('--check');
+  const verbose = args.includes('--verbose');
+
+  if (args.includes('--help') || args.includes('-h')) {
+    showHelp();
+    process.exit(0);
+  }
+
+  log('Generating repository capability index...\n');
+
+  const index = generateIndex();
+  const jsonContent = JSON.stringify(index, null, 2);
+  const mdContent = generateMarkdown(index);
+
+  if (verbose) {
+    log(`Found ${String(index.cli.commands.length)} CLI commands`);
+    log(`Found ${String(index.mcp.tools.length)} MCP tools`);
+    log(`Found ${String(index.workflows.templates.length)} workflow templates`);
+    log('');
+  }
+
+  const jsonChanged = hasJsonChanged(OUTPUT_JSON, jsonContent);
+  const mdChanged = hasMdChanged(OUTPUT_MD, mdContent);
+
+  if (check) {
+    runCheckMode(jsonChanged, mdChanged);
+    return;
+  }
+
+  writeOutput(index, jsonContent, mdContent, jsonChanged, mdChanged);
+}
+
+if (process.argv[1]?.endsWith('generate-repo-index.ts') === true) {
+  main();
+}

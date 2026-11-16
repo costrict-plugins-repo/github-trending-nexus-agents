@@ -1,0 +1,51 @@
+/**
+ * `nexus-agents auto-remediate` — run one auto-remediation cycle (#3540 phase 3 / #3671).
+ *
+ * The user-facing surface for {@link runAutoRemediationCycle}. The mode comes from
+ * `NEXUS_AUTO_REMEDIATE` (off | audit | enforce), default `audit` since #3769 —
+ * so a bare run collects improvement_review signals and runs research → consensus
+ * vote with ZERO writes (the soak), accumulating readiness evidence. `off`
+ * disables; `enforce` is opt-in + gated by the readiness verdict (the Option B
+ * implement adapter #3669 has landed, but the cycle withholds repoRoot so enforce
+ * stays structurally unreachable until it is threaded — #3769 Step 2).
+ *
+ * Flags:
+ *   --format <text|json>   Output mode (default text)
+ *
+ * This NEVER flips the mode on itself — enabling enforce is the owner's decision
+ * (set `NEXUS_AUTO_REMEDIATE=enforce`), gated by the readiness vote.
+ *
+ * @module cli/auto-remediate-command
+ */
+
+import type { CliExitResult, ParsedCliArgs } from '../cli-types.js';
+import { cliExit, EXIT_CODES } from '../cli-types.js';
+import { runAutoRemediationCycle } from '../mcp/tools/auto-remediation-cycle.js';
+import type { AutoRemediationResult } from '../mcp/tools/improvement-remediation-enforce.js';
+
+/** One-line text summary of a cycle result. */
+function summarize(r: AutoRemediationResult): string {
+  const head = `auto-remediation [${r.mode}]`;
+  if (r.aborted !== undefined) return `${head}: aborted — ${r.aborted}\n`;
+  return (
+    `${head}: ${String(r.considered)} considered · ${String(r.plans.length)} planned · ` +
+    `${String(r.remediated.length)} PR(s) · ${String(r.skipped.length)} skipped\n`
+  );
+}
+
+/**
+ * Handle `nexus-agents auto-remediate`.
+ *
+ * #3942: RETURNS a {@link CliExitResult}; the dispatcher owns `process.exit`.
+ * This command never forced an exit (natural exit 0) — SUCCESS (0) is
+ * byte-identical.
+ */
+export async function handleAutoRemediateCommand(args: ParsedCliArgs): Promise<CliExitResult> {
+  const result = await runAutoRemediationCycle();
+  if (args.options.format === 'json') {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return cliExit(EXIT_CODES.SUCCESS);
+  }
+  process.stdout.write(summarize(result));
+  return cliExit(EXIT_CODES.SUCCESS);
+}

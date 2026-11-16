@@ -1,0 +1,1459 @@
+---
+title: 'Configuration Guide'
+description: Configure nexus-agents with YAML files, environment variables, and programmatic options
+diataxis: reference
+audience: user
+tier: 2
+keywords: [configuration, yaml, environment, settings, options, getting-started]
+---
+
+# Configuration
+
+Configure nexus-agents with YAML files, environment variables, and programmatic options.
+
+## Configuration Precedence
+
+The loader selects **one** config file — the **first match wins**, it does NOT merge multiple files:
+
+1. `NEXUS_CONFIG_PATH` (explicit path), else
+2. **Project config** — `./.nexus-agents/nexus-agents.yaml` or `./nexus-agents.yaml` (current directory), else
+3. **User config** — `~/.nexus-agents/nexus-agents.yaml`
+
+Whatever single file is selected is layered over the built-in **defaults**. Then **environment variables** (`NEXUS_*`) overlay the result **per-setting at consumption time** — so an env var overrides just that one key, and env vars (not a second config file) are the right tool for machine-local overrides. See [Configuration for Reusable Pipelines](#configuration-for-reusable-pipelines) for the project-vs-local split.
+
+## Quick Setup
+
+Generate a starter configuration file:
+
+```bash
+nexus-agents config init
+```
+
+This creates `nexus-agents.yaml` with sensible defaults.
+
+## Configuration File
+
+The main configuration file is `nexus-agents.yaml`:
+
+> **Note:** Model IDs below come from the in-tree ModelRegistry — they are what nexus-agents recognises out of the box. The full list lives in `packages/nexus-agents/src/config/in-tree-data.ts`; supported IDs include `claude-opus` / `claude-sonnet` / `claude-haiku`, `gemini-3-pro` / `gemini-3-flash`, `codex-5.3` / `codex-5.2` / `codex-5.1-mini`, plus `opencode-*` and `openrouter-*` variants. To use a model outside this set (e.g. an OpenAI-compatible gateway), see the `NEXUS_CUSTOM_MODEL` env var below.
+
+```yaml
+# nexus-agents.yaml
+
+# Model configuration — use latest models from each provider
+models:
+  # Default model for general tasks
+  default: claude-sonnet
+
+  # Model tiers for routing
+  tiers:
+    fast:
+      - claude-haiku
+      - codex-5.1-mini
+      - gemini-3-flash
+    balanced:
+      - claude-sonnet
+      - codex-5.2
+      - gemini-3-pro
+    powerful:
+      - claude-opus
+      - codex-5.3
+      - gemini-3-pro
+
+# Expert configuration
+experts:
+  # Enable built-in experts (code, architecture, security, performance, research)
+  builtin: true
+
+  # Custom expert definitions
+  custom:
+    rust_expert:
+      prompt: |
+        You are a Rust expert specializing in systems programming,
+        memory safety, and performance optimization. You follow the
+        Rust API Guidelines and prefer idiomatic solutions.
+      tier: powerful
+      tools:
+        - read_file
+        - write_file
+        - execute_command
+
+    react_expert:
+      prompt: |
+        You are a React expert specializing in modern React patterns,
+        hooks, and performance optimization. You follow React best
+        practices and prefer functional components.
+      tier: balanced
+
+# Routing configuration
+routing:
+  # Enable three-stage routing pipeline
+  enableBudgetFilter: true
+  enableTopsisRanking: true
+  enableLinUCBSelection: true
+
+  # Budget constraints
+  budget:
+    tokenBudget: 1000000 # Session token limit
+    costBudgetUsd: 10.0 # Session cost limit
+    resetIntervalMs: 3600000 # 1 hour reset
+
+  # TOPSIS multi-criteria ranking
+  topsis:
+    minQualityThreshold: 5 # 0-10; candidates below this are not ranked
+    criteria: # weights must sum to 1.0
+      - { name: quality, weight: 0.5, beneficial: true }
+      - { name: cost, weight: 0.3, beneficial: false }
+      - { name: latency, weight: 0.2, beneficial: false }
+
+  # LinUCB bandit configuration
+  linucb:
+    alpha: 1.0 # Exploration parameter
+
+# Memory configuration
+memory:
+  # Session memory
+  session:
+    maxEntries: 1000
+    ttlMs: 86400000 # 24 hours
+
+  # Graph memory
+  graph:
+    enabled: true
+    maxNodes: 10000
+    maxEdges: 50000
+
+  # Typed memory (MIRIX six-type system)
+  typed:
+    enabled: true
+    pruneThreshold: 0.3
+
+  # Coordinated decay across belief / agentic / adaptive / MobiMem (#5097)
+  decay:
+    enabled: true
+    decayIntervalMs: 3600000 # 1 hour
+    agenticMaxEntries: 10000
+
+# Security configuration
+security:
+  # Allowed paths for file operations
+  allowedPaths:
+    - ./
+    - /tmp
+
+  # Sandbox execution mode: none, policy, container
+  sandbox:
+    mode: policy
+    fallbackMode: none
+    resourceLimits:
+      memory: 512m
+      cpu: 2
+      timeout: 300s
+      maxProcesses: 10
+
+  # Rate limiting
+  rateLimit:
+    enabled: true
+    requestsPerMinute: 60
+
+# Workflow configuration
+workflows:
+  # Directory containing workflow templates
+  templateDir: ./workflows
+
+  # Maximum parallel steps
+  maxParallelSteps: 5
+
+  # Step timeout
+  stepTimeoutMs: 300000 # 5 minutes
+
+# Logging configuration
+logging:
+  level: info # debug, info, warn, error
+  format: json # json, pretty
+  file: null # Optional log file path
+```
+
+## Environment Variables
+
+All configuration can be overridden with environment variables:
+
+The MCP server process receives its environment from the client's server configuration when it launches. After changing that configuration, restart the client (or its MCP server process) to apply the new values. Some settings are read during calls, while others are retained from startup or adapter initialization; do not rely on hot reload.
+
+**Every `NEXUS_*` variable is validated at startup** against
+`packages/nexus-agents/src/config/env-schema.ts`. A name the schema does not
+recognize is reported as unknown, with a typo suggestion — including a name
+that is correct and documented here but absent from the schema, which is how
+`NEXUS_DATA_DIR` came to be flagged (#4722). A variable added to this document
+must be added to the schema in the same change, and a test now cross-checks the
+two lists so they cannot drift apart again.
+
+### Core Variables
+
+| Variable                          | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Default                   |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| `NEXUS_CONFIG_PATH`               | Path to config file                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | `./nexus-agents.yaml`     |
+| `NEXUS_LOG_LEVEL`                 | Logging level (`debug` / `info` / `warn` / `error`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | `info`                    |
+| `NEXUS_CONSOLE`                   | Force `console.*` on/off. `0` always off; `1` always on; unset → on for CLI, off for stdio-MCP, on for HTTP-MCP                                                                                                                                                                                                                                                                                                                                                                                                                              | unset                     |
+| `NEXUS_DATA_DIR`                  | Explicit runtime data root. Overrides the per-repo/cross-repo split (#2872)                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | per-repo `.nexus-agents/` |
+| `NEXUS_REPO_PREFERRED`            | Boolean: `false`/`0` opts out of the per-repo data dir (epic #2872). One accept-set since #5464 — `0` alone opted out before                                                                                                                                                                                                                                                                                                                                                                                                                 | `1`                       |
+| `NEXUS_TMPDIR`                    | Scratch root for short-lived working files — throwaway worktrees, generated MCP configs, system-prompt files (#4412). Unset resolves to `<dataDir>/tmp`, inside the already-gitignored `.nexus-agents/` tree; falls back to `os.tmpdir()` if neither can be created                                                                                                                                                                                                                                                                          | `<dataDir>/tmp`           |
+| `NEXUS_PORTABLE_MODE`             | Force portable (sandbox-friendly) data dir. `0` opts out of auto-detect; `1` forces on; unset → heuristic (writable home, container env vars)                                                                                                                                                                                                                                                                                                                                                                                                | unset (heuristic)         |
+| `NEXUS_GITIGNORE_AUTO`            | Boolean (`true`/`1`, `false`/`0`); `false` silences the auto-append of `.nexus-agents/` to the repo's `.gitignore` (#5155)                                                                                                                                                                                                                                                                                                                                                                                                                   | `1`                       |
+| `NEXUS_BUDGET_ENFORCE`            | Boolean (`true`/`1`/`false`/`0`): caps per-run token spend for `run_pipeline` (estimate-relative ceiling) and, since #4754, `run_workflow` (only when the call sets `maxTokens` — no estimated default, which would sit far below real step spend; otherwise `budget.status` is `not_enforced`. Checked before each phase and before each step is dispatched — steps already running are not halted, and a run where any step reported no usage is reported `unmeasured`). Previously only `1` was read; `=true` was a silent no-op (#5155). | `0`                       |
+| `NEXUS_BUDGET_TOLERANCE`          | Overrun-tolerance multiplier for routing budget capping (`resolveBudgetTolerance`, #3262). Must be a float >= `1.0` (e.g. `1.5` allows up to 150% of nominal budget).                                                                                                                                                                                                                                                                                                                                                                        | `1.5`                     |
+| `NEXUS_DYNAMIC_MODELS`            | Boolean (`true`/`1`/`false`/`0`): enable live model discovery as a registry source. Previously only `true` was read; `=1` was a silent no-op (#5155).                                                                                                                                                                                                                                                                                                                                                                                        | `0`                       |
+| `NEXUS_BACKFILL_RESEARCH_QUALITY` | Boolean (`true`/`1`): backfill missing research paper quality scores and evidence tiers on load (#4288)                                                                                                                                                                                                                                                                                                                                                                                                                                      | unset                     |
+| `NEXUS_NO_SCAFFOLD`               | `1` disables scaffolding of missing `docs/` registry files on read                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | unset                     |
+| `NEXUS_CONTEXT_RETRIEVER_INJECT`  | Boolean (`true`/`1` enables); inject `priorMemorySummary` from `ContextRetriever` into `orchestrate` / `execute_expert` inputs (#2792, #2921, #5155)                                                                                                                                                                                                                                                                                                                                                                                         | `0`                       |
+| `NEXUS_CONTEXT_RANKED`            | Boolean: `1`/`true` renders the unified cross-ranked memory prefix (`rankedMemories`) instead of per-backend sections; `0`/`false` opts out to legacy per-section output (#3236)                                                                                                                                                                                                                                                                                                                                                             | `1`                       |
+| `NEXUS_REPO_MAP`                  | `1` attaches a ranked, token-budgeted repo-map (module import graph, PageRank centrality) for structural tasks only; pull-shaped/rank-gated (never pushed onto every call), import-graph-only (no call-site data), flag-off output is byte-identical (#4254)                                                                                                                                                                                                                                                                                 | `0`                       |
+| `NEXUS_LLM_CLASSIFICATION`        | Boolean: `true`/`1` permits an LLM call to classify a pipeline task when keyword scoring finds no evidence at all. Off by default: the gate guarding this call was unreachable until #4677 (a `Math.max(…, 1)` floor pinned confidence at 1/3 against a `< 0.2` gate), and measurement put the newly-reachable rate at ~60% of realistic goals — one LLM call each. Enabling it is a cost decision, not a restoration                                                                                                                        | `0`                       |
+| `NEXUS_META_SHADOW_TRAIN`         | Boolean: `true`/`1` feeds live `run` dispatch outcomes into the MetaOrchestrator shadow selector and persists them to `learning/meta-outcomes.jsonl` (feature values only, no task text) for cross-process learning; stays shadow-only — never alters what runs or feeds enforce. Requires learning persistence enabled (#3593)                                                                                                                                                                                                              | `0`                       |
+| `NEXUS_ROUTE_MODEL_SELECTION`     | Boolean: `true`/`1` lets the CompositeRouter resolve a concrete model from the computed difficulty tier at route time (`resolveModelForTier`, #3394)                                                                                                                                                                                                                                                                                                                                                                                         | `false`                   |
+| `NEXUS_ROUTE_MODEL_SHADOW`        | Boolean: `true`/`1` records, per outcome-joined routing decision, the model the tier resolver WOULD have picked vs the model actually used, to `learning/model-selection-shadow.jsonl` (CLI slot, tier, model ids, success only — no task text) for the offline flip eval; shadow-only — never alters routing. The log is append-only/unbounded; readers apply a 30-day lookback (matches `meta-outcomes.jsonl`). Requires learning persistence enabled (#4197)                                                                              | `0`                       |
+| `NEXUS_CAPABILITY_GAP_INFERRED`   | `1` records capability gaps that task analysis INFERRED (e.g. a request to extract symbols from a source language the extractor does not support, `extract_symbols:.py`) to the capability-gap ledger, which feeds research triggers and autofile. Default `0`: inferred gaps still appear in gap reports with `origin: 'inferred'`, but only observed run-time refusals are recorded (#6930)                                                                                                                                                | `0`                       |
+| `NEXUS_VERSION_CHECK`             | Startup warning if the build lags the latest published version (#3283); one npm-registry call. `0` disables; skips dev + CI                                                                                                                                                                                                                                                                                                                                                                                                                  | `1`                       |
+
+### Model Provider Keys
+
+| Variable                            | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`                 | Claude API key                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `OPENAI_API_KEY`                    | OpenAI API key                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `GOOGLE_AI_API_KEY`                 | Google AI (Gemini) API key                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `GEMINI_API_KEY`                    | Not read by nexus-agents: the in-process Google adapter reads `GOOGLE_AI_API_KEY`. Forwarded to the spawned `gemini`-arm (`agy`) and `opencode` subprocesses by the env allowlist. `agy` authenticates through its own sign-in; see [INSTALLATION.md](INSTALLATION.md#antigravity-cli-agy--serves-the-gemini-arm) (#4389)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `OPENROUTER_API_KEY`                | OpenRouter API key (for free-model adapters; also a path to Bedrock/Vertex/Azure — see [CLOUD_PROVIDERS.md](../guides/CLOUD_PROVIDERS.md))                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `OLLAMA_HOST`                       | Ollama server URL (default: `http://localhost:11434`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `NEXUS_CUSTOM_MODEL`                | Model pin for the `custom-openai` gateway alias (#7150). With a catalogue, resolves through the gateway default selection; an unavailable pin falls back to the catalogue default. Without a catalogue, sends this id or `gpt-5.5` (`CUSTOM_API_DEFAULT_MODEL` in `config/defaults.ts`); failed discovery marks that choice unverified. Not deprecated. The `claude`/`codex`/`gemini` slots use their own family selection: see `NEXUS_GATEWAY_MODEL_<FAMILY>` (#6604)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `NEXUS_CUSTOM_API_SURFACE`          | OpenAI API surface the `custom-openai` alias calls (#7150); discovered per-model clients keep chat completions: `chat` (default) posts to `<base>/chat/completions`, the surface OpenAI-spec gateways commonly serve; `responses` posts to `<base>/responses` (the Responses API) for an endpoint that serves it. Any other value is refused when the adapter is built. Also applies to the direct OpenAI adapter (`OPENAI_API_KEY`) when `OPENAI_BASE_URL` names a host other than `api.openai.com`, where the default is likewise `chat` (#6654); with `OPENAI_BASE_URL` unset or naming `api.openai.com` that adapter keeps the Responses API and this variable is not read. Both surfaces support completions, streaming and tool calls through the shared gateway client                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `NEXUS_GATEWAY_MODEL_<FAMILY>`      | `NEXUS_GATEWAY_MODEL_ANTHROPIC`, `NEXUS_GATEWAY_MODEL_OPENAI`, `NEXUS_GATEWAY_MODEL_GOOGLE` (#6604). When the gateway (`NEXUS_OPENAI_COMPAT_URL`/`KEY`) was discovered, a `claude`, `codex` or `gemini` slot whose CLI is not available (not installed, unhealthy or logged out; a router arm re-checks after an authentication failure) is served by a gateway model of its own family: Anthropic, OpenAI or Google. By default the family's best chat model is used (realtime, audio, transcription, TTS, image, live and video ids never count). Tier comes first (flagship, then mid such as sonnet/mini/flash, then small such as haiku/nano/lite), then the `/models` `created` stamp when every model has one, then the generation parsed from the id. A vendor `-latest` alias and a date stamp in an id only break ties. This variable pins the family's model instead. An id missing from the discovered catalogue, or classified as another family, is ignored with a warning, and the default order applies. An id whose vendor cannot be classified is honoured, with a warning. A slot whose family the gateway does not serve uses a same-family direct API key if one is set. Otherwise it is unavailable: it gets no router arm when its CLI is not installed, and it never falls back to another family or to `NEXUS_CUSTOM_MODEL`. A gateway-served slot is priced by `NEXUS_GATEWAY_COST`, so with that unset the router's budget filter excludes it. The mapping is logged at startup. Without a discovered gateway nothing changes |
+| `NEXUS_GATEWAY_COST`                | What a gateway arm costs (#4392): `free` \| `local` \| `priced` \| `priced:<inputPer1M>,<outputPer1M>`, optionally endpoint-scoped as `endpoint=decl[;endpoint=decl]` with at most one bare declaration applying to every gateway. `free`/`local` price at $0; bare `priced` uses the registry rate of the model the gateway lists first, or of `NEXUS_CUSTOM_MODEL` for `api:custom-openai` — with neither it is fail-closed like UNDECLARED, never the display slot's rate (#6404); `priced:<in>,<out>` is a flat per-1M rate. Recorded explicit rates (`priced:<in>,<out>`, `free`, `local`) carry `priceBasis: 'declared'`, the operator's statement; bare `priced` inherits the resolved registry tier's basis (`'declared'` for an overlay-priced model, `'list'` for an in-tree price), otherwise `'unknown'`. See [price-basis compatibility](../reference/price-basis.md). **Unset or invalid means UNDECLARED**: the task-class cost ceiling and the per-task budget (`checkBudget`, #6393) both exclude the gateway (fail-closed) and `doctor` warns; the exclusion is recorded on `BudgetRoutingResult.unpricedArms` with its reason. `nexus-agents init --opencode` writes `openai-compat=free` into the MCP block it generates — scoped to the `providers.openai-compat` gateway the bridge reads, not a bare `free`; edit the value in `mcp.nexus-agents.environment` to override (`openai-compat=priced:<in>,<out>` for a metered proxy) and a re-run keeps the edit                                                                     |
+| `NEXUS_OPENAI_COMPAT_URL`           | OpenAI-compatible gateway URL (epic #2500, child #2503). Paired with `NEXUS_OPENAI_COMPAT_KEY` it configures model discovery, in-process voter transport and the `api:<endpoint>` arm. The `custom-openai` auto-adapter is an alias using the resolved gateway model with its own client, retaining its `api:custom-openai` attribution (#7150). Wins over `NEXUS_OPENCODE_CONFIG`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `NEXUS_ROUTE_GATEWAY_ARMS`          | Opt in to registered gateway endpoint routing arms (#7151, OPTION B). Default `false`; accepts `true`/`1` and `false`/`0`, case-insensitively. Requires a valid `NEXUS_GATEWAY_COST` declaration for the endpoint in both billing modes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `NEXUS_OPENAI_COMPAT_ENDPOINT`      | Endpoint identity the OpenAI-compat gateway registers as (#4392 step 2): the `<endpoint>` of its `api:<endpoint>` arm in the adapter registry and the circuit breaker, and the key a scoped `NEXUS_GATEWAY_COST` entry names it by (`<endpoint>=free`). Lowercase alphanumerics plus `.` `_` `-`, 1–64 chars, never the URL, and never a built-in vendor segment (`anthropic`, `openai`, `google`) — that would register the gateway as a vendor arm, where its `NEXUS_GATEWAY_COST` declaration is unreachable (#6409). Default `openai-compat` (the `providers.openai-compat` key of `opencode.json`); an invalid value is reported at startup and the default applies                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `NEXUS_OPENAI_COMPAT_KEY`           | API key for the OpenAI-compat gateway (paired with `NEXUS_OPENAI_COMPAT_URL` — both required)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `NEXUS_OPENAI_COMPAT_MODELS`        | Allowlist of gateway model ids (#6600): comma-separated, `*` is a wildcard (`anthropic/*,gemini-2.5-pro`). Applied after duplicate and non-chat models (embedding, TTS, image, moderation, audio, rerank) are removed and BEFORE the 256-model adapter cap, so a gateway listing more models than the cap serves the ones named here instead of refusing discovery. An entry that matches no listed chat model is warned. Unset or empty means no allowlist; a catalogue over the cap is then refused with an error naming this variable                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `NEXUS_OPENAI_COMPAT_AUTH_HEADER`   | Header that carries the gateway key instead of `Authorization: Bearer <key>` (#6608), e.g. `api-key` for Azure-style gateways. The bearer header is then not sent. Applies to discovery and every completion. An illegal header name is warned (name of the variable and the reason, never the key) and the bearer default applies. See [Gateway behind a corporate network](#gateway-behind-a-corporate-network-6608)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `NEXUS_OPENAI_COMPAT_EXTRA_HEADERS` | Extra static headers on every gateway request (#6608): `Name=value,Name2=value2`, whitespace trimmed. The whole value is refused (warned, no extra headers sent) on a newline or other control character, an entry without `=`, an illegal or duplicate name, `Authorization`, or the header named by `NEXUS_OPENAI_COMPAT_AUTH_HEADER`. Values are never logged                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `NEXUS_OPENCODE_CONFIG`             | Path to an `opencode.json` whose `providers.openai-compat.options.{baseURL,apiKey}` configures the OpenAI-compat adapter (fallback when the `_URL`/`_KEY` pair is unset)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `SEMANTIC_SCHOLAR_API_KEY`          | Optional. Lifts research_discover's semantic_scholar source past the unauthenticated 429 ceiling (#2234). Apply at https://www.semanticscholar.org/product/api#api-key-form                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+
+### Spawned CLI config locations
+
+The subprocess environment allowlist forwards `CODEX_HOME` (Codex),
+`CLAUDE_CONFIG_DIR` (Claude Code), and `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
+`XDG_STATE_HOME`, `XDG_CACHE_HOME` (OpenCode) when set. These variables hold paths;
+they do not require `NEXUS_SUBPROCESS_EXTRA_ENV` or disabling the allowlist.
+Unset variables remain absent, and cross-vendor credential filtering still applies.
+The Codex read-only MCP isolation scan uses the same forwarded `CODEX_HOME` as
+the spawned child, reading `$CODEX_HOME/config.toml` instead of `~/.codex/config.toml`.
+
+See the [Codex environment reference](https://developers.openai.com/codex/environment-variables),
+[Claude Code environment reference](https://code.claude.com/docs/en/env-vars), and
+[OpenCode directory resolution](https://github.com/anomalyco/opencode/blob/v1.2.0/packages/opencode/src/global/index.ts).
+The `gemini` arm runs `agy`, which keeps its state under `~/.gemini/`
+(`~/.gemini/antigravity-cli/`). `GEMINI_CLI_HOME` relocated the retired
+`gemini` CLI only; the name does not appear in the `agy` 1.3.1 binary, so
+forwarding it with `NEXUS_SUBPROCESS_EXTRA_ENV` has no effect on `agy`.
+
+### Security Variables
+
+| Variable                         | Description                                                                                                                                                                                                                             | Default              |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `NEXUS_SANDBOX`                  | Sandbox **flavor string** (e.g. `docker-opencode`) set by the host image; a signal for sandbox-detection and doctor, it restricts nothing (#5026, #5695)                                                                                | unset                |
+| `NEXUS_SANDBOX_ROOT`             | Sandbox root directory for the sandbox executor                                                                                                                                                                                         | unset                |
+| `NEXUS_SUBPROCESS_ENV_ALLOWLIST` | Boolean (`true`/`1`, `false`/`0`); `false` disables the spawned-CLI env allowlist (#2865, #5155) entirely — full passthrough (minus `CLAUDECODE`). Blunt escape hatch; re-leaks cross-vendor keys. Prefer `NEXUS_SUBPROCESS_EXTRA_ENV`. | unset (allowlist on) |
+| `NEXUS_SUBPROCESS_EXTRA_ENV`     | Comma/space-separated list of additional env-var **names** to forward to spawned CLIs, e.g. a custom gateway key (#4037). Keeps cross-vendor isolation; forwards only the named vars.                                                   | unset                |
+| `NEXUS_SENSITIVE_REFS`           | Comma/space-separated org/gov reference **terms** scrubbed from auto-filed issue text (#3382 opsec). Intentionally not hardcoded — set your org's terms here. Unset ⇒ no scrubbing.                                                     | unset                |
+| `NEXUS_AUTH_ENABLED`             | Enable MCP auth (applies only to network transports; no effect on the default stdio MCP)                                                                                                                                                | `true`               |
+| `NEXUS_CUSTOM_API_ALLOW_PRIVATE` | Boolean (`true`/`1`, `false`/`0`): SSRF guard escape hatch allowing custom/OpenAI-compat gateway URLs to target private or loopback IP addresses (#4392)                                                                                | unset (fail closed)  |
+| `NEXUS_DRIFT_ADVISORY`           | Model-string drift CI gate: any value except `0` (incl. unset) = advisory (warn); `0` = blocking (#2199). CI sets `0` to enforce.                                                                                                       | unset (advisory)     |
+
+`NEXUS_DRIFT_ADVISORY` is **script-scoped**: it is read by
+`scripts/check-model-string-drift.ts` and never by the server, so it is
+deliberately absent from the runtime env-schema, which validates the server's
+own process env. Setting it affects the CI gate, not a running server (#5159).
+
+### Orchestration Variables
+
+| Variable                         | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Default               |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| `NEXUS_V2_MODE`                  | V2 pipeline mode (`off`/`partial`/`full`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `full`                |
+| `NEXUS_AORCHESTRA`               | AOrchestra dynamic agent planning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `true`                |
+| `NEXUS_AORCHESTRA_DISPATCH`      | AOrchestra worker dispatch                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `true`                |
+| `NEXUS_WORKER_MAX_CALLS`         | Maximum worker and synthesis adapter completion attempts per dispatch, including retries and refinement. Excludes planning, voting, and adapter-internal provider retries                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `6`                   |
+| `NEXUS_MAX_CONCURRENT_EXPERTS`   | Expert pool semaphore capacity                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | `6`                   |
+| `NEXUS_ALLOW_MOCK_ORCHESTRATION` | Allow mock orchestration (test/CI only)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `false`               |
+| `NEXUS_ALLOW_SIMULATE`           | Explicit opt-in (`1`) for `simulateVotes: true` outside test runners (demos only — simulated votes are random, #4170). Unset = such requests are rejected with a `permission` error                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | unset (fail closed)   |
+| `NEXUS_DISABLED_CLIS`            | Comma-separated CLIs to take out of service (`claude`, `gemini`, `codex`, `opencode`; trimmed, case-insensitive), e.g. `codex,gemini` when a plan is out of quota (#6590). It disables the CLI **transport** (#6720): the binary is never spawned or probed, it gets no CLI voter seat, and `doctor` lists it and skips its probe. On a gateway host the family's gateway model still serves the slot (router arm, pinned slot, fallback and `delegate_to_model` included) when the gateway lists that family, and gateway voter seats still land on that family; with no gateway, or no model of that family, the slot has no arm. On a gateway host a disabled CLI's pinned slot is served by the gateway family model only, never by a same-family API key; with no family model it fails as unavailable. An unknown name warns once and is ignored. Disabling every CLI removes only the CLI adapters. With the default `cli-first` priority, an unpinned call then falls back as it does with no CLI installed: to `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GOOGLE_AI_API_KEY` in that order, then the custom-openai gateway adapter. It gets the no-adapter error only when none of these is set, and `cli-only` always throws. On a host with no gateway, a pinned disabled slot is served by another available CLI when there is one, and otherwise takes the same API-key fallback | unset (none disabled) |
+
+**`NEXUS_ALLOW_SIMULATE` scope notes (#4170).** Test-runner detection trusts `VITEST=true` / `NODE_ENV=test` — a server started with an inherited test environment therefore disables the ban. The gate covers the MCP tool surface (`consensus_vote`, `run_pipeline`, `run_dev_pipeline`, `pr_review`, `supply_chain_tradeoff_panel`); programmatic library consumers (e.g. `createAgentStages` / `executeVoting` via the package exports) sit below the gate by design.
+
+**Scheduled `improvement_review` (#3229).** Periodically runs `improvement_review` server-side so its `signal.fitness_declined` fires without manual invocation, feeding the self-tuning loop:
+
+| Variable                               | Description                                                                   | Default   |
+| -------------------------------------- | ----------------------------------------------------------------------------- | --------- |
+| `NEXUS_IMPROVEMENT_REVIEW_INTERVAL_MS` | Poll interval in ms. `0`/unset disables. Suggested opt-in: `21600000` (6h)    | `0` (off) |
+| `NEXUS_IMPROVEMENT_REVIEW_FILE_ISSUES` | Whether the scheduled run files GitHub issues (separate opt-in — avoids spam) | `false`   |
+
+The scheduled run is **analysis-only by default** (emits signals, files no issues); `NEXUS_IMPROVEMENT_REVIEW_FILE_ISSUES=true` is a deliberate, separate opt-in (the tool's 5-issues/run rate-limit + open-issue dedup are backstops, not the primary guard).
+
+### Learning & Memory Variables
+
+| Variable                      | Description                                                       | Default  |
+| ----------------------------- | ----------------------------------------------------------------- | -------- |
+| `NEXUS_PERSIST_LEARNING`      | Cross-session routing persistence (boolean; `false`/`0` disables) | `true`   |
+| `NEXUS_STRATEGY_DISTILLATION` | Strategy distillation only (boolean; `false`/`0` disables)        | `true`   |
+| `NEXUS_REFLECTIVE_MEMORY`     | Reflective memory retrieval (`shadow`/`true`/`false`)             | `shadow` |
+| `NEXUS_BILLING_MODE`          | Cost mode (`plan`=strongest model wins, `api`=cost-aware)         | `plan`   |
+| `NEXUS_TUNE_ENFORCE`          | Self-tuning loop: apply bounded routing demotions                 | `true`   |
+| `NEXUS_ROUTE_GATEWAY_SHADOW`  | Shadow-mode evaluation for Route=(model, gateway) (#7071)         | `false`  |
+
+Outcomes and distilled routing rules persist to `~/.nexus-agents/learning/` — this is **cross-repo** state (shared across all your projects) and is not affected by the per-repo data dir (epic #2872). When persistence is enabled, `routingMemory`, `strategyDistillation`, and `preferenceRouting` also auto-enable (no separate config needed). Opt out with `NEXUS_PERSIST_LEARNING=false`.
+
+**`NEXUS_STRATEGY_DISTILLATION` — distilled routing rules (#6512).** When it is on (the default), the first route in each process distills rules from the persisted outcome store if at least 50 eligible outcomes are newer than the last `rules.json` snapshot. Only `delegate` outcomes marked `cliSource: 'executed'`, with a positive duration and a real CLI name, are eligible. `false`/`0` turns distillation off without touching outcome persistence: the router builds no distiller, and it reads or applies no distilled rule. It overrides a config that enables `routing.stages.strategyDistillation`. `nexus-agents doctor` reports `Distilled rules: N (A active; trained on E eligible outcomes; last distill: …)`.
+
+**`NEXUS_TUNE_ENFORCE` — the self-tuning routing loop (epic #3143 / #3147).** The loop reacts to health signals (`signal.swarm_unhealthy` from SwarmObserver bottlenecks and adapter circuit-breaker failovers) by **demoting** an unhealthy CLI in routing. The same flag gates both the write (the `TuneStage` applies the demotion) and the read (the `CompositeRouter` folds it into candidate scoring), so the loop is **either fully live or fully shadow — never half-wired**.
+
+- `true` (**enforce**, default since v2.96) — a `signal.swarm_unhealthy` applies a **bounded** routing demotion via the provenance-tagged `TuneAdjustmentStore`. Every demotion is recorded to the tamper-evident append-only audit chain as a `tune.demote` event (verify with `verify_audit_chain`; tamper-evident, not tamper-proof — see the [audit hash-chain threat model](../security/audit-hash-chain-threat-model.md)).
+- `false` (**shadow**, opt-out) — the loop logs the demotion it _would_ apply and records it to the `intended` counter, but **routing is untouched**. Use this to disable auto-tuning fleet-wide, or to observe the would-be behavior first: `nexus-agents health` shows `applied` vs `intended` per CLI under "Self-Tuning Demotions".
+
+The demotion is bounded by hard safety invariants so the loop is self-correcting, never a ratchet: **demotion-only** (a CLI is slowed, never boosted), **floored** at `0.5` (never zeroed out of routing — a sole-viable CLI is always still selectable), **capped** at `0.2` per step, and **time-decaying** linearly back to neutral over 30 minutes (a transient health blip auto-reverses). The channel is separate from the LinUCB real-outcome bandit. **Opt out** with `NEXUS_TUNE_ENFORCE=false`. See [Self-Tuning Loop](../architecture/EVENT_BUS_BOUNDARIES.md#the-self-tuning-loop-3143).
+
+Files stored:
+
+- `outcomes.jsonl` — Append-only JSONL of task outcomes
+- `rules.json` — Atomic JSON snapshot of distilled routing rules
+
+### Security & Governance Variables
+
+| Variable                       | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Default                 |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `NEXUS_REPUTATION_GATING`      | Author-reputation tier gating: `off` / `audit` / `enforce` (#3122, epic #3118). Default flipped `audit` -> `enforce` in #4667 after measurement; this column said `audit` until #5382 corrected it. Read once per process at first use since #4992; a running MCP server needs a restart to pick up a change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `enforce`               |
+| `NEXUS_FIREWALL_POLICY`        | `HostileInputFirewall` rollout gate: `off` / `audit` / `enforce` (#5382, epic #5281). `off` is pre-#5382 behaviour exactly; `audit` reports `wouldRefuse` without refusing; `enforce` returns `POLICY_REFUSED` on a blocking violation. Defaults `off` — unlike the row above — because the firewall is a **published** API whose external callers would see a stricter default as a silent breaking change. Since #4992 the `issue_triage` and `pr_review` paths route through the firewall and honour this mode: `audit` logs a would-be refusal for the caller's real access posture, `enforce` refuses the triage/review outright, and since #6309 also refuses an uncorroborated per-action decision at the firewall's corroboration stage (recorded as refused, never dropped). Read once per process at first use since #4992; a running MCP server needs a restart to pick up a change | `off`                   |
+| `NEXUS_MCP_POLICY_ENFORCE`     | Runs the MCP `PolicyFirewall` in `enforce` instead of the rollout default `warn` (#6431; the per-operator opt-in #4987/#4988 described before it had a reader). Same accept-set as every boolean flag: `true`/`1` on, `false`/`0` off, anything else reported invalid at startup and treated as off. In `warn` every rule is evaluated and every would-be denial is logged, none is applied; in `enforce` a denial fails the tool call. Overrides `security.policy.policyMode`, which is not read for the effective mode. The startup line reports the mode in effect and why: `policyMode: enforce (NEXUS_MCP_POLICY_ENFORCE)` or `warn (rollout default)`. Whether enforce becomes the default is #4988                                                                                                                                                                                      | unset (enforce off)     |
+| `NEXUS_TASK_STATE_ENABLED`     | Structured task-state log + Magentic-One ledgers (`0`/`false` to disable, #2278)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | enabled (v2.50+)        |
+| `NEXUS_CONTEXT_WARN_THRESHOLD` | Per-expert context-warning threshold (0..1]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `0.85`                  |
+| `NEXUS_PR_REVIEW_RECORDS_PATH` | Forces the `pr_review` governance-record ledger path to an explicit absolute file. Escape hatch for MCP server processes whose `process.cwd()` has no `.git` ancestor, where cwd-based auto-detection silently fails to persist the record (#4278). Takes precedence over the per-call `pr_review({ repoPath })` input and over cwd auto-detection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | unset (cwd auto-detect) |
+
+**`NEXUS_REPUTATION_GATING` graduation path:** `off` bypasses entirely; `audit` logs every violation and blocks nothing; `enforce` blocks. Author-reputation tier demotion in `issue_triage` (epic #3118). (The `NEXUS_ACCESS_POLICY_MODE` ladder that used to sit here — `audit` → `confirm_risky` → `enforce` — was retired with the ClawGuard deriver in #5108; the secret-path control it fronted is the PolicyFirewall `secret-paths` rule, whose enforce rollout is #4988.)
+
+- `off` — reputation never affects the enforced trust tier
+- `audit` — reputation is computed and the would-be demotion is logged + surfaced (`trustAssessment.effectiveTrustTier`/`gatingMode`), but the **classifier** tier is enforced. Collects telemetry on the demotion rate before enforcing
+- `enforce` (default) — apply the reputation demotion at the policy gate (a suspicious author's tier-gated actions are blocked)
+
+**Escape hatch:** in every mode the maintainer allowlist (Tier 1) is authoritative — reputation can never demote an allowlisted/owner author. To clear a false-positive demotion for a specific user, add them to the allowlist; to disable gating fleet-wide, set `off`.
+
+### Timeout Variables
+
+| Variable                  | Description                                                                                                                                                                                                                 | Default                              |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `NEXUS_VOTE_TIMEOUT_MS`   | Per-vote consensus timeout (ms). Clamped to `[30000, 600000]` (raised to 300s in #1640 — experts averaged 315s on complex proposals)                                                                                        | `300000`                             |
+| `NEXUS_EXPERT_TIMEOUT_MS` | Expert handler timeout (ms). Clamped to `[30000, 900000]`; `execute_expert` floors at `120000`. Picked per-category — complex (architecture/security_review/planning/devops/documentation) override defaults to `complexMs` | `300000` standard / `600000` complex |
+| `NEXUS_WORKER_TIMEOUT_MS` | Worker subprocess timeout (ms)                                                                                                                                                                                              | `60000`                              |
+
+#### Central timeout authority (#3734)
+
+Timeouts are **runaway-guards, not SLAs** — each MCP tool maps to an operation class with a generous upper bound (the historical 60s MCP default was accidental + punitive). The class an unclassified tool falls back to is `single-llm` (300s).
+
+| Class             | Guard (default) | Covers                                                        |
+| ----------------- | --------------- | ------------------------------------------------------------- |
+| `interactive`     | `60000`         | fast local reads/writes (memory/query/list/get)               |
+| `single-llm`      | `300000`        | one expert/delegate call; CPU-heavy local (extract/search)    |
+| `multi-llm-panel` | `900000`        | parallel voters/reviewers (consensus_vote, pr_review, …)      |
+| `pipeline`        | `1800000`       | multi-stage orchestration (run, orchestrate, run_pipeline, …) |
+| `network-fetch`   | `120000`        | external discovery/catalog/repo fetches                       |
+| `async-job-body`  | `3600000`       | the body of a backgrounded job (no request timeout)           |
+
+| Variable                                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Default   |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------- |
+| `NEXUS_TIMEOUT_MULTIPLIER`               | Float scaling EVERY class guard. Clamped `[0.25, 10]`. `2` doubles every guard, subject to each class's ceiling.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | `1`       |
+| `NEXUS_TIMEOUT_CLASS_INTERACTIVE_MS`     | Override the `interactive` class guard (ms). Floored at `1000`, × multiplier, then ceilinged at `3600000` (the MCP request ceiling).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | `60000`   |
+| `NEXUS_TIMEOUT_CLASS_SINGLE_LLM_MS`      | Override the `single-llm` class guard (ms). Ceiling `3600000`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `300000`  |
+| `NEXUS_TIMEOUT_CLASS_MULTI_LLM_PANEL_MS` | Override the `multi-llm-panel` class guard (ms). Ceiling `3600000`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `900000`  |
+| `NEXUS_TIMEOUT_CLASS_PIPELINE_MS`        | Override the `pipeline` class guard (ms). Ceiling `3600000`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `1800000` |
+| `NEXUS_TIMEOUT_CLASS_NETWORK_FETCH_MS`   | Override the `network-fetch` class guard (ms). Ceiling `3600000`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | `120000`  |
+| `NEXUS_TIMEOUT_CLASS_ASYNC_JOB_BODY_MS`  | Override the `async-job-body` class guard (ms). Ceiling `7200000` (2h), not the MCP request ceiling — a backgrounded job has no MCP request (#5995). The default is unchanged; raising it is opt-in. Above the `3600000` MCP ceiling the body must prove liveness (#6162): `runAsJob` hands it a `progress()` heartbeat, and a body silent for 3 heartbeat intervals (interval = guard / 8, so 3/8 of the guard — 22.5 min at just over 3.6M, 45 min at 7.2M) is failed as `wedged (no progress for N ms)` exactly that long after its last heartbeat (a lazy watchdog measured from the record, not a poll tick) and its concurrency slot released before the guard fires. Every in-tree async body heartbeats (panels per settled seat, pipelines through the stage events they emit, orchestrate per stage transition and per agent model call, graph and workflow bodies per node or phase); a custom `runAsJob` body that never heartbeats is wedged by definition. At or under the ceiling nothing is watched and a wedged job still holds its slot for the whole guard. | `3600000` |
+
+Resolution, one order for every class (#6162): `max(envClassOverride ?? base, 1000) × multiplier`, clamped once to the class ceiling — `MCP_TIMEOUTS.maxMs` (`3600000`) for every class that runs inside an MCP request, `7200000` for `async-job-body`, which runs outside any MCP request (#5995). The ceiling is applied to the product, so an override above it is reported as reduced rather than trimmed before the multiplier sees it; an override above `7200000` with a multiplier below `1` on a request-bound class resolves to `min(override × multiplier, 3600000)` and is attributed to the override. A value clamped away is reported at startup (`Environment variable … had no effect`). The near-timeout WARN for a backgrounded job fires at 0.5 of whatever guard it runs under, and the effective guard is logged once at job start; `get_job_result` and `list_jobs` expose a pending job's `lastProgressAt` (its last heartbeat, absent when it never sent one) so a poller can tell slow from stuck. Explicit per-call and `security.perToolTimeout` overrides still win over the class guard.
+
+> **Rate limiting, retries and circuit breakers are configured in the config
+> file, not by environment variable.** `NEXUS_RATE_LIMIT_*`, `NEXUS_RETRY_*` and
+> `NEXUS_CIRCUIT_BREAKER_*` were removed in #5903 — they were registered and
+> documented but read by nothing that runs, so setting one changed nothing while
+> `config get` reported it as `Source: (env)`. Use `security.rateLimit` (see the
+> config-file example above); retry and circuit-breaker behaviour is currently
+> code-level, not operator-configurable.
+
+### Infrastructure Variables
+
+| Variable                    | Description                                                                                                                                                                                                                                         | Default      |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| `NEXUS_EVENTBUS_ENABLED`    | EventBus A2A bridge                                                                                                                                                                                                                                 | `true`       |
+| `NEXUS_V2_POLICY_MODE`      | Policy enforcement (`off`/`warn`/`block`); governs the V2 orchestrate pre-execution check (`checkPipelinePolicy(task, 'execute')`)                                                                                                                  | `block`      |
+| `NEXUS_AUTO_REMEDIATE`      | Autonomous remediation cycle (`off`/`audit`/`enforce`, #3653; default `audit` zero-write soak, #3769)                                                                                                                                               | `audit`      |
+| `NEXUS_CONSENSUS_ENFORCE`   | Consensus verdict enforcement for `run` (`off`/`audit`/`enforce`, #4464); see below.                                                                                                                                                                | `audit`      |
+| `NEXUS_POLICY_GATE_MODE`    | Stage-boundary policy gate (`off`/`warn`/`block`, #3177): dev-pipeline's consensus→execute gate, and any compiled gate node whose caller supplies a `policyEnforcement` bundle (none in-tree today); the V2 delegate graph declares no gate (#4657) | `warn`       |
+| `NEXUS_JOB_RESULT_SOURCE`   | Async job-result reader source (`sidecar`/`task_state`, #3090/#3693): `task_state` prefers+unions the Stage-2 task-state log (default); `sidecar` selects legacy fallback; reader half of the sidecar→Stage-2 migration (epic #2631)                | `task_state` |
+| `NEXUS_MODELS_OVERLAY_PATH` | Path to a model-registry overlay manifest (#3185 hot-reload)                                                                                                                                                                                        | _(unset)_    |
+| `NEXUS_DISABLE_SESSIONS`    | Disable session tracking                                                                                                                                                                                                                            | `false`      |
+| `NEXUS_DISABLE_METRICS`     | Disable metrics tracking                                                                                                                                                                                                                            | `false`      |
+
+### Consensus enforcement
+
+`NEXUS_CONSENSUS_ENFORCE` controls the consensus strategy dispatched by
+`run({ execute: true })`. It defaults to `audit`.
+
+- `off` records the final panel without judging its verdict. The `enforcement`
+  field reports `{ mode: 'off', attempts: 1, reason: 'unmeasured' }`; `wouldBlock`
+  is omitted.
+- `audit` reports whether enforcement would block, while allowing the run to
+  succeed. It does not retry the panel.
+- `enforce` returns a business error for `rejected`. It retries `no_quorum`
+  exactly once, then fails closed if the retry still lacks quorum. An approval
+  must have approvals > 0.5 × (approve + reject + errored seats). Unverifiable
+  seats (unable to read the artifact) count with errored seats; genuine
+  abstentions leave the denominator. An approval below this bar is treated
+  like `no_quorum` (reason `not_outage_invariant`): retried once, then
+  blocked. The engine's recorded decision is not changed. For example, 3 approvals, 1 rejection and 3 genuine
+  abstentions pass; replacing those abstentions with unverifiable seats blocks.
+  3 approvals, 2 rejections and 2 errored seats block; 5 approvals and 2 errored
+  seats pass.
+
+Every consensus run exposes `{ mode, attempts, reason }` in `enforcement`, plus
+`wouldBlock` when measured. `attempts` is 1 or 2. The ledger records the final
+panel's engine decision unchanged; a quorum retry also records the first
+panel's cost through the existing cost writer, without a second ledger line.
+Recording errors fail the run under `enforce`; `audit` and `off` log them and
+continue. Under `audit` and `enforce`, `enforcement.recordingError` reports a
+recording failure separately from the verdict's `reason`. Enforced refusals
+carry `{ decision, enforcement, voteRecord }` in the error envelope's `detail`.
+An enforced refusal also ends an asynchronous run job as `failed`.
+`pr_review` remains advisory.
+
+```bash
+NEXUS_CONSENSUS_ENFORCE=enforce nexus-agents --mode=server
+```
+
+### Gateway behind a corporate network (#6608)
+
+These apply to the in-process OpenAI-compatible gateway path (model discovery
+and the per-model adapters behind `NEXUS_OPENAI_COMPAT_URL`), including the
+`custom-openai` alias. They share auth headers, extra headers, proxy transport
+and the bounded private-address guard (#7150). CLI subprocesses get the proxy variables
+through their own environment (`subprocess-env.ts`).
+
+- **Auth header.** `NEXUS_OPENAI_COMPAT_AUTH_HEADER` and
+  `NEXUS_OPENAI_COMPAT_EXTRA_HEADERS`, above.
+- **Proxy.** Gateway calls honour `HTTPS_PROXY` (for an `https://` gateway) or
+  `HTTP_PROXY` (for `http://`), lowercase spellings first, and skip the proxy
+  when the gateway host matches `NO_PROXY` / `no_proxy` (`*`, a host, a domain
+  suffix with or without a leading `.`, optionally `:port`). The proxy must be
+  an `http://` or `https://` URL; any other scheme is warned and gateway calls
+  go direct. The proxy URL is never logged, since it can carry credentials.
+  Measured on Node 22.22.3: the global `fetch`, and so the `openai` SDK, does
+  **not** read these variables unless the process was started with
+  `NODE_USE_ENV_PROXY=1` (a loopback proxy saw no traffic without it). The
+  gateway therefore gets an explicit proxy agent (undici `ProxyAgent`), so the
+  variables apply without `NODE_USE_ENV_PROXY`; this was measured on Node
+  22.22.3 only.
+- **Corporate CA.** `NODE_EXTRA_CA_CERTS` reaches gateway calls: measured on
+  Node 22.22.3 against a self-signed loopback gateway, the global `fetch`, the
+  `openai` SDK, and the SDK through the proxy agent's tunnel all failed with
+  `DEPTH_ZERO_SELF_SIGNED_CERT` without it and succeeded with it. Node reads
+  it once at startup, so set it in the server's launch environment.
+- **Private addresses.** A gateway host that resolves to a private, loopback or
+  link-local address is refused unless `NEXUS_CUSTOM_API_ALLOW_PRIVATE=1`. The
+  startup warning names that variable and says the gateway is not in use;
+  under sandbox mode the server exits instead.
+- **Gateway down at boot.** When discovery fails at startup because the
+  gateway is unreachable, returns an error or lists no models, the server
+  starts on CLI subprocesses and retries discovery on a later model call, at
+  most once every 60 s (the boot attempt starts the clock). Retries run only on
+  a call, never on a timer, and stop once the gateway is wired. Since #6659
+  every adapter the registry hands out triggers the retry, not only voting and
+  `pr_review`, and each re-detects once after a late discovery, so the default
+  adapter and the family slots move onto the gateway. A DNS lookup that takes
+  over 5 s fails the attempt closed and is retried; a DNS error fails open. A
+  private-address refusal is not retried: fixing it is an environment change,
+  which needs a restart.
+
+### Runtime internals, record paths and nesting guards (#5142)
+
+These are read by production code and are registered in `config/env-schema.ts`.
+They were previously unregistered, so setting one produced an "unknown variable"
+warning at startup with a typo suggestion, even though the value was honoured.
+
+| Variable                         | Description                                                                                                                                                                                                                                                                                   | Default                 |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `NEXUS_MCP_DEPTH`                | Nesting depth stamped on a child Codex MCP process; the adapter refuses to recurse past its limit. Set by the parent, not normally by a user                                                                                                                                                  | `0` (top level)         |
+| `NEXUS_SUBPROCESS_DEPTH`         | Same idea for spawned CLI subprocesses (`subprocess-env.ts`), guarding runaway self-invocation                                                                                                                                                                                                | `0` (top level)         |
+| `NEXUS_JOB_MAX_CONCURRENT_TOTAL` | Global cap on in-flight async MCP jobs across all tools. **`0` is meaningful** — it disables async dispatch entirely                                                                                                                                                                          | built-in cap            |
+| `NEXUS_CI_HEALTH_MAX_BYTES`      | Byte cap on the log slice `ci_health_check` reads before truncating                                                                                                                                                                                                                           | built-in cap            |
+| `NEXUS_VOTE_RECORDS_PATH`        | Overrides where consensus vote records are written. Relative paths resolve against the repo data dir and must not escape it                                                                                                                                                                   | `<dataDir>/governance/` |
+| `NEXUS_VOTE_SIGNING_KEY`         | SSH key `scripts/append-ratification-record.ts` signs a committed vote record's hash with (#3927 item 4); `--signing-key` overrides. Unset: the agent key at `<dataDir>/auth/vote-record-signing.key` if generated (#6257), else appended unsigned. An owner-principal key needs `--as-owner` | unset                   |
+| `NEXUS_MODEL_REGISTRY_OVERLAY`   | Path to a model-registry overlay manifest layered over the in-tree model data                                                                                                                                                                                                                 | unset                   |
+
+**Dynamic families.** Two variable names are constructed at runtime, so they are
+matched by prefix rather than listed individually:
+
+| Pattern                           | Description                                                                                                                     |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `NEXUS_VOTER_MODEL_<ROLE>`        | Pins the model for one voter role, e.g. `NEXUS_VOTER_MODEL_ARCHITECT=claude-opus`. `<ROLE>` is a `VOTER_ROLES` key, upper-cased |
+| `NEXUS_JOB_MAX_CONCURRENT_<TOOL>` | Per-tool async job cap, e.g. `NEXUS_JOB_MAX_CONCURRENT_ORCHESTRATE=2`. `<TOOL>` is an MCP tool name, upper-cased                |
+
+A `<ROLE>` that is not a real voter role is still reported as an unknown
+variable — the prefix match is checked against the canonical role list, not
+accepted blindly.
+
+### Code-PR adapter activation (#3670) — ARMED but DORMANT
+
+The autonomous code-PR adapter (#3670) is **built and owner-approved (2026-06-19)
+but DORMANT**. It is "armed", not "active": the owner approval satisfies the
+human-authorization gate, but it does **not** activate the push path. Activation
+is **earned** through conjunctive, falsifiable, evidence-based gates — every one
+must hold, and each is an independently checkable operational fact (never model
+output, never "the owner said so").
+
+A push is **impossible** unless ALL of the following conjunctive gates hold:
+
+- **Enable flag** — the explicit OFF→on flag. There is **no enable env var** yet:
+  the flag is passed in as the `flagEnabled` boolean on the readiness evidence
+  (`CodePrEnableReadinessEvidence` / `CodePrPushReadiness.flagEnabled`), supplied by
+  the operator wiring point that constructs the push input. The gate stays pure and
+  reads no env for the flag.
+- **Enable-vote ref** — a recorded enable-vote ref (`enableVoteRef`, non-empty),
+  supplied on the readiness evidence alongside the named `owner` acknowledgement.
+- **`NEXUS_CODEPR_TOKEN`** — a **least-privilege** scoped credential that may open a
+  feature-branch PR ONLY. It **cannot** merge, push to `main`/`master`, force-push,
+  or alter branch protections. It is an operator-provisioned env var read directly by
+  the push seam (`CODEPR_TOKEN_ENV`), not part of the validated `validateNexusEnv`
+  set; absent or empty ⇒ a hard `no_credentials` refusal.
+- **`guardsGreenSoak ≥ 50`** — at least 50 **consecutive** clean (zero guard-denial)
+  dry-run plans, accrued automatically by the `NEXUS_AUTO_REMEDIATE=audit` soak
+  consumer. The streak is read from the durable soak store at push time, **not** from
+  caller input — it cannot be forged.
+
+> **Warning — setting the flag alone does NOT activate the adapter.** Flipping
+> `flagEnabled` true (or recording the enable-vote, or provisioning the token) is
+> necessary but **never sufficient**: every evidence gate above still applies, and
+> any unmet gate fails closed. This is deliberate (per the DevX vote condition) so
+> there is no "enabled but does nothing" confusion — the adapter is dormant until
+> the soak is earned AND the scoped token is present AND the flag/vote/owner-ack are
+> all recorded. Owner approval authorizes activation; it does not perform it.
+
+See #3670 for the staged rollout (the push path is the gated capability; nothing
+here wires it to a live runtime trigger).
+
+### Audit-mode remediation soak: the operator store is the evidence path (#4224, #4279)
+
+The enforce-readiness soak (`learning/remediation-soak.jsonl`, read by
+`remediation-readiness-collector.ts`) only accrues when someone runs
+`nexus-agents auto-remediate`. It is **not** a byproduct of normal work, so
+without a scheduler the evidence the enforce gate depends on cannot accumulate —
+it flatlined on 2026-06-17 despite heavy repo activity, and again at one record
+for the five weeks before #4279 was re-verified. There is ONE evidence path (the
+local operator cycle below) and one CI job that is deliberately **not** one:
+
+**1. The CI job is a smoke test, not evidence
+(`.github/workflows/remediation-audit-soak.yml`, display name
+"Remediation Audit Smoke (no readiness evidence)").** It runs the build then
+`nexus-agents auto-remediate` in **audit** mode daily (`cron: '17 7 * * *'`)
+plus `workflow_dispatch`, and proves the audit path — collect → research → vote
+→ append — runs end to end on the built CLI. It exports `NEXUS_AUTO_REMEDIATE=audit`
+and asserts it before running, and the cycle entry point structurally withholds
+`repoRoot`, so `enforce` cannot engage from CI. It keeps `permissions: contents: read`.
+
+> **A green run is not progress toward #3769.** The #4279 panel (5–2, Option B)
+> declared the CI soak non-evidence, for three reasons that hold independently:
+>
+> - **Disjoint store.** The job appends under a workspace `NEXUS_DATA_DIR` that
+>   lives only in `actions/cache` (evicted after 7 idle days). The readiness gate
+>   reads the operator store (`~/.nexus-agents/learning/remediation-soak.jsonl`);
+>   nothing bridges the two, and 43 green runs moved the gate by zero records.
+> - **Un-judged by construction.** A bridged CI corpus arrives with no soundness
+>   judgments. It needs human reviews or live `remediation-review panel-judge`
+>   judgments, owner checks of a random panel sample, and a named owner sign-off;
+>   volume alone cannot satisfy readiness.
+> - **Self-authorship.** Letting the job commit its records would widen the
+>   cron-triggered token to `contents: write` so the automation seeking enforce
+>   authority could author the evidence that grants it.
+>
+> The job also wires no model/gateway secrets, so its per-signal vote degrades to
+> `no_quorum` at zero LLM cost and its records carry no `voteOutcome` — thin even
+> as smoke coverage. Treat it as an alarm that the audit path still runs, nothing more.
+
+**2. LOCAL cron / systemd timer — the evidence path.** Readiness evidence comes
+from **your real `~/.nexus-agents` telemetry**, not a clean CI runner: a fresh
+checkout has little of your outcome/decision-cost telemetry, so the
+`improvement_review` signals it collects are thin and near-identical day to day.
+If you operate nexus-agents day-to-day, schedule the audit cycle _locally_ where
+that telemetry lives. Audit mode is the default: the cycle appends soak evidence
+without applying remediation changes. Create `~/.nexus-agents/logs` before installing
+the cron entry, and retain the output so failures are visible:
+
+```cron
+# crontab -e — daily audit-mode soak against your real ~/.nexus-agents telemetry
+17 7 * * * cd /path/to/your/repo && NEXUS_AUTO_REMEDIATE=audit nexus-agents auto-remediate >>~/.nexus-agents/logs/auto-remediate.log 2>&1
+```
+
+Or as a systemd timer (`~/.config/systemd/user/nexus-soak.service` +
+`nexus-soak.timer` with `OnCalendar=daily`) running the same command.
+
+After a soak window, judge pending selections with a live panel, draw an owner
+sample, review those records, then sign off:
+
+```bash
+nexus-agents remediation-review panel-judge --batch 100
+nexus-agents remediation-review sample --n 10 --owner '<owner>' --format json
+# Read each sampled soak record and judge it independently; use the emitted ID/ref.
+nexus-agents remediation-review mark '<soakRef>' --sample '<sampleId>' --evaluator '<owner>' --sound
+# Use --unsound for an unsound selection. Repeat mark for every sampled ref.
+nexus-agents remediation-review sign-off --owner '<owner>'
+nexus-agents remediation-review readiness
+```
+
+`panel-judge` runs one live `higher_order` vote per pending record with
+`absolute_quorum`, using the full seven-seat panel by default (`--quick` uses
+three). The proposal allows signal identity, category, priority, severity,
+title, description and evidence, plus the selected remediation steps and their
+count. Earlier vote reasons/results and future fields are excluded. New soak
+records retain the signal and plan content before voting. Each judgment retains
+its vote record ID, the absolute ledger path returned by persistence, and the
+SHA256 hash of the original stored line. Quorum failures and errors record no
+judgment and are reported per ref. Malformed lines and duplicate references are
+skipped and reported; the batch parses one soak snapshot. Readiness verifies
+against exactly the recorded ledger path, checking decision, proposal hash/text
+and self-hash. Missing, unreadable or malformed ledgers and duplicate soak
+references make panel evidence unverifiable. The readiness criteria and text
+name each ref's cause (missing ledger path, unreadable ledger, record ID not
+found, or hash mismatch) and say: "re-judge the ref by a human or re-run panel-judge".
+A later human judgment supersedes the earlier panel row, removing its verification
+failure while retaining the superseded count.
+
+`sample` requires `--owner` and persists that name at draw time with a
+crypto-generated seed and the panel judgments selected for owner review; `--seed S` reproduces the draw over the same panel-judged corpus.
+The latest draw is the active sample; previous draws remain in the audit history.
+Sign-off refuses an incomplete active sample and preserves panel provenance.
+Readiness reports human, panel and sampled owner counts separately. Its existing
+100-selection, 80%-judged and 90%-sound thresholds remain unchanged, with an
+additional owner-agreement criterion requiring at least 10 fully measured sample
+refs drawn strictly after the latest current panel judgment. Disagreements across
+all draws block readiness until a later agreeing owner-sample mark on the same
+ref is made by that sample's recorded owner (`--evaluator` and `--owner`
+must match the name saved at draw time). Only that evaluator's sampled marks
+count as owner judgments; other evaluators' marks are ordinary human judgments
+and cannot resolve owner disagreements. Sign-off must also use the recorded
+owner name. Names are free text, at the same trust level as the existing
+named-evaluator and named-owner criteria: this binds consistency, not identity.
+Human primary judgments do not resolve owner disagreements. Review/sample histories
+do not rotate automatically; damaged stores block readiness and refuse appends.
+Panel IDs never qualify as named evaluators, and owner annotations require
+explicit sign-off. Owner agreement is `n/a` only when the raw review store has
+zero non-superseded panel rows and zero owner-sample rows. Superseded panel
+rows remain reported as a count. Unverifiable or evicted active panels block
+owner agreement and judged coverage with named reasons. Human-only review can
+still reach READY. Every tier's record is judgeable — `mark` keys on the soak
+ref, never on whether a dry-run was captured (#4279 Gap 2).
+
+**Watch the store, not the CI job.** `nexus-agents remediation-review readiness`
+prints a `Soak store:` line beside the verdict (#4279): `UNMEASURED` when the
+store is empty, `ALARM` when it holds ≤1 record or has had no new record for
+14 days (each cause named), `fresh` otherwise; `--format json` carries the same
+signal as `soakStore`. A flatlined operator store is a stalled evidence path and
+this is the only place it is reported — the CI smoke job cannot see it.
+
+> **Known limitation — `dryRunResult` (plan content) is not captured in the
+> scheduled/local audit cycle.** The p0 `dry-run` audit event that populates a
+> soak record's `dryRunResult` only fires when a `dryRun` capability is wired into
+> the deps — `buildAutoRemediationDeps` does not wire one, and there is **no
+> config/flag/env** to enable it from the CLI. So accrued records carry the real
+> `signalKey`, `category`, `priority`, `planStepCount`, and `reason` (plus
+> `voteOutcome` only where LLM credentials are present — i.e. the local path, not
+> credential-less CI, per the note above), a large improvement over the prior
+> synthetic, uniform volume — but not the full dry-run plan text. This limits what
+> an evaluator has to read; it does not limit what they can mark. Wiring a `dryRun`
+> adapter into the audit cycle so the accrued selections are fully plan-bearing is
+> tracked as follow-up to #4224 (and would also need the dry-run audit `detail` to
+> carry plan content rather than just `ok`/error).
+
+### On-demand MetaOrchestrator shadow-training soak (#4310)
+
+The shadow-training MECHANISM has worked since #3593: with
+`NEXUS_META_SHADOW_TRAIN=1`, `executeGoal` (the `run{execute:true}` engine)
+feeds every live dispatch outcome into the MetaOrchestrator shadow selector
+and appends a sanitized record — bandit feature values + a success flag only,
+**never task text** — to `learning/meta-outcomes.jsonl`. But nothing ever
+TRIGGERED it: training only fires on a live `run` call, and no CI/cron/CLI
+ever made one, so the shadow-agreement evidence the #3552 shadow→route flip
+decision depends on could not accumulate. `.github/workflows/meta-shadow-soak.yml`
+and `scripts/meta-shadow-soak.ts` give it an organic feed, mirroring the #4224
+remediation-audit-soak precedent above.
+
+> **This is a FEEDER, not a router.** `NEXUS_META_SHADOW_TRAIN=1` is the only
+> lever this soak pulls. It never alters which strategy `run` actually
+> dispatches, and it never feeds the enforce/routing path — the #3552
+> shadow→route flip stays a separate, human-gated change. The workflow asserts
+> this invariant explicitly before running.
+
+**Goal sourcing (ratified for #4310): REAL backlog issues, not synthetic.**
+The script fetches open issues from the repo via `gh issue list`, formats
+each as `#<number>: <title>` plus its first body paragraph, and deterministically
+selects a bounded set (default 12, most-recent-first by issue number — a
+reproducible proxy for recency). Synthetic goals would exercise the router on
+a distribution that doesn't resemble what `run` actually sees in production,
+undermining the shadow-agreement evidence the flip decision depends on. The
+selection/formatting logic is pure and unit-tested
+(`scripts/meta-shadow-soak-core.ts`); the `gh` fetch and the live `executeGoal`
+dispatch are the thin, untested-by-unit I/O edge (`scripts/meta-shadow-soak.ts`),
+mirroring the curate-pr-review-harvest.ts / mine-pr-review-candidates-core.ts
+split (#3847).
+
+**1. `workflow_dispatch` only — deliberately NO `schedule:` trigger.** The #4224
+audit-mode cycle costs zero LLM spend without credentials (`createAutoAdapter`
+throws before any network call), but this soak dispatches REAL strategies
+(dev-pipeline / pipeline / research / consensus) through real model gateways
+when credentials are present, so a recurring cron would recur real API cost
+with no CI-cost mandate to justify it. An owner triggers it manually from the
+Actions tab as the evidence window needs topping up.
+
+**Secret-gated — skips cleanly, never fails, when no model-gateway credential
+is configured.** A `check-secrets` step inspects `ANTHROPIC_API_KEY` /
+`OPENAI_API_KEY` / `GOOGLE_AI_API_KEY` / `OPENROUTER_API_KEY` (the same set
+`pr-review.yml` checks) and every downstream step is conditioned on at least
+one being present. Without one, the job reports "skipped" in the step summary
+and exits green — this workflow is safe to leave present even before model
+credentials are configured as repo secrets.
+
+**2. LOCAL on-demand run (no CI cost, uses your own credentials/telemetry):**
+
+```bash
+NEXUS_META_SHADOW_TRAIN=1 pnpm exec tsx scripts/meta-shadow-soak.ts --count 12 --repo nexus-substrate/nexus-agents
+```
+
+Requires `gh` authenticated against the target repo (`gh auth status`) and
+model-gateway credentials for whichever strategies the router selects. A goal
+that routes to an unwired strategy (`graph-workflow` / `spec` / `orchestrate` /
+`single-shot`) still accrues a **failure** shadow-training record — the
+dispatcher records an outcome even for a `no_executor` dispatch — so even
+those goals are not wasted soak volume. The script prints a summary: goals
+run, `meta-outcomes.jsonl` record count before/after, and file size.
+
+> **Stub vs. live:** goal selection/formatting (`meta-shadow-soak-core.ts`) is
+> pure and fully unit-tested against fixtures — no network, no live models.
+> The `gh` fetch and the `executeGoal` dispatch are real I/O with no stub or
+> mock path; there is no `simulateVotes`/synthetic-outcome mode by design (a
+> mocked evidence trail would be worse than no evidence trail for a decision
+> #3552 depends on).
+
+### Removed in 2.82.0 (#2977)
+
+These 8 env vars were declared but never read by any production code (silent
+no-ops). They have been removed from the env-schema; setting them is now an
+error from `validateNexusEnv`. If you had any of them set, just unset them:
+
+`NEXUS_WORKERS_MAX`, `NEXUS_WORKERS_POOL_SIZE`, `NEXUS_WORKERS_IDLE_TIMEOUT`,
+`NEXUS_WORKFLOW_MAX_PARALLEL`, `NEXUS_TEST_PARALLELISM`,
+`NEXUS_EVALUATION_MAX_WORKERS`, `NEXUS_EVENTBUS_MAX_HISTORY`,
+`NEXUS_SWARM_OBSERVER_MAX_EVENTS`.
+
+The matching `WORKER_DEFAULTS.*` config-set keys are also gone; `config set
+WORKER_DEFAULTS.foo X` now returns "key not found" instead of a false success.
+
+### Removed (#4180)
+
+Three more env vars from the same silent-no-op class, missed by the #2977 sweep,
+were declared in the env-schema but never read by any production code. They have
+been removed; `validateNexusEnv` now flags them as unknown. If you had any of
+them set, just unset them:
+
+`NEXUS_TEST_TIMEOUT_MS`, `NEXUS_TIMEOUT_CLISIMPLE`, `NEXUS_TIMEOUT_CLICOMPLEX`.
+
+The matching (equally unread) `TIMEOUT_DEFAULTS.cliSimpleMs` /
+`TIMEOUT_DEFAULTS.cliComplexMs` defaults keys are also gone. Per-complexity CLI
+timeouts were never driven by these knobs — they flow through the internal
+per-CLI `TIMEOUT_PROFILES` (`getTimeoutForCli`).
+
+### Removed (#4939)
+
+The last four variables of the `getTimeout()` family — `NEXUS_TIMEOUT_CLI`,
+`NEXUS_TIMEOUT_API`, `NEXUS_TIMEOUT_WORKFLOW`, `NEXUS_TIMEOUT_MCP` — were
+registered in the env-schema and read by nothing that runs: `getTimeout()` had
+zero production callers, and the only observable effect of setting one was
+`config get TIMEOUT_DEFAULTS.cliMs` answering `Source: (env)` for a value no code
+consumed (the same false-positive #5903 removed for the rate-limit, retry and
+circuit-breaker families). They are gone from the schema; `validateNexusEnv` now
+reports them as unknown. If you had any of them set, just unset them. The
+timeout knobs that ARE read are `NEXUS_VOTE_TIMEOUT_MS`, `NEXUS_EXPERT_TIMEOUT_MS`,
+`NEXUS_WORKER_TIMEOUT_MS`, `NEXUS_TIMEOUT_MULTIPLIER` and the
+`NEXUS_TIMEOUT_CLASS_*_MS` family documented above.
+
+### Removed in 10.0 (#6319)
+
+`NEXUS_ACCESS_POLICY_MODE` has been removed after its only reader was deleted
+in #6321. Unset it; no replacement is needed. Setting it now produces an
+unknown-variable warning from `validateNexusEnv`, including for the formerly
+accepted values `off`, `audit`, `confirm_risky` and `enforce`.
+
+The unused `deprecatedVars` result field and `DeprecatedVar` type have also been
+removed. Consumers of `validateNexusEnv` should use `unknownVars`, `invalidVars`
+and `ineffectiveVars`.
+
+### Removed in 10.0 (#6291, B1)
+
+`NEXUS_CUSTOM_API_BASE_URL` and `NEXUS_CUSTOM_API_KEY`, deprecated in #4392
+increment 3, have been removed in 10.0 (#7144). Rename them to `NEXUS_OPENAI_COMPAT_URL` and
+`NEXUS_OPENAI_COMPAT_KEY`, respectively. The old names are ignored;
+`validateNexusEnv` reports them in `unknownVars`, and normal startup validation
+warns that they are unknown variables.
+
+```diff
+-export NEXUS_CUSTOM_API_BASE_URL="https://your-gateway.example.com/v1"
+-export NEXUS_CUSTOM_API_KEY="your-gateway-key"
++export NEXUS_OPENAI_COMPAT_URL="https://your-gateway.example.com/v1"
++export NEXUS_OPENAI_COMPAT_KEY="your-gateway-key"
+```
+
+The canonical URL/key pair configures model discovery, in-process voter
+transport and the `api:<endpoint>` routing arm. The `custom-openai` auto-adapter
+is now a thin alias over this gateway path (#7150), with `api:custom-openai`
+attribution retained. Both values must be non-empty after trimming to
+turn on the gateway path. `nexus-agents setup --custom-api` writes these names.
+Other `NEXUS_CUSTOM_*` settings, including `NEXUS_CUSTOM_MODEL`, remain supported.
+
+### Removed (#5665)
+
+`NEXUS_AUTH_METHOD` was registered and documented (default `token`) but never
+reached enforcement: `initializeAuth` reads `security.auth.method` from the
+config file only, and the variable's sole reader was the startup log line
+(#5663). It has been removed from the env-schema by panel decision (3/3,
+remove rather than wire — same reasoning as #2977 / #4180); `validateNexusEnv`
+now reports it as unknown. Set `security.auth.method` in the config file
+instead.
+
+## Model Configuration
+
+### Default Model
+
+The default model is used when no specific model is requested:
+
+```yaml
+models:
+  default: claude-sonnet
+```
+
+### Model Tiers
+
+Models are organized into tiers for automatic routing:
+
+```yaml
+models:
+  tiers:
+    fast:
+      - claude-haiku # Quick, simple tasks
+      - codex-5.1-mini
+    balanced:
+      - claude-sonnet # Most tasks
+      - codex-5.2
+    powerful:
+      - claude-opus # Complex reasoning
+      - codex-5.3
+```
+
+The router selects the appropriate tier based on task complexity.
+
+### Model-Specific Settings
+
+Override settings for specific models:
+
+```yaml
+models:
+  settings:
+    claude-opus:
+      temperature: 0.7
+      maxTokens: 8192
+    codex-5.3:
+      temperature: 0.5
+      maxTokens: 4096
+```
+
+## Expert Configuration
+
+### Built-in Experts
+
+Enable or disable built-in experts:
+
+```yaml
+experts:
+  builtin: true # Enable code, architecture, security, performance, research
+```
+
+### Custom Experts
+
+Define domain-specific experts:
+
+```yaml
+experts:
+  custom:
+    database_expert:
+      prompt: |
+        You are a database expert specializing in PostgreSQL,
+        query optimization, and schema design. You follow
+        database normalization principles and prefer
+        efficient, maintainable solutions.
+      tier: balanced
+      tools:
+        - read_file
+        - execute_command
+      capabilities:
+        - sql_analysis
+        - schema_design
+        - query_optimization
+```
+
+### Expert Prompt Templates
+
+> **Planned feature:** Variable interpolation in expert prompts (`{{variable}}` syntax) is not yet implemented. The `variables` key shown below is not currently processed by the runtime. This section describes the intended configuration shape.
+
+```yaml
+experts:
+  custom:
+    project_expert:
+      prompt: |
+        You are an expert for the {{project_name}} project.
+        The project uses {{language}} and follows {{style_guide}}.
+      variables:
+        project_name: nexus-agents
+        language: TypeScript
+        style_guide: Google TypeScript Style Guide
+```
+
+## Routing Configuration
+
+### Budget Constraints
+
+Control cost and resource usage:
+
+```yaml
+routing:
+  budget:
+    tokenBudget: 1000000 # Max tokens per session
+    costBudgetUsd: 10.0 # Max cost per session
+    resetIntervalMs: 3600000 # Reset every hour
+```
+
+### Opt-In Gateway Endpoint Routing
+
+Gateway discovery still serves the existing tools and family slots. By default,
+registered `api:<endpoint>` arms do not join `CompositeRouter`, including in
+`plan` mode. To let an endpoint compete with CLI arms, set:
+
+```bash
+export NEXUS_ROUTE_GATEWAY_ARMS=true
+export NEXUS_GATEWAY_COST='openai-compat=local'
+```
+
+The opt-in applies to both MCP server routing and standalone commands such as
+`nexus-agents orchestrate`. Standalone CLI startup discovers and registers the
+endpoint through the same gateway bootstrap before dispatching the command.
+Help and version commands skip discovery.
+
+Use the configured `NEXUS_OPENAI_COMPAT_ENDPOINT` in a scoped declaration, or
+use a bare declaration for every gateway. `free`, `local`, `priced`, and
+`priced:<inputPer1M>,<outputPer1M>` are supported. An undeclared or invalid cost
+excludes the endpoint with a warning in both `plan` and `api` modes, even with
+no configured budget. Opting in can admit metered endpoint calls in plan mode;
+plan mode still disables cost weighting and task-class ceilings.
+
+An endpoint already reachable through a family-slot arm is omitted from the
+endpoint arm set. This includes a slot still deciding between its CLI and the
+same gateway: reserving that endpoint for the slot avoids duplicate history
+and breaker identities. When no family slot can reach it, the endpoint gets
+its own `api:<endpoint>` identity, shared breaker, neutral learning prior, and
+ranked default from `resolveGatewayDefault` (including `NEXUS_CUSTOM_MODEL`).
+In API billing mode, admitting the configured endpoint replaces the legacy
+`api:custom-openai` route to that same gateway. Flag-off and excluded endpoints
+retain the legacy route.
+
+CLI-only profiles, preference tiers, and available-model probes do not alias
+that identity to a CLI slot; endpoint selection remains available to LinUCB.
+
+Endpoint arms pass the CLI quality constraints without measurement; routing
+records label this `quality-constraint:endpoint-unmeasured` when that stage is
+enabled. An endpoint-only candidate set does not report a measured
+`quality-constraint` stage. Non-fail-closed category preferences also preserve
+endpoints without measuring them and add
+`category-override:endpoint-unmeasured`. Fail-closed category policies exclude
+endpoints because they have no admitted CLI slot.
+
+Observer and feedback decision records retain the raw endpoint identity,
+including in SQLite. Budget admission uses the resolved endpoint model's
+context window and capabilities; latency is unmeasured until an endpoint
+profile exists. Dry-run output prices the resolved model using the gateway
+cost declaration. Model recommendations use its capability profile and omit
+endpoint alternatives, because the decision carries only the selected adapter.
+
+CLI subcommands and MCP handlers that use the global registry retain
+per-complexity CLI timeouts. The server's private execution registry retains
+its 30-minute default. With endpoint routing enabled, gateway bootstrap and
+rediscovery register endpoint wrappers in both registries, sharing the breaker.
+A later global registry claim with configuration warns that it is ignored.
+
+### Per-Task-Class Cost Ceilings
+
+Cap the per-task USD cost by task class (#4196, #4214). Each key is a
+`TaskCategory` (`architecture`, `code_generation`, `code_review`, `research`,
+`security_review`, `planning`, `documentation`, `testing`, `devops`,
+`exploration`); a typo'd key fails config validation instead of silently
+configuring nothing:
+
+```yaml
+routing:
+  budget:
+    taskClassMaxCostUsd:
+      code_generation: 0.25 # Max $0.25 per code-generation task
+      research: 1.00 # Research tasks may spend more
+```
+
+Three things to know before relying on ceilings:
+
+- **`NEXUS_BILLING_MODE=api` is required.** Ceilings are only enforced in
+  cost-aware (`api`) billing mode. Under the default `plan` mode they are an
+  annotated no-op — the routing decision reason carries
+  `cost weighting disabled: plan mode` and no candidate is ever filtered.
+- **Unpriced candidates fail closed.** When a ceiling is configured for the
+  task's detected class, any candidate whose model has no registry pricing is
+  excluded — an unknown cost is never allowed to slip under a configured
+  ceiling. If every candidate exceeds the ceiling (or is unpriced), routing
+  fails at the budget-filter stage rather than falling back to
+  all-candidates.
+- **List-price admissions are warned.** A candidate whose list-price estimate
+  clears the ceiling stays in the pool. Its ceiling-evaluation record logs at
+  warning level with `priceBasis: 'list'`, `ceilingMeasurement: 'estimated'`,
+  `withinCeiling: true`, and a `caveat` that actual contract or gateway charges
+  may differ. This check does not guarantee actual spend stays below the ceiling.
+  Explicit `NEXUS_GATEWAY_COST` rates (`priced:<in>,<out>`, `free`, or `local`)
+  use `declared`: they are the operator's own rates, and admissions log at info
+  level without a caveat or warning. Manifest-overlay prices (user or operator
+  tier) also use `declared`. Bare `priced` inherits the resolved registry tier's
+  basis: `declared` for an overlay-priced model, `list` for an in-tree price.
+
+Omit `taskClassMaxCostUsd` (or leave it empty) to disable ceilings entirely
+(the default).
+
+### TOPSIS Weights
+
+Adjust multi-criteria optimization:
+
+```yaml
+routing:
+  topsis:
+    criteria: # weights must sum to 1.0
+      - { name: quality, weight: 0.5, beneficial: true } # prioritise quality
+      - { name: cost, weight: 0.3, beneficial: false } # consider cost
+      - { name: latency, weight: 0.2, beneficial: false } # some latency tolerance
+```
+
+For cost-sensitive deployments:
+
+```yaml
+routing:
+  topsis:
+    criteria:
+      - { name: quality, weight: 0.3, beneficial: true }
+      - { name: cost, weight: 0.5, beneficial: false }
+      - { name: latency, weight: 0.2, beneficial: false }
+```
+
+### LinUCB Bandit
+
+Control exploration vs exploitation:
+
+```yaml
+routing:
+  linucb:
+    alpha: 1.0 # Higher = more exploration
+```
+
+- `alpha: 0.5` - Conservative, prefer known-good models
+- `alpha: 1.0` - Balanced exploration (default)
+- `alpha: 2.0` - Aggressive exploration, try new combinations
+
+### Advanced Routing Stages (Optional)
+
+Enable optional routing stages for specialized use cases:
+
+```yaml
+routing:
+  stages:
+    # Confidence-based cascade routing (SATER-style escalation)
+    confidenceCascade: false
+
+    # Task capability matching (matches task requirements to model capabilities)
+    capabilityMatch: false
+
+    # Quality-constrained routing (RouteLLM-style cost/quality tradeoff)
+    qualityConstraint: false
+```
+
+These stages are disabled by default for backward compatibility. Enable them to add additional routing intelligence:
+
+| Stage               | Purpose                                            | Use When                   |
+| ------------------- | -------------------------------------------------- | -------------------------- |
+| `confidenceCascade` | Escalate to more powerful models on low confidence | Quality-sensitive tasks    |
+| `capabilityMatch`   | Match task type to model capabilities              | Diverse task workloads     |
+| `qualityConstraint` | Enforce quality thresholds with cost awareness     | Balancing quality and cost |
+
+## Memory Configuration
+
+### Session Memory
+
+Configure conversation context:
+
+```yaml
+memory:
+  session:
+    maxEntries: 1000 # Max memories per session
+    ttlMs: 86400000 # 24 hour TTL
+    pruneStrategy: lru # Least recently used
+```
+
+### Graph Memory
+
+Configure relationship tracking:
+
+```yaml
+memory:
+  graph:
+    enabled: true
+    maxNodes: 10000
+    maxEdges: 50000
+    similarityThreshold: 0.6
+```
+
+### Typed Memory (MIRIX)
+
+Configure six-type memory system:
+
+```yaml
+memory:
+  typed:
+    enabled: true
+    types:
+      core: true # Agent identity
+      episodic: true # Task experiences
+      semantic: true # Domain knowledge
+      procedural: true # Learned workflows
+      resource: true # External references
+      vault: true # Persistent storage
+    pruneThreshold: 0.3
+```
+
+### Coordinated Decay
+
+Configure the FADE-style decay sweep that `MemoryDecayManager` runs across the
+belief, agentic, adaptive and MobiMem stores. Every key is optional; an unset
+key falls through to the default in `DEFAULT_DECAY_CONFIG`
+(`packages/nexus-agents/src/mcp/tools/memory-decay.ts`) — the schema carries no
+second copy of the defaults. Before #5097 this manager was constructed with a
+hardcoded `{}`, so none of these keys could reach it.
+
+```yaml
+memory:
+  decay:
+    enabled: true # false disables the sweep entirely
+    decayIntervalMs: 3600000 # ms between automatic runs (default: 1 hour; minimum 1000)
+    beliefMaxAgeDays: 30 # prune superseded beliefs older than this
+    agenticMaxEntries: 10000 # importance-based eviction starts above this
+    agenticImportanceThreshold: 0.3 # 0-1; agentic entries below are evicted
+    adaptivePriorityThreshold: 0.2 # 0-1; adaptive entries below are evicted
+    mobimemEvictOnDecay: true # run MobiMem TTL eviction on each sweep
+    checkCrossReferences: true # keep cross-referenced items past the sweep
+    crossReferenceGracePeriodMs: 604800000 # 7 days
+```
+
+Validation happens at config load: counts and durations must be positive safe
+integers (`crossReferenceGracePeriodMs` may be `0`; `decayIntervalMs` has a
+1000 ms floor because sweeps are not re-entrant and a sub-second cadence would
+let them overlap), thresholds must lie in `[0, 1]`, and a bad value fails
+startup with the offending path named (`memory.decay.decayIntervalMs`, for
+example). The server logs one line at activation —
+`MemoryDecayManager activated (Phase 5 #746)` — carrying the effective value of
+every key, read back from the manager, plus a `source` field: `config` when the
+MCP server applied `nexus-agents.yaml`, or
+`defaults (configureToolMemory never called)` on CLI paths (composite-router,
+dev-pipeline, graph-executor) that build the memory singleton without loading
+the file. Defaults on those paths are therefore labelled as such rather than
+passing for a file that happened to say the default.
+
+## Security Configuration
+
+### Sandbox Mode
+
+Choose execution isolation level:
+
+```yaml
+security:
+  sandbox:
+    mode: policy # none, policy, container
+    fallbackMode: none
+```
+
+| Mode        | Description       | Security         |
+| ----------- | ----------------- | ---------------- |
+| `none`      | No sandboxing     | Development only |
+| `policy`    | Command allowlist | Medium           |
+| `container` | Docker isolation  | High             |
+
+### Resource Limits
+
+For container mode:
+
+```yaml
+security:
+  sandbox:
+    resourceLimits:
+      memory: 512m
+      cpu: 2
+      timeout: 300s
+      maxProcesses: 10
+```
+
+### Policy Firewall
+
+Every locally registered MCP tool call is evaluated by the `PolicyFirewall` (`src/mcp/middleware/policy.ts`) under an execution mode:
+
+```yaml
+security:
+  policy:
+    defaultMode: read-write # default; read-only is the operator's lock (see below)
+    policyMode: enforce # default, but NOT the effective mode — see NEXUS_MCP_POLICY_ENFORCE
+```
+
+| Key           | Values                      | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `defaultMode` | `read-write` (default)      | The mode every tool call is evaluated under. Mutation tools (the manifest entries with `readOnlyHint: false` — `consensus_vote`, `run_dev_pipeline`, `memory_write`, …) are allowed; the path rules (`safe-paths`, `secret-paths`) still apply.                                                                                                                                                                                                                                                                                                                                                                                           |
+|               | `read-only`                 | An operator opt-in lock: the `deny-mutations-without-mode` rule forbids **every** tool the manifest classifies as a mutation, any unclassified tool, and `run { execute: true }` as its selected strategy's tool (`run_dev_pipeline`, `run_pipeline`, `consensus_vote`, …), for this host. In the default `warn` mode each such call is logged as a would-be denial and still runs; once the firewall enforces (`NEXUS_MCP_POLICY_ENFORCE=1`) the calls fail. Set this only on a host that should never mutate anything through MCP. Default was `read-only` before #6431, which would have denied all mutation tools on enforcement day. |
+| `policyMode`  | `enforce` (default), `warn` | Accepted but **not read** for the effective mode: `NEXUS_MCP_POLICY_ENFORCE` is the one switch (rollout default `warn`). Whether this key should govern the default is #4988's decision.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+
+The startup `Security configuration` line reports both: `policyMode` (effective mode and its reason) and `defaultExecutionMode`.
+
+### Rate Limiting
+
+Protect against abuse:
+
+```yaml
+security:
+  rateLimit:
+    enabled: true
+    requestsPerMinute: 60
+    burstLimit: 10
+```
+
+### Authentication (Network Transport)
+
+Configure authentication for network-exposed MCP transports:
+
+```yaml
+security:
+  auth:
+    enabled: true # Enable authentication
+    method: token # Only supported authentication method
+    tokenHeader: Authorization # Header name for bearer token
+    tokenFile: ~/.nexus-agents/auth/server-token # Token file path (auth/ is cross-repo)
+```
+
+Since 10.0, configs with `security.auth.method: oauth2` are rejected at load.
+OAuth2 was never implemented; replace it with `security.auth.method: token` to
+retain the bearer-token authentication used by earlier versions
+([#5681](https://github.com/nexus-substrate/nexus-agents/issues/5681)).
+
+Generate and manage auth tokens with CLI commands:
+
+```bash
+# Generate initial token
+nexus-agents auth init
+
+# Show token status
+nexus-agents auth show
+
+# Rotate token (invalidate old, generate new)
+nexus-agents auth rotate
+```
+
+> **Note:** Authentication is for network-exposed transports (HTTP, WebSocket). Stdio transport is inherently secure as it only communicates with the parent process.
+
+## Workflow Configuration
+
+### Template Directory
+
+Specify where workflows are stored:
+
+```yaml
+workflows:
+  templateDir: ./workflows
+```
+
+### Execution Limits
+
+Control workflow behavior:
+
+```yaml
+workflows:
+  maxParallelSteps: 5
+  stepTimeoutMs: 300000
+  maxRetries: 3
+  retryDelayMs: 1000
+```
+
+## Programmatic Configuration
+
+When using nexus-agents as a library:
+
+```typescript
+import { createServer, startStdioServer } from 'nexus-agents';
+
+const result = await startStdioServer({
+  name: 'my-server',
+  version: '1.0.0',
+  config: {
+    models: {
+      default: 'claude-sonnet',
+    },
+    routing: {
+      enableLinUCBSelection: true,
+      budget: {
+        tokenBudget: 500000,
+      },
+    },
+    security: {
+      sandbox: {
+        mode: 'policy',
+      },
+    },
+  },
+});
+```
+
+## Inspecting Configuration
+
+View the resolved configuration (merging defaults, file, and environment variables):
+
+```bash
+nexus-agents config show
+```
+
+Read a specific key:
+
+```bash
+nexus-agents config get models.default
+```
+
+Set a key in the config file:
+
+```bash
+nexus-agents config set models.default claude-haiku
+```
+
+> **Note:** `nexus-agents config validate` does not exist. The valid subcommands are: `init`, `show`, `get`, `set`, `import`.
+
+## Configuration Examples
+
+### Cost-Optimized
+
+Minimize API costs:
+
+```yaml
+models:
+  default: claude-haiku
+
+routing:
+  budget:
+    costBudgetUsd: 1.0
+  topsis:
+    criteria:
+      - { name: quality, weight: 0.3, beneficial: true }
+      - { name: cost, weight: 0.6, beneficial: false }
+      - { name: latency, weight: 0.1, beneficial: false }
+```
+
+### Quality-Focused
+
+Maximize output quality:
+
+```yaml
+models:
+  default: claude-opus
+
+routing:
+  budget:
+    costBudgetUsd: 50.0
+  topsis:
+    criteria:
+      - { name: quality, weight: 0.7, beneficial: true }
+      - { name: cost, weight: 0.1, beneficial: false }
+      - { name: latency, weight: 0.2, beneficial: false }
+```
+
+### CI/CD Pipeline
+
+Fast, secure, cost-aware:
+
+```yaml
+models:
+  default: claude-sonnet
+
+security:
+  sandbox:
+    mode: container
+  rateLimit:
+    enabled: true
+    requestsPerMinute: 100
+
+routing:
+  budget:
+    tokenBudget: 500000
+    costBudgetUsd: 5.0
+
+logging:
+  level: warn
+  format: json
+```
+
+## Configuration for Reusable Pipelines
+
+A composed pipeline (research → vote → plan → run → review) inherits the same resolved config at every stage, so a single knob changes behavior fleet-wide. Three high-impact knobs and what they do across stages:
+
+- **`NEXUS_BILLING_MODE`** — `plan` (default) zeroes model cost in scoring, so routing's `ZeroRouter`/TOPSIS stages pick the strongest model regardless of price; every voter, planner, and worker in the pipeline trends toward `claude-opus`-tier. `api` keeps cost-aware routing, so the same pipeline shifts toward cheaper tiers under the session budget. Verified in `decision-cost-recording.ts` (default `'plan'`) and `defaults.ts:298`.
+- **`NEXUS_DATA_DIR` / `NEXUS_REPO_PREFERRED`** — per-repo state (`sessions`, `checkpoints`, `traces`, `runs`, `audit`, `pipeline`, `tasks`, `jobs`, `ci-health`, `governance`) lands in `<repo>/.nexus-agents/` when `NEXUS_REPO_PREFERRED=1` (default), so two checkouts keep independent run/audit history. `NEXUS_DATA_DIR` overrides the split entirely. Cross-repo state — `learning/`, `memory`, `voting`, `research`, `auth` — always resolves to `~/.nexus-agents/`, so the routing-feedback loop is shared across projects regardless (`nexus-data-dir.ts`). **Under the MCP server** the "repo" is the workspace the client declares via the MCP `roots` capability (no env var needed): a globally-installed server learns the active workspace root from the connected editor/agent at handshake time, so per-repo state still lands in `<repo>/.nexus-agents/` even though the server's own working directory is the npm global bin. Clients that don't advertise `roots` fall back to the server's working directory, then `~/.nexus-agents/` (`mcp/workspace-roots.ts`, #3991).
+- **Model tiers + sandbox** — `models.tiers` (`fast`/`balanced`/`powerful`) and `models.default` feed the router at every stage; `security.sandbox.mode` (`none`/`policy`/`container`) bounds every `execute_command` the pipeline issues.
+
+### Project-level vs user-level
+
+The loader selects **one** config file (first match wins): `NEXUS_CONFIG_PATH`, then `./.nexus-agents/nexus-agents.yaml` or `./nexus-agents.yaml`, then `~/.nexus-agents/nexus-agents.yaml`. It does not merge a project file with a user file. Per-setting **environment variables** overlay the loaded file at consumption time, so use them — not a second file — for local overrides.
+
+Commit the **project file** for shared, reproducible choices: `models.tiers`/`default`, `routing` weights, gate modes (`NEXUS_POLICY_GATE_MODE`, `NEXUS_FIREWALL_POLICY`), and `security.sandbox.mode`. Keep **machine-specific** settings out of the repo and set them per-user via env: API keys (`ANTHROPIC_API_KEY`, …), `NEXUS_DATA_DIR`, `NEXUS_SANDBOX_ROOT`, and `NEXUS_BILLING_MODE`. Committed config defines the team's pipeline; each env var wins over it locally.
+
+```yaml
+# nexus-agents.yaml (committed)
+models:
+  default: claude-sonnet
+  tiers:
+    powerful: [claude-opus, codex-5.3]
+security:
+  sandbox: { mode: policy }
+```
+
+```bash
+# each teammate, locally (not committed)
+export ANTHROPIC_API_KEY=...
+export NEXUS_BILLING_MODE=api   # cost-aware on a personal key
+export NEXUS_DATA_DIR=/scratch/nexus
+```
+
+## Related Documentation
+
+- [CLI Usage](../ENTRYPOINTS.md) - Use configuration in CLI commands
+- [Workflow Templates](../guides/WORKFLOW_TEMPLATES.md) - Create custom workflows
+- [Architecture Overview](../architecture/README.md) - Understand system design

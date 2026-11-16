@@ -1,0 +1,785 @@
+/* eslint max-lines: ["error", { "max": 600, "skipBlankLines": true, "skipComments": true }] */
+// A BOUNDED ceiling, not `eslint-disable max-lines` (#5766).
+//
+// The file is 499 lines by the measure the rule uses (blanks and comments
+// skipped) and 715 by `wc -l`. Those are different units, and comparing them is
+// what went wrong here: the previous comment read the raw 715 against the
+// "400-600 lines if cohesive" band in .rules/governance.md:67 and concluded the
+// file "sits well past the band it invoked". By the rule's own counting it sits
+// INSIDE that band, so the original justification never stopped holding — only
+// the number quoted against it was measured differently.
+//
+// A blanket disable is why that could go unnoticed for so long: it silenced the
+// one check that knows the real count, leaving a hand-maintained number in a
+// comment as the only record, and hand-maintained numbers rot (this one drifted
+// from 426 to 711 to 715). The ceiling is set at 600 — the TOP of the governance
+// band — so the file is checked against the same band its justification cites,
+// and growing out of it fails the build instead of a comment quietly aging.
+
+/**
+ * nexus-agents/consensus - Consensus Engine
+ *
+ * Core consensus engine implementation supporting multiple voting strategies.
+ * Manages proposal lifecycle, vote collection, and outcome determination.
+ */
+
+import type { Result, ILogger } from '../core/index.js';
+import { ok, err, AgentError, createLogger, getTimeProvider } from '../core/index.js';
+import type {
+  Proposal,
+  ProposalId,
+  Vote,
+  ConsensusResult,
+  ConsensusAlgorithm,
+  ConsensusEngineConfig,
+  ProposalState,
+  ConsensusMetrics,
+  ProposalCacheConfig,
+  IncrementalQuorumConfig,
+  VoterExpansionCallback,
+} from './types.js';
+import {
+  ProposalSchema,
+  VoteSchema,
+  DEFAULT_CONSENSUS_CONFIG,
+  DEFAULT_INCREMENTAL_QUORUM_CONFIG,
+} from './types.js';
+import { VOTING_THRESHOLDS } from './decision/thresholds.js';
+import { VotingStrategyFactory, type VotingOutcome } from './strategies.js';
+import { buildFinalResult, buildTimeoutResult, buildPendingResult } from './result-builder.js';
+import { generateProposalId } from './helpers.js';
+import { isVotingAmbiguous } from './incremental-quorum.js';
+
+/**
+ * Error class for consensus-related failures.
+ */
+export class ConsensusError extends AgentError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super(message, context !== undefined ? { context } : {});
+    this.name = 'ConsensusError';
+  }
+}
+
+/**
+ * Interface for the consensus engine.
+ */
+export interface IConsensusEngine {
+  propose(proposal: Proposal): Promise<Result<ProposalId, ConsensusError>>;
+  vote(proposalId: ProposalId, agentId: string, vote: Vote): Promise<Result<void, ConsensusError>>;
+  getResult(proposalId: ProposalId): Promise<Result<ConsensusResult, ConsensusError>>;
+  close(proposalId: ProposalId): Promise<Result<ConsensusResult, ConsensusError>>;
+  getMetrics(): ConsensusMetrics;
+}
+
+interface InternalMetrics {
+  totalProposals: number;
+  approvedProposals: number;
+  rejectedProposals: number;
+  timedOutProposals: number;
+  totalDurationMs: number;
+  totalVotes: number;
+  algorithmUsage: Record<ConsensusAlgorithm, number>;
+}
+
+/**
+ * Cache entry for proposal content-based caching (Issue #589).
+ */
+interface ProposalCacheEntry {
+  readonly proposalId: ProposalId;
+  readonly result: ConsensusResult;
+  readonly cachedAt: number;
+}
+
+/**
+ * Default proposal cache configuration.
+ * Enabled by default to improve determinism (fitness audit recommendation).
+ */
+/**
+ * Hypothetical-vote stand-ins used by {@link ConsensusEngine.canCascadeEarly}
+ * to probe the strategy's outcome under best/worst-case pending votes.
+ * The actual `confidence` and `reasoning` fields are never inspected by
+ * `IVotingStrategy.calculateOutcome` (all strategies count by `decision`),
+ * but must satisfy `VoteSchema` (confidence in [0,1], reasoning non-empty).
+ */
+const HYPOTHETICAL_APPROVE: Vote = {
+  decision: 'approve',
+  confidence: 0.5,
+  reasoning: 'hypothetical-cascade-probe',
+};
+const HYPOTHETICAL_REJECT: Vote = {
+  decision: 'reject',
+  confidence: 0.5,
+  reasoning: 'hypothetical-cascade-probe',
+};
+
+const DEFAULT_PROPOSAL_CACHE_CONFIG: ProposalCacheConfig = {
+  enabled: true,
+  ttlMs: 3600000, // 1 hour
+  maxEntries: 500,
+};
+
+/**
+ * Consensus engine for multi-agent decision making.
+ *
+ * @example
+ * ```typescript
+ * const engine = new ConsensusEngine({ defaultTimeout: 30000 });
+ * const proposalResult = await engine.propose({
+ *   title: 'Use microservices architecture',
+ *   description: 'Proposal to adopt microservices',
+ *   algorithm: 'supermajority',
+ * });
+ * if (proposalResult.ok) {
+ *   await engine.vote(proposalResult.value, 'agent-1', {
+ *     decision: 'approve',
+ *     confidence: 0.9,
+ *     reasoning: 'Good for scalability',
+ *   });
+ * }
+ * ```
+ */
+export class ConsensusEngine implements IConsensusEngine {
+  private readonly proposals: Map<ProposalId, ProposalState> = new Map();
+  private readonly closedProposals: Map<ProposalId, ConsensusResult> = new Map();
+  private readonly proposalContentCache: Map<string, ProposalCacheEntry> = new Map();
+  private readonly strategyFactory: VotingStrategyFactory;
+  private readonly config: ConsensusEngineConfig;
+  private readonly cacheConfig: ProposalCacheConfig;
+  private readonly quorumConfig: IncrementalQuorumConfig;
+  private readonly logger: ILogger;
+  private readonly metrics: InternalMetrics;
+  private voterExpansionCallback?: VoterExpansionCallback;
+
+  constructor(config?: Partial<ConsensusEngineConfig>, logger?: ILogger) {
+    this.config = { ...DEFAULT_CONSENSUS_CONFIG, ...config };
+    this.cacheConfig = { ...DEFAULT_PROPOSAL_CACHE_CONFIG, ...config?.proposalCache };
+    this.quorumConfig = { ...DEFAULT_INCREMENTAL_QUORUM_CONFIG, ...config?.incrementalQuorum };
+    this.logger = logger ?? createLogger({ component: 'ConsensusEngine' });
+    this.strategyFactory = new VotingStrategyFactory();
+    this.metrics = this.createInitialMetrics();
+  }
+
+  /**
+   * Sets the callback for incremental quorum voter expansion (Issue #1408).
+   * When ambiguous votes are detected, this callback requests additional voters.
+   */
+  setVoterExpansionCallback(callback: VoterExpansionCallback): void {
+    this.voterExpansionCallback = callback;
+  }
+
+  propose(proposal: Proposal): Promise<Result<ProposalId, ConsensusError>> {
+    const validation = ProposalSchema.safeParse(proposal);
+    if (!validation.success) {
+      return Promise.resolve(
+        err(
+          new ConsensusError(`Invalid proposal: ${validation.error.message}`, {
+            errors: validation.error.issues,
+          })
+        )
+      );
+    }
+
+    // Check cache for identical proposal content (Issue #589)
+    if (this.cacheConfig.enabled) {
+      const cachedEntry = this.getCachedResult(validation.data);
+      if (cachedEntry !== undefined) {
+        this.logger.debug('Returning cached proposal result', {
+          cachedProposalId: cachedEntry.proposalId,
+          cachedOutcome: cachedEntry.result.outcome,
+        });
+        return Promise.resolve(ok(cachedEntry.proposalId));
+      }
+    }
+
+    if (this.proposals.size >= this.config.maxActiveProposals) {
+      return Promise.resolve(
+        err(
+          new ConsensusError(
+            `Maximum active proposals (${String(this.config.maxActiveProposals)}) reached`
+          )
+        )
+      );
+    }
+
+    const proposalId = proposal.id ?? generateProposalId();
+    const state = this.createProposalState(validation.data, proposalId);
+    this.setupTimeout(state, proposalId, proposal.timeout);
+    this.registerProposal(proposalId, state, proposal.algorithm);
+    return Promise.resolve(ok(proposalId));
+  }
+
+  async vote(
+    proposalId: ProposalId,
+    agentId: string,
+    vote: Vote
+  ): Promise<Result<void, ConsensusError>> {
+    const validationErr = this.validateVote(vote);
+    if (validationErr !== undefined) return err(validationErr);
+
+    const stateErr = this.validateProposalState(proposalId);
+    if (stateErr !== undefined) return err(stateErr);
+
+    const state = this.proposals.get(proposalId);
+    if (state === undefined) {
+      return err(new ConsensusError(`Proposal ${proposalId} not found`));
+    }
+
+    this.recordVote(state, agentId, vote);
+
+    // Agreement-based cascade always takes priority
+    if (this.canCascadeEarly(state)) {
+      return this.closeInternal(proposalId).then((r) => (r.ok ? ok(undefined) : err(r.error)));
+    }
+
+    // All required voters voted — check for incremental quorum expansion
+    if (this.allRequiredVotersVoted(state)) {
+      // Re-entry guard (#2861): `tryExpandQuorum` awaits its callback and
+      // then mutates `state.proposal.requiredVoters` / `expansionRounds`.
+      // A concurrent `vote()` that also sees `allRequiredVotersVoted`
+      // must NOT start a second expansion — that would invoke the
+      // expansion callback twice and clobber the first expansion's
+      // voter list. This vote is already recorded; return ok and let
+      // the in-flight expansion settle.
+      if (state.expansionInFlight === true) {
+        return Promise.resolve(ok(undefined));
+      }
+      state.expansionInFlight = true;
+      let expanded: boolean;
+      try {
+        expanded = await this.tryExpandQuorum(proposalId, state);
+      } finally {
+        state.expansionInFlight = false;
+      }
+      if (!expanded) {
+        return this.closeInternal(proposalId).then((r) => (r.ok ? ok(undefined) : err(r.error)));
+      }
+      // Expansion succeeded — wait for new voters
+    }
+
+    return Promise.resolve(ok(undefined));
+  }
+
+  getResult(proposalId: ProposalId): Promise<Result<ConsensusResult, ConsensusError>> {
+    const closedResult = this.closedProposals.get(proposalId);
+    if (closedResult !== undefined) return Promise.resolve(ok(closedResult));
+
+    const state = this.proposals.get(proposalId);
+    if (state === undefined) {
+      return Promise.resolve(err(new ConsensusError(`Proposal ${proposalId} not found`)));
+    }
+
+    const outcome = this.calculateOutcome(state);
+    return Promise.resolve(ok(buildPendingResult(state, proposalId, outcome, this.config)));
+  }
+
+  close(proposalId: ProposalId): Promise<Result<ConsensusResult, ConsensusError>> {
+    return this.closeInternal(proposalId);
+  }
+
+  getMetrics(): ConsensusMetrics {
+    const completed =
+      this.metrics.approvedProposals +
+      this.metrics.rejectedProposals +
+      this.metrics.timedOutProposals;
+    return {
+      totalProposals: this.metrics.totalProposals,
+      approvedProposals: this.metrics.approvedProposals,
+      rejectedProposals: this.metrics.rejectedProposals,
+      timedOutProposals: this.metrics.timedOutProposals,
+      averageDurationMs: completed > 0 ? this.metrics.totalDurationMs / completed : 0,
+      averageVotesPerProposal: completed > 0 ? this.metrics.totalVotes / completed : 0,
+      algorithmUsage: { ...this.metrics.algorithmUsage },
+    };
+  }
+
+  getActiveProposalCount(): number {
+    return this.proposals.size;
+  }
+
+  private createProposalState(data: Proposal, proposalId: ProposalId): ProposalState {
+    const now = new Date(getTimeProvider().now());
+    return {
+      proposal: { ...data, id: proposalId, createdAt: now.toISOString() },
+      status: 'voting',
+      votes: new Map(),
+      startedAt: now,
+    };
+  }
+
+  private setupTimeout(state: ProposalState, proposalId: ProposalId, timeout?: number): void {
+    const timeoutMs = timeout ?? this.config.defaultTimeout;
+    state.timeoutId = setTimeout(() => {
+      this.handleTimeout(proposalId);
+    }, timeoutMs);
+  }
+
+  private registerProposal(
+    proposalId: ProposalId,
+    state: ProposalState,
+    algorithm: ConsensusAlgorithm
+  ): void {
+    this.proposals.set(proposalId, state);
+    this.metrics.totalProposals++;
+    this.metrics.algorithmUsage[algorithm]++;
+    this.logger.info('Proposal created', {
+      proposalId,
+      title: state.proposal.title,
+      algorithm,
+      timeout: this.config.defaultTimeout,
+    });
+  }
+
+  private validateVote(vote: Vote): ConsensusError | undefined {
+    const validation = VoteSchema.safeParse(vote);
+    if (!validation.success) {
+      return new ConsensusError(`Invalid vote: ${validation.error.message}`, {
+        errors: validation.error.issues,
+      });
+    }
+    return undefined;
+  }
+
+  private validateProposalState(proposalId: ProposalId): ConsensusError | undefined {
+    const state = this.proposals.get(proposalId);
+    if (state === undefined) {
+      if (this.closedProposals.has(proposalId)) {
+        return new ConsensusError(`Proposal ${proposalId} is already closed`);
+      }
+      return new ConsensusError(`Proposal ${proposalId} not found`);
+    }
+    if (state.status !== 'voting') {
+      return new ConsensusError(`Proposal ${proposalId} is not accepting votes`, {
+        status: state.status,
+      });
+    }
+    return undefined;
+  }
+
+  private normalizeDigest(digest?: string): string | undefined {
+    if (digest === undefined) return undefined;
+    const trimmed = digest.trim();
+    if (/^[0-9a-f]{64}$/i.test(trimmed)) {
+      return `sha256:${trimmed.toLowerCase()}`;
+    }
+    return trimmed.toLowerCase();
+  }
+
+  private recordVote(state: ProposalState, agentId: string, vote: Vote): void {
+    let recordedVote = vote;
+    const expectedDigest = this.normalizeDigest(state.proposal.artifactDigest);
+    const actualDigest = this.normalizeDigest(vote.boundArtifactDigest);
+    if (
+      expectedDigest !== undefined &&
+      actualDigest !== undefined &&
+      actualDigest !== expectedDigest
+    ) {
+      this.logger.warn('Subject mismatch: artifact digest changed (#M1)', {
+        proposalId: state.proposal.id,
+        expected: expectedDigest,
+        actual: actualDigest,
+      });
+      recordedVote = {
+        ...vote,
+        // Only void 'approve' to 'abstain'; preserve 'reject' so an unverified seat cannot turn a rejection into an approval (#Security)
+        decision: vote.decision === 'approve' ? 'abstain' : vote.decision,
+        confidence: vote.decision === 'approve' ? 0 : vote.confidence,
+        artifactReadiness: 'unverifiable',
+        reasoning: `${vote.reasoning} [Subject mismatch: expected ${expectedDigest}, got ${actualDigest}]`,
+      };
+    } else if (vote.artifactReadiness === 'artifact_starved') {
+      recordedVote = {
+        ...vote,
+        // Only void 'approve' to 'abstain'; preserve 'reject' so an unverified seat cannot turn a rejection into an approval (#Security)
+        decision: vote.decision === 'approve' ? 'abstain' : vote.decision,
+        confidence: vote.decision === 'approve' ? 0 : vote.confidence,
+      };
+    }
+
+    state.votes.set(agentId, {
+      ...recordedVote,
+      timestamp: getTimeProvider().nowIso(),
+    });
+    this.logger.debug('Vote recorded', {
+      proposalId: state.proposal.id,
+      agentId,
+      decision: recordedVote.decision,
+      confidence: recordedVote.confidence,
+    });
+  }
+
+  private closeInternal(proposalId: ProposalId): Promise<Result<ConsensusResult, ConsensusError>> {
+    const state = this.proposals.get(proposalId);
+    if (state === undefined) {
+      const closed = this.closedProposals.get(proposalId);
+      if (closed !== undefined) return Promise.resolve(ok(closed));
+      return Promise.resolve(err(new ConsensusError(`Proposal ${proposalId} not found`)));
+    }
+
+    if (state.timeoutId !== undefined) clearTimeout(state.timeoutId);
+
+    const outcome = this.calculateOutcome(state);
+    const result = buildFinalResult(state, proposalId, outcome, this.config);
+    this.finalize(proposalId, result, state.votes.size);
+    return Promise.resolve(ok(result));
+  }
+
+  private handleTimeout(proposalId: ProposalId): void {
+    const state = this.proposals.get(proposalId);
+    if (state?.status !== 'voting') return;
+
+    this.logger.warn('Proposal timed out', { proposalId, voteCount: state.votes.size });
+    const outcome = this.calculateOutcome(state);
+    const result = buildTimeoutResult(state, proposalId, outcome, this.config);
+    this.proposals.delete(proposalId);
+    this.addClosedProposal(proposalId, result);
+    this.metrics.timedOutProposals++;
+    this.metrics.totalDurationMs += result.durationMs;
+    this.metrics.totalVotes += state.votes.size;
+  }
+
+  private finalize(proposalId: ProposalId, result: ConsensusResult, voteCount: number): void {
+    this.proposals.delete(proposalId);
+    this.addClosedProposal(proposalId, result);
+    this.updateMetrics(result);
+
+    // Cache successful results for determinism (Issue #589)
+    if (
+      this.cacheConfig.enabled &&
+      (result.outcome === 'approved' || result.outcome === 'rejected')
+    ) {
+      this.addToCache(result.proposal, proposalId, result);
+    }
+
+    this.logger.info('Proposal closed', {
+      proposalId,
+      outcome: result.outcome,
+      approvalPercentage: result.approvalPercentage.toFixed(1),
+      voteCount,
+      quorumReached: result.quorumReached,
+      durationMs: result.durationMs,
+    });
+  }
+
+  /**
+   * Adds a closed proposal and evicts oldest entries if over limit.
+   * Issue #549: Prevent unbounded memory growth in closedProposals Map.
+   */
+  private addClosedProposal(proposalId: ProposalId, result: ConsensusResult): void {
+    // Evict oldest entries if at capacity (Map maintains insertion order)
+    while (this.closedProposals.size >= this.config.maxClosedProposals) {
+      const firstKey = this.closedProposals.keys().next();
+      if (firstKey.done === true) break;
+      const oldestKey = firstKey.value;
+      this.closedProposals.delete(oldestKey);
+      this.logger.debug('Evicted oldest closed proposal', { evictedId: oldestKey });
+    }
+    this.closedProposals.set(proposalId, result);
+  }
+
+  private hasArtifactRequirement(proposal: Proposal): boolean {
+    return proposal.requireArtifact === true || proposal.artifactDigest !== undefined;
+  }
+
+  private calculateRequiredArtifactFloor(panelSize: number): number {
+    if (panelSize <= 0) return 1;
+    return Math.min(panelSize, Math.max(Math.ceil((panelSize * 2) / 3), 3));
+  }
+
+  private countEligibleInspectedVoters(votes: Iterable<Vote>, requiredDigest?: string): number {
+    const expected = this.normalizeDigest(requiredDigest);
+    let count = 0;
+    for (const v of votes) {
+      const actual = this.normalizeDigest(v.boundArtifactDigest);
+      if (v.artifactReadiness === 'ready' && (expected === undefined || actual === expected)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  private calculateOutcome(state: ProposalState): VotingOutcome {
+    const strategy = this.strategyFactory.getStrategy(state.proposal.algorithm);
+    const outcome = strategy.calculateOutcome(state.votes);
+    if (outcome.approved && this.hasArtifactRequirement(state.proposal)) {
+      const panelSize =
+        state.proposal.totalRoles ?? state.proposal.requiredVoters?.length ?? state.votes.size;
+      const minFloor = this.calculateRequiredArtifactFloor(panelSize);
+      const inspected = this.countEligibleInspectedVoters(
+        state.votes.values(),
+        state.proposal.artifactDigest
+      );
+      if (inspected < minFloor) {
+        return {
+          ...outcome,
+          approved: false,
+          artifactFloorUnmet: true,
+          reason: `Insufficient eligible voters inspected the required artifact (${String(inspected)}/${String(minFloor)} required)`,
+        };
+      }
+    }
+    return outcome;
+  }
+
+  /**
+   * Agreement-based cascading: close early when outcome is mathematically determined.
+   *
+   * #2822: the prior implementation computed approval rates against
+   * `totalExpected = requiredVoters.length` and compared against
+   * `VOTING_THRESHOLDS[algorithm]` directly. Every voting strategy
+   * (`SimpleMajorityStrategy`, `SupermajorityStrategy`, `UnanimousStrategy`,
+   * `HigherOrderVotingStrategy`) uses `approve + reject` as its denominator —
+   * abstains are explicitly excluded. The two diverged whenever abstains
+   * were present, producing wrong-winner cascades (e.g. 5-voter supermajority
+   * with [approve, abstain, abstain, abstain, pending] cascade-rejected even
+   * though the strategy would approve at close).
+   *
+   * The fix delegates to the strategy itself: build a best-case (all pending
+   * voters approve) and worst-case (all pending voters reject) hypothetical
+   * vote map, call `strategy.calculateOutcome` on each, and cascade only
+   * when both extremes yield the same outcome. This guarantees parity with
+   * the strategy's denominator semantics by construction.
+   */
+  private probeHypotheticalEquivalence(
+    state: ProposalState,
+    pending: readonly string[]
+  ): { determined: boolean; approved: boolean } {
+    const strategy = this.strategyFactory.getStrategy(state.proposal.algorithm);
+    const bestCase = new Map<string, Vote>(state.votes);
+    const worstCase = new Map<string, Vote>(state.votes);
+    for (const voter of pending) {
+      bestCase.set(voter, HYPOTHETICAL_APPROVE);
+      worstCase.set(voter, HYPOTHETICAL_REJECT);
+    }
+    const bestOutcome = strategy.calculateOutcome(bestCase);
+    const worstOutcome = strategy.calculateOutcome(worstCase);
+    return {
+      determined: bestOutcome.approved === worstOutcome.approved,
+      approved: bestOutcome.approved,
+    };
+  }
+
+  private meetsCascadeArtifactFloor(state: ProposalState, totalRequired: number): boolean {
+    if (!this.hasArtifactRequirement(state.proposal)) return true;
+    const panelSize = state.proposal.totalRoles ?? totalRequired;
+    const minFloor = this.calculateRequiredArtifactFloor(panelSize);
+    const inspected = this.countEligibleInspectedVoters(
+      state.votes.values(),
+      state.proposal.artifactDigest
+    );
+    return inspected >= minFloor;
+  }
+
+  private canCascadeEarly(state: ProposalState): boolean {
+    const required = state.proposal.requiredVoters;
+    if (required === undefined || required.length === 0) return false;
+    if (state.votes.size === 0) return false;
+
+    const pending = required.filter((voter) => !state.votes.has(voter));
+    if (pending.length === 0) return false; // All voted — handled by allRequiredVotersVoted
+
+    const { determined, approved } = this.probeHypotheticalEquivalence(state, pending);
+    if (!determined) return false;
+
+    if (approved && !this.meetsCascadeArtifactFloor(state, required.length)) {
+      return false;
+    }
+
+    this.logger.info('Agreement cascade: outcome determined', {
+      proposalId: state.proposal.id,
+      outcome: approved ? 'approve' : 'reject',
+      votesCast: state.votes.size,
+      pending: pending.length,
+      algorithm: state.proposal.algorithm,
+    });
+    return true;
+  }
+
+  private allRequiredVotersVoted(state: ProposalState): boolean {
+    const required = state.proposal.requiredVoters;
+    if (required === undefined || required.length === 0) return false;
+    return required.every((voterId) => state.votes.has(voterId));
+  }
+
+  /**
+   * Attempts incremental quorum expansion when voting is ambiguous (Issue #1408).
+   * Returns true if expansion occurred (wait for new voters), false to close immediately.
+   */
+  private async tryExpandQuorum(proposalId: ProposalId, state: ProposalState): Promise<boolean> {
+    if (!this.quorumConfig.enabled) return false;
+    if (this.voterExpansionCallback === undefined) return false;
+
+    const rounds = state.expansionRounds ?? 0;
+    if (rounds >= this.quorumConfig.maxExpansionRounds) return false;
+
+    const required = state.proposal.requiredVoters;
+    if (required === undefined) return false;
+
+    const threshold = VOTING_THRESHOLDS[state.proposal.algorithm];
+    const ambiguous = isVotingAmbiguous(state.votes, required.length, threshold, {
+      confidenceThreshold: this.quorumConfig.confidenceThreshold,
+      ambiguityBand: this.quorumConfig.ambiguityBand,
+    });
+
+    if (!ambiguous) return false;
+
+    let newVoters: readonly string[];
+    try {
+      newVoters = await this.voterExpansionCallback(
+        proposalId,
+        required.length,
+        this.quorumConfig.votersPerExpansion
+      );
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.logger.warn('Incremental quorum: expansion callback threw; closing as-is', {
+        proposalId,
+        errorMessage: error.message,
+      });
+      return false;
+    }
+
+    if (newVoters.length === 0) {
+      this.logger.info('Incremental quorum: no additional voters available', { proposalId });
+      return false;
+    }
+
+    // Expand the required voters list
+    state.proposal.requiredVoters = [...required, ...newVoters];
+    state.expansionRounds = rounds + 1;
+
+    this.logger.info('Incremental quorum: expanded voter pool', {
+      proposalId,
+      round: rounds + 1,
+      newVoters: newVoters.length,
+      totalVoters: state.proposal.requiredVoters.length,
+    });
+
+    return true;
+  }
+
+  private updateMetrics(result: ConsensusResult): void {
+    this.metrics.totalDurationMs += result.durationMs;
+    this.metrics.totalVotes += result.voteCounts.total;
+    if (result.outcome === 'approved') this.metrics.approvedProposals++;
+    else if (result.outcome === 'rejected') this.metrics.rejectedProposals++;
+    else if (result.outcome === 'timeout') this.metrics.timedOutProposals++;
+  }
+
+  private createInitialMetrics(): InternalMetrics {
+    return {
+      totalProposals: 0,
+      approvedProposals: 0,
+      rejectedProposals: 0,
+      timedOutProposals: 0,
+      totalDurationMs: 0,
+      totalVotes: 0,
+      algorithmUsage: {
+        simple_majority: 0,
+        supermajority: 0,
+        unanimous: 0,
+        opinion_wise: 0,
+        higher_order: 0,
+      },
+    };
+  }
+
+  // ============================================================================
+  // Proposal Content Caching (Issue #589)
+  // ============================================================================
+
+  /**
+   * Creates a content hash for a proposal to enable cache lookups.
+   * Hash is based on title, description, and algorithm (deterministic content).
+   */
+  private hashProposalContent(proposal: Proposal): string {
+    const content = [
+      proposal.title,
+      proposal.description,
+      proposal.algorithm,
+      String(proposal.requireArtifact ?? false),
+      proposal.artifactDigest ?? '',
+      (proposal.requiredVoters ?? []).join(','),
+    ].join('|');
+    // Simple FNV-1a hash for fast deterministic hashing
+    let hash = 2166136261;
+    for (let i = 0; i < content.length; i++) {
+      hash ^= content.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
+  }
+
+  /**
+   * Gets cached result for a proposal if it exists and hasn't expired.
+   */
+  private getCachedResult(proposal: Proposal): ProposalCacheEntry | undefined {
+    const hash = this.hashProposalContent(proposal);
+    const cached = this.proposalContentCache.get(hash);
+    if (cached === undefined) return undefined;
+
+    const now = getTimeProvider().now();
+    if (now - cached.cachedAt > this.cacheConfig.ttlMs) {
+      this.proposalContentCache.delete(hash);
+      this.logger.debug('Cache entry expired', { hash });
+      return undefined;
+    }
+
+    return cached;
+  }
+
+  /**
+   * Adds a proposal result to the cache, evicting oldest entries if needed.
+   */
+  private addToCache(proposal: Proposal, proposalId: ProposalId, result: ConsensusResult): void {
+    const hash = this.hashProposalContent(proposal);
+
+    // Evict oldest entries if at capacity (Map maintains insertion order)
+    while (this.proposalContentCache.size >= this.cacheConfig.maxEntries) {
+      const firstKey = this.proposalContentCache.keys().next();
+      if (firstKey.done === true) break;
+      const oldestKey = firstKey.value;
+      this.proposalContentCache.delete(oldestKey);
+      this.logger.debug('Evicted oldest cache entry', { hash: oldestKey });
+    }
+
+    this.proposalContentCache.set(hash, {
+      proposalId,
+      result,
+      cachedAt: getTimeProvider().now(),
+    });
+    this.logger.debug('Added proposal to cache', { hash, proposalId });
+  }
+
+  /**
+   * Gets the current cache size (for testing/monitoring).
+   */
+  getCacheSize(): number {
+    return this.proposalContentCache.size;
+  }
+
+  /**
+   * Clears the proposal content cache (for testing/reset).
+   */
+  clearCache(): void {
+    this.proposalContentCache.clear();
+    this.logger.debug('Proposal cache cleared');
+  }
+}
+
+/**
+ * Create a consensus engine with the given configuration.
+ *
+ * @example
+ * ```typescript
+ * const engine = createConsensusEngine({
+ *   defaultTimeout: 60000,
+ *   maxActiveProposals: 10,
+ * });
+ * ```
+ */
+export function createConsensusEngine(
+  config?: Partial<ConsensusEngineConfig>,
+  logger?: ILogger
+): ConsensusEngine {
+  return new ConsensusEngine(config, logger);
+}

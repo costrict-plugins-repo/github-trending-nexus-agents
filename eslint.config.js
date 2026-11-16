@@ -1,0 +1,375 @@
+import { defineConfig, globalIgnores } from 'eslint/config';
+import tseslint from 'typescript-eslint';
+import jsdoc from 'eslint-plugin-jsdoc';
+import eslintComments from '@eslint-community/eslint-plugin-eslint-comments';
+import noVacuousVerdict from './eslint-rules/no-vacuous-verdict.js';
+import governedDecisionImports from './eslint-rules/governed-decision-imports-6000.js';
+
+/**
+ * In-repo custom rules (#4581). Flat config lets a plugin be an object literal,
+ * so this needs no separate package — the rules live in `eslint-rules/` and are
+ * covered by RuleTester fixtures under the root vitest config.
+ */
+const nexusRules = { rules: { 'no-vacuous-verdict': noVacuousVerdict } };
+
+export default defineConfig([
+  globalIgnores(['**/dist/**', '**/node_modules/**', '**/coverage/**']),
+
+  // JSDoc accuracy (epic #3516, Phase 1 #3517). WARN-FIRST and accuracy-only:
+  // these `check-*` rules fire only when a JSDoc block EXISTS and is
+  // structurally wrong (param names that don't match the signature, undefined
+  // or malformed types, typo'd tags) — they do NOT require docs on every
+  // symbol. Coverage rules (`require-param`/`require-returns`) are deliberately
+  // deferred (#3518) so this stays an accuracy baseline, not a CI wall. Tests
+  // are excluded — JSDoc accuracy on the shipped/public surface is the target.
+  {
+    name: 'nexus-agents/jsdoc-accuracy',
+    files: ['**/*.ts', '**/*.tsx'],
+    ignores: ['**/*.test.ts', '**/*.spec.ts', '**/test/**', '**/__tests__/**'],
+    plugins: { jsdoc },
+    rules: {
+      // ERROR (baseline clean as of #3518): these fire only on existing-but-wrong
+      // JSDoc and are now at zero across non-test source, so they gate going
+      // forward. checkDestructured:false keeps check-param-names focused on
+      // genuine name mismatches rather than demanding a @param line for every
+      // nested destructured property (coverage — a separate decision, #3518).
+      'jsdoc/check-param-names': ['error', { checkDestructured: false }],
+      'jsdoc/check-property-names': 'error',
+      'jsdoc/check-types': 'error',
+      'jsdoc/check-alignment': 'error',
+      'jsdoc/check-tag-names': 'error',
+      'jsdoc/empty-tags': 'error',
+      'jsdoc/valid-types': 'error',
+      // jsdoc/no-undefined-types is intentionally OMITTED: in TypeScript, type
+      // references are import-resolved and already enforced by the compiler
+      // (strictTypeChecked), so the rule is redundant for real accuracy. Its
+      // only signal here was 10 false-positives on legitimate `{@link symbol}`
+      // navigation references (which may point at any symbol, imported or not).
+      // Investigated in the #3518 follow-up — see that PR for the per-site review.
+    },
+  },
+
+  // Base TypeScript configuration
+  {
+    name: 'nexus-agents/typescript',
+    files: ['**/*.ts', '**/*.tsx'],
+    extends: [tseslint.configs.strictTypeChecked],
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    plugins: { nexus: nexusRules },
+    rules: {
+      // A verdict aggregated over an empty collection reports a pass having
+      // measured nothing. Measured before enabling: 68 `.every()` sites, 10
+      // real defects — hence verdict-position scoping rather than a blanket
+      // ban. See the rule's own header for its known blind spot (#4581).
+      'nexus/no-vacuous-verdict': 'error',
+      // typescript-eslint 8.71.1 still OOMs despite upstream #12957 (#6994).
+      // Measured 2026-10-08: `/usr/bin/time -v npx eslint src/` in
+      // packages/nexus-agents, Node 24.21.0, default heap (no NODE_OPTIONS):
+      // rule on: 4,504,576 KiB peak RSS, exit 134 (heap OOM);
+      // rule off: 4,145,496 KiB peak RSS, exit 0. Keep off pending a further fix.
+      '@typescript-eslint/no-unsafe-enum-assignment': 'off',
+      '@typescript-eslint/switch-exhaustiveness-check': [
+        'error',
+        { considerDefaultExhaustiveForUnions: true },
+      ],
+      // Code structure limits (enforced)
+      'max-lines': ['error', { max: 400, skipBlankLines: true, skipComments: true }],
+      'max-lines-per-function': ['error', { max: 50, skipBlankLines: true, skipComments: true }],
+      complexity: ['error', 10],
+      'max-params': ['error', 5],
+      'max-depth': ['error', 4],
+
+      // TypeScript strict rules
+      '@typescript-eslint/no-explicit-any': 'error',
+      '@typescript-eslint/explicit-function-return-type': ['error', { allowExpressions: true }],
+      // The `_` prefix is the deliberate, GREPPABLE way to say "intentionally
+      // unused". It replaces an ad-hoc `void x;` idiom that existed only to
+      // suppress this rule — 25 of them, invisible to every linter and to
+      // review, and reclassified as errors by
+      // `no-meaningless-void-operator` in typescript-eslint 8.69 (which is
+      // right: `void` on a plain identifier discards nothing).
+      //
+      // The exemption is narrower than what it replaces. Before, ANY unused
+      // binding could be waved through with `void x;` and nothing fired. Now it
+      // must carry a visible prefix, and an unprefixed one still errors.
+      // `ignoreRestSiblings` exempts only the keys pulled off an object to omit
+      // them from a rest — the destructure-to-omit idiom and nothing else.
+      // `caughtErrors` is deliberately NOT relaxed: unused catch bindings are
+      // removed with optional catch binding (`catch {`) instead.
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', ignoreRestSiblings: true },
+      ],
+      '@typescript-eslint/prefer-nullish-coalescing': 'error',
+      '@typescript-eslint/prefer-optional-chain': 'error',
+      '@typescript-eslint/strict-boolean-expressions': 'error',
+
+      // Best practices
+      'no-console': ['warn', { allow: ['warn', 'error'] }],
+      eqeqeq: ['error', 'always'],
+      'no-throw-literal': 'error',
+      'prefer-const': 'error',
+      'no-var': 'error',
+    },
+  },
+
+  // The one site the rule flags that this repo may not fix unilaterally.
+  // `src/governance/claims-verify.ts:202` reports `passed: true` over an empty
+  // claims registry, but governance source requires owner ratification and is
+  // never auto-merged (CODEOWNERS, and the Mission section of CLAUDE.md). The
+  // exemption is deliberately a single file at warn rather than a silent `off`
+  // or a directory-wide skip, so the governor's own violation stays visible in
+  // every lint run until #4586 lands and this block is deleted.
+  {
+    name: 'nexus-agents/vacuous-verdict-governance-pending-4586',
+    files: ['packages/nexus-agents/src/governance/claims-verify.ts'],
+    rules: { 'nexus/no-vacuous-verdict': 'warn' },
+  },
+
+  // #5191: adapter ACQUISITION goes through `getGlobalRegistry()`.
+  //
+  // `createAllAdapters()` is NOT deprecated — #5191 ratified it as canonical for
+  // a different operation (building the router's arm set), and CLAUDE.md's
+  // canonical-paths table lists both. Calling it deprecated here contradicted
+  // the `router-construction-operation-5191` block below and would have
+  // misdirected anyone reading the rule's message while doing legitimate router
+  // construction (#5313). What this rule bans is using it FOR ACQUISITION: it
+  // returns RAW adapters with no shared circuit-breaker registry, so each
+  // caller's breaker state is isolated —
+  // "one adapter keeps routing to a CLI another has already seen fail", the
+  // exact failure #4330 added the shared registry to prevent
+  // (`adapters/unified-registry.ts:150`).
+  //
+  // Buy the detection, build only the wrapper (epic #5121 constraint 1): this
+  // is the stock rule, not a bespoke gate.
+  {
+    name: 'nexus-agents/canonical-adapter-acquisition-5191',
+    files: ['packages/nexus-agents/src/**/*.ts'],
+    ignores: [
+      // The definition itself.
+      'packages/nexus-agents/src/cli-adapters/factory.ts',
+      // The PUBLIC export surface re-exports this symbol
+      // (`exports/cli-adapters.ts:52`). That is an export, not a use — banning
+      // it here would drop `createAllAdapters` from the package's public API,
+      // which is a semver decision for #5191, not a side effect of a lint rule.
+      // The rule found this surface; enumerating it by hand had missed it.
+      'packages/nexus-agents/src/exports/cli-adapters.ts',
+      '**/*.test.ts',
+    ],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          // `patterns` with a glob, not `paths` with a literal: the specifier is
+          // RELATIVE, so its depth varies by importer ('../cli-adapters/...'
+          // vs '../../cli-adapters/...'). A literal entry silently misses every
+          // importer at a different depth.
+          //
+          // Both the module AND the barrel are listed, because the symbol is
+          // re-exported at `cli-adapters/index.ts:87` and one call site reaches
+          // it that way. `importNames` keeps the ban to this one symbol, so the
+          // rest of the barrel is unaffected.
+          //
+          // KNOWN GAP, stated rather than papered over: this does NOT catch
+          // `const { createAllAdapters } = await import(...)`. Two call sites
+          // use that form (`pipeline/expert-bridge.ts:273`,
+          // `mcp/tools/list-available-models-tool.ts:137`) and are invisible to
+          // it. They are enumerated in #5191; a dynamic-import ban would need a
+          // bespoke rule, which epic #5121's constraint 1 says not to build.
+          patterns: [
+            {
+              group: ['**/cli-adapters/factory.js', '**/cli-adapters/index.js'],
+              importNames: ['createAllAdapters'],
+              message:
+                'Adapter ACQUISITION goes through getGlobalRegistry() (adapters/unified-registry.ts) — createAllAdapters returns raw adapters with no shared circuit-breaker registry (#5191, #4330). Building the ROUTER arm set is a different, legitimate operation: add the file to router-construction-operation-5191 instead of migrating.',
+            },
+          ],
+        },
+      ],
+      // #5313: the dynamic form, which `no-restricted-imports` cannot see.
+      // The gap was documented above as needing "a bespoke rule, which epic
+      // #5121's constraint 1 says not to build" — that turned out to be wrong.
+      // `no-restricted-syntax` is stock, and `ImportExpression` is a standard
+      // ESTree node, so the selector below buys the detection exactly as
+      // constraint 1 requires. Nothing bespoke is built.
+      //
+      // The selector matches the MODULE, not the symbol: a dynamic import has
+      // no `importNames` equivalent, because the destructuring happens after
+      // the import expression resolves. That is coarser than the static rule —
+      // it also catches a dynamic import of the barrel for some other symbol —
+      // which is why it lives in the same scope, with the same exemptions.
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: 'ImportExpression[source.value=/cli-adapters\\u002F(factory|index)\\.js$/]',
+          message:
+            'Dynamic import of cli-adapters/factory or /index is restricted for the same reason as the static form (#5191, #5313). Router construction is exempt — add the file to router-construction-operation-5191.',
+        },
+      ],
+    },
+  },
+
+  // Layering invariant: core/ must not import from the presentation layer cli/ (#5129 item 1).
+  {
+    name: 'nexus-agents/no-core-to-cli-imports-5129',
+    files: ['packages/nexus-agents/src/core/**/*.ts'],
+    ignores: ['**/*.test.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/cli/**', '../cli/**', '**/cli/*.js', '../cli/*.js'],
+              message:
+                'Layering violation: core/ is the foundational substrate layer and must not import from cli/ (#5129 item 1). Move shared presentation or ANSI formatting utilities into core/ or inject them from the caller.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+
+  // ROUTER CONSTRUCTION is a second, legitimate operation (#5191, ratified 5/6)
+  // — not drift. `createCompositeRouter` takes `Map<RoutingArmId, ICliAdapter>`;
+  // the registry offers `IResilientAdapter` (which extends `IModelAdapter`) one
+  // CLI at a time, so the canonical path structurally cannot serve these two.
+  //
+  // It also should not: the router IS the selection/failover layer, so
+  // resilient-wrapped arms would nest two failover mechanisms, and shared
+  // breaker state would make an arm report unavailable without the router ever
+  // testing it — the same defect the doctor-probe exemption documents (#5209).
+  {
+    name: 'nexus-agents/router-construction-operation-5191',
+    files: [
+      'packages/nexus-agents/src/pipeline/expert-bridge.ts',
+      'packages/nexus-agents/src/cli/orchestrate-command.ts',
+      // Not router construction, but the same arm-set operation: it
+      // enumerates the arm set with per-CLI provenance (#6769, panel A). The
+      // registry cannot serve it — `ResilientAdapter` has no `listModels` and
+      // can fail over to another CLI, so a catalogue read through it is not
+      // attributable to the transport it is reported under. The panel's
+      // concern (do not advertise what the router refuses) is met by
+      // reporting the SHARED breaker state per CLI instead.
+      'packages/nexus-agents/src/mcp/tools/list-available-models-tool.ts',
+    ],
+    // Both rules: `expert-bridge.ts` reaches `createAllAdapters` through a
+    // DYNAMIC import, so it is caught by `no-restricted-syntax` rather than
+    // `no-restricted-imports`. Exempting only the latter would have left a
+    // ratified-legitimate call site failing lint (#5313).
+    rules: { 'no-restricted-imports': 'off', 'no-restricted-syntax': 'off' },
+  },
+
+  // #6000 step 2: a verdict site under consensus/, cli/ or mcp/tools/ reaches
+  // the governed decision symbols only through consensus/decision/ (and
+  // cli/voter-roles.ts), never through a legacy re-export home — so step 3's
+  // governor path cannot be bypassed by importing around it. Stock
+  // `no-restricted-imports`, same shape as the two blocks above; the block
+  // lives in eslint-rules/ so its fixtures can run it without type information.
+  // What it cannot catch (inline re-implementation, `|| true`) is stated in the
+  // module header; `scripts/arch-lint-inline-verdict.ts` ratchets the former.
+  governedDecisionImports,
+
+  // Audit-sink interfaces must declare members as function PROPERTIES, never
+  // method shorthand (#4991). TypeScript exempts method-shorthand parameters
+  // from `strictFunctionTypes` and checks them bivariantly, so widening a
+  // parameter union on a method lets a stale out-of-tree implementor keep
+  // compiling and then mishandle the new value at runtime — on the audit path,
+  // that means silently dropped records.
+  //
+  // Scoped to the audit types rather than applied repo-wide: this is a real
+  // constraint for an interface that external code implements and whose
+  // parameter unions grow, not a general style preference, and a repo-wide flip
+  // would be a large unrelated diff. `audit-types-variance.test.ts` asserts the
+  // same invariant on the source, so the guarantee does not rest on lint alone.
+  {
+    name: 'nexus-agents/audit-sink-contravariance-4991',
+    files: ['packages/nexus-agents/src/audit/audit-types.ts'],
+    rules: {
+      '@typescript-eslint/method-signature-style': ['error', 'property'],
+    },
+  },
+
+  // The remaining call sites, visible at `warn` rather than silenced.
+  // Same shape as the vacuous-verdict exemption above: an explicit named block
+  // that keeps the debt in every lint run until #5191 migrates them, instead of
+  // an `off` or a directory-wide skip that would hide it.
+  //
+  // Each needs a judgement, not a blanket replace — `doctor` probes liveness and
+  // may legitimately want an unwrapped adapter. Delete this block as the list
+  // empties.
+  {
+    name: 'nexus-agents/adapter-acquisition-baseline-pending-5191',
+    files: [
+      'packages/nexus-agents/src/cli/doctor.ts',
+      'packages/nexus-agents/src/cli/doctor-live.ts',
+      'packages/nexus-agents/src/cli/demo-command.ts',
+      // `list-available-models-tool.ts` left this block in #6769: the audit
+      // #138 panel wanted it migrated so an open breaker reads as signal; the
+      // registry could not serve the per-CLI enumeration, so panel A kept the
+      // factory and added the shared breaker state to the report instead. It is
+      // now listed under router-construction-operation-5191.
+    ],
+    rules: { 'no-restricted-imports': 'warn', 'no-restricted-syntax': 'warn' },
+  },
+
+  // #6153: a suppression states its reason, in the directive's own
+  // `-- <reason>` clause. This is the stock rule (buy the detection, epic
+  // #5121 constraint 1) that replaced the bespoke `max-lines`-only text check
+  // in `scripts/arch-lint-suppression.ts` (#6008, #6151). A bare
+  // `eslint-disable` silences the only thing that knows the code is past the
+  // bar, and the bare ones were the ones that had drifted furthest (#6008).
+  //
+  // `ignore: ['eslint']` exempts the bounded `/* eslint max-lines: [...] */`
+  // ceilings (#6021): those are configuration, not suppression — the rule still
+  // fires on a file that outgrows its ceiling. Tests are exempt like they are
+  // for `max-lines`: 341 of the 388 undescribed directives measured on #6151's
+  // head were test boilerplate (`no-unused-vars` at the top of adapter tests),
+  // which is not the population that drifted. The rule takes `ignore` by
+  // DIRECTIVE TYPE, not rule name, so it cannot be narrowed to `max-lines`.
+  {
+    name: 'nexus-agents/suppression-reason-6153',
+    files: ['packages/*/src/**/*.ts', 'scripts/**/*.ts'],
+    ignores: ['**/*.test.ts', '**/*.spec.ts', '**/test/**', '**/__tests__/**'],
+    plugins: { '@eslint-community/eslint-comments': eslintComments },
+    rules: {
+      '@eslint-community/eslint-comments/require-description': [
+        'error',
+        // `eslint-enable` restores a rule; it suppresses nothing and the
+        // matching disable already carries the reason.
+        { ignore: ['eslint', 'eslint-enable'] },
+      ],
+    },
+  },
+
+  // scripts/ are CLI programs whose stdout IS the report (drift checks,
+  // generators, CI gates), so `console.log` is the output channel, not
+  // debugging left behind. Stated once here rather than as the same
+  // `eslint-disable no-console` at the top of 40 files (#6153).
+  {
+    name: 'nexus-agents/scripts-stdout-is-the-report-6153',
+    files: ['scripts/**/*.ts'],
+    rules: { 'no-console': 'off' },
+  },
+
+  // Test files - relaxed rules
+  {
+    name: 'nexus-agents/tests',
+    files: ['**/*.test.ts', '**/*.spec.ts'],
+    rules: {
+      'max-lines': 'off', // Test files can be longer for comprehensive coverage
+      'max-lines-per-function': 'off',
+      '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/no-non-null-assertion': 'off', // Allow ! assertions in tests
+      '@typescript-eslint/no-unnecessary-condition': 'off', // Allow optional chaining in tests
+      '@typescript-eslint/unbound-method': 'off', // Allow mock method assertions
+      '@typescript-eslint/no-unsafe-assignment': 'off', // Allow JSON.parse in tests
+      '@typescript-eslint/no-unsafe-member-access': 'off', // Allow accessing parsed JSON
+    },
+  },
+]);

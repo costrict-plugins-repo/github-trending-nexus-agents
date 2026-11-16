@@ -1,0 +1,95 @@
+# Dockerfile.sandbox — Docker Desktop Sandbox template with nexus-agents MCP
+# Extends the official opencode sandbox template with nexus-agents MCP server.
+#
+# Usage:
+#   docker build -f Dockerfile.sandbox -t nexus-sandbox:latest .
+#   docker sandbox run -t nexus-sandbox:latest opencode .
+#
+# Requires: Docker Desktop with Sandbox v0.12.0+
+
+# Stage 1: Build nexus-agents (reused from Dockerfile.opencode)
+FROM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS builder
+
+RUN corepack enable && corepack prepare pnpm@10.34.5 --activate
+
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json ./
+COPY packages/nexus-agents/package.json packages/nexus-agents/
+
+
+RUN pnpm install --frozen-lockfile
+
+COPY packages/ packages/
+COPY tsconfig.json ./
+
+RUN pnpm build
+
+# Stage 2: Flat node_modules via npm (no pnpm symlinks)
+FROM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS runtime-deps
+
+WORKDIR /opt/nexus-agents
+COPY --from=builder /app/packages/nexus-agents/package.json ./
+# Include all deps since some devDeps (ts-morph) are bundled as externals
+RUN npm install --ignore-scripts 2>/dev/null; exit 0
+RUN npm rebuild 2>/dev/null; exit 0
+
+# Stage 3: Extend official opencode sandbox template
+FROM docker/sandbox-templates:opencode@sha256:809e53f7a44e7a297fc88e1b81586143a150b9bfafe749a7b9c8801a07d90ece
+
+USER root
+
+# Copy nexus-agents dist and dependencies
+COPY --from=builder /app/packages/nexus-agents/dist /opt/nexus-agents/dist
+COPY --from=builder /app/packages/nexus-agents/package.json /opt/nexus-agents/
+COPY --from=runtime-deps /opt/nexus-agents/node_modules /opt/nexus-agents/node_modules
+
+# Sandbox awareness (#2501, epic #2500). Tells nexus-agents it's running
+# inside a host-provided sandbox so it adapts boot behaviour: defaults
+# NEXUS_DATA_DIR to the multi-repo root, fail-fast on missing gateway
+# config, suppresses CLI-detection noise.
+ENV NEXUS_SANDBOX=docker-opencode
+
+# Redirect all runtime data (memory, learning, audit, voting, sessions,
+# checkpoints, traces) to a workspace-mounted volume so it survives
+# sandbox restarts and stays scoped to the workspace, not the container's
+# $HOME (#2302, child of #2301). Operators override at launch time when
+# they mount a different multi-repo root.
+ENV NEXUS_DATA_DIR=/workspace/.nexus-agents
+RUN mkdir -p /workspace/.nexus-agents
+
+# Create opencode config with MCP server pointing to nexus-agents
+# OpenCode reads from ~/.config/opencode/opencode.json (global config)
+#
+# NEXUS_OPENAI_COMPAT_URL / NEXUS_OPENAI_COMPAT_KEY are NOT baked in here.
+# The host injects them at launch time so the workspace proxy URL + key
+# stay out of the image. nexus-agents fail-fast at boot if they're
+# missing while NEXUS_SANDBOX is set (#2502).
+RUN mkdir -p /home/agent/.config/opencode && \
+    cat > /home/agent/.config/opencode/opencode.json <<'OCEOF'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "nexus-agents": {
+      "type": "local",
+      "command": [
+        "node",
+        "/opt/nexus-agents/dist/cli.js",
+        "--mode=server"
+      ],
+      "enabled": true,
+      "environment": {
+        "NEXUS_SANDBOX": "{env:NEXUS_SANDBOX}",
+        "NEXUS_DATA_DIR": "{env:NEXUS_DATA_DIR}",
+        "NEXUS_OPENAI_COMPAT_URL": "{env:NEXUS_OPENAI_COMPAT_URL}",
+        "NEXUS_OPENAI_COMPAT_KEY": "{env:NEXUS_OPENAI_COMPAT_KEY}",
+        "NEXUS_OPENCODE_CONFIG": "/home/agent/.config/opencode/opencode.json"
+      }
+    }
+  }
+}
+OCEOF
+
+# Fix ownership for agent user
+RUN chown -R agent:agent /opt/nexus-agents /home/agent/.config
+
+USER agent

@@ -1,0 +1,1408 @@
+/**
+ * Tests for voter agents module.
+ * (Source: Issue #226, Issue #280 - timeout/retry fixes)
+ */
+
+import { afterEach, describe, it, expect, vi } from 'vitest';
+
+// Mock delay to skip retry backoff waits (perf: saves ~2s from retry tests)
+vi.mock('../utils/async-utils.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/async-utils.js')>();
+  return {
+    ...actual,
+    delay: vi.fn(() => Promise.resolve()),
+  };
+});
+
+import {
+  VOTER_SYSTEM_PROMPTS,
+  VoteResponseSchema,
+  buildVotePrompt,
+  extractJsonFromResponse,
+  parseVoteResponse,
+  simulateVote,
+  getRoleDescription,
+  executeAgentVote,
+  collectRealVotes,
+  NoAdapterError,
+} from './voter-agents.js';
+import type { VoterRole } from './vote-types.js';
+import type { IModelAdapter, CompletionResponse, ILogger } from '../core/index.js';
+import type { Result } from '../core/index.js';
+import { createLogger } from '../core/index.js';
+import { UNRESOLVED_MODEL_ID } from '../config/model-equivalence.js';
+import { GatewayRediscovery, setGatewayRediscovery } from '../adapters/gateway-rediscovery.js';
+import { resolvedModel } from './vote-diversity.js';
+
+describe('voter-agents', () => {
+  describe('VOTER_SYSTEM_PROMPTS', () => {
+    const roles: VoterRole[] = ['architect', 'security', 'devex', 'ai_ml', 'pm'];
+
+    it.each(roles)('should have a system prompt for %s role', (role) => {
+      expect(VOTER_SYSTEM_PROMPTS[role]).toBeDefined();
+      expect(typeof VOTER_SYSTEM_PROMPTS[role]).toBe('string');
+      expect(VOTER_SYSTEM_PROMPTS[role].length).toBeGreaterThan(100);
+    });
+
+    it('should include evaluation criteria for architect', () => {
+      expect(VOTER_SYSTEM_PROMPTS.architect).toContain('Technical design');
+      expect(VOTER_SYSTEM_PROMPTS.architect).toContain('Scalability');
+      expect(VOTER_SYSTEM_PROMPTS.architect).toContain('Maintainability');
+    });
+
+    it('should include security concerns for security role', () => {
+      expect(VOTER_SYSTEM_PROMPTS.security).toContain('OWASP');
+      expect(VOTER_SYSTEM_PROMPTS.security).toContain('vulnerabilities');
+      expect(VOTER_SYSTEM_PROMPTS.security).toContain('injection');
+    });
+
+    it('should include developer experience criteria for devex role', () => {
+      expect(VOTER_SYSTEM_PROMPTS.devex).toContain('API usability');
+      expect(VOTER_SYSTEM_PROMPTS.devex).toContain('Documentation');
+      expect(VOTER_SYSTEM_PROMPTS.devex).toContain('Learning curve');
+    });
+
+    it('should include AI/ML criteria for ai_ml role', () => {
+      expect(VOTER_SYSTEM_PROMPTS.ai_ml).toContain('Multi-agent');
+      expect(VOTER_SYSTEM_PROMPTS.ai_ml).toContain('Model selection');
+      expect(VOTER_SYSTEM_PROMPTS.ai_ml).toContain('Context management');
+    });
+
+    it('should include business criteria for pm role', () => {
+      expect(VOTER_SYSTEM_PROMPTS.pm).toContain('Business value');
+      expect(VOTER_SYSTEM_PROMPTS.pm).toContain('Resource requirements');
+      expect(VOTER_SYSTEM_PROMPTS.pm).toContain('CLAUDE.md');
+    });
+  });
+
+  describe('VoteResponseSchema', () => {
+    it('should validate a valid vote response', () => {
+      const validResponse = {
+        decision: 'approve',
+        reasoning: 'Good technical design and aligns with patterns.',
+        confidence: 0.85,
+      };
+
+      const result = VoteResponseSchema.safeParse(validResponse);
+      expect(result.success).toBe(true);
+    });
+
+    it('should accept optional conditions', () => {
+      const responseWithConditions = {
+        decision: 'approve',
+        reasoning: 'Approved with conditions',
+        confidence: 0.75,
+        conditions: ['Add tests before merge', 'Update documentation'],
+      };
+
+      const result = VoteResponseSchema.safeParse(responseWithConditions);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.conditions).toEqual(['Add tests before merge', 'Update documentation']);
+      }
+    });
+
+    it('should reject invalid decision values', () => {
+      const invalidResponse = {
+        decision: 'maybe',
+        reasoning: 'Not sure about this',
+        confidence: 0.5,
+      };
+
+      const result = VoteResponseSchema.safeParse(invalidResponse);
+      expect(result.success).toBe(false);
+    });
+
+    it('should reject reasoning that is too short', () => {
+      const shortReasoning = {
+        decision: 'approve',
+        reasoning: 'OK',
+        confidence: 0.9,
+      };
+
+      const result = VoteResponseSchema.safeParse(shortReasoning);
+      expect(result.success).toBe(false);
+    });
+
+    it('should reject confidence outside 0-1 range', () => {
+      const invalidConfidence = {
+        decision: 'approve',
+        reasoning: 'Valid reasoning text here',
+        confidence: 1.5,
+      };
+
+      const result = VoteResponseSchema.safeParse(invalidConfidence);
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('buildVotePrompt', () => {
+    it('should include the proposal text', () => {
+      const proposal = 'Add a new routing feature';
+      const prompt = buildVotePrompt(proposal);
+
+      expect(prompt).toContain(proposal);
+      expect(prompt).toContain('PROPOSAL:');
+    });
+
+    it('should include voting instructions', () => {
+      const prompt = buildVotePrompt('Test proposal');
+
+      expect(prompt).toContain('approve');
+      expect(prompt).toContain('reject');
+      expect(prompt).toContain('abstain');
+      expect(prompt).toContain('confidence');
+    });
+
+    it('should include example JSON response', () => {
+      const prompt = buildVotePrompt('Test proposal');
+
+      expect(prompt).toContain('"decision"');
+      expect(prompt).toContain('"reasoning"');
+      expect(prompt).toContain('"confidence"');
+    });
+  });
+
+  describe('extractJsonFromResponse', () => {
+    it('should extract JSON from plain text', () => {
+      const text = '{"decision": "approve", "reasoning": "Good", "confidence": 0.8}';
+      const result = extractJsonFromResponse(text);
+
+      expect(result).toBe(text);
+    });
+
+    it('should extract JSON from markdown code block', () => {
+      const text = `Here is my response:
+\`\`\`json
+{"decision": "approve", "reasoning": "Good", "confidence": 0.8}
+\`\`\`
+That's my vote.`;
+
+      const result = extractJsonFromResponse(text);
+      expect(result).toBe('{"decision": "approve", "reasoning": "Good", "confidence": 0.8}');
+    });
+
+    it('should extract JSON from code block without language specifier', () => {
+      const text = `\`\`\`
+{"decision": "reject", "reasoning": "Concerns", "confidence": 0.6}
+\`\`\``;
+
+      const result = extractJsonFromResponse(text);
+      expect(result).toBe('{"decision": "reject", "reasoning": "Concerns", "confidence": 0.6}');
+    });
+
+    it('should extract JSON object from mixed text', () => {
+      const text =
+        'I think {"decision": "abstain", "reasoning": "Need more info", "confidence": 0.5} is my vote';
+
+      const result = extractJsonFromResponse(text);
+      expect(result).toContain('"decision": "abstain"');
+    });
+
+    it('should return trimmed text when no JSON found', () => {
+      const text = '   Some plain text without JSON   ';
+      const result = extractJsonFromResponse(text);
+
+      expect(result).toBe('Some plain text without JSON');
+    });
+  });
+
+  describe('parseVoteResponse', () => {
+    it('should parse valid JSON vote response', () => {
+      const output =
+        '{"decision": "approve", "reasoning": "Good design and implementation", "confidence": 0.85}';
+      const vote = parseVoteResponse(output, 'architect');
+
+      expect(vote.decision).toBe('approve');
+      expect(vote.reasoning).toBe('Good design and implementation');
+      expect(vote.confidence).toBe(0.85);
+    });
+
+    it('should parse response with conditions', () => {
+      const output = `{
+        "decision": "approve",
+        "reasoning": "Looks good overall with some suggestions",
+        "confidence": 0.75,
+        "conditions": ["Add tests", "Update docs"]
+      }`;
+      const vote = parseVoteResponse(output, 'pm');
+
+      expect(vote.decision).toBe('approve');
+      expect(vote.conditions).toEqual(['Add tests', 'Update docs']);
+    });
+
+    it('should throw SyntheticVoteError for invalid JSON', () => {
+      const output = 'I approve this proposal because it looks good';
+
+      expect(() => parseVoteResponse(output, 'devex')).toThrow(/Vote response parsing failed/);
+    });
+
+    it('should throw SyntheticVoteError for malformed JSON', () => {
+      const output = '{"decision": "approve", "reasoning": missing quotes}';
+
+      expect(() => parseVoteResponse(output, 'architect')).toThrow(/Vote response parsing failed/);
+    });
+  });
+
+  describe('simulateVote', () => {
+    it('should return a valid vote structure', () => {
+      const vote = simulateVote('architect', 'Test proposal');
+
+      expect(['approve', 'reject', 'abstain']).toContain(vote.decision);
+      expect(vote.reasoning).toMatch(/\[Simulated/); // Matches '[Simulated]' or '[Simulated - no LLM available]'
+      // Confidence varies by decision: reject 0.6-0.9, approve 0.5-0.8, abstain 0.3-0.5 (Issue #453)
+      expect(vote.confidence).toBeGreaterThanOrEqual(0.3);
+      expect(vote.confidence).toBeLessThanOrEqual(0.9);
+    });
+
+    it('should include role-specific reasoning', () => {
+      const architectVote = simulateVote('architect', 'Test');
+      const securityVote = simulateVote('security', 'Test');
+
+      expect(architectVote.reasoning).toContain('architecture');
+      expect(securityVote.reasoning).toContain('security');
+    });
+
+    it('should include truncated proposal in reasoning', () => {
+      const longProposal = 'A'.repeat(100);
+      const vote = simulateVote('pm', longProposal);
+
+      expect(vote.reasoning).toContain('A'.repeat(50));
+      expect(vote.reasoning).toContain('...');
+    });
+  });
+
+  describe('getRoleDescription', () => {
+    it('should return description for architect', () => {
+      const description = getRoleDescription('architect');
+      expect(description).toContain('Software Architect');
+      expect(description).toContain('technical design');
+    });
+
+    it('should return description for security', () => {
+      const description = getRoleDescription('security');
+      expect(description).toContain('Security Engineer');
+    });
+
+    it('should return description for all roles', () => {
+      const roles: VoterRole[] = ['architect', 'security', 'devex', 'ai_ml', 'pm'];
+      for (const role of roles) {
+        const description = getRoleDescription(role);
+        expect(typeof description).toBe('string');
+        expect(description.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  // ============================================================================
+  // Issue #280: Timeout, retry, and simulation fallback tests
+  // ============================================================================
+
+  describe('executeAgentVote (Issue #280)', () => {
+    const logger = createLogger({ component: 'test', level: 'silent' });
+
+    /** Creates a mock adapter with configurable behavior. */
+    function createMockAdapter(behavior: {
+      response?: Result<CompletionResponse, Error>;
+      delay?: number;
+    }): IModelAdapter {
+      return {
+        providerId: 'test',
+        modelId: 'test-model',
+        capabilities: [],
+        complete: vi.fn().mockImplementation(async () => {
+          if (behavior.delay !== undefined) {
+            await new Promise((resolve) => setTimeout(resolve, behavior.delay));
+          }
+          return (
+            behavior.response ?? {
+              ok: true,
+              value: { content: '{}', usage: {}, stopReason: 'end_turn', model: 'test' },
+            }
+          );
+        }),
+        stream: vi.fn(),
+        countTokens: vi.fn().mockResolvedValue(100),
+        validateConfig: vi.fn().mockReturnValue({ ok: true }),
+      };
+    }
+
+    it('should return successful vote on first attempt', async () => {
+      const adapter = createMockAdapter({
+        response: {
+          ok: true,
+          value: {
+            // Content is typed as ContentBlock[] but extractTextFromResponse handles strings
+            content: JSON.stringify({
+              decision: 'approve',
+              reasoning: 'Good technical design that follows patterns.',
+              confidence: 0.9,
+            }) as unknown as CompletionResponse['content'],
+            usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+            stopReason: 'end_turn' as const,
+            model: 'test',
+          },
+        },
+      });
+
+      const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+        timeoutMs: 5000,
+        maxRetries: 2,
+      });
+
+      expect(result.source).toBe('llm');
+      expect(result.vote.decision).toBe('approve');
+      expect(result.error).toBeUndefined();
+    });
+
+    // #6821: the seat result carries the usage of every settled completion.
+    describe('attempt usage on the seat (#6821)', () => {
+      const usage = { inputTokens: 100, outputTokens: 50, totalTokens: 150 };
+
+      it('a voting seat carries its attempt usage beside the answer’s own', async () => {
+        const adapter = createMockAdapter({
+          response: {
+            ok: true,
+            value: {
+              content: JSON.stringify({
+                decision: 'approve',
+                reasoning: 'Good technical design that follows patterns.',
+                confidence: 0.9,
+              }) as unknown as CompletionResponse['content'],
+              usage,
+              stopReason: 'end_turn' as const,
+              model: 'test',
+            },
+          },
+        });
+        const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+          timeoutMs: 5000,
+          maxRetries: 0,
+        });
+        expect(result.inputTokens).toBe(100);
+        expect(result.attemptUsage).toEqual({
+          completions: 1,
+          reportedCompletions: 1,
+          inputTokens: 100,
+          outputTokens: 50,
+        });
+      });
+
+      it('an errored seat keeps the usage its parse-failed completion billed', async () => {
+        const adapter = createMockAdapter({
+          response: {
+            ok: true,
+            value: {
+              content: 'no vote here' as unknown as CompletionResponse['content'],
+              usage,
+              stopReason: 'end_turn' as const,
+              model: 'test',
+            },
+          },
+        });
+        const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+          timeoutMs: 5000,
+          maxRetries: 0,
+        });
+        expect(result.source).toBe('error');
+        // The legacy fields describe an answering completion; there was none.
+        expect(result.inputTokens).toBeUndefined();
+        expect(result.attemptUsage).toEqual({
+          completions: 1,
+          reportedCompletions: 1,
+          inputTokens: 100,
+          outputTokens: 50,
+        });
+      });
+    });
+
+    // #4392 inc 2 step 4: the seat carries the gateway arm it answered on, so
+    // the cost rollup prices it by the arm's declaration. Without this the
+    // rollup falls back to the model id's vendor list price — the misreport.
+    describe('a gateway seat carries its arm (#4392 inc 2 step 4)', () => {
+      const approve = {
+        ok: true as const,
+        value: {
+          content: JSON.stringify({
+            decision: 'approve',
+            reasoning: 'Good technical design that follows patterns.',
+            confidence: 0.9,
+          }) as unknown as CompletionResponse['content'],
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+          stopReason: 'end_turn' as const,
+          model: 'test',
+        },
+      };
+
+      it('attaches gatewayArm from a gateway model adapter', async () => {
+        const adapter = { ...createMockAdapter({ response: approve }), gatewayArm: 'api:x' };
+        const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+          timeoutMs: 5000,
+          maxRetries: 0,
+        });
+        expect(result.source).toBe('llm');
+        expect(result.gatewayArm).toBe('api:x');
+      });
+
+      it('leaves gatewayArm absent on a vendor adapter', async () => {
+        const adapter = createMockAdapter({ response: approve });
+        const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+          timeoutMs: 5000,
+          maxRetries: 0,
+        });
+        expect(result.source).toBe('llm');
+        expect(Object.keys(result)).not.toContain('gatewayArm');
+      });
+    });
+
+    describe('a seat that could not read the artifact is unverifiable (#6094)', () => {
+      // A spy logger: the discarded decision must be LOGGED, and the shared
+      // silent logger above cannot assert that.
+      const logger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        child: vi.fn(),
+        setLevel: vi.fn(),
+      } as unknown as ILogger;
+      const BLIND_APPROVE = JSON.stringify({
+        decision: 'approve',
+        reasoning:
+          "This is a proposal assessment, not an independently verified diff review. My attempted repository inspection failed with 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted', so I could not confirm caller coverage.",
+        confidence: 0.8,
+        selectedOption: 'C',
+      });
+
+      it('classifies from the reasoning text and discards the approve, logging it', async () => {
+        const adapter = createMockAdapter({
+          response: {
+            ok: true,
+            value: {
+              content: BLIND_APPROVE as unknown as CompletionResponse['content'],
+              stopReason: 'end_turn' as const,
+              model: 'test',
+            },
+          },
+        });
+        const result = await executeAgentVote('scope_steward', 'Test proposal', adapter, logger, {
+          timeoutMs: 5000,
+          maxRetries: 0,
+          declaredOptions: ['A', 'C'],
+        });
+        expect(result.source).toBe('unverifiable');
+        expect(result.unverifiableSignal).toBe('reasoning');
+        expect(result.vote.decision).toBe('abstain');
+        expect(result.selectedOption).toBeUndefined();
+        expect(result.model).toBe('test-model');
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining('unverifiable'),
+          expect.objectContaining({ role: 'scope_steward', discardedDecision: 'approve' })
+        );
+      });
+
+      it('classifies from the structured stderr signal before the reasoning text', async () => {
+        const adapter = createMockAdapter({
+          response: {
+            ok: true,
+            value: {
+              content: JSON.stringify({
+                decision: 'approve',
+                reasoning: 'Approve. The diff is small and the tests name the empty case.',
+                confidence: 0.9,
+              }) as unknown as CompletionResponse['content'],
+              stopReason: 'end_turn' as const,
+              model: 'test',
+              cliStderr: 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n',
+            },
+          },
+        });
+        const result = await executeAgentVote('devex', 'Test proposal', adapter, logger, {
+          timeoutMs: 5000,
+          maxRetries: 0,
+        });
+        expect(result.source).toBe('unverifiable');
+        expect(result.unverifiableSignal).toBe('stderr');
+        expect(result.vote.decision).toBe('abstain');
+      });
+
+      it('a genuine abstention stays an llm abstain', async () => {
+        const adapter = createMockAdapter({
+          response: {
+            ok: true,
+            value: {
+              content: JSON.stringify({
+                decision: 'abstain',
+                reasoning: 'I abstain: this proposal is outside my expertise.',
+                confidence: 0.3,
+              }) as unknown as CompletionResponse['content'],
+              stopReason: 'end_turn' as const,
+              model: 'test',
+            },
+          },
+        });
+        const result = await executeAgentVote('pm', 'Test proposal', adapter, logger, {
+          timeoutMs: 5000,
+          maxRetries: 0,
+        });
+        expect(result.source).toBe('llm');
+        expect(result.vote.decision).toBe('abstain');
+        expect(result.unverifiableSignal).toBeUndefined();
+      });
+
+      // #6244: the catfish seat on the #6241 panel logged two response-parse
+      // failures; a parse failure says the model returned non-JSON, not that
+      // the seat could not read the repository. It is an errored seat whose
+      // `error` names the parse cause, it spends the retry budget (the
+      // failure is transient), and it is never re-recorded as unverifiable.
+      it.each([
+        ['an empty completion', '', /Unexpected end of JSON input$/],
+        [
+          'prose instead of JSON',
+          'I cannot access the repository from here.',
+          /Unexpected token 'I', "I cannot a"\.\.\. is not valid JSON$/,
+        ],
+      ])(
+        'a response-parse failure (%s) is an errored seat with the parse cause, not unverifiable',
+        async (_label, nonJson, cause) => {
+          const adapter = createMockAdapter({
+            response: {
+              ok: true,
+              value: {
+                content: nonJson as unknown as CompletionResponse['content'],
+                stopReason: 'end_turn' as const,
+                model: 'test',
+              },
+            },
+          });
+          const result = await executeAgentVote('catfish', 'Test proposal', adapter, logger, {
+            timeoutMs: 5000,
+            maxRetries: 1,
+          });
+          expect(adapter.complete).toHaveBeenCalledTimes(2);
+          expect(result.source).toBe('error');
+          expect(result.error).toMatch(/^Vote parsing failed: Vote response parsing failed: /);
+          expect(result.error).toMatch(cause);
+          expect(result.unverifiableSignal).toBeUndefined();
+          expect(result.vote.decision).toBe('abstain');
+        }
+      );
+    });
+
+    it('should retry on failure and succeed', async () => {
+      const adapter = createMockAdapter({});
+      (adapter.complete as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ ok: false, error: new Error('Temporary failure') })
+        .mockResolvedValueOnce({
+          ok: true,
+          value: {
+            content: JSON.stringify({
+              decision: 'approve',
+              reasoning: 'Good design after retry.',
+              confidence: 0.8,
+            }),
+            usage: {},
+            stopReason: 'end_turn',
+            model: 'test',
+          },
+        });
+
+      const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+        timeoutMs: 5000,
+        maxRetries: 2,
+      });
+
+      expect(result.source).toBe('llm');
+      expect(result.vote.decision).toBe('approve');
+      expect(adapter.complete).toHaveBeenCalledTimes(2);
+    });
+
+    it('should return abstain vote when all retries exhausted (no simulation)', async () => {
+      const adapter: IModelAdapter = {
+        ...createMockAdapter({
+          response: { ok: false, error: new Error('Persistent failure') },
+        }),
+        providerId: 'cli-codex',
+      };
+
+      const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+        timeoutMs: 5000,
+        maxRetries: 1,
+        allowSimulation: false,
+      });
+
+      expect(result.vote.decision).toBe('abstain');
+      expect(result.vote.confidence).toBe(0);
+      expect(result.vote.reasoning).toContain('[Error]');
+      expect(result.error).toBe('Persistent failure');
+      expect(result.cli).toBe('codex');
+    });
+
+    // #3350: a stale-OAuth voter failure must surface a `<cli> login`
+    // remediation in the error text instead of a raw fail-closed string.
+    it('appends a re-auth remediation when the failure is a stale-OAuth error', async () => {
+      const adapter: IModelAdapter = {
+        ...createMockAdapter({
+          response: {
+            ok: false,
+            error: new Error(
+              'Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.'
+            ),
+          },
+        }),
+        providerId: 'cli-codex',
+      };
+
+      const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+        timeoutMs: 5000,
+        maxRetries: 0,
+        allowSimulation: false,
+      });
+
+      expect(result.vote.decision).toBe('abstain');
+      expect(result.error).toContain('refresh token was already used');
+      expect(result.error).toContain('codex login');
+    });
+
+    it('leaves a non-auth failure error unchanged (no remediation appended)', async () => {
+      const adapter: IModelAdapter = {
+        ...createMockAdapter({
+          response: { ok: false, error: new Error('rate limit exceeded') },
+        }),
+        providerId: 'cli-codex',
+      };
+
+      const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+        timeoutMs: 5000,
+        maxRetries: 0,
+        allowSimulation: false,
+      });
+
+      expect(result.vote.decision).toBe('abstain');
+      expect(result.error).toBe('rate limit exceeded');
+      expect(result.error).not.toContain('login');
+    });
+
+    it('should fall back to simulation only when explicitly allowed', async () => {
+      const adapter = createMockAdapter({
+        response: { ok: false, error: new Error('Failure') },
+      });
+
+      const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+        timeoutMs: 5000,
+        maxRetries: 0,
+        allowSimulation: true,
+      });
+
+      expect(result.source).toBe('simulation');
+      expect(result.vote.reasoning).toMatch(/\[Simulated/); // Matches '[Simulated]' or '[Simulated - no LLM available]'
+    });
+
+    it('should timeout and return error when adapter is slow', async () => {
+      const adapter = createMockAdapter({
+        delay: 10, // 10ms delay (perf: reduced from 200ms)
+        response: {
+          ok: true,
+          value: {
+            content: JSON.stringify({
+              decision: 'approve',
+              reasoning: 'This should timeout.',
+              confidence: 0.9,
+            }) as unknown as CompletionResponse['content'],
+            usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+            stopReason: 'end_turn' as const,
+            model: 'test',
+          },
+        },
+      });
+
+      const result = await executeAgentVote('architect', 'Test proposal', adapter, logger, {
+        timeoutMs: 2, // 2ms timeout (less than 10ms delay)
+        maxRetries: 0,
+        allowSimulation: false,
+      });
+
+      expect(result.vote.decision).toBe('abstain');
+      expect(result.error).toContain('timeout');
+    });
+  });
+
+  describe('collectRealVotes (Issue #280)', () => {
+    const logger = createLogger({ component: 'test', level: 'silent' });
+
+    it('should construct NoAdapterError with proper message format', () => {
+      // Test the error construction directly since CLIs may be available
+      // in the test environment, making the actual throw hard to test
+      const error = new NoAdapterError(
+        'No adapter available for voting: Test error. ' +
+          'Install a CLI (claude/gemini/codex) or set ANTHROPIC_API_KEY.'
+      );
+      expect(error.name).toBe('NoAdapterError');
+      expect(error.message).toContain('No adapter available');
+      expect(error.message).toContain('Install a CLI');
+    });
+
+    it('should use simulation when explicitly requested', async () => {
+      const results = await collectRealVotes({
+        roles: ['architect', 'security'],
+        proposal: 'Test proposal',
+        logger,
+        simulate: true,
+      });
+
+      expect(results).toHaveLength(2);
+      for (const result of results) {
+        expect(result.source).toBe('simulation');
+      }
+    });
+
+    it('should pass timeout and retry options to executeAgentVote', async () => {
+      const mockAdapter: IModelAdapter = {
+        providerId: 'test',
+        modelId: 'test-model',
+        capabilities: [],
+        complete: vi.fn().mockResolvedValue({
+          ok: true,
+          value: {
+            content: JSON.stringify({
+              decision: 'approve',
+              reasoning: 'Good design with proper patterns.',
+              confidence: 0.85,
+            }),
+            usage: {},
+            stopReason: 'end_turn',
+            model: 'test',
+          },
+        }),
+        stream: vi.fn(),
+        countTokens: vi.fn().mockResolvedValue(100),
+        validateConfig: vi.fn().mockReturnValue({ ok: true }),
+      };
+
+      const results = await collectRealVotes({
+        roles: ['architect'],
+        proposal: 'Test proposal',
+        logger,
+        adapter: mockAdapter,
+        timeoutMs: 10000,
+        maxRetries: 3,
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.source).toBe('llm');
+      expect(results[0]?.vote.decision).toBe('approve');
+    });
+  });
+
+  // #4390: the diversity check compared raw modelId STRINGS, so one model
+  // reached through two gateways — `anthropic/claude-sonnet-4-6` and
+  // `custom/claude-sonnet-4-6` are the same weights — counted as two distinct
+  // models and the warning never fired.
+  describe('panel diversity uses canonical model identity (#4390)', () => {
+    function adapterFor(modelId: string): IModelAdapter {
+      return {
+        providerId: 'gateway',
+        modelId,
+        capabilities: [],
+        complete: vi.fn().mockResolvedValue({
+          ok: true,
+          value: {
+            content: JSON.stringify({
+              decision: 'approve',
+              reasoning: 'Reasonable enough for a test fixture.',
+              confidence: 0.8,
+            }),
+            usage: {},
+            stopReason: 'end_turn',
+            model: modelId,
+          },
+        }),
+        stream: vi.fn(),
+        countTokens: vi.fn().mockResolvedValue(10),
+        validateConfig: vi.fn().mockReturnValue({ ok: true }),
+      };
+    }
+
+    async function warningsFor(modelIds: readonly string[]): Promise<string[]> {
+      const warnings: string[] = [];
+      const capturing = {
+        info: vi.fn(),
+        debug: vi.fn(),
+        error: vi.fn(),
+        warn: (msg: string) => warnings.push(msg),
+      } as unknown as ILogger;
+
+      await collectRealVotes({
+        roles: ['architect', 'security'],
+        proposal: 'Test proposal',
+        logger: capturing,
+        gatewayAdapters: modelIds.map(adapterFor),
+      });
+      return warnings;
+    }
+
+    it('warns when two gateways serve the same underlying model', async () => {
+      const warnings = await warningsFor([
+        'anthropic/claude-sonnet-4-6',
+        'custom/claude-sonnet-4-6',
+      ]);
+
+      expect(warnings.some((w) => w.includes('collapsed to a single gateway model'))).toBe(true);
+    });
+
+    it('stays quiet for a genuinely diverse panel', async () => {
+      const warnings = await warningsFor(['anthropic/claude-sonnet-4-6', 'openai/gpt-5.5']);
+
+      expect(warnings.some((w) => w.includes('collapsed to a single gateway model'))).toBe(false);
+    });
+
+    it('does not merge two unidentifiable models into one', async () => {
+      // The inverse error: collapsing distinct models because neither can be
+      // identified would silence a warning that should NOT fire.
+      const warnings = await warningsFor(['some-private-model', 'another-private-model']);
+
+      expect(warnings.some((w) => w.includes('collapsed to a single gateway model'))).toBe(false);
+    });
+  });
+
+  describe('panel independence is judged after detection (#4983)', () => {
+    // The bug: lazy detection (#811) means every CLI adapter reports
+    // `pending-detection` at assignment time, so an equality check saw "one
+    // model" and warned on EVERY vote — while a genuinely collapsed panel
+    // produced the identical line. Both directions are pinned here.
+    function votingAdapter(
+      modelId: string,
+      providerId = modelId,
+      reportedModel?: string
+    ): IModelAdapter {
+      return {
+        providerId,
+        modelId,
+        complete: vi.fn().mockResolvedValue({
+          ok: true,
+          value: {
+            ...(reportedModel === undefined ? {} : { reportedModel }),
+            content: [
+              {
+                type: 'text' as const,
+                text: '{"decision":"approve","confidence":0.9,"reasoning":"Test vote."}',
+              },
+            ],
+          },
+        }),
+      } as unknown as IModelAdapter;
+    }
+
+    function failingAdapter(modelId: string, providerId = modelId): IModelAdapter {
+      const adapter = votingAdapter(modelId, providerId);
+      (adapter.complete as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ok: false,
+        error: new Error(`failure from ${modelId}`),
+      });
+      return adapter;
+    }
+
+    function captureWarnings(): { readonly logger: ILogger; readonly warnings: string[] } {
+      const warnings: string[] = [];
+      const logger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn((message: string) => warnings.push(message)),
+        error: vi.fn(),
+      } as unknown as ILogger;
+      return { logger, warnings };
+    }
+
+    function pinRolesTo(assignments: ReadonlyMap<VoterRole, IModelAdapter>): void {
+      for (const [role, adapter] of assignments) {
+        vi.stubEnv(`NEXUS_VOTER_MODEL_${role.toUpperCase()}`, adapter.modelId);
+      }
+    }
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    async function warnsAfterVoting(modelId: string, reportedModel?: string): Promise<string[]> {
+      const warnings: string[] = [];
+      const logger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn((message: string) => warnings.push(message)),
+        error: vi.fn(),
+      } as unknown as ILogger;
+
+      await collectRealVotes({
+        roles: ['architect', 'security', 'devex'] as VoterRole[],
+        proposal: 'Panel independence',
+        adapter: votingAdapter(modelId, modelId, reportedModel),
+        interAgentDelayMs: 0,
+        logger,
+      });
+      return warnings;
+    }
+
+    it('warns when every role really did run on one model', async () => {
+      const warnings = await warnsAfterVoting('gpt-5.5', 'gpt-5.5');
+
+      expect(warnings.some((w) => w.includes('ran on ONE model'))).toBe(true);
+      expect(warnings.some((w) => w.includes('UNMEASURED'))).toBe(false);
+    });
+
+    it('keeps configured-only answering models unmeasured instead of claiming correlation', async () => {
+      const { logger, warnings } = captureWarnings();
+      const results = await collectRealVotes({
+        roles: ['architect', 'security', 'devex'],
+        proposal: 'Configured identity is not a serving report',
+        adapter: votingAdapter('gpt-5.5'),
+        interAgentDelayMs: 0,
+        logger,
+      });
+
+      expect(results.map((result) => result.servedModel)).toEqual([
+        undefined,
+        undefined,
+        undefined,
+      ]);
+      expect(results.map(resolvedModel)).toEqual(['gpt-5.5', 'gpt-5.5', 'gpt-5.5']);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('UNMEASURED'),
+        expect.objectContaining({ unresolved: 3, total: 3, roleCount: 3 })
+      );
+      expect(warnings.some((warning) => warning.includes('ran on ONE model'))).toBe(false);
+    });
+
+    it('does not claim correlation from an undetected placeholder', async () => {
+      // `pending-detection` is what four DIFFERENT CLIs report before they have
+      // looked. Reading that as one model is the false positive.
+      const warnings = await warnsAfterVoting(UNRESOLVED_MODEL_ID);
+
+      expect(warnings.some((w) => w.includes('ran on ONE model'))).toBe(false);
+      expect(warnings.some((w) => w.includes('UNMEASURED'))).toBe(true);
+    });
+
+    it('warns when diverse primaries fail and one fallback model serves every vote', async () => {
+      const roles: VoterRole[] = ['architect', 'security', 'devex'];
+      const fallback = votingAdapter('fallback-model', 'fallback-model', 'fallback-model');
+      const primaries = roles.map((role) => failingAdapter(`primary-${role}`));
+      pinRolesTo(new Map(roles.map((role, index) => [role, primaries[index]!] as const)));
+      const { logger, warnings } = captureWarnings();
+
+      const results = await collectRealVotes({
+        roles,
+        proposal: 'Fallback provenance',
+        gatewayAdapters: [fallback, ...primaries],
+        interAgentDelayMs: 0,
+        maxRetries: 0,
+        logger,
+      });
+
+      expect(results.map((result) => result.model)).toEqual(roles.map(() => 'fallback-model'));
+      expect(results.map((result) => result.pinnedModel)).toEqual(
+        primaries.map((adapter) => adapter.modelId)
+      );
+      expect(warnings.some((warning) => warning.includes('ran on ONE model'))).toBe(true);
+    });
+
+    it('captures a primary pin before adapter execution can change its model ID', async () => {
+      const adapter = votingAdapter('assigned-primary');
+      const complete = (): ReturnType<IModelAdapter['complete']> => {
+        (adapter as { modelId: string }).modelId = 'detected-serving-model';
+        return Promise.resolve({
+          ok: true,
+          value: {
+            content: [
+              {
+                type: 'text' as const,
+                text: '{"decision":"approve","confidence":0.9,"reasoning":"Test vote."}',
+              },
+            ],
+            model: 'detected-serving-model',
+            stopReason: 'end_turn',
+          },
+        });
+      };
+      (adapter as { complete: IModelAdapter['complete'] }).complete = complete;
+
+      const [result] = await collectRealVotes({
+        roles: ['architect'],
+        proposal: 'Mutable model identity',
+        adapter,
+        interAgentDelayMs: 0,
+      });
+
+      expect(result?.model).toBe('detected-serving-model');
+      expect(result?.pinnedModel).toBe('assigned-primary');
+    });
+
+    it('resolves every lazy assignment in a mixed-fallback panel (#7295)', async () => {
+      const claude = votingAdapter(UNRESOLVED_MODEL_ID, 'cli-claude');
+      vi.mocked(claude.complete).mockImplementation(() => {
+        (claude as { modelId: string }).modelId = 'claude-fable-5';
+        return Promise.resolve({
+          ok: true,
+          value: {
+            content: [
+              {
+                type: 'text',
+                text: '{"decision":"approve","confidence":0.9,"reasoning":"Test vote."}',
+              },
+            ],
+            model: 'claude-opus',
+            fallbackFrom: 'fable',
+            stopReason: 'end_turn',
+          },
+        });
+      });
+      const openai = votingAdapter('gpt-5.5', 'cli-codex');
+      const { logger } = captureWarnings();
+      const results = await collectRealVotes({
+        roles: ['architect', 'security', 'scope_steward'],
+        proposal: 'Mixed capacity fallback',
+        gatewayAdapters: [claude, openai],
+        roleAdapters: new Map([
+          ['architect', claude],
+          ['security', openai],
+          ['scope_steward', claude],
+        ]),
+        interAgentDelayMs: 0,
+        maxRetries: 0,
+        logger,
+      });
+      expect(results.map((vote) => vote.pinnedModel)).toEqual([
+        'claude-fable-5',
+        'gpt-5.5',
+        'claude-fable-5',
+      ]);
+      expect(results.map((vote) => vote.servedModel)).toEqual([undefined, undefined, undefined]);
+      expect(results.map((vote) => vote.operationalModel)).toEqual([
+        'claude-opus',
+        undefined,
+        'claude-opus',
+      ]);
+      expect(results.map(resolvedModel)).toEqual(['claude-opus', 'gpt-5.5', 'claude-opus']);
+      expect(results.map((vote) => vote.fallback?.fromModel)).toEqual([
+        'fable',
+        undefined,
+        'fable',
+      ]);
+    });
+
+    it('does not warn for a genuinely diverse successful panel', async () => {
+      const { logger, warnings } = captureWarnings();
+
+      await collectRealVotes({
+        roles: ['architect', 'security', 'devex'],
+        proposal: 'Diverse provenance',
+        gatewayAdapters: [
+          votingAdapter('gpt-5.5', 'gpt-5.5', 'gpt-5.5'),
+          votingAdapter('claude-sonnet-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-6'),
+          votingAdapter('gemini-3-pro', 'gemini-3-pro', 'gemini-3-pro'),
+        ],
+        interAgentDelayMs: 0,
+        logger,
+      });
+
+      expect(warnings.some((warning) => warning.includes('ran on ONE model'))).toBe(false);
+      expect(warnings.some((warning) => warning.includes('UNMEASURED'))).toBe(false);
+    });
+
+    it('excludes error votes from the post-vote model count', async () => {
+      const roles: VoterRole[] = ['architect', 'security', 'devex'];
+      const fallback = failingAdapter('fallback-error', 'cli-codex');
+      const sameModelA = votingAdapter('gpt-5.5', 'gpt-5.5', 'gpt-5.5');
+      const failedPrimary = failingAdapter('failed-primary');
+      const sameModelB = votingAdapter('gpt-5.5', 'gpt-5.5', 'gpt-5.5');
+      pinRolesTo(
+        new Map<VoterRole, IModelAdapter>([
+          ['architect', sameModelA],
+          ['security', failedPrimary],
+          ['devex', sameModelB],
+        ])
+      );
+      const { logger, warnings } = captureWarnings();
+
+      const results = await collectRealVotes({
+        roles,
+        proposal: 'Error provenance',
+        gatewayAdapters: [fallback, sameModelA, failedPrimary, sameModelB],
+        interAgentDelayMs: 0,
+        maxRetries: 0,
+        logger,
+      });
+
+      expect(results.map((result) => result.source)).toEqual(['llm', 'error', 'llm']);
+      expect(results[1]?.cli).toBe('codex');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('ran on ONE model'),
+        expect.objectContaining({ roleCount: 2 })
+      );
+      expect(warnings.some((warning) => warning.includes('ran on ONE model'))).toBe(true);
+    });
+  });
+
+  describe('staggered vote launches', () => {
+    it('launches votes with inter-agent delay', async () => {
+      const callTimestamps: number[] = [];
+      const adapter = {
+        providerId: 'test-provider',
+        modelId: 'test-model',
+        complete: vi.fn().mockImplementation(() => {
+          callTimestamps.push(Date.now());
+          return Promise.resolve({
+            ok: true,
+            value: {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '{"decision":"approve","confidence":0.9,"reasoning":"Test vote."}',
+                },
+              ],
+            },
+          });
+        }),
+      } as unknown as IModelAdapter;
+
+      await collectRealVotes({
+        roles: ['architect', 'security', 'devex'] as VoterRole[],
+        proposal: 'Test stagger',
+        adapter,
+        interAgentDelayMs: 100,
+      });
+
+      // All 3 votes should complete
+      expect(adapter.complete).toHaveBeenCalledTimes(3);
+    });
+
+    it('supports interAgentDelayMs option in CollectRealVotesOptions', async () => {
+      const adapter = {
+        providerId: 'test-provider',
+        modelId: 'test-model',
+        complete: vi.fn().mockResolvedValue({
+          ok: true,
+          value: {
+            content: [
+              {
+                type: 'text' as const,
+                text: '{"decision":"approve","confidence":0.9,"reasoning":"Test vote."}',
+              },
+            ],
+          },
+        }),
+      } as unknown as IModelAdapter;
+
+      // Should not throw — interAgentDelayMs is a valid option
+      const results = await collectRealVotes({
+        roles: ['architect'] as VoterRole[],
+        proposal: 'Test',
+        adapter,
+        interAgentDelayMs: 0,
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.source).toBe('llm');
+    });
+  });
+
+  describe('NoAdapterError', () => {
+    it('should have correct name', () => {
+      const error = new NoAdapterError('Test message');
+      expect(error.name).toBe('NoAdapterError');
+      expect(error.message).toBe('Test message');
+    });
+
+    it('should be instanceof Error', () => {
+      const error = new NoAdapterError('Test');
+      expect(error).toBeInstanceOf(Error);
+      expect(error).toBeInstanceOf(NoAdapterError);
+    });
+  });
+});
+
+describe('collectRealVotes — gateway routing (#4040)', () => {
+  const logger = createLogger({ component: 'test', level: 'silent' });
+
+  /** A gateway-style in-process adapter (distinct modelId) returning an approve vote. */
+  function gatewayAdapter(modelId: string): IModelAdapter {
+    return {
+      providerId: 'openai-compat',
+      modelId,
+      capabilities: [],
+      complete: vi.fn().mockResolvedValue({
+        ok: true,
+        value: {
+          content: JSON.stringify({
+            decision: 'approve',
+            reasoning: `ok from ${modelId}`,
+            confidence: 0.9,
+          }) as unknown as CompletionResponse['content'],
+          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          stopReason: 'end_turn' as const,
+          model: modelId,
+        },
+      }),
+      stream: vi.fn(),
+      countTokens: vi.fn().mockResolvedValue(10),
+      validateConfig: vi.fn().mockReturnValue({ ok: true }),
+    };
+  }
+
+  const calls = (a: IModelAdapter): number =>
+    (a.complete as ReturnType<typeof vi.fn>).mock.calls.length;
+
+  it('round-robins roles across the per-model gateway adapters (in-process, no CLI)', async () => {
+    const a = gatewayAdapter('gw-a');
+    const b = gatewayAdapter('gw-b');
+    const c = gatewayAdapter('gw-c');
+    const roles: VoterRole[] = ['architect', 'security', 'scope_steward'];
+
+    const results = await collectRealVotes({
+      roles,
+      proposal: 'ship it',
+      gatewayAdapters: [a, b, c],
+      logger,
+      timeoutMs: 5000,
+      maxRetries: 1,
+      interAgentDelayMs: 0,
+    });
+
+    expect(results).toHaveLength(3);
+    expect(results.every((r) => r.source === 'llm')).toBe(true);
+    // 3 roles across 3 gateway adapters → each invoked exactly once. That the
+    // gateway adapters were called at all proves voters did NOT shell to a CLI.
+    expect(calls(a)).toBe(1);
+    expect(calls(b)).toBe(1);
+    expect(calls(c)).toBe(1);
+  });
+
+  it('re-discovers a gateway that was down at boot before assigning seats (#6608)', async () => {
+    const a = gatewayAdapter('gw-late-a');
+    const b = gatewayAdapter('gw-late-b');
+    const c = gatewayAdapter('gw-late-c');
+    const live: IModelAdapter[] = [];
+    const discover = vi.fn(() => Promise.resolve([a, b, c]));
+    // lastAttemptAt 0: the boot attempt is long past the backoff.
+    setGatewayRediscovery(
+      new GatewayRediscovery({ target: live, discover, logger, lastAttemptAt: 0 })
+    );
+    try {
+      const results = await collectRealVotes({
+        roles: ['architect', 'security', 'scope_steward'],
+        proposal: 'ship it',
+        gatewayAdapters: live,
+        logger,
+        timeoutMs: 5000,
+        maxRetries: 1,
+        interAgentDelayMs: 0,
+      });
+      expect(results.every((r) => r.source === 'llm')).toBe(true);
+    } finally {
+      setGatewayRediscovery(undefined);
+    }
+    expect(discover).toHaveBeenCalledTimes(1);
+    expect(calls(a) + calls(b) + calls(c)).toBe(3);
+  });
+
+  it('wraps round-robin when the gateway serves fewer models than roles', async () => {
+    const a = gatewayAdapter('gw-a');
+    const b = gatewayAdapter('gw-b');
+    const roles: VoterRole[] = ['architect', 'security', 'scope_steward'];
+
+    await collectRealVotes({
+      roles,
+      proposal: 'ship it',
+      gatewayAdapters: [a, b],
+      logger,
+      timeoutMs: 5000,
+      maxRetries: 1,
+      interAgentDelayMs: 0,
+    });
+
+    // indices 0,2 → a; index 1 → b.
+    expect(calls(a)).toBe(2);
+    expect(calls(b)).toBe(1);
+  });
+
+  it('uses a single gateway model for all roles when only one is served', async () => {
+    const only = gatewayAdapter('gw-only');
+    const roles: VoterRole[] = ['architect', 'security', 'scope_steward'];
+
+    await collectRealVotes({
+      roles,
+      proposal: 'ship it',
+      gatewayAdapters: [only],
+      logger,
+      timeoutMs: 5000,
+      maxRetries: 1,
+      interAgentDelayMs: 0,
+    });
+
+    expect(calls(only)).toBe(3);
+  });
+});
+
+describe('collectRealVotes forwards the cancel signal (#5393)', () => {
+  const logger = createLogger({ component: 'test', level: 'silent' });
+
+  function approvingAdapter(): IModelAdapter {
+    return {
+      providerId: 'test',
+      modelId: 'test-model',
+      capabilities: [],
+      complete: vi.fn().mockResolvedValue({
+        ok: true,
+        value: {
+          content: JSON.stringify({ decision: 'approve', reasoning: 'ok', confidence: 0.9 }),
+          usage: {},
+          stopReason: 'end_turn',
+          model: 'test',
+        },
+      }),
+      stream: vi.fn(),
+      countTokens: vi.fn().mockResolvedValue(100),
+      validateConfig: vi.fn().mockReturnValue({ ok: true }),
+    };
+  }
+
+  it('does not call the adapter when the signal is already aborted', async () => {
+    // The middle link. `voter-agents-deadline.test.ts` proves the launcher
+    // honours a signal, and the consensus_vote dispatch test proves the tool
+    // hands one to this function — but both stay green if THIS function drops
+    // it on the floor between them, which is the shape of the whole defect.
+    const controller = new AbortController();
+    controller.abort();
+    const adapter = approvingAdapter();
+
+    const results = await collectRealVotes({
+      roles: ['architect', 'security'],
+      proposal: 'Test proposal',
+      logger,
+      adapter,
+      signal: controller.signal,
+    });
+
+    expect(adapter.complete).not.toHaveBeenCalled();
+    expect(results).toHaveLength(2);
+    expect(results.every((r) => r.source === 'error')).toBe(true);
+  });
+
+  it('still launches the voter when no signal is supplied', async () => {
+    // The empty case: omitting the signal must not suppress anything. Asserted
+    // on whether the adapter was REACHED, which is the exact contrast with the
+    // test above — the vote's eventual decision depends on parsing details this
+    // change does not touch, so asserting it here would couple this test to
+    // something unrelated.
+    const adapter = approvingAdapter();
+
+    await collectRealVotes({
+      roles: ['architect'],
+      proposal: 'Test proposal',
+      logger,
+      adapter,
+      timeoutMs: 10000,
+      maxRetries: 3,
+    });
+
+    expect(adapter.complete).toHaveBeenCalled();
+  });
+});

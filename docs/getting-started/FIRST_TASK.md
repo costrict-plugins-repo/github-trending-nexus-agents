@@ -1,0 +1,173 @@
+---
+title: 'Your First Task'
+description: 'Install, verify, see a real consensus vote, then plug into your editor. ~5 minutes.'
+diataxis: tutorial
+audience: user
+tier: 1
+keywords: [getting-started, first-task, smoke-test, tutorial, onboarding]
+related_files: [./INSTALLATION.md, ./CONFIGURATION.md, ./PLUGIN_INSTALL.md]
+order: 3
+---
+
+# Your first task
+
+A focused tutorial: install → verify → run a real consensus vote → wire it into your editor. About 5 minutes if you have Node 24; less if everything's already installed.
+
+This is the canonical new-user path. If you want platform-specific install details, jump to [INSTALLATION.md](./INSTALLATION.md). If you want every knob enumerated, jump to [CONFIGURATION.md](./CONFIGURATION.md). For Claude Code plugin install specifically, see [PLUGIN_INSTALL.md](./PLUGIN_INSTALL.md). Everything below stays on the canonical "first 5 minutes" path.
+
+> **CLI vs MCP — read this first.** The standalone CLI surface (`vote`, `orchestrate`, `review`) is a useful subset you can run from any terminal. The full control plane — the `run` entry point plus the 47 MCP tools — lives behind `setup` and an MCP-aware editor (Claude Code, Cursor, etc.). If you're an MCP user, the one command to learn is `run "<goal>"`: it's read-only by default (pass `execute: true` to actually run), and the MetaOrchestrator picks the strategy for you, so you rarely pick a pipeline tool by hand. Note `run` is **MCP-only** — it is not a CLI command.
+
+---
+
+## 1. Install
+
+```bash
+npm install -g nexus-agents
+```
+
+If you hit `EACCES` on Linux/macOS, configure a user-local npm prefix instead of using `sudo` ([details](./INSTALLATION.md#permission-errors-on-linuxmacos)).
+
+For Claude Code, you can install as a plugin instead:
+
+```
+/plugin marketplace add nexus-substrate/nexus-agents
+/plugin install nexus-agents@nexus-substrate
+```
+
+---
+
+## 2. Verify
+
+```bash
+nexus-agents doctor
+```
+
+Prints a health table (illustrative example output — your versions and counts will differ):
+
+```
+Nexus Agents Doctor
+===================
+
+Checking environment...
+
+✓ Node.js version: v24.x.x
+⚠ API keys configured: 0 of 3
+  Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_AI_API_KEY
+
+Checking CLI installations...
+
+✓ Claude CLI    Version: 2.x  Auth: CLI auth
+✓ Codex CLI     Version: 0.x  Auth: CLI auth
+⚠ Gemini CLI    Auth: Not authenticated   Fix: gemini
+```
+
+Read-only; safe to run any time. To try a walkthrough before configuring CLI authentication:
+
+```bash
+nexus-agents tour
+```
+
+The tour shows illustrative cached fixtures and makes no live model calls. It requires no API keys or authenticated CLI. Add `--non-interactive` to skip the prompts between steps. [Try nexus-agents with the tour](./TOUR.md) walks through it step by step.
+
+For the live vote below, you need **at least one** authenticated Claude Code or Codex CLI. Gemini and OpenCode do not serve voter seats. No separate API keys are required.
+
+---
+
+## 3. Run a real consensus vote (no API keys needed)
+
+```bash
+nexus-agents vote --quick --proposal "Use SQLite over JSON files for the outcome store"
+```
+
+Three voter roles (`architect`, `security`, `scope_steward`) deliberate through your authenticated Claude Code or Codex CLIs. Expected output:
+
+```
+Nexus Agents Consensus Vote
+============================
+
+Collecting votes from 3 agents (timeout: 300s each)...
+
+Proposal: Use SQLite over JSON files for the outcome store
+
+Votes
+
+  ✓ Software Architect: APPROVE (86%)
+  ✓ Security Engineer:  APPROVE (74%)
+  ✓ Scope Steward:      APPROVE (91%)
+
+Summary
+
+  Approve:  3
+  Reject:   0
+  Abstain:  0
+  Approval: 100.0%
+  Threshold: simple_majority
+
+Result: APPROVED
+
+Completed in ~30s
+```
+
+That's the smoke task. The verdict prints; the vote tally and per-voter confidence are recorded. For the richer 7-voter version (which also demonstrates mixed APPROVE/REJECT outcomes and graceful error handling), see the [project site hero](https://nexus-substrate.github.io/nexus-agents/).
+
+---
+
+## 4. Wire into your editor (optional but recommended)
+
+```bash
+nexus-agents setup
+```
+
+Auto-configures nexus-agents as an MCP server in Claude Code, Cursor, OpenCode, Gemini, and Codex (whichever you have). Restart the editor; the 47 MCP tools (`orchestrate`, `consensus_vote`, `research_synthesize`, `verify_audit_chain`, …) become available to whatever agent you're already using.
+
+`setup` writes/updates up to seven things — each opt-outtable with the corresponding `--skip-*` flag. The full breakdown is in the [project README](../../README.md#what-setup-configures); if you'd rather configure one CLI at a time, run `setup --interactive` (the default).
+
+---
+
+## 5. Try a real task
+
+[Your first run](./YOUR_FIRST_RUN.md) covers this step in full: it shows the routing decision `run` returns, the live vote, and how to verify the audit chain afterwards.
+
+After `setup`, ask your MCP-aware agent:
+
+> Use the nexus-agents `run` tool to decide whether to use SQLite over JSON files for the outcome store, with `requiresConsensus: true` and `execute: true`.
+
+The tool arguments are:
+
+```json
+{
+  "goal": "Should we use SQLite over JSON files for the outcome store?",
+  "requiresConsensus": true,
+  "execute": true
+}
+```
+
+`run` selects the consensus strategy for this goal and executes it, returning the decision and vote details. To inspect only the routing decision and recommended tool, omit `execute` or set it to `false`. `run` is an MCP tool; ask your agent to call it.
+
+For standalone CLI usage:
+
+```bash
+# Run a real orchestration task (uses an API key if available)
+export ANTHROPIC_API_KEY=your-key
+nexus-agents orchestrate "Explain the architecture of this codebase"
+```
+
+The multi-stage CompositeRouter picks the right CLI, the right expert persona, and the right model based on task analysis. The trace goes to `<repo>/.nexus-agents/traces/` for later replay.
+
+nexus-agents writes per-repo state to `<repo>/.nexus-agents/` (auto-gitignored and created on first use) and shared, cross-repo state to `~/.nexus-agents/`. Run `nexus-agents doctor` to see the resolved paths for your environment.
+
+---
+
+## Where to go next
+
+| Want to …                                                           | Read                                                                            |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **Chain tools into a goal** (research → vote → build)               | [COMPOSE_YOUR_FIRST_PIPELINE.md](./COMPOSE_YOUR_FIRST_PIPELINE.md)              |
+| Understand the consensus voting strategies                          | [CONSENSUS_PROTOCOLS.md](../architecture/CONSENSUS_PROTOCOLS.md)                |
+| Understand the routing pipeline                                     | [ROUTING_SYSTEM.md](../architecture/ROUTING_SYSTEM.md)                          |
+| Configure model preferences, custom experts, sandbox modes          | [CONFIGURATION.md](./CONFIGURATION.md)                                          |
+| Wire an editor we don't auto-detect                                 | [../guides/HARNESS_COMPATIBILITY.md](../guides/HARNESS_COMPATIBILITY.md)        |
+| Run the full dev pipeline (research → plan → vote → implement → QA) | `run_dev_pipeline` MCP tool — see [../ENTRYPOINTS.md](../ENTRYPOINTS.md)        |
+| Inspect the audit chain                                             | `verify_audit_chain` MCP tool, or the JSONL under `<repo>/.nexus-agents/audit/` |
+| Browse the research registry                                        | [../research/RESEARCH_INDEX.md](../research/RESEARCH_INDEX.md)                  |
+| See every CLI command + MCP tool                                    | [../ENTRYPOINTS.md](../ENTRYPOINTS.md)                                          |

@@ -1,0 +1,166 @@
+/**
+ * Verdict accounting for `nexus-agents doctor` — which of `isAllHealthy`'s terms
+ * are currently failing.
+ *
+ * A separate module from the formatting because it answers a different question:
+ * formatting decides how a result is rendered, this decides what counts as a
+ * problem. Keeping the count derivable from a named list is what stops the
+ * count and the verdict drifting apart again (#4851).
+ *
+ * @module cli/doctor-verdict-terms
+ */
+
+import {
+  scratchSeverityIsAcceptable,
+  scratchSpaceIsUnmeasured,
+  worstSeverity,
+} from './doctor-scratch-space.js';
+import * as installFreshness from './doctor-install-freshness.js';
+import type { CliReadiness } from './cli-readiness.js';
+import type { DoctorResult } from './doctor.js';
+import { cliFailsVerdict, gatewayVerdict, type GatewayVerdict } from './doctor-gateway.js';
+import { gatewayCoveredClis, hasHealthyVoterCli } from './doctor-gateway-slots.js';
+
+/**
+ * The verdict's failing terms, named.
+ *
+ * #4851 established the invariant — every term `isAllHealthy` reads must be a
+ * term the count reads, or a lone failing diagnostic renders "Summary: 0
+ * issue(s) found": a summary shown ONLY because something is wrong, saying
+ * nothing is wrong. It was fixed by adding the terms that were missing at the
+ * time, which left two still absent (an unsupported CLI version, and
+ * `hasAuthMethod`) and the same bug reachable two other ways.
+ *
+ * Returning the terms instead of a bare number is what stops that recurring:
+ * the list is the count, so a term cannot be added to the verdict and forgotten
+ * in the total. Keep this in step with {@link isAllHealthy} — every `&&` there
+ * needs a row here.
+ */
+export function failingVerdictTerms(
+  result: DoctorResult,
+  live?: readonly CliReadiness[]
+): string[] {
+  const gateway = gatewayVerdict(result.gateway);
+  const terms: string[] = gatewayTerms(result.gateway, gateway);
+  if (!result.nodeVersion.supported) terms.push('node version');
+  if (!result.mcpServerReady) terms.push('MCP server');
+  if (result.configFile.error !== undefined) terms.push('configuration');
+  if (installFreshness.installFreshnessFailsVerdict(result.installFreshness)) {
+    terms.push('install freshness');
+  }
+  if (!scratchSeverityIsAcceptable(worstSeverity(result.scratchSpace))) terms.push('scratch space');
+  terms.push(...cliVerdictTerms(result, gateway, live), ...liveFailureTerms(live));
+  return terms;
+}
+
+/** Local CLI findings remain only for adapters the live run did not measure. */
+function cliVerdictTerms(
+  result: DoctorResult,
+  gateway: GatewayVerdict,
+  live: readonly CliReadiness[] | undefined
+): string[] {
+  const terms: string[] = [];
+  const measured = new Set((live ?? []).map((r) => r.cli));
+  // `hasAuthMethod` (an API key OR an installed+authenticated CLI) deliberately
+  // gets NO row of its own. Whenever it fails with CLIs present, every CLI is
+  // unauthenticated and the per-CLI rows below already count it; a separate row
+  // would report one problem twice. Its only otherwise-uncovered case is an
+  // empty CLI list, which the 'no CLIs detected' row covers.
+  // `versionStatus === 'unsupported'` was the term the per-CLI filter missed: an
+  // installed, authenticated CLI on an unsupported version failed the verdict
+  // while contributing nothing to the count.
+  // With a passing gateway a missing CLI is not a term (#6609): the same
+  // predicate `isAllHealthy` uses decides both.
+  // #6782: a broken CLI whose slot the gateway serves is named, not counted.
+  const covered = gatewayCoveredClis(result.gateway, result.clis).map((c) => c.cli);
+  const voterCliHealthy = hasHealthyVoterCli(result.clis);
+  for (const c of result.clis) {
+    if (measured.has(c.name)) continue;
+    if (cliFailsVerdict(c, gateway, covered.includes(c.name), voterCliHealthy)) {
+      terms.push(`CLI ${c.name}`);
+    }
+  }
+  // `isAllHealthy` passes `whenEmpty = false` (#4581) unless a gateway passes:
+  // zero detected CLIs is not a healthy install. Without this row an
+  // API-key-only setup with no CLI reads as unhealthy with nothing counted.
+  if (
+    result.clis.length === 0 &&
+    gateway !== 'pass' &&
+    !(live ?? []).some((r) => r.levels.serves.status === 'verified')
+  )
+    terms.push('no CLIs detected');
+  return terms;
+}
+
+/** Failure terms from the measured ladder, preserving transport attribution. */
+function liveFailureTerms(live: readonly CliReadiness[] | undefined): string[] {
+  const terms: string[] = [];
+  for (const r of live ?? []) {
+    const serving = r.levels.serves;
+    if (serving.status === 'failed') {
+      const target =
+        r.gateway === undefined
+          ? `CLI ${r.cli}`
+          : `gateway ${r.gateway.gatewayModel} (${r.cli} slot)`;
+      terms.push(`${target}: failed (${serving.errorClass ?? 'execution'})`);
+    } else if (serving.status === 'not-attempted') {
+      const failedLevel = (['installed', 'authenticated'] as const).find(
+        (level) => r.levels[level].status === 'failed'
+      );
+      if (failedLevel !== undefined) terms.push(`CLI ${r.cli}: ${failedLevel} failed`);
+    }
+  }
+  return terms;
+}
+
+/**
+ * The verdict sections that could not be measured (#6782), named.
+ *
+ * One rule for every section that feeds the verdict: unmeasured renders ⚠,
+ * is named here for the summary, and does not fail the exit code by itself —
+ * doctor must not fail closed on a diagnostic it could not run, and must not
+ * report a default as a measurement either.
+ */
+function unmeasuredVerdictSections(result: DoctorResult): string[] {
+  const sections: string[] = [];
+  if (installFreshness.installFreshnessIsUnmeasured(result.installFreshness)) {
+    sections.push('install freshness');
+  }
+  if (scratchSpaceIsUnmeasured(result.scratchSpace)) sections.push('scratch space');
+  return sections;
+}
+
+/**
+ * Summary notes for installed-but-broken CLIs the gateway serves around
+ * (#6782): not issues, since service is unaffected, but never silent.
+ */
+function gatewayCoveredCliNotes(result: DoctorResult, live?: readonly CliReadiness[]): string[] {
+  return gatewayCoveredClis(result.gateway, result.clis)
+    .filter((c) => {
+      const measured = live?.find((r) => r.cli === c.cli);
+      return (
+        measured === undefined ||
+        (measured.gateway !== undefined && measured.levels.serves.status === 'verified')
+      );
+    })
+    .map((c) => `${c.cli} CLI unhealthy, slot served by gateway`);
+}
+
+/**
+ * The summary line's suffix: the freshness note, the unmeasured sections and
+ * the gateway-covered CLIs (#6782). Each is named, none is counted as an issue.
+ */
+export function summaryNotes(result: DoctorResult, live?: readonly CliReadiness[]): string {
+  const unmeasured = unmeasuredVerdictSections(result);
+  const covered = gatewayCoveredCliNotes(result, live);
+  return (
+    installFreshness.describeInstallFreshnessSummary(result.installFreshness) +
+    (unmeasured.length > 0 ? ` — unmeasured: ${unmeasured.join(', ')}` : '') +
+    (covered.length > 0 ? ` — ⚠ ${covered.join('; ')}` : '')
+  );
+}
+
+/** A failing gateway's term, naming its host (#6609); none otherwise. */
+function gatewayTerms(health: DoctorResult['gateway'], verdict: GatewayVerdict): string[] {
+  return verdict === 'fail' && health.state !== 'not_configured' ? [`gateway ${health.host}`] : [];
+}

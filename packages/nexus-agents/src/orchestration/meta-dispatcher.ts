@@ -1,0 +1,392 @@
+/**
+ * nexus-agents/orchestration - MetaDispatcher
+ *
+ * Executes the strategy a {@link MetaDecision} selected and records the result.
+ * Kept separate from the MetaOrchestrator on purpose: the orchestrator stays a
+ * thin, pure selector; the dispatcher owns execution. To stay free of the MCP
+ * tool dependency graph (and the init-time cycle it would create), the
+ * dispatcher does NOT import the engine handlers — the caller injects a
+ * per-strategy executor map. Real engine executors are wired in by the
+ * outward-facing entry point (a separate, owner-approved sub-step of #3548).
+ *
+ * Outcomes are recorded as a dedicated {@link MetaOutcomeRecord} keyed by
+ * `decisionId` rather than reusing the orchestration/learning `TaskOutcome`
+ * types — both of those require CLI/model fields that a strategy-level outcome
+ * (which may span many CLIs/models) cannot supply. Joining selection records
+ * (#3550) with these outcome records by `decisionId` gives step 3 an
+ * uncontaminated dataset.
+ *
+ * @module orchestration/meta-dispatcher
+ * (Source: Issue #3559 — MetaOrchestrator dispatch wiring)
+ */
+
+import { createLogger, getTimeProvider } from '../core/index.js';
+import type { ConsensusEnforcementMode } from './consensus-enforcement-mode.js';
+import type { ILogger } from '../core/index.js';
+import type {
+  ExecutionStrategy,
+  MetaDecision,
+  MetaOrchestratorInput,
+} from './meta-orchestrator.js';
+
+/**
+ * Executes one strategy. Receives the decision and the original input; returns
+ * whatever the underlying engine produces. May throw — the dispatcher records
+ * the failure and rethrows a {@link MetaDispatchError}.
+ */
+export type StrategyExecutor = (
+  decision: MetaDecision,
+  input: MetaOrchestratorInput
+) => Promise<unknown>;
+
+/** Per-strategy executor map. Strategies without an executor fail closed. */
+export type StrategyExecutorMap = Partial<Record<ExecutionStrategy, StrategyExecutor>>;
+
+/** An observability record of one strategy execution, keyed by decision id. */
+export interface MetaOutcomeRecord {
+  /** Matches {@link MetaDecision.decisionId}. */
+  readonly decisionId: string;
+  /** ISO timestamp of when the outcome was recorded. */
+  readonly timestamp: string;
+  /** The strategy that was executed. */
+  readonly strategy: ExecutionStrategy;
+  /**
+   * Whether the STRATEGY executed and produced its result. A policy gate
+   * refusing that result does not make this false — see {@link gateRefusal}
+   * (#7127).
+   */
+  readonly success: boolean;
+  /** Wall-clock execution duration in milliseconds. */
+  readonly durationMs: number;
+  /** Failure reason when {@link success} is false. */
+  readonly failureReason?: string;
+  /**
+   * Set when the strategy succeeded but a policy gate refused the run on the
+   * strategy's own result — e.g. an enforced consensus panel that delivered a
+   * "rejected" verdict (#7127). The run returns a business error; the strategy
+   * is still credited with `success: true`.
+   */
+  readonly gateRefusal?: string;
+}
+
+/** A sink that receives every execution outcome. */
+export interface MetaOutcomeSink {
+  /** Records one outcome. Must not throw (observability is best-effort). */
+  recordOutcome(record: MetaOutcomeRecord): void;
+}
+
+/** A {@link MetaOutcomeSink} that also exposes its buffered outcomes. */
+export interface IRecordingMetaOutcomeSink extends MetaOutcomeSink {
+  /** Returns the buffered outcomes, oldest first. */
+  getOutcomes(): readonly MetaOutcomeRecord[];
+}
+
+/** Result of a successful dispatch. */
+export interface DispatchResult {
+  /** The decision that was dispatched. */
+  readonly decisionId: string;
+  /** The strategy that executed. */
+  readonly strategy: ExecutionStrategy;
+  /** Execution duration in milliseconds. */
+  readonly durationMs: number;
+  /** The raw result returned by the strategy executor. */
+  readonly result: unknown;
+}
+
+/** Reason codes for a dispatch failure. */
+export type MetaDispatchErrorCode = 'no_executor' | 'executor_failed';
+
+/** Typed error thrown when dispatch fails. An outcome is always recorded first. */
+export class MetaDispatchError extends Error {
+  readonly code: MetaDispatchErrorCode;
+  readonly strategy: ExecutionStrategy;
+  readonly decisionId: string;
+
+  constructor(
+    code: MetaDispatchErrorCode,
+    strategy: ExecutionStrategy,
+    decisionId: string,
+    message: string,
+    options?: { cause?: unknown }
+  ) {
+    super(message, options);
+    this.name = 'MetaDispatchError';
+    this.code = code;
+    this.strategy = strategy;
+    this.decisionId = decisionId;
+  }
+}
+
+const DEFAULT_MAX_OUTCOMES = 200;
+
+/** Creates a sink that emits each outcome as a structured audit log line. */
+export function createAuditLogOutcomeSink(logger: ILogger): MetaOutcomeSink {
+  return {
+    recordOutcome(record: MetaOutcomeRecord): void {
+      logger.info('MetaDispatcher execution outcome', { ...record });
+    },
+  };
+}
+
+/** Creates an in-memory recording outcome sink with a bounded buffer. */
+export function createRecordingOutcomeSink(
+  maxOutcomes = DEFAULT_MAX_OUTCOMES
+): IRecordingMetaOutcomeSink {
+  const outcomes: MetaOutcomeRecord[] = [];
+  return {
+    recordOutcome(record: MetaOutcomeRecord): void {
+      outcomes.push(record);
+      if (outcomes.length > maxOutcomes) {
+        outcomes.splice(0, outcomes.length - maxOutcomes);
+      }
+    },
+    getOutcomes(): readonly MetaOutcomeRecord[] {
+      return outcomes;
+    },
+  };
+}
+
+/** Public interface for the MetaDispatcher. */
+export interface IMetaDispatcher {
+  /**
+   * Executes the decision's strategy via its injected executor, recording an
+   * outcome keyed by `decisionId`. Resolves with a {@link DispatchResult} on
+   * success; rejects with a {@link MetaDispatchError} on failure (after the
+   * failure outcome is recorded — fail closed, never silent).
+   */
+  dispatch(decision: MetaDecision, input: MetaOrchestratorInput): Promise<DispatchResult>;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Optional outcome observer invoked after every dispatch (success OR failure),
+ * with the {@link MetaOutcomeRecord} and the {@link MetaDecision} that produced
+ * it in scope. The dispatcher stays selector-agnostic: the caller (the `run`
+ * entry point) is the only place that knows about the shadow selector, so it
+ * wires the train edge here. Must not throw — errors are caught and logged
+ * (observability is best-effort, exactly like {@link MetaOutcomeSink}). (#3593)
+ */
+export type MetaOutcomeObserver = (record: MetaOutcomeRecord, decision: MetaDecision) => void;
+
+/**
+ * Result classification verdict.
+ */
+interface MetaResultClassification {
+  /** The RUN verdict: false makes the `run` tool return a business error. */
+  readonly success: boolean;
+  readonly failureReason?: string | undefined;
+  /**
+   * Set (with `success: false`) when the failure is a policy gate refusing a
+   * result the strategy did produce, rather than the strategy failing to
+   * execute. Outcome telemetry records such a run as a strategy success (#7127).
+   */
+  readonly gateRefusal?: string | undefined;
+}
+
+/**
+ * Classifier that inspects an engine result to determine success or in-band failure.
+ */
+export type MetaResultClassifier = (result: unknown) => MetaResultClassification;
+
+/** String error accessors keep message shaping separate from verdict classification. */
+function resultError(record: Record<string, unknown>, fallback: string): string {
+  return typeof record['error'] === 'string' ? record['error'] : fallback;
+}
+
+function consensusReason(record: Record<string, unknown>): string {
+  const enforcement = record['enforcement'];
+  if (typeof enforcement === 'object' && enforcement !== null) {
+    const reason = (enforcement as Record<string, unknown>)['reason'];
+    if (typeof reason === 'string') return reason;
+  }
+  return String(record['decision']);
+}
+
+const BLOCKING_CONSENSUS_DECISIONS = new Set<unknown>(['rejected', 'no_quorum']);
+
+/** Classify the engine verdict and the separate run-layer consensus judgement. */
+function classifyConsensusResult(
+  record: Record<string, unknown>,
+  mode: ConsensusEnforcementMode
+): MetaResultClassification {
+  const enforcement = record['enforcement'];
+  const wouldBlock =
+    typeof enforcement === 'object' &&
+    enforcement !== null &&
+    (enforcement as Record<string, unknown>)['wouldBlock'] === true;
+  if (mode === 'enforce' && (BLOCKING_CONSENSUS_DECISIONS.has(record['decision']) || wouldBlock)) {
+    const reason = consensusReason(record);
+    const failureReason =
+      reason === record['decision']
+        ? `Consensus ${reason}`
+        : `Consensus ${String(record['decision'])}: ${reason}`;
+    // #7127: a "rejected" verdict is the panel doing its job — the gate refused,
+    // the strategy did not fail. no_quorum and a non-outage-invariant approval
+    // (which the run layer treats as no_quorum) produced no usable verdict.
+    if (record['decision'] === 'rejected' && reason === 'rejected') {
+      return { success: false, failureReason, gateRefusal: failureReason };
+    }
+    return { success: false, failureReason };
+  }
+  return { success: true };
+}
+
+/**
+ * Default engine result classifier (#5641).
+ *
+ * Inspects engine results that report failure in-band:
+ * - `AdaptiveOrchestratorResult`: `success: false`
+ * - `DevPipelineResult`: `completed: false` (unless `dryRun: true` and `planStatus === undefined`)
+ *
+ * Consensus verdicts are advisory by default; enforce-mode rejection or
+ * unresolved quorum is a business failure (#4464). The run layer supplies
+ * outage-invariance assessment and the resolved mode.
+ */
+export function classifyEngineResult(
+  result: unknown,
+  mode: ConsensusEnforcementMode = 'audit'
+): MetaResultClassification {
+  if (typeof result !== 'object' || result === null) {
+    return { success: true };
+  }
+  const record = result as Record<string, unknown>;
+
+  if (record['success'] === false) {
+    return { success: false, failureReason: resultError(record, 'no error message') };
+  }
+  if (record['completed'] === false) {
+    if (record['dryRun'] === true && record['planStatus'] === undefined) {
+      return { success: true };
+    }
+    return { success: false, failureReason: resultError(record, 'pipeline did not complete') };
+  }
+  return classifyConsensusResult(record, mode);
+}
+
+interface DispatchDeps {
+  readonly executors: StrategyExecutorMap;
+  readonly outcomeSink: MetaOutcomeSink;
+  readonly logger: ILogger;
+  readonly onOutcome?: MetaOutcomeObserver | undefined;
+  readonly classifyResult: MetaResultClassifier;
+}
+
+/** Records one outcome to the sink, computing duration from the start timestamp. */
+function recordOutcome(
+  deps: DispatchDeps,
+  decision: MetaDecision,
+  start: number,
+  verdict: MetaResultClassification
+): void {
+  // #7127: telemetry credits the strategy, not the gate. A gate refusal of a
+  // result the strategy produced is a strategy success with the refusal beside it.
+  const refused = verdict.gateRefusal !== undefined;
+  const record: MetaOutcomeRecord = {
+    decisionId: decision.decisionId,
+    timestamp: new Date(getTimeProvider().now()).toISOString(),
+    strategy: decision.strategy,
+    success: verdict.success || refused,
+    durationMs: Math.max(0, getTimeProvider().now() - start),
+    ...(!refused && verdict.failureReason !== undefined
+      ? { failureReason: verdict.failureReason }
+      : {}),
+    ...(refused ? { gateRefusal: verdict.gateRefusal } : {}),
+  };
+  deps.outcomeSink.recordOutcome(record);
+  if (deps.onOutcome !== undefined) {
+    try {
+      deps.onOutcome(record, decision);
+    } catch (err) {
+      deps.logger.warn('MetaDispatcher onOutcome observer threw (ignored)', {
+        decisionId: decision.decisionId,
+        error: errorMessage(err),
+      });
+    }
+  }
+}
+
+/** Executes one decision and records its outcome. See {@link IMetaDispatcher.dispatch}. */
+async function dispatchDecision(
+  decision: MetaDecision,
+  input: MetaOrchestratorInput,
+  deps: DispatchDeps
+): Promise<DispatchResult> {
+  const { strategy, decisionId } = decision;
+  const start = getTimeProvider().now();
+
+  const executor = deps.executors[strategy];
+  if (executor === undefined) {
+    const reason = `No executor registered for strategy "${strategy}"`;
+    recordOutcome(deps, decision, start, { success: false, failureReason: reason });
+    deps.logger.error('MetaDispatcher dispatch failed', undefined, {
+      decisionId,
+      strategy,
+      reason,
+    });
+    throw new MetaDispatchError('no_executor', strategy, decisionId, reason);
+  }
+
+  try {
+    const result = await executor(decision, input);
+    const classification = deps.classifyResult(result);
+    recordOutcome(deps, decision, start, classification);
+    return {
+      decisionId,
+      strategy,
+      durationMs: Math.max(0, getTimeProvider().now() - start),
+      result,
+    };
+  } catch (err) {
+    const reason = errorMessage(err);
+    recordOutcome(deps, decision, start, { success: false, failureReason: reason });
+    deps.logger.error(
+      'MetaDispatcher strategy executor threw',
+      err instanceof Error ? err : undefined,
+      {
+        decisionId,
+        strategy,
+        reason,
+      }
+    );
+    throw new MetaDispatchError('executor_failed', strategy, decisionId, reason, { cause: err });
+  }
+}
+
+/**
+ * Creates a MetaDispatcher.
+ *
+ * @param options.executors - per-strategy executor map (injected; required).
+ * @param options.outcomeSink - outcome sink (default: audit-log sink).
+ * @param options.logger - optional logger.
+ * @param options.onOutcome - optional observer fired with (record, decision)
+ *   after every dispatch; the train edge to the shadow selector is wired here
+ *   by the caller (the dispatcher itself stays selector-agnostic). (#3593)
+ * @param options.classifyResult - optional custom result classifier; defaults
+ *   to {@link classifyEngineResult}. (#5641)
+ */
+export function createMetaDispatcher(options: {
+  readonly executors: StrategyExecutorMap;
+  readonly outcomeSink?: MetaOutcomeSink | undefined;
+  readonly logger?: ILogger | undefined;
+  readonly onOutcome?: MetaOutcomeObserver | undefined;
+  readonly classifyResult?: MetaResultClassifier | undefined;
+}): IMetaDispatcher {
+  const logger = options.logger ?? createLogger({ component: 'MetaDispatcher' });
+  const outcomeSink = options.outcomeSink ?? createAuditLogOutcomeSink(logger);
+  const deps: DispatchDeps = {
+    executors: options.executors,
+    outcomeSink,
+    logger,
+    onOutcome: options.onOutcome,
+    classifyResult: options.classifyResult ?? classifyEngineResult,
+  };
+
+  return {
+    dispatch(decision: MetaDecision, input: MetaOrchestratorInput): Promise<DispatchResult> {
+      return dispatchDecision(decision, input, deps);
+    },
+  };
+}

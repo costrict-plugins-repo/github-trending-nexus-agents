@@ -1,0 +1,40 @@
+---
+title: 'MCP Tool: run_dev_pipeline'
+description: 'Full dev pipeline: research, plan, vote, implement, QA'
+diataxis: reference
+audience: user
+tier: 2
+keywords: [mcp, tool, reference, run_dev_pipeline]
+---
+
+# `run_dev_pipeline`
+
+> Auto-generated from the registered MCP tool descriptions and input
+> schemas. Do not edit by hand — run `pnpm docs:tools` to regenerate.
+
+Run the multi-agent development pipeline. Accepts direct task instructions, a plan file, or a spec file. Implement, QA and gates use a per-run scratch worktree pinned to HEAD. Isolation of scratch-bound expert, install, gate and change-capture subprocesses is an OS sandbox with the source read-only when changes.isolation.mode is os-sandbox. Otherwise isolation is best-effort and changes.isolation.reason explains why bwrap or sandbox setup is unavailable. Pipeline-owned git runs hermetically with repository-local GIT_* variables removed, optional index refresh disabled, fsmonitor disabled and source hooks disabled. Gate subprocesses receive the hermetic git environment. Installs are scratch-local with inherited directory overrides removed, copy imports and HUSKY=0, and are killed as a process tree on timeout. Changes to the source repository's shared git config are reported as a warning, or logged when the run throws or times out. Only in best-effort mode, an install descendant that ignores SIGTERM can write during the kill grace period before the config snapshot. The OS sandbox confines descendants too. Dependencies are installed inside the scratch, frozen from the HEAD root lockfile before implementation. OS-sandbox installs use private writable package stores and caches under a private TMPDIR with copy imports. Shared package stores and caches remain read-only. Best-effort installs prefer the local package cache and fetch missing packages. Returns changes (unified diff, baseSha, worktreePath, worktreeRemoved, dependencies, isolation, empty, status: changes, no_changes or tampered) for the operator to apply. changes.dependencies reports status installed, none or failed, with manager and failure reason when applicable. No root package.json or supported lockfile means none. Provisioning failure makes the quality gate unmeasured with the reason. worktreeRemoved reflects whether the scratch path exists after cleanup, and prune failures have a separate warning. Failed removal preserves the diff with a leftover-path warning. Dirty-source warnings identify HEAD and the number of omitted uncommitted paths. Scratch-bound expert CLIs and change capture run inside the same sandbox. The sandbox executable is pinned before execution. Change capture disables external diff and textconv. The scratch gitfile, commondir and gitdir are checked against their pre-run bytes. Modified metadata refuses the diff with status tampered and a warning. Cleanup removes only the scratch and worktree metadata paths recorded before execution, then prunes from the source repository. The sandbox permits writes to the scratch, its own git metadata and a private TMPDIR. Host IPC environment redirects are removed, /run/user is masked and existing Docker socket paths are masked. DNS resolver paths under /run remain available. Network and abstract-namespace sockets remain reachable. Supports dry-run (plan+vote only). Supports dispatch: 'async' (non-dryRun runs) — returns a jobId immediately, then poll get_job_result.
+
+## Parameters
+
+| Parameter | Type | Required | Constraints | Description |
+| --------- | ---- | -------- | ----------- | ----------- |
+| `task` | string | no | maxLength 10000 | Direct task instructions (what to build) |
+| `sourceTrustTier` | enum | no | one of: 1 \| 2 \| 3 \| 4 | Trust tier ('1'-'4') of where the task text came from, per .rules/untrusted-input.md: '1' only for text the caller authored or took from repo files, '3' for issue/PR/web text. Omitted means '3'. Can only lower trust: the effective tier is the least-trusted of this, the measured caller tier and every source the run fetched. Recorded with the caller tier at the consensus→execute policy gate. |
+| `planFile` | string | no | maxLength 500 | Path to a plan/spec file to use as input |
+| `dryRun` | boolean | no | default false | If true, stop after plan+vote (no implementation) |
+| `maxVoteIterations` | integer | no | min 1; max 5; default 3 | Max plan→vote iterations |
+| `maxQaIterations` | integer | no | min 1; max 5; default 3 | Max QA review iterations per task |
+| `workingDir` | string | no | maxLength 500 | Working directory (default: cwd) |
+| `issueNumber` | integer | no | max 9007199254740991; > 0 | GitHub issue to post progress to |
+| `repo` | string | no | maxLength 200 | GitHub repo for issue tracking (e.g., owner/repo) |
+| `trackerBackend` | enum | no | one of: github \| gitlab \| json; default json | Task tracking backend for issue creation |
+| `labels` | array of string | no | — | Labels for created issues |
+| `sessionId` | string | no | maxLength 128; pattern `^[a-zA-Z0-9_-]+$` | Session ID for checkpoint/resume (crash recovery) |
+| `simulateVotes` | boolean | no | default false | TESTS ONLY — random output, must not be used for real decisions (#2319) |
+| `votingStrategy` | enum | no | one of: simple_majority \| supermajority \| unanimous \| higher_order \| opinion_wise | Voting strategy for plan approval (default: higher_order) |
+| `quickMode` | boolean | no | default false | Start with 3 voters (architect, security, scope_steward) instead of 7. An approved quick vote may escalate to the full 7-role panel when the Bayesian posterior is borderline or a separate contrarian check rejects with high confidence, matching CLI --quick |
+| `timeoutMs` | integer | no | min 30000; max 600000 | Max time for EACH stage call in ms (30000-600000), not for the whole run; applies to every stage, the vote included, and to each plan/vote and implement/QA iteration. A stage past it fails with a timeout and its model calls are aborted. Default: the vote stage gets the multi-LLM panel guard (900000 unless overridden), other stages the pipeline guard (1800000 unless overridden) |
+| `mode` | enum | no | one of: autonomous \| harness; default autonomous | 'autonomous': full pipeline. 'harness': stops after decompose, returns tasks for caller to implement. (Not the async switch — that is `dispatch`.) |
+| `dispatch` | enum | no | one of: sync \| async; default sync | Async dispatch (#4968). 'sync' (default): run inline and return the result. 'async': return { status: 'pending', jobId } immediately and run in the background; poll get_job_result({ jobId }). Ignored for dryRun. |
+| `qualityGate` | enum | no | one of: off \| advisory \| blocking; default off | Pre-ship local quality gate. 'off' (default): skip. 'advisory': run + record feedback, never fail. 'blocking': a red gate fails the pipeline. |
+| `maxBudgetTokens` | integer | no | max 9007199254740991; > 0 | Per-run token ceiling (#3395). When set, expert calls stop (returning failures) once cumulative usage crosses it — a hard-stop safety cap for unattended/multi-day runs. Omit to disable (default). |

@@ -1,0 +1,204 @@
+/**
+ * Per-role retry of errored voter seats (#5578).
+ *
+ * Split out of `voter-agents.ts`, which was already at its 400-line cap.
+ * @module cli/voter-retry
+ */
+
+import type { VoterRole, AgentVoteResult, RetriedFrom } from './vote-types.js';
+import type { ILogger } from '../core/index.js';
+import { clipForRecord } from '../audit/vote-record.js';
+import { sleep } from '../utils/async-utils.js';
+import { isAbsentSeat } from './voter-unverifiable.js';
+import { isCancelled } from './voter-cancel.js';
+import { DEADLINE_MESSAGE } from './voter-agents-deadline.js';
+import { preserveVoterAttemptTelemetry } from './voter-attempt-events.js';
+import { carryAttemptUsage } from './voter-attempt-usage.js';
+
+/**
+ * C0 and C1 control characters, DEL included (#6246, security seat; the C1
+ * range on the #6252 panel's rejection — `\x9b` is the single-byte CSI,
+ * equivalent to `ESC [`, so an ASCII-only range still let a terminal escape
+ * through). A first-pass error string can be a subprocess's stderr; each of
+ * these becomes one space so the carried cause cannot inject a line into the
+ * summary row or the JSONL ledger line, nor an escape sequence into the
+ * terminal.
+ */
+const CONTROL_CHARS_RE = /[\x00-\x1f\x7f-\x9f]/g;
+
+/**
+ * What the retry is about to discard, carried onto the seat that replaces it
+ * (#6246). `source` is the first pass's; `error` is its error string when it
+ * had one — de-controlled, then bounded by the #5373 record clip so the marker
+ * travels with it rather than a silent slice. Called only at the discard site,
+ * so a seat that was never retried, or whose retry failed again, has no key.
+ */
+function retriedFromOf(first: AgentVoteResult): RetriedFrom {
+  const source = first.source === 'unverifiable' ? 'unverifiable' : 'error';
+  if (first.error === undefined) return { source };
+  const { text, truncated } = clipForRecord(first.error.replace(CONTROL_CHARS_RE, ' '));
+  return { source, error: text, ...(truncated === true ? { errorTruncated: true as const } : {}) };
+}
+
+/**
+ * Backoff before retrying an errored voter role (#5578).
+ *
+ * Short on purpose: a voter at `source: 'error'` has already exhausted the
+ * resilient adapter's own retries and breaker, so this is not a backoff for
+ * that adapter — it is a gap for a transient panel-wide condition (a rate
+ * limit window, a stalled gateway) to clear.
+ */
+export const DEFAULT_ERRORED_ROLE_BACKOFF_MS = 3000;
+
+/** Keep failure retryability local to one panel, across both passes and result copies. */
+export function createVoterRetryState(): {
+  nonRetryableRoles: ReadonlySet<VoterRole>;
+  onError: (role: VoterRole, retryable: boolean | undefined) => void;
+} {
+  const nonRetryableRoles = new Set<VoterRole>();
+  return {
+    nonRetryableRoles,
+    onError: (role, retryable) => {
+      // A cross-CLI fallback can fail differently; track its latest failure.
+      if (retryable === false) nonRetryableRoles.add(role);
+      else nonRetryableRoles.delete(role);
+    },
+  };
+}
+
+/**
+ * Re-launch retryable absent roles once, unless the panel deadline was exhausted.
+ *
+ * The panel launches once. A voter that errors is dropped: under
+ * `reduce_denominator` its seat silently leaves the denominator, and under
+ * `absolute_quorum` the whole vote voids to `no_quorum` and the caller replays
+ * all N voters for a single failure. Retrying just the errored roles recovers
+ * the seat for one extra call instead of N.
+ *
+ * The empty case is named: a panel with no absent voter issues no retry and
+ * returns its results untouched. When any seat exhausts the shared overall
+ * deadline, no seat gets a fresh whole-panel budget (#6811); their first-pass
+ * results remain for the same quorum policy to decide.
+ *
+ * A role that errors again keeps its first-attempt result, so the existing
+ * error policy still sees an errored seat and decides unchanged. This recovers
+ * seats; it never manufactures one.
+ *
+ * An UNVERIFIABLE seat (#6094) is relaunched by the same call: it is an
+ * absence, not a judgment. Exactly once — on the deterministic host failure a
+ * second attempt is futile, so a retry that comes back unverifiable again
+ * REPLACES the first result (marked `retried: true`) rather than looping, and
+ * the panel records one entry for the role.
+ */
+/** The absent seats to relaunch — none once the panel is cancelled (#6729). */
+function rolesToRetry(first: readonly AgentVoteResult[], options: RetryPassOptions): VoterRole[] {
+  if (first.length === 0 || isCancelled(options.signal)) return [];
+  // The launcher spent the shared overall budget; another pass would start a
+  // fresh whole-panel deadline even for a different errored seat (#6811).
+  if (first.some((v) => v.source === 'error' && v.error === DEADLINE_MESSAGE)) return [];
+  return first
+    .filter(
+      (v) =>
+        isAbsentSeat(v) && (v.source !== 'error' || options.nonRetryableRoles?.has(v.role) !== true)
+    )
+    .map((v) => v.role);
+}
+
+interface RetryPassOptions {
+  /** The panel cancel also suppresses the retry pass. */
+  readonly signal?: AbortSignal | undefined;
+  /** Shared wall-clock cutoff of both passes; absent for direct callers. */
+  readonly deadlineAtMs?: number;
+  /** Panel-local failure metadata; the public vote-result shape stays unchanged. */
+  readonly nonRetryableRoles?: ReadonlySet<VoterRole>;
+}
+
+function retryWindowExpired(options: RetryPassOptions): boolean {
+  return options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs;
+}
+
+async function waitForRetryWindow(backoffMs: number, options: RetryPassOptions): Promise<boolean> {
+  const remainingMs =
+    options.deadlineAtMs === undefined ? backoffMs : options.deadlineAtMs - Date.now();
+  const waitMs = Math.min(backoffMs, remainingMs);
+  if (waitMs > 0) await sleep(waitMs);
+  return !retryWindowExpired(options);
+}
+
+export async function retryErroredRoles(
+  first: readonly AgentVoteResult[],
+  relaunch: (roles: readonly VoterRole[]) => Promise<readonly AgentVoteResult[]>,
+  logger: ILogger,
+  backoffMs: number,
+  options: RetryPassOptions = {}
+): Promise<readonly AgentVoteResult[]> {
+  const erroredRoles = rolesToRetry(first, options);
+  if (erroredRoles.length === 0) return first;
+
+  logger.warn('Retrying errored or unverifiable voter roles before aggregating (#5578, #6094)', {
+    erroredRoles,
+    unverifiableRoles: first.filter((v) => v.source === 'unverifiable').map((v) => v.role),
+    of: first.length,
+  });
+  // A transient error near the end of the first pass may spend the remaining
+  // budget in backoff without producing a deadline-error seat (#6811).
+  if (!(await waitForRetryWindow(backoffMs, options))) return first;
+
+  const retriedResults = await relaunch(erroredRoles);
+  const firstByRole = new Map(first.map((v) => [v.role, v]));
+  const recovered = new Map<VoterRole, AgentVoteResult>();
+  for (const r of retriedResults) {
+    if (r.source === 'error') continue;
+    // #6246: this is where the first pass is discarded — carry what it was
+    // before it goes, so the seat names both what it is and what it recovered
+    // from. Every relaunched role has an absent first pass; the guard holds
+    // the relaunch to that contract rather than carrying a `source` the first
+    // pass never had.
+    const prior = firstByRole.get(r.role);
+    const from = prior !== undefined && isAbsentSeat(prior) ? retriedFromOf(prior) : undefined;
+    const carried = carryAttemptUsage(prior, r);
+    recovered.set(
+      r.role,
+      preserveVoterAttemptTelemetry(carried, {
+        // #6821: the replaced first pass billed its completions too.
+        ...carried,
+        retried: true,
+        ...(from !== undefined ? { retriedFrom: from } : {}),
+      })
+    );
+  }
+  const kept = keepFailedRetryUsage(first, retriedResults);
+  if (recovered.size === 0) {
+    logger.warn('Per-role retry recovered no voter — the panel stays degraded', { erroredRoles });
+    return kept;
+  }
+  logger.info('Per-role retry recovered voters', {
+    recoveredRoles: [...recovered.values()].filter((v) => v.source === 'llm').map((v) => v.role),
+    stillUnverifiable: [...recovered.values()]
+      .filter((v) => v.source === 'unverifiable')
+      .map((v) => v.role),
+    stillErrored: erroredRoles.filter((r) => !recovered.has(r)),
+  });
+  return kept.map((v) => recovered.get(v.role) ?? v);
+}
+
+/**
+ * The first pass, with the usage of each retry that errored again folded into
+ * its seat (#6821): the seat keeps its first result, but the failed retry's
+ * settled completions were billed all the same.
+ */
+function keepFailedRetryUsage(
+  first: readonly AgentVoteResult[],
+  retried: readonly AgentVoteResult[]
+): readonly AgentVoteResult[] {
+  const failedByRole = new Map(retried.filter((r) => r.source === 'error').map((r) => [r.role, r]));
+  return first.map((v) => {
+    const failed = failedByRole.get(v.role);
+    if (failed === undefined) return v;
+    const carried = carryAttemptUsage(v, failed);
+    return preserveVoterAttemptTelemetry(carried, {
+      ...v,
+      ...(carried.attemptUsage !== undefined ? { attemptUsage: carried.attemptUsage } : {}),
+    });
+  });
+}

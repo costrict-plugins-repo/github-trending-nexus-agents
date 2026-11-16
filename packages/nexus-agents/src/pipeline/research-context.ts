@@ -1,0 +1,253 @@
+/**
+ * Structured ResearchContext — the research stage's output, captured directly
+ * from the research tools instead of LLM-serialized to bare text (#3372).
+ *
+ * Per the 7/7 higher_order vote (Option A): the dev-pipeline research stage calls
+ * `executeDiscovery` + the analyze path DIRECTLY for structured data, builds the
+ * metadata here, and DERIVES the human-readable `text` deterministically from that
+ * same structure — a single source of truth, so the text voters read and the
+ * maturity signals downstream consumers (plan/vote, #3372 increment 2) weight on
+ * can never diverge. No LLM in this path.
+ *
+ * Security (vote condition): discovered titles + recommendations are EXTERNAL,
+ * untrusted content — they are escaped (backticks/control chars neutralized,
+ * newlines collapsed) and the rendered list is bounded before being embedded in a
+ * prompt. The full item set is preserved in `metadata` for programmatic consumers;
+ * only the rendered `text` is truncated.
+ *
+ * @module pipeline/research-context
+ */
+
+import type { ResearchDiscoverResponse } from '../mcp/tools/research-discover.js';
+
+/** Max discovered items rendered into the human-readable text (metadata keeps all). */
+export const MAX_RENDERED_ITEMS = 8;
+
+/** A discovered research item, projected to the fields downstream consumers use. */
+export interface ResearchDiscoveredItem {
+  readonly title: string;
+  readonly url: string;
+  readonly relevanceScore?: number;
+  readonly alreadyInRegistry: boolean;
+}
+
+/** Coarse maturity signals voters can weight on (#3372). */
+export interface ResearchQualitySignals {
+  readonly totalFound: number;
+  readonly newItems: number;
+  readonly alreadyInRegistry: number;
+}
+
+/** Structured research metadata — the part that was previously lost to text. */
+export interface ResearchContextMetadata {
+  readonly discoveredItems: readonly ResearchDiscoveredItem[];
+  readonly recommendations: readonly string[];
+  readonly qualitySignals: ResearchQualitySignals;
+}
+
+/** The research stage's output: derived text + the structure it was derived from. */
+export interface ResearchContext {
+  readonly text: string;
+  readonly metadata: ResearchContextMetadata;
+}
+
+/** Minimal shape of the analyze result this builder consumes (focus=gaps). */
+export interface ResearchAnalyzeLike {
+  readonly recommendations: readonly string[];
+}
+
+/**
+ * Neutralize untrusted external text for safe embedding in a markdown prompt:
+ * strip backticks (code-span/escape vectors), replace ASCII control chars with a
+ * space (no list-item or cross-line instruction injection), collapse runs of
+ * whitespace, and clamp length. Returns a single-line, bounded string.
+ */
+function sanitizeExternal(value: string, maxLen = 160): string {
+  const collapsed = value
+    .replace(/`/g, '')
+    // Control chars (incl. newlines) -> space, so external text can't inject lines.
+    .replace(/[\x00-\x1f\x7f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return collapsed.length > maxLen ? `${collapsed.slice(0, maxLen - 1)}…` : collapsed;
+}
+
+/** Build the structured metadata from the discover response + optional analyze result. */
+export function buildResearchContextMetadata(
+  discover: ResearchDiscoverResponse,
+  analyze: ResearchAnalyzeLike | undefined
+): ResearchContextMetadata {
+  const discoveredItems: ResearchDiscoveredItem[] = discover.items
+    .map((item) => ({
+      title: item.title,
+      url: item.url,
+      ...(item.relevanceScore !== undefined ? { relevanceScore: item.relevanceScore } : {}),
+      alreadyInRegistry: item.alreadyInRegistry,
+    }))
+    // Highest-relevance first; undefined scores sort last (treated as 0).
+    .sort((a, b) => (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0));
+
+  return {
+    discoveredItems,
+    recommendations: analyze?.recommendations ?? [],
+    qualitySignals: {
+      totalFound: discover.totalFound,
+      newItems: discover.newItems,
+      alreadyInRegistry: discover.alreadyInRegistry,
+    },
+  };
+}
+
+/**
+ * Render the deterministic, evidence-rich human-readable research text from the
+ * metadata (the same structure programmatic consumers see). Surfaces the maturity
+ * signals — relevance scores, new-vs-known counts, gap recommendations — that the
+ * old LLM narrative buried. Pure: identical metadata -> identical text.
+ */
+export function renderResearchText(metadata: ResearchContextMetadata, topic: string): string {
+  const { discoveredItems, recommendations, qualitySignals } = metadata;
+  const lines: string[] = [];
+  lines.push(`[Research] ${sanitizeExternal(topic, 120)}`);
+  lines.push(
+    `Maturity: ${String(qualitySignals.totalFound)} found, ${String(qualitySignals.newItems)} new, ` +
+      `${String(qualitySignals.alreadyInRegistry)} already in registry.`
+  );
+  if (discoveredItems.length > 0) {
+    lines.push('Top discoveries (by relevance):');
+    for (const item of discoveredItems.slice(0, MAX_RENDERED_ITEMS)) {
+      const score = item.relevanceScore !== undefined ? item.relevanceScore.toFixed(2) : 'n/a';
+      const known = item.alreadyInRegistry ? ' [in registry]' : '';
+      lines.push(`- ${sanitizeExternal(item.title)} (relevance ${score})${known}`);
+    }
+  } else {
+    lines.push('Top discoveries (by relevance): none.');
+  }
+  if (recommendations.length > 0) {
+    lines.push('Gap recommendations:');
+    for (const rec of recommendations) lines.push(`- ${sanitizeExternal(rec)}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Build the full {@link ResearchContext} (metadata + derived text) from the raw
+ * research-tool responses. The single entry point the research stage calls.
+ */
+export function buildResearchContext(
+  discover: ResearchDiscoverResponse,
+  analyze: ResearchAnalyzeLike | undefined,
+  topic: string = discover.topic
+): ResearchContext {
+  const metadata = buildResearchContextMetadata(discover, analyze);
+  return { text: renderResearchText(metadata, topic), metadata };
+}
+
+/**
+ * Item count at which research-maturity saturates to 1.0. Few-vs-many is the
+ * signal we care about; beyond this, more items don't mean "more mature".
+ */
+export const RESEARCH_MATURITY_SATURATION = 8;
+
+/** Coarse research-maturity bucket for the #3234 measurement surface. */
+export type ResearchMaturityBucket = 'none' | 'low' | 'high';
+
+/**
+ * Derive a deterministic, bounded `[0, 1]` research-MATURITY score from the
+ * structured metadata (#3234). 0 when no research ran (the absent-research
+ * baseline); otherwise scales with how much research was found, saturating at
+ * {@link RESEARCH_MATURITY_SATURATION} items. Pure — no routing influence; this
+ * is RECORDED on outcomes and measured (the live-weighting gate is #3815).
+ */
+export function deriveResearchMaturity(metadata: ResearchContextMetadata): number {
+  const found = metadata.qualitySignals.totalFound;
+  if (found <= 0) return 0;
+  return Math.min(1, found / RESEARCH_MATURITY_SATURATION);
+}
+
+/** Bucket a maturity score for the measurement surface (#3234). */
+export function researchMaturityBucket(score: number): ResearchMaturityBucket {
+  if (score <= 0) return 'none';
+  return score < 0.5 ? 'low' : 'high';
+}
+
+/** Per-bucket aggregate for the research-maturity measurement report (#3234). */
+export interface ResearchMaturityBucketStats {
+  /** Number of records (patterns) in this bucket. */
+  readonly count: number;
+  /** Total attempts across the bucket's records (the successRate denominator). */
+  readonly attempts: number;
+  /** Attempt-weighted success rate `[0,1]` (0 when there are no attempts). */
+  readonly successRate: number;
+}
+
+/** One outcome/pattern record the measurement reads (decoupled from MobiMem types). */
+export interface ResearchMaturityRecord {
+  readonly successCount: number;
+  readonly attemptCount: number;
+  readonly researchMaturity?: number | undefined;
+}
+
+/**
+ * The #3234 measurement surface output: success-rate by research-maturity bucket.
+ * This is the NAMED CONSUMER that makes the recorded `researchMaturity` non-
+ * speculative — it does NOT influence routing (that is gated on a measured lift,
+ * #3815). v1 LIMITATION: the buckets are not yet controlled for task-vector
+ * similarity, so a positive `highVsNoneDelta` is suggestive, not causal (it may
+ * partly re-measure topic). Use it to decide whether to pursue #3815, not to act.
+ */
+export interface ResearchMaturityReport {
+  readonly byBucket: Readonly<Record<ResearchMaturityBucket, ResearchMaturityBucketStats>>;
+  /** `high.successRate − none.successRate`; 0 when either bucket is empty. */
+  readonly highVsNoneDelta: number;
+  readonly totalRecords: number;
+}
+
+/**
+ * Bucket recorded outcome records by research-maturity and report the
+ * attempt-weighted success rate per bucket plus the high-vs-none delta (#3234).
+ * Pure + deterministic. Records with absent maturity fall in the `none` bucket.
+ */
+export function computeResearchMaturityReport(
+  records: readonly ResearchMaturityRecord[]
+): ResearchMaturityReport {
+  const acc: Record<ResearchMaturityBucket, { count: number; succ: number; att: number }> = {
+    none: { count: 0, succ: 0, att: 0 },
+    low: { count: 0, succ: 0, att: 0 },
+    high: { count: 0, succ: 0, att: 0 },
+  };
+  for (const r of records) {
+    const b = acc[researchMaturityBucket(r.researchMaturity ?? 0)];
+    b.count += 1;
+    b.succ += r.successCount;
+    b.att += r.attemptCount;
+  }
+  const rate = (b: { succ: number; att: number }): number => (b.att > 0 ? b.succ / b.att : 0);
+  const byBucket = {
+    none: { count: acc.none.count, attempts: acc.none.att, successRate: rate(acc.none) },
+    low: { count: acc.low.count, attempts: acc.low.att, successRate: rate(acc.low) },
+    high: { count: acc.high.count, attempts: acc.high.att, successRate: rate(acc.high) },
+  };
+  // No spurious signal when a bucket is empty.
+  const delta =
+    byBucket.high.count > 0 && byBucket.none.count > 0
+      ? byBucket.high.successRate - byBucket.none.successRate
+      : 0;
+  return { byBucket, highVsNoneDelta: delta, totalRecords: records.length };
+}
+
+/** Empty metadata — the "no structured research" baseline (#3234). */
+export const EMPTY_RESEARCH_METADATA: ResearchContextMetadata = {
+  discoveredItems: [],
+  recommendations: [],
+  qualitySignals: { totalFound: 0, newItems: 0, alreadyInRegistry: 0 },
+};
+
+/**
+ * Wrap a bare research-text string into a {@link ResearchContext} with empty
+ * metadata (#3234). Used where only text exists — the research-stage failure
+ * path, the `researchOverride` shortcut, a resumed-from-checkpoint research event
+ * (whose persisted form is text-only), and test stages.
+ */
+export function researchContextFromText(text: string): ResearchContext {
+  return { text, metadata: EMPTY_RESEARCH_METADATA };
+}

@@ -1,0 +1,823 @@
+/* ─────────────────────────────────────────────────────────────────────────
+ * Site stylesheet — remarque tokens for every page; the docs pages use its
+ * Reference/Docs archetype, the landing page its Landing archetype (#7199).
+ *
+ * remarque-tokens is pinned exact (pre-1.0). Import order is its contract
+ * (AGENT_RULES.md "Build Order"): fonts, then tokens (core + palette +
+ * prose), then the optional essay module (TOC rail) and print sheet.
+ * String-form @import only — url() imports of local files are dropped
+ * silently by some bundlers (AGENT_RULES.md Pitfall #6).
+ *
+ * The fonts are self-hosted: fonts.css references ./fonts/*.woff2 relative
+ * to itself, and Vite copies those files into dist/_astro with hashed names.
+ *
+ * Nothing here overrides a core-tier token. The palette is remarque's
+ * default (bound to the upstream remarque-light / remarque-dark themes,
+ * REMARQUE.md "Color Providers") with the lightness nudges in tokens.css
+ * that the contrast-grade test requires (#7285). Light/dark: `color-scheme: light dark` follows the OS; the
+ * toggle sets [data-theme] on <html>, which remarque keys on.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+@import 'remarque-tokens/fonts.css';
+@import 'remarque-tokens/tokens.css';
+@import 'remarque-tokens/essay.css';
+@import 'remarque-tokens/print.css';
+/* Chrome module: the Palette Deck picker styles (and the skip link, breadcrumb,
+   pager and tag styles the site has not adopted yet). */
+@import 'remarque-tokens/chrome.css';
+/* Site token layer (USWDS-derived) and palette overrides — after remarque. */
+@import './tokens.css';
+/* Content components (callouts, tables, process list, summary box). */
+@import './components.css';
+
+/* ─── Shiki css-variables bridge (REMARQUE.md "Astro / Shiki wiring") ──── */
+.astro-code {
+  --color-syntax-foreground: var(--color-code-fg);
+  --color-syntax-background: var(--color-code-bg);
+  --color-syntax-token-keyword: var(--color-syntax-keyword);
+  --color-syntax-token-string: var(--color-syntax-string);
+  --color-syntax-token-string-expression: var(--color-syntax-string);
+  --color-syntax-token-constant: var(--color-syntax-constant);
+  --color-syntax-token-comment: var(--color-syntax-comment);
+  --color-syntax-token-function: var(--color-syntax-function);
+  --color-syntax-token-parameter: var(--color-syntax-variable);
+  --color-syntax-token-punctuation: var(--color-syntax-punctuation);
+  --color-syntax-token-link: var(--color-syntax-link);
+  /* token-inserted/-deleted/-changed intentionally left undefined (diff
+     markers are out of remarque's scope; they inherit the foreground). */
+}
+
+/* ─── Base ──────────────────────────────────────────────────────────────── */
+/* The UA's 8px body margin was never reset (#7285 finding 11). */
+body {
+  margin: 0;
+}
+
+/* Every link on the site takes the accent, not only links inside prose
+   (landing, footer, 404 used the UA's blue/purple). Components that are
+   not inline links (nav, pager, wordmark) opt out with their own rules. */
+a {
+  color: var(--color-link);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+a:hover {
+  color: var(--color-link-hover);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+/* ─── Copy button (added to code blocks by PageScripts.astro) ───────────── */
+.docs-body pre {
+  position: relative;
+}
+.copy-btn {
+  position: absolute;
+  top: var(--space-2);
+  inset-inline-end: var(--space-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 48px;
+  min-height: 48px;
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--leading-meta);
+  color: var(--color-fg-muted);
+  background: var(--color-code-bg);
+  border: var(--border-width) var(--border-style) var(--color-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  /* Always visible (finding 15): it used to be opacity 0 until hover, so
+     touch screens never showed it. Not dimmed with opacity either — at 0.6
+     its label measured 2.76:1 (axe color-contrast). At rest it is quiet by
+     its border; hover and focus strengthen the border and the text. */
+  transition:
+    border-color var(--motion-fast) var(--motion-easing),
+    color var(--motion-fast) var(--motion-easing);
+}
+pre:hover .copy-btn,
+.copy-btn:focus-visible,
+.copy-btn.copied {
+  border-color: var(--color-border-bold);
+  color: var(--color-fg);
+}
+.copy-btn:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Wide-table scroll container (src/plugins/hast-wrap-tables.ts). */
+.remarque-prose .scroll-wrap:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* ─── Skip link ─────────────────────────────────────────────────────────── */
+.docs-skip-link {
+  position: absolute;
+  inset-inline-start: var(--space-4);
+  top: var(--space-2);
+  z-index: var(--z-skip-link);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-bg);
+  border: var(--border-width) var(--border-style) var(--color-border-bold);
+  border-radius: var(--radius-sm);
+  transform: translateY(-200%);
+}
+.docs-skip-link:focus {
+  transform: none;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ─── Masthead ──────────────────────────────────────────────────────────────
+ * One row at every width (#7308). From 64rem: wordmark, Primary nav, search,
+ * theme. Below 64rem: wordmark, search, theme, Menu — the Primary nav and the
+ * side nav open in the Menu drawer (MenuDrawer.svelte). Below 40rem search
+ * is an icon button (SearchBox.svelte).
+ *
+ * [data-menu-drawer] on <html> is set by ThemeInit's pre-paint script, so the
+ * narrow layout depends on JS being there. Without it the Menu button stays
+ * hidden and the Primary nav wraps onto a second row (no scrolling strip).
+ */
+.docs-masthead {
+  border-bottom: var(--border-width) var(--border-style) var(--color-border);
+}
+.docs-masthead-inner {
+  position: relative;
+  max-width: var(--content-wide);
+  margin-inline: auto;
+  padding: var(--space-2) var(--gutter);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    'brand tools'
+    'nav nav';
+  align-items: center;
+  column-gap: var(--space-4);
+}
+.docs-wordmark {
+  grid-area: brand;
+  font-family: var(--font-display);
+  font-size: var(--text-section);
+  line-height: var(--leading-section);
+  color: var(--color-fg);
+  text-decoration: none;
+}
+.docs-masthead-tools {
+  grid-area: tools;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: var(--space-2);
+}
+.docs-primary-nav {
+  grid-area: nav;
+  min-width: 0;
+}
+.docs-primary-nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: 0 var(--space-5);
+  white-space: nowrap;
+}
+/* No-JS fallback below 64rem: the links wrap under the row. */
+@media (max-width: 63.99rem) {
+  .docs-primary-nav ul {
+    flex-wrap: wrap;
+  }
+}
+.docs-primary-nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  font-size: var(--text-meta);
+  color: var(--color-fg);
+  text-decoration: none;
+  transition: color var(--motion-fast) var(--motion-easing);
+}
+.docs-primary-nav a:hover,
+.docs-primary-nav a[aria-current] {
+  color: var(--color-accent);
+}
+.docs-primary-nav a[aria-current] {
+  font-weight: var(--weight-medium);
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.35em;
+}
+
+/* Menu button: icon plus visible text, a 48px-high target. Hidden until the
+   page is known to have JS, and from 64rem. */
+/* .docs-control sets 44px; these take the full 48px target. */
+.docs-control.docs-menu-button,
+.docs-control.docs-menu-close {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--touch-target);
+  cursor: pointer;
+  flex: none;
+}
+.docs-control.docs-menu-button {
+  display: none;
+}
+@media (max-width: 63.99rem) {
+  :root[data-menu-drawer] .docs-control.docs-menu-button {
+    display: inline-flex;
+  }
+  /* The drawer holds these below 64rem; in the page they are hidden. */
+  :root[data-menu-drawer] .docs-masthead-inner > .docs-primary-nav,
+  :root[data-menu-drawer] .docs-page > .docs-rail {
+    display: none;
+  }
+}
+.docs-menu-button:hover,
+.docs-menu-close:hover {
+  border-color: var(--color-fg-muted);
+}
+
+/* ─── Menu drawer (native <dialog>, opened with showModal) ──────────────── */
+.docs-menu {
+  position: fixed;
+  inset: 0 0 0 auto;
+  margin: 0;
+  padding: 0;
+  inline-size: min(22rem, 100%);
+  max-inline-size: 100%;
+  block-size: 100dvh;
+  max-block-size: 100dvh;
+  border: 0;
+  border-inline-start: var(--border-width) var(--border-style) var(--color-border-bold);
+  background: var(--color-bg);
+  color: var(--color-fg);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.docs-menu::backdrop {
+  background: color-mix(in oklch, var(--color-fg) 45%, transparent);
+}
+/* The page behind does not scroll while the drawer is open. */
+:root:has(.docs-menu[open]) {
+  overflow: hidden;
+}
+/* Fills the dialog box, so a click on the dialog itself is a backdrop click. */
+.docs-menu-panel {
+  min-block-size: 100%;
+}
+.docs-menu-head {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--gutter);
+  background: var(--color-bg);
+  border-bottom: var(--border-width) var(--border-style) var(--color-border);
+}
+.docs-menu-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-section);
+  line-height: var(--leading-section);
+}
+.docs-menu-body {
+  padding: var(--space-3) var(--gutter) var(--space-6);
+}
+/* Primary nav, moved in: a list of full-width 48px rows. */
+.docs-menu .docs-primary-nav ul {
+  flex-direction: column;
+  gap: 0;
+}
+.docs-menu .docs-primary-nav a {
+  display: flex;
+  min-height: var(--touch-target);
+  font-size: var(--text-body);
+}
+.docs-menu .docs-primary-nav {
+  padding-block-end: var(--space-3);
+  border-bottom: var(--border-width) var(--border-style) var(--color-border);
+}
+/* Side nav, moved in: always open, so its outer toggle is not shown, and
+   every row is a 48px target. */
+.docs-menu .docs-rail > details > summary {
+  display: none;
+}
+.docs-menu .docs-rail summary,
+.docs-menu .docs-rail-subgroup > summary {
+  min-height: var(--touch-target);
+}
+.docs-menu .docs-rail a {
+  display: flex;
+  align-items: center;
+  min-height: var(--touch-target);
+  padding-block: 0;
+}
+
+/* Quiet bordered control, shared by the theme toggle and the search input. */
+.docs-control {
+  font: inherit;
+  font-size: var(--text-meta);
+  min-height: 44px;
+  padding: 0 var(--space-3);
+  border: var(--border-width) var(--border-style) var(--color-border-bold);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-fg);
+}
+.docs-control:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+/* Square icon button at the USWDS 48px touch target. */
+.docs-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: var(--touch-target);
+  block-size: var(--touch-target);
+  min-height: var(--touch-target);
+  padding: 0;
+  flex: none;
+}
+
+/* ─── Docs shell ────────────────────────────────────────────────────────────
+ * DOM order: breadcrumb, side nav, main (whose article holds the in-page nav
+ * right after its H1). Below 64rem that is also the visual order.
+ */
+.docs-page {
+  max-width: var(--content-wide);
+  margin-inline: auto;
+  padding: 0 var(--gutter) var(--space-8);
+}
+
+/* Disclosure summaries in the shell: Inter, sentence case, the marker on
+   the left with the label beside it. */
+.docs-rail summary,
+.docs-toc summary {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--space-2);
+  min-height: 44px;
+  cursor: pointer;
+  list-style: none;
+  font-family: var(--font-body);
+  font-size: var(--text-meta);
+  font-variant-caps: normal;
+  letter-spacing: normal;
+  line-height: var(--leading-ui);
+  font-weight: var(--weight-medium);
+  color: var(--color-fg-muted);
+}
+.docs-rail summary::-webkit-details-marker {
+  display: none;
+}
+.docs-rail summary::before {
+  content: '\25B8';
+  display: inline-block;
+  color: var(--color-muted);
+  transition: transform var(--motion-fast) var(--motion-easing);
+}
+.docs-rail details[open] > summary::before {
+  transform: rotate(90deg);
+}
+.docs-rail summary:hover,
+.docs-toc summary:hover {
+  color: var(--color-fg);
+}
+.docs-rail > details > summary {
+  border-bottom: var(--border-width) var(--border-style) var(--color-border);
+}
+.docs-rail-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-block: var(--space-3);
+}
+.docs-rail-group > summary {
+  color: var(--color-fg);
+  font-weight: var(--weight-semibold);
+}
+.docs-rail-subgroup > summary {
+  min-height: 40px;
+  padding-inline-start: var(--space-2);
+  font-weight: var(--weight-medium);
+}
+.docs-rail-subgroup ul {
+  padding-inline-start: var(--space-4);
+}
+.docs-rail-count {
+  color: var(--color-muted);
+  font-weight: var(--weight-regular);
+}
+.docs-rail ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.docs-rail-group > ul {
+  margin-block-end: var(--space-3);
+}
+.docs-rail a {
+  display: block;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-meta);
+  line-height: var(--leading-meta);
+  color: var(--color-fg);
+  text-decoration: none;
+  transition:
+    color var(--motion-fast) var(--motion-easing),
+    background-color var(--motion-fast) var(--motion-easing);
+}
+.docs-rail a:hover {
+  background: var(--color-bg-subtle);
+  color: var(--color-accent);
+}
+/* Current page: a left bar as well as colour, so it does not rely on hue. */
+.docs-rail a[aria-current] {
+  background: var(--color-accent-subtle);
+  color: var(--color-accent);
+  font-weight: var(--weight-medium);
+  box-shadow: inset 3px 0 0 var(--color-accent);
+}
+
+/* ─── Breadcrumb ────────────────────────────────────────────────────────── */
+.docs-breadcrumb {
+  padding-top: var(--space-5);
+}
+.docs-breadcrumb ol {
+  list-style: none;
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  font-family: var(--font-body);
+  font-size: var(--text-meta);
+  line-height: var(--leading-ui);
+  color: var(--color-fg-muted);
+}
+.docs-breadcrumb li + li::before {
+  content: '/';
+  margin-inline-end: var(--space-2);
+  color: var(--color-muted);
+}
+.docs-breadcrumb a {
+  color: var(--color-fg-muted);
+  text-decoration: underline;
+  text-decoration-color: var(--color-border-bold);
+}
+.docs-breadcrumb a:hover {
+  color: var(--color-accent);
+  text-decoration-color: currentColor;
+}
+
+/* ─── Main: the article, page meta and pager ───────────────────────────── */
+.docs-main {
+  min-width: 0;
+  padding-top: var(--space-2);
+}
+
+.docs-body {
+  /* Long identifiers and paths (API names, `docs/api/exports/{…}`) have no
+     break opportunity and pushed phones into horizontal scroll. */
+  overflow-wrap: break-word;
+}
+/* Prose is capped at the reading measure, and so are the boxes that hold
+   prose (callouts, the how-to summary box), so they share its right edge.
+   Code blocks, tables and figures are deliberately NOT capped: they may use
+   the whole content track, because their lines do not reflow. */
+.docs-body > :where(p, ul, ol, blockquote, dl, h1, h2, h3, h4, h5, h6, .callout, .summary-box) {
+  max-width: var(--measure);
+}
+/* Hyphenation: a gap remarque leaves to the consumer (#7199). */
+.docs-body :where(p, li) {
+  hyphens: auto;
+}
+
+/* The page title is the document's own leading H1 (137 of 138 published
+   docs open with one), which remarque's prose sheet leaves unstyled. */
+.docs-body h1 {
+  font-family: var(--font-display);
+  font-weight: var(--weight-display);
+  font-size: var(--text-title);
+  line-height: var(--leading-title);
+  letter-spacing: var(--tracking-title);
+  text-wrap: balance;
+  margin: 0 0 var(--space-5);
+}
+/* H2 uses remarque's --text-section token (issue #7231). */
+.docs-body h2 {
+  font-size: var(--text-section);
+}
+.docs-body h3 {
+  line-height: 1.3;
+}
+
+/* ─── In-page nav ("On this page") ──────────────────────────────────────── */
+.docs-toc.remarque-toc-rail {
+  margin-block: 0 var(--space-5);
+  border-block: var(--border-width) var(--border-style) var(--color-border);
+}
+.docs-toc summary {
+  border-bottom: none;
+  padding-block: 0;
+}
+.docs-toc summary::before {
+  order: -1;
+}
+.docs-toc ul {
+  margin: 0 0 var(--space-3);
+}
+.docs-toc li + li {
+  margin-top: 0;
+}
+.docs-toc a {
+  display: block;
+  padding: var(--space-1) var(--space-3);
+  border-inline-start: 2px solid transparent;
+  font-family: var(--font-body);
+  font-size: var(--text-meta);
+  line-height: var(--leading-meta);
+  color: var(--color-fg-muted);
+}
+.docs-toc li.depth-3 a {
+  padding-inline-start: var(--space-6);
+}
+.docs-toc a:hover {
+  color: var(--color-accent);
+}
+.docs-toc a[aria-current='location'] {
+  color: var(--color-fg);
+  font-weight: var(--weight-medium);
+  border-inline-start-color: var(--color-accent);
+}
+.docs-toc-title {
+  display: none;
+  margin: 0 0 var(--space-2);
+  font-family: var(--font-body);
+  font-size: var(--text-meta);
+  line-height: var(--leading-ui);
+  font-weight: var(--weight-medium);
+  color: var(--color-fg);
+}
+.docs-toc-note {
+  margin: 0 0 var(--space-3);
+  /* Lines up with the link text (2px marker + padding). */
+  padding-inline-start: calc(var(--space-3) + 2px);
+  font-size: var(--text-meta);
+  color: var(--color-fg-muted);
+}
+
+/* ─── Page meta and pager ───────────────────────────────────────────────── */
+.docs-aside {
+  margin-block: var(--space-7) 0;
+  max-width: var(--measure);
+}
+.docs-page-meta {
+  margin: 0;
+  padding-top: var(--space-3);
+  border-top: var(--border-width) var(--border-style) var(--color-border);
+  font-size: var(--text-meta);
+  line-height: var(--leading-ui);
+  color: var(--color-fg-muted);
+}
+.docs-page-meta dt {
+  font-weight: var(--weight-medium);
+  color: var(--color-fg-muted);
+}
+.docs-page-meta dd {
+  margin: 0 0 var(--space-2);
+}
+
+.docs-pager {
+  margin-top: var(--space-6);
+  padding-top: var(--space-5);
+  border-top: var(--border-width) var(--border-style) var(--color-border);
+}
+.docs-pager ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+.docs-pager a {
+  display: flex;
+  flex-direction: column;
+  text-decoration: none;
+}
+.docs-pager .docs-pager-next {
+  margin-inline-start: auto;
+  text-align: end;
+}
+.docs-pager-label {
+  font-size: var(--text-meta);
+  line-height: var(--leading-ui);
+  color: var(--color-fg-muted);
+}
+
+/* ─── Footer ────────────────────────────────────────────────────────────── */
+.docs-footer {
+  border-top: var(--border-width) var(--border-style) var(--color-border);
+}
+.docs-footer-inner {
+  max-width: var(--content-wide);
+  margin-inline: auto;
+  padding: var(--space-5) var(--gutter);
+  font-size: var(--text-meta);
+  line-height: var(--leading-ui);
+  color: var(--color-fg-muted);
+}
+.docs-footer-inner p {
+  margin: 0;
+}
+.docs-footer-inner p + p {
+  margin-top: var(--space-2);
+}
+
+/* ─── Breakpoints ───────────────────────────────────────────────────────────
+ * Values are tokens.css's --bp-* reference values, repeated as literals
+ * because media queries cannot read custom properties.
+ *   < 40rem  search is an icon button.
+ *   < 64rem  one column: breadcrumb, then the page with its "On this page"
+ *            disclosure after the H1; Primary and side nav in the Menu
+ *            drawer (without JS: the "Section navigation" disclosure).
+ *   ≥ 64rem  side nav column (16rem) | content; header one row.
+ *   ≥ 75rem  side nav | content | in-page nav column (15rem).
+ */
+@media (min-width: 64rem) {
+  .docs-masthead-inner {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: 'brand nav tools';
+    column-gap: var(--space-6);
+    padding-block: var(--space-3);
+  }
+  .docs-primary-nav ul {
+    gap: var(--space-1) var(--space-5);
+  }
+
+  .docs-page {
+    display: grid;
+    grid-template-columns: var(--sidenav-width) minmax(0, 1fr);
+    grid-template-areas:
+      'nav crumb'
+      'nav main';
+    grid-template-rows: auto 1fr;
+    column-gap: var(--space-6);
+    align-items: start;
+  }
+  .docs-breadcrumb {
+    grid-area: crumb;
+    /* remarque: at least --space-9 before the main heading. */
+    padding-top: var(--space-8);
+  }
+  .docs-main {
+    grid-area: main;
+    padding-top: 0;
+  }
+  .docs-rail {
+    grid-area: nav;
+    position: sticky;
+    top: 0;
+    z-index: var(--z-sticky);
+    max-height: 100vh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-block: var(--space-6);
+  }
+  /* Forced open by the layout script, so the toggle is hidden. A closed
+     nav here means no JS: keep its summary so it can still be opened. */
+  .docs-rail > details[open] > summary {
+    display: none;
+  }
+  .docs-rail-sections {
+    padding-block: 0;
+  }
+}
+
+@media (min-width: 75rem) {
+  /* The in-page nav sits in the article after the H1 (DOM = reading order)
+     and is lifted into a right-hand column: main reserves the column, and
+     the nav fills it at full height so its list can stick while reading. */
+  .docs-main {
+    position: relative;
+    padding-inline-end: calc(var(--toc-width) + var(--space-6));
+  }
+  .docs-toc.remarque-toc-rail {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-end: 0;
+    width: var(--toc-width);
+    margin: 0;
+    border: 0;
+  }
+  .docs-toc > details {
+    position: sticky;
+    top: var(--space-5);
+    max-height: calc(100vh - var(--space-5));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-block-end: var(--space-5);
+  }
+  /* The column is always open here. Hiding the summary (as the side nav
+     does from 64rem) takes it out of the tab order, so a keyboard cannot
+     collapse the column; the plain-text title replaces it on screen. */
+  .docs-toc summary {
+    display: none;
+  }
+  .docs-toc .docs-toc-title {
+    display: block;
+  }
+}
+
+@media (min-width: 87.5rem) {
+  .docs-page {
+    column-gap: var(--space-7);
+  }
+  .docs-main {
+    padding-inline-end: calc(var(--toc-width) + var(--space-7));
+  }
+}
+
+@media (max-width: 39.99rem) {
+  .docs-wordmark {
+    font-size: 1.375rem;
+  }
+  /* Four 48px controls share the row with the wordmark (search, color
+     theme, light/dark, Menu). The Menu button keeps its text as its
+     accessible name but shows only the icon, and the gaps tighten; without
+     this the controls ran over the wordmark below ~430px. The span is hidden
+     with the .remarque-sr-only declarations restated here, because the class
+     cannot be applied only below 40rem. */
+  .docs-masthead-inner {
+    column-gap: var(--space-2);
+  }
+  .docs-masthead-tools {
+    gap: var(--space-1);
+  }
+  .docs-control.docs-menu-button {
+    inline-size: var(--touch-target);
+    justify-content: center;
+    padding: 0;
+  }
+  .docs-menu-button > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+@media (max-width: 23.99rem) {
+  .docs-wordmark {
+    font-size: 1.125rem;
+  }
+}
+/* Below 360px even that row does not fit: the controls take a second row. */
+@media (max-width: 22.49rem) {
+  .docs-masthead-inner {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      'brand'
+      'tools'
+      'nav';
+  }
+}
+
+@media print {
+  .docs-masthead,
+  .docs-rail,
+  .docs-toc,
+  .docs-aside,
+  .docs-pager,
+  .docs-footer {
+    display: none;
+  }
+  .docs-main {
+    padding-top: 0;
+  }
+}

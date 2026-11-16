@@ -1,0 +1,520 @@
+/**
+ * nexus-agents/cli - Release Announce Command Tests
+ * (Source: Issue #641 - Release announcement bot)
+ */
+
+import { describe, it, expect, vi, beforeEach, type MockInstance } from 'vitest';
+import type { ReleaseAnnounceResult, ChannelAnnouncementResult } from './release-announce-types.js';
+
+// ============================================================================
+// Mocks
+// ============================================================================
+
+vi.mock('node:fs', () => ({
+  readFileSync: vi.fn().mockReturnValue('{"version":"3.0.0"}'),
+  existsSync: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock('./ansi-output.js', () => ({
+  colors: {
+    reset: '',
+    bold: '',
+    dim: '',
+    green: '',
+    yellow: '',
+    red: '',
+    cyan: '',
+  },
+}));
+
+vi.mock('./release-notes-helpers.js', () => ({
+  getLatestTag: vi.fn(),
+  getCommitsBetween: vi.fn(),
+  tryGetCommitsBetween: vi.fn().mockReturnValue({ kind: 'ok', commits: [] }),
+  parseConventionalCommit: vi.fn(),
+  groupCommitsByCategory: vi.fn(),
+}));
+
+import { readFileSync, existsSync } from 'node:fs';
+import {
+  runReleaseAnnounce,
+  printReleaseAnnounceResult,
+  releaseAnnounceCommand,
+} from './release-announce-command.js';
+import {
+  getLatestTag,
+  getCommitsBetween,
+  parseConventionalCommit,
+  groupCommitsByCategory,
+} from './release-notes-helpers.js';
+
+/** Configure release-notes-helpers mocks with default return values. */
+// eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+function setupReleaseNotesMocks() {
+  vi.mocked(getLatestTag).mockReturnValue('v2.5.0');
+  vi.mocked(getCommitsBetween).mockReturnValue([
+    'abc1234 feat: add orchestration',
+    'def5678 fix: resolve timeout',
+  ]);
+  vi.mocked(parseConventionalCommit).mockImplementation((_hash: string, msg: string) => ({
+    hash: 'abc1234',
+    type: msg.startsWith('feat') ? 'feat' : 'fix',
+    subject: msg.replace(/^(feat|fix): /, ''),
+    message: msg,
+    breaking: false,
+    issues: [],
+  }));
+  vi.mocked(groupCommitsByCategory).mockReturnValue([
+    {
+      name: 'Added',
+      commits: [
+        {
+          hash: 'abc1234',
+          type: 'feat',
+          scope: 'core',
+          subject: 'add orchestration',
+          message: 'feat: add orchestration',
+          breaking: false,
+          issues: [],
+        },
+      ],
+    },
+    {
+      name: 'Fixed',
+      commits: [
+        {
+          hash: 'def5678',
+          type: 'fix',
+          subject: 'resolve timeout',
+          message: 'fix: resolve timeout',
+          breaking: false,
+          issues: [],
+        },
+      ],
+    },
+  ]);
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+// eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+function makeSuccessResult(overrides: Partial<ReleaseAnnounceResult> = {}) {
+  return {
+    success: true,
+    version: '3.0.0',
+    channels: [
+      { channel: 'blog' as const, success: true, content: 'blog content', url: 'http://blog' },
+    ],
+    durationMs: 42,
+    ...overrides,
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+function makeChannelResult(overrides: Partial<ChannelAnnouncementResult> = {}) {
+  return {
+    channel: 'blog' as const,
+    success: true,
+    content: 'some content',
+    ...overrides,
+  };
+}
+
+// ============================================================================
+// runReleaseAnnounce
+// ============================================================================
+
+describe('runReleaseAnnounce', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setupReleaseNotesMocks();
+    vi.mocked(existsSync).mockReturnValue(false);
+  });
+
+  it('should return success for blog dry-run', async () => {
+    const result = await runReleaseAnnounce({
+      version: '3.0.0',
+      channels: ['blog'],
+      dryRun: true,
+      verbose: false,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.version).toBe('3.0.0');
+    expect(result.channels).toHaveLength(1);
+    expect(result.channels[0]?.channel).toBe('blog');
+  });
+
+  it('should include durationMs in result', async () => {
+    const result = await runReleaseAnnounce({
+      version: '3.0.0',
+      channels: ['blog'],
+      dryRun: true,
+      verbose: false,
+    });
+
+    expect(result.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('should generate blog content with version', async () => {
+    const result = await runReleaseAnnounce({
+      version: '3.0.0',
+      channels: ['blog'],
+      dryRun: true,
+      verbose: false,
+    });
+
+    expect(result.channels[0]?.content).toContain('3.0.0');
+  });
+
+  it('should use custom highlights in blog content', async () => {
+    const result = await runReleaseAnnounce({
+      version: '3.0.0',
+      channels: ['blog'],
+      dryRun: true,
+      verbose: false,
+      highlights: ['Custom highlight one', 'Custom highlight two'],
+    });
+
+    expect(result.channels[0]?.content).toContain('Custom highlight one');
+    expect(result.channels[0]?.content).toContain('Custom highlight two');
+  });
+
+  it('should use custom releaseUrl in blog content', async () => {
+    const result = await runReleaseAnnounce({
+      version: '3.0.0',
+      channels: ['blog'],
+      dryRun: true,
+      verbose: false,
+      releaseUrl: 'https://github.com/custom/release/v3.0.0',
+    });
+
+    expect(result.channels[0]?.content).toContain('https://github.com/custom/release/v3.0.0');
+  });
+
+  it('should handle unknown channel gracefully', async () => {
+    const result = await runReleaseAnnounce({
+      version: '3.0.0',
+      channels: ['slack' as 'blog'],
+      dryRun: false,
+      verbose: false,
+    });
+
+    expect(result.channels[0]?.success).toBe(false);
+    expect(result.channels[0]?.error).toContain('Unknown channel');
+  });
+
+  it('should log verbose output when verbose is true', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await runReleaseAnnounce({
+      version: '3.0.0',
+      channels: ['blog'],
+      dryRun: true,
+      verbose: true,
+    });
+
+    const output = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+    expect(output).toContain('Release Announcement Generator');
+    expect(output).toContain('3.0.0');
+    logSpy.mockRestore();
+  });
+
+  // This test previously asserted `success: true` for an empty channel list —
+  // it pinned the vacuous pass rather than catching it (#4581). Announcing
+  // nothing is not a successful announcement.
+  it('should not report success when no channels were announced', async () => {
+    const result = await runReleaseAnnounce({
+      version: '3.0.0',
+      channels: [],
+      dryRun: true,
+      verbose: false,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.channels).toHaveLength(0);
+  });
+});
+
+// ============================================================================
+// printReleaseAnnounceResult
+// ============================================================================
+
+describe('printReleaseAnnounceResult', () => {
+  let logSpy: MockInstance;
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  it('should print version and duration', () => {
+    printReleaseAnnounceResult(makeSuccessResult());
+
+    const output = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+    expect(output).toContain('3.0.0');
+    expect(output).toContain('42ms');
+    logSpy.mockRestore();
+  });
+
+  it('should print channel URL when present', () => {
+    printReleaseAnnounceResult(
+      makeSuccessResult({
+        channels: [makeChannelResult({ url: 'https://example.com/post' })],
+      })
+    );
+
+    const output = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+    expect(output).toContain('https://example.com/post');
+    logSpy.mockRestore();
+  });
+
+  it('should print channel error when present', () => {
+    printReleaseAnnounceResult(
+      makeSuccessResult({
+        success: false,
+        channels: [makeChannelResult({ success: false, error: 'Connection failed' })],
+      })
+    );
+
+    const output = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+    expect(output).toContain('Connection failed');
+    logSpy.mockRestore();
+  });
+
+  it('should print content preview in verbose mode', () => {
+    printReleaseAnnounceResult(
+      makeSuccessResult({
+        channels: [makeChannelResult({ content: 'Line 1\nLine 2\nLine 3' })],
+      }),
+      true
+    );
+
+    const output = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+    expect(output).toContain('Content preview');
+    logSpy.mockRestore();
+  });
+
+  it('should print all-success message when all channels pass', () => {
+    printReleaseAnnounceResult(makeSuccessResult());
+
+    const output = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+    expect(output).toContain('All announcements generated');
+    logSpy.mockRestore();
+  });
+
+  it('should print warning when some channels fail', () => {
+    printReleaseAnnounceResult(
+      makeSuccessResult({
+        channels: [makeChannelResult({ success: false, error: 'fail' })],
+      })
+    );
+
+    const output = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+    expect(output).toContain('Some announcements failed');
+    logSpy.mockRestore();
+  });
+});
+
+// ============================================================================
+// releaseAnnounceCommand
+// ============================================================================
+
+describe('releaseAnnounceCommand', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setupReleaseNotesMocks();
+    vi.mocked(existsSync).mockReturnValue(false);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  it('should return 0 on success with explicit version', async () => {
+    const exitCode = await releaseAnnounceCommand({
+      positionals: ['release-announce'],
+      options: { version: '3.0.0', channels: 'blog', dryRun: true },
+    });
+
+    expect(exitCode).toBe(0);
+  });
+
+  it('should read version from package.json when not provided', async () => {
+    vi.mocked(readFileSync).mockReturnValue('{"version":"2.9.0"}');
+
+    const exitCode = await releaseAnnounceCommand({
+      positionals: ['release-announce'],
+      options: { channels: 'blog', dryRun: true },
+    });
+
+    expect(exitCode).toBe(0);
+  });
+
+  it('should return 1 when package.json has no version', async () => {
+    vi.mocked(readFileSync).mockReturnValue('{}');
+
+    const exitCode = await releaseAnnounceCommand({
+      positionals: ['release-announce'],
+      options: { dryRun: true },
+    });
+
+    expect(exitCode).toBe(1);
+  });
+
+  it('should return 1 when package.json is unreadable', async () => {
+    vi.mocked(readFileSync).mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+
+    const exitCode = await releaseAnnounceCommand({
+      positionals: ['release-announce'],
+      options: { dryRun: true },
+    });
+
+    expect(exitCode).toBe(1);
+  });
+
+  it('should parse repeated supported channels', async () => {
+    const exitCode = await releaseAnnounceCommand({
+      positionals: ['release-announce'],
+      options: { version: '3.0.0', channels: 'blog,blog', dryRun: true },
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  it('should retain supported channels when another unknown channel is filtered', async () => {
+    const exitCode = await releaseAnnounceCommand({
+      positionals: ['release-announce'],
+      options: { version: '3.0.0', channels: 'blog,slack', dryRun: true },
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  it('should reject an explicit empty channel list', async () => {
+    const exitCode = await releaseAnnounceCommand({
+      positionals: ['release-announce'],
+      options: { version: '3.0.0', channels: '', dryRun: true },
+    });
+    expect(exitCode).toBe(1);
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('No known announcement channels')
+    );
+  });
+
+  it('should pass releaseUrl option through', async () => {
+    const exitCode = await releaseAnnounceCommand({
+      positionals: ['release-announce'],
+      options: {
+        version: '3.0.0',
+        channels: 'blog',
+        dryRun: true,
+        releaseUrl: 'https://github.com/test/v3.0.0',
+      },
+    });
+
+    expect(exitCode).toBe(0);
+  });
+  it('should reject an unrecognised channel rather than announcing nothing', async () => {
+    const exitCode = await releaseAnnounceCommand({
+      positionals: ['release-announce'],
+      options: { version: '3.0.0', channels: 'bogus', dryRun: true },
+    });
+
+    expect(exitCode).toBe(1);
+  });
+
+  it('should not print the all-clear banner when no channels were announced', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    printReleaseAnnounceResult(makeSuccessResult({ success: false, channels: [] }));
+
+    const output = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+    expect(output).not.toContain('All announcements generated');
+    expect(output).toContain('No announcements');
+    logSpy.mockRestore();
+  });
+});
+
+describe('Bluesky retirement draft', () => {
+  let logSpy: MockInstance;
+  let errorSpy: MockInstance;
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setupReleaseNotesMocks();
+    vi.mocked(existsSync).mockReturnValue(false);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  it('uses a blog-only default without requesting another channel', async () => {
+    const result = await runReleaseAnnounce({ version: '3.0.0', dryRun: true });
+    expect(result.success).toBe(true);
+    expect(result.channels.map((channel) => channel.channel)).toEqual(['blog']);
+  });
+
+  it('rejects a mixed programmatic request before generating blog content', async () => {
+    const result = await runReleaseAnnounce({
+      version: '3.0.0',
+      channels: ['blog', 'bluesky' as 'blog'],
+      dryRun: false,
+    });
+    expect(result.success).toBe(false);
+    expect(result.channels).toHaveLength(2);
+    for (const channel of result.channels) {
+      expect(channel.content).toBe('');
+      expect(channel.error).toContain('Bluesky announcement channel is retired');
+    }
+    expect(getLatestTag).not.toHaveBeenCalled();
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['bluesky', false],
+    ['blog,bluesky', false],
+    ['bluesky,blog', false],
+    ['blog, bluesky', false],
+    ['blog,Bluesky', false],
+    ['bluesky ', false],
+    [' Bluesky,blog', false],
+    ['bluesky', true],
+    ['blog,bluesky', true],
+    ['bluesky,blog', true],
+    ['blog, bluesky', true],
+    ['blog,Bluesky', true],
+    ['bluesky ', true],
+    [' Bluesky,blog', true],
+  ] as const)(
+    'rejects retired %s before any announcement (dryRun=%s)',
+    async (channels, dryRun) => {
+      const result = await releaseAnnounceCommand({
+        positionals: ['release-announce'],
+        options: { version: '3.0.0', channels, dryRun },
+      });
+      expect(result).toBe(1);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Bluesky announcement channel is retired')
+      );
+      expect(getLatestTag).not.toHaveBeenCalled();
+      expect(logSpy).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([false, true])(
+    'rejects a noncanonical retired programmatic token before blog generation (dryRun=%s)',
+    async (dryRun) => {
+      const result = await runReleaseAnnounce({
+        version: '3.0.0',
+        channels: ['blog', ' Bluesky ' as 'blog'],
+        dryRun,
+      });
+      expect(result.success).toBe(false);
+      expect(result.channels).toHaveLength(2);
+      for (const channel of result.channels) {
+        expect(channel.content).toBe('');
+        expect(channel.error).toContain('Bluesky announcement channel is retired');
+      }
+      expect(getLatestTag).not.toHaveBeenCalled();
+      expect(logSpy).not.toHaveBeenCalled();
+    }
+  );
+});

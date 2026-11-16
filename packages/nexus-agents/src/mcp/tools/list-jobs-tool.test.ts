@@ -1,0 +1,391 @@
+/**
+ * Tests for list_jobs MCP tool (#3046 / epic #2631 Stage 5).
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readdirSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { ListJobsInputSchema, registerListJobsTool } from './list-jobs-tool.js';
+import { registerGetJobResultTool } from './get-job-result-tool.js';
+import { initTaskState, updateStage, appendResult } from '../../context/structured-task-state.js';
+import {
+  writeJobPending,
+  writeJobComplete,
+  writeJobFailed,
+  heartbeatJob,
+  listJobs,
+  listJobsWithDiagnostics,
+} from '../jobs/job-result-store.js';
+import { resetNexusDataDirCache } from '../../config/nexus-data-dir.js';
+import { RateLimiter } from '../middleware/rate-limiter.js';
+
+let tmpDir: string;
+const originalDataDir = process.env['NEXUS_DATA_DIR'];
+
+beforeEach(() => {
+  tmpDir = mkdtempSync(join(tmpdir(), 'nexus-list-jobs-test-'));
+  process.env['NEXUS_DATA_DIR'] = tmpDir;
+  resetNexusDataDirCache();
+});
+
+afterEach(() => {
+  if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+  else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+  resetNexusDataDirCache();
+  rmSync(tmpDir, { recursive: true, force: true });
+});
+
+describe('ListJobsInputSchema', () => {
+  it('accepts empty input (all filters absent)', () => {
+    const result = ListJobsInputSchema.safeParse({});
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts toolName filter', () => {
+    const result = ListJobsInputSchema.safeParse({ toolName: 'orchestrate' });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.toolName).toBe('orchestrate');
+  });
+
+  it('accepts status filter (all 4 lifecycle states)', () => {
+    for (const status of ['pending', 'complete', 'failed', 'cancelled'] as const) {
+      const result = ListJobsInputSchema.safeParse({ status });
+      expect(result.success).toBe(true);
+    }
+  });
+
+  it('rejects unknown status', () => {
+    const result = ListJobsInputSchema.safeParse({ status: 'fire-and-forget' });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts limit in [1, 200]', () => {
+    expect(ListJobsInputSchema.safeParse({ limit: 1 }).success).toBe(true);
+    expect(ListJobsInputSchema.safeParse({ limit: 200 }).success).toBe(true);
+  });
+
+  it('rejects limit > 200 or < 1', () => {
+    expect(ListJobsInputSchema.safeParse({ limit: 201 }).success).toBe(false);
+    expect(ListJobsInputSchema.safeParse({ limit: 0 }).success).toBe(false);
+  });
+});
+
+describe('listJobs (store integration)', () => {
+  it('returns empty list when jobs dir does not exist yet', () => {
+    expect(listJobs()).toEqual([]);
+  });
+
+  it('returns one summary per sidecar file', () => {
+    writeJobPending('job-a', 'orchestrate');
+    writeJobPending('job-b', 'run_workflow');
+    const jobs = listJobs();
+    expect(jobs.length).toBe(2);
+    expect(jobs.map((j) => j.toolName).sort()).toEqual(['orchestrate', 'run_workflow']);
+  });
+
+  it('summaries exclude the full result payload (size discipline)', () => {
+    writeJobPending('job-c', 'orchestrate');
+    writeJobComplete('job-c', 'orchestrate', { huge: 'x'.repeat(10_000) });
+    const jobs = listJobs();
+    const c = jobs.find((j) => j.jobId === 'job-c');
+    expect(c).toBeDefined();
+    // JobSummary shape does NOT include the result field — confirms
+    // list_jobs is a discovery surface, not a retrieval one.
+    expect((c as unknown as { result?: unknown }).result).toBeUndefined();
+  });
+
+  it('sorts newest createdAt first', () => {
+    // writeJobPending uses Date.now() — second call lands later than first.
+    writeJobPending('job-old', 'orchestrate');
+    // Tiny spin to ensure distinct ISO timestamps.
+    const start = Date.now();
+    while (Date.now() - start < 5) {
+      /* spin */
+    }
+    writeJobPending('job-new', 'run_workflow');
+    const jobs = listJobs();
+    expect(jobs[0]?.jobId).toBe('job-new');
+    expect(jobs[1]?.jobId).toBe('job-old');
+  });
+
+  it('preserves status field through the summary', () => {
+    writeJobPending('job-pending', 'orchestrate');
+    writeJobPending('job-failed', 'run_workflow');
+    writeJobFailed('job-failed', 'run_workflow', 'something broke');
+    writeJobPending('job-done', 'consensus_vote');
+    writeJobComplete('job-done', 'consensus_vote', { ok: true });
+
+    const statuses = new Map(listJobs().map((j) => [j.jobId, j.status]));
+    expect(statuses.get('job-pending')).toBe('pending');
+    expect(statuses.get('job-failed')).toBe('failed');
+    expect(statuses.get('job-done')).toBe('complete');
+  });
+
+  it('hasError flag matches failed records', () => {
+    writeJobPending('job-x', 'orchestrate');
+    writeJobFailed('job-x', 'orchestrate', 'rip');
+    writeJobPending('job-y', 'orchestrate');
+    writeJobComplete('job-y', 'orchestrate', { ok: true });
+
+    const byId = new Map(listJobs().map((j) => [j.jobId, j]));
+    expect(byId.get('job-x')?.hasError).toBe(true);
+    expect(byId.get('job-y')?.hasError).toBe(false);
+  });
+
+  it('skips non-matching filenames in the jobs dir (defensive)', async () => {
+    writeJobPending('job-real', 'orchestrate');
+    // Drop a stray file in the jobs dir that doesn't match `result-*.json`.
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    fs.writeFileSync(path.join(tmpDir, 'jobs', 'README.md'), '# scratch');
+    const jobs = listJobs();
+    expect(jobs.length).toBe(1);
+    expect(jobs[0]?.jobId).toBe('job-real');
+  });
+});
+
+describe('a listing that could not read everything says so (#6038)', () => {
+  // `truncated` describes the LIMIT CAP only, so it positively asserted
+  // completeness over a silently lossy read: listJobs returned [] for an
+  // unreadable directory and skipped every sidecar failing JobResultSchema.
+  // `{"count":0,"truncated":false,"jobs":[]}` was returned for all of it, and
+  // a caller without the jobId has nothing to cross-check against.
+  const jobsDir = (): string => join(tmpDir, 'jobs');
+
+  it('a sidecar that fails validation is counted, not silently dropped', () => {
+    writeJobPending('job-good', 'orchestrate');
+    // Same naming pattern the reader globs, contents it cannot validate --
+    // e.g. written by a newer nexus-agents, or half-written by a live job.
+    writeFileSync(join(jobsDir(), 'result-job-corrupt.json'), '{"not":"a job record"}');
+
+    const listing = listJobsWithDiagnostics();
+    expect(listing.jobs.map((j) => j.jobId)).toEqual(['job-good']);
+    expect(listing.diagnostics.unparseableRecords).toBe(1);
+    expect(listing.diagnostics.dirUnreadable).toBe(false);
+  });
+
+  it('unparseable and absent are different: a clean listing reports zero', () => {
+    // The pair. Without it, hardcoding a non-zero count would pass.
+    writeJobPending('job-good', 'orchestrate');
+    const listing = listJobsWithDiagnostics();
+    expect(listing.jobs).toHaveLength(1);
+    expect(listing.diagnostics.unparseableRecords).toBe(0);
+  });
+
+  it('an ABSENT jobs directory is a measured absence, not an unreadable one', () => {
+    // Deliberately NOT flagged: no jobs have ever been written, which is a real
+    // answer. Only a directory that exists and will not open is a failure.
+    const listing = listJobsWithDiagnostics();
+    expect(listing.jobs).toEqual([]);
+    expect(listing.diagnostics.dirUnreadable).toBe(false);
+    expect(listing.diagnostics.unparseableRecords).toBe(0);
+  });
+
+  it('listJobs keeps its array signature for existing callers', () => {
+    writeJobPending('job-good', 'orchestrate');
+    writeFileSync(join(jobsDir(), 'result-job-corrupt.json'), '{"not":"a job record"}');
+    expect(listJobs().map((j) => j.jobId)).toEqual(['job-good']);
+  });
+
+  it('an unreadable jobs directory is reported, not rendered as no jobs', () => {
+    writeJobPending('job-good', 'orchestrate');
+    chmodSync(jobsDir(), 0o000);
+    try {
+      let threw = false;
+      try {
+        readdirSync(jobsDir());
+      } catch {
+        threw = true;
+      }
+      // Running as root defeats the permission bit; assert nothing rather than
+      // pass vacuously on a check the environment cannot perform.
+      if (!threw) return;
+
+      const listing = listJobsWithDiagnostics();
+      expect(listing.jobs).toEqual([]);
+      expect(listing.diagnostics.dirUnreadable).toBe(true);
+    } finally {
+      chmodSync(jobsDir(), 0o755);
+    }
+  });
+});
+
+describe('list_jobs heartbeat disclosure (#6162)', () => {
+  type SdkCallback = (args: unknown) => Promise<{ content: readonly { text: string }[] }>;
+
+  /** Drive the callback the tool actually registers, through its wrappers. */
+  async function listEnvelope(): Promise<Record<string, unknown>> {
+    let registered: SdkCallback | undefined;
+    const server = {
+      registerTool: (_name: string, _config: unknown, callback: SdkCallback): void => {
+        registered = callback;
+      },
+    };
+    registerListJobsTool(server as never, {
+      rateLimiter: new RateLimiter({ capacity: 100, refillRate: 100 }),
+    });
+    if (registered === undefined) throw new Error('list_jobs registered no callback');
+    const result = await registered({});
+    return JSON.parse(result.content[0]?.text ?? '{}') as Record<string, unknown>;
+  }
+
+  it('each summary carries lastProgressAt when the record has one, and omits it otherwise', async () => {
+    writeJobPending('job-hb-yes', 'orchestrate');
+    heartbeatJob('job-hb-yes', '2026-09-16T12:34:56.000Z');
+    writeJobPending('job-hb-no', 'orchestrate');
+
+    const body = await listEnvelope();
+    const jobs = body['jobs'] as Array<Record<string, unknown>>;
+    const yes = jobs.find((j) => j['jobId'] === 'job-hb-yes');
+    const no = jobs.find((j) => j['jobId'] === 'job-hb-no');
+
+    expect(yes?.['lastProgressAt']).toBe('2026-09-16T12:34:56.000Z');
+    expect(no).toBeDefined();
+    expect(no).not.toHaveProperty('lastProgressAt');
+  });
+});
+
+describe('list_jobs and get_job_result report the same job the same way (#6726)', () => {
+  type SdkCallback = (args: unknown) => Promise<{ content: readonly { text: string }[] }>;
+  const originalSource = process.env['NEXUS_JOB_RESULT_SOURCE'];
+  /** Three runaway guards old: past the abandoned bound under any default. */
+  const STALE_AGE_MS = 3 * 3_600_000;
+
+  /** Register a tool against a stub server and return its real callback. */
+  function registeredCallback(
+    register: (server: never, deps: { rateLimiter: RateLimiter }) => void
+  ): SdkCallback {
+    let registered: SdkCallback | undefined;
+    const server = {
+      registerTool: (_name: string, _config: unknown, callback: SdkCallback): void => {
+        registered = callback;
+      },
+    };
+    register(server as never, { rateLimiter: new RateLimiter({ capacity: 100, refillRate: 100 }) });
+    if (registered === undefined) throw new Error('tool registered no callback');
+    return registered;
+  }
+
+  async function callTool(
+    register: (server: never, deps: { rateLimiter: RateLimiter }) => void,
+    args: unknown
+  ): Promise<Record<string, unknown>> {
+    const result = await registeredCallback(register)(args);
+    return JSON.parse(result.content[0]?.text ?? '{}') as Record<string, unknown>;
+  }
+
+  async function listed(args: Record<string, unknown> = {}): Promise<Record<string, unknown>[]> {
+    const body = await callTool(registerListJobsTool, args);
+    return body['jobs'] as Record<string, unknown>[];
+  }
+
+  /** What each tool says about one job: status and the abandoned flag. */
+  async function bothViews(jobId: string): Promise<{
+    list: { status: unknown; abandoned: unknown } | undefined;
+    detail: { status: unknown; abandoned: unknown };
+  }> {
+    const row = (await listed()).find((j) => j['jobId'] === jobId);
+    const detail = await callTool(registerGetJobResultTool, { jobId });
+    const record = detail['record'] as Record<string, unknown> | undefined;
+    return {
+      list: row === undefined ? undefined : { status: row['status'], abandoned: row['abandoned'] },
+      detail: { status: record?.['status'], abandoned: detail['abandoned'] },
+    };
+  }
+
+  /** An async task-state log still in `executing` — maps to `pending`. */
+  function writeExecutingTaskState(taskId: string): void {
+    initTaskState({
+      taskId,
+      stage: 'executing',
+      decisions: [],
+      blockers: [],
+      position: { currentStep: 'run' },
+      dispatch: 'async',
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /** Backdate a sidecar record's createdAt so it has outlived the guard. */
+  function backdateSidecar(jobId: string): void {
+    const path = join(tmpDir, 'jobs', `result-${jobId}.json`);
+    const record = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    const stale = new Date(Date.now() - STALE_AGE_MS).toISOString();
+    writeFileSync(path, JSON.stringify({ ...record, createdAt: stale }));
+  }
+
+  afterEach(() => {
+    if (originalSource === undefined) delete process.env['NEXUS_JOB_RESULT_SOURCE'];
+    else process.env['NEXUS_JOB_RESULT_SOURCE'] = originalSource;
+  });
+
+  describe.each(['sidecar', 'task_state'] as const)('NEXUS_JOB_RESULT_SOURCE=%s', (source) => {
+    beforeEach(() => {
+      process.env['NEXUS_JOB_RESULT_SOURCE'] = source;
+    });
+
+    it('a terminal sidecar over a still-pending task-state log', async () => {
+      // An orchestrate past its overall deadline: `ok` partial written to the
+      // sidecar, no terminal stage set, so task state still says executing.
+      writeJobPending('orch-parity-1', 'orchestrate');
+      writeJobComplete('orch-parity-1', 'orchestrate', { ok: true, partial: true });
+      writeExecutingTaskState('orch-parity-1');
+
+      const { list, detail } = await bothViews('orch-parity-1');
+
+      expect(detail.status).toBe('complete');
+      expect(list).toEqual(detail);
+      const completeOnly = await listed({ status: 'complete' });
+      expect(completeOnly.map((j) => j['jobId'])).toContain('orch-parity-1');
+      const pendingOnly = await listed({ status: 'pending' });
+      expect(pendingOnly.map((j) => j['jobId'])).not.toContain('orch-parity-1');
+    });
+
+    it('a terminal task-state log over a pending sidecar', async () => {
+      writeJobPending('orch-parity-2', 'orchestrate');
+      writeExecutingTaskState('orch-parity-2');
+      updateStage('orch-parity-2', 'complete', new Date().toISOString());
+      appendResult('orch-parity-2', { ok: true }, new Date().toISOString());
+
+      const { list, detail } = await bothViews('orch-parity-2');
+
+      // Under the sidecar source the task-state log is not read at all.
+      expect(detail.status).toBe(source === 'task_state' ? 'complete' : 'pending');
+      expect(list).toEqual(detail);
+    });
+
+    it('an abandoned job is flagged in both views, kept under status:pending, and filterable', async () => {
+      writeJobPending('orch-parity-dead', 'orchestrate');
+      backdateSidecar('orch-parity-dead');
+      writeJobPending('orch-parity-live', 'orchestrate');
+
+      const dead = await bothViews('orch-parity-dead');
+      expect(dead.detail).toEqual({ status: 'pending', abandoned: true });
+      expect(dead.list).toEqual(dead.detail);
+      const live = await bothViews('orch-parity-live');
+      expect(live.detail).toEqual({ status: 'pending', abandoned: undefined });
+      expect(live.list).toEqual(live.detail);
+
+      const pending = (await listed({ status: 'pending' })).map((j) => j['jobId']);
+      expect(pending).toEqual(expect.arrayContaining(['orch-parity-dead', 'orch-parity-live']));
+      const liveOnly = (await listed({ status: 'pending', abandoned: false })).map(
+        (j) => j['jobId']
+      );
+      expect(liveOnly).toEqual(['orch-parity-live']);
+      const deadOnly = (await listed({ abandoned: true })).map((j) => j['jobId']);
+      expect(deadOnly).toEqual(['orch-parity-dead']);
+    });
+  });
+
+  it('a settled job is never flagged abandoned however old it is', async () => {
+    writeJobPending('orch-parity-old-done', 'orchestrate');
+    writeJobComplete('orch-parity-old-done', 'orchestrate', { ok: true });
+    backdateSidecar('orch-parity-old-done');
+
+    const { list, detail } = await bothViews('orch-parity-old-done');
+    expect(detail).toEqual({ status: 'complete', abandoned: undefined });
+    expect(list).toEqual(detail);
+  });
+});

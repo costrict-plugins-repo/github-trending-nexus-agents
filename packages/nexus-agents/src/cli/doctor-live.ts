@@ -1,0 +1,181 @@
+import { isCliName } from '../cli-adapters/types.js';
+/**
+ * The `serves` readiness level for `nexus-agents doctor --live` (#4376).
+ *
+ * Runs a real completion against every configured adapter and reports whether
+ * content actually came back. This is the only level that can catch #4351 —
+ * every voter returning `stop_sequence` with zero tokens while `healthCheck()`
+ * and the auth probe both reported healthy — and the only one that spends the
+ * resource it measures, which is why it is opt-in.
+ *
+ * @module cli/doctor-live
+ * (Source: Issue #4376)
+ */
+
+import { createAllAdapters } from '../cli-adapters/factory.js';
+import { GEMINI_CLI_COMMAND } from '../cli-adapters/cli-error-envelope.js';
+import type { CliName } from '../cli-adapters/types.js';
+import { isCliDisabled } from '../cli-adapters/disabled-clis.js';
+import { resolveGatewayServedSlot } from '../cli-adapters/gateway-slot-arm.js';
+import { CLI_NAMES } from '../config/model-capabilities-types.js';
+import { probeCli } from './cli-auth-probe.js';
+import { detectCliBinary } from './setup-cli-detection.js';
+import {
+  buildGatewayReadiness,
+  buildReadiness,
+  formatReadiness,
+  probeServes,
+  type CliReadiness,
+  type GatewayServedReadiness,
+  type LevelOutcome,
+  type ServesProbeTarget,
+} from './cli-readiness.js';
+
+/** Reason recorded when a level is skipped because an earlier one failed. */
+const NOT_REACHED = 'earlier level did not pass, so this was not attempted';
+
+/**
+ * Run the full ladder for every adapter.
+ *
+ * The ladder short-circuits: a CLI that is not installed is not probed for
+ * auth, and one that is not authenticated is not billed for a completion. The
+ * skipped levels report `not-attempted`, never `failed` — nothing was learned
+ * about them, and saying otherwise would invent a measurement.
+ */
+export async function runLiveReadiness(
+  deps: {
+    readonly adapters?: Map<CliName, ServesProbeTarget>;
+    readonly authStates?: ReadonlyMap<CliName, 'authenticated' | 'unknown' | 'not-ok'>;
+    /**
+     * Whether a CLI's binary is on PATH. Defaults to a real `which` +
+     * `--version` probe (#4840); overridable so the ladder can be exercised
+     * without the host's actual toolchain.
+     */
+    readonly isInstalled?: (cli: CliName) => boolean;
+    /**
+     * Whether the main doctor CLI list admitted each CLI (`routerAdmits`). Its
+     * health check and this run's are separate calls; when the live run finds
+     * the CLI unavailable after the list admitted it, the live line says so
+     * rather than letting the two disagree silently (#6781).
+     */
+    readonly cliListAdmits?: ReadonlyMap<CliName, boolean>;
+  } = {}
+): Promise<readonly CliReadiness[]> {
+  // DELIBERATE raw-adapter probe — same reasoning as `doctor.ts:checkCli`
+  // (#5191). Readiness must reflect the CLI's actual state, not shared
+  // circuit-breaker state another caller populated.
+  const adapters =
+    deps.adapters ?? (createAllAdapters() as unknown as Map<CliName, ServesProbeTarget>);
+  const authStates = deps.authStates ?? (await readAuthStates());
+  const isInstalled =
+    deps.isInstalled ??
+    ((cli: CliName) => detectCliBinary(cli === 'gemini' ? GEMINI_CLI_COMMAND : cli).installed);
+
+  const results: CliReadiness[] = [];
+  for (const [cli, adapter] of adapters) {
+    // #6720: a gateway-served slot — its CLI disabled or not available — is
+    // measured as the gateway, and the CLI's own rungs are not run. A disabled
+    // CLI's binary is never looked up, spawned or probed.
+    //
+    // #6781: the arm is asked to DECIDE first. An arm whose binary is on PATH
+    // is undecided until its first call, and a synchronous read of it said
+    // "not gateway-served"; the probe then made it choose the gateway, and the
+    // report credited the CLI's rungs with the gateway's completion. Deciding
+    // commits the arm, so the probe below goes to the target named here.
+    const served = await resolveGatewayServedSlot(adapter);
+    if (served !== undefined) {
+      const gateway = gatewayReadinessOf(cli, served.modelId, deps.cliListAdmits);
+      results.push(buildGatewayReadiness(cli, gateway, await probeServes(adapter)));
+      continue;
+    }
+    if (isCliDisabled(cli)) continue;
+    results.push(await ladderFor(cli, adapter, authStates.get(cli), isInstalled(cli)));
+  }
+  return results;
+}
+
+/** Why the CLI does not serve a gateway-served slot, and whether the CLI list disagrees. */
+function gatewayReadinessOf(
+  cli: CliName,
+  gatewayModel: string,
+  cliListAdmits: ReadonlyMap<CliName, boolean> | undefined
+): GatewayServedReadiness {
+  if (isCliDisabled(cli)) return { gatewayModel, cliState: 'disabled' };
+  return {
+    gatewayModel,
+    cliState: 'not-available',
+    ...(cliListAdmits?.get(cli) === true ? { cliListAdmitted: true } : {}),
+  };
+}
+
+async function ladderFor(
+  cli: CliName,
+  adapter: ServesProbeTarget,
+  auth: 'authenticated' | 'unknown' | 'not-ok' | undefined,
+  binaryPresent: boolean
+): Promise<CliReadiness> {
+  // Was the literal `{ status: 'verified' }` — the first rung of a readiness
+  // ladder asserting itself (#4840). It also made the auth rung report "no
+  // usable credentials found" for a CLI that simply is not installed.
+  if (!binaryPresent) {
+    return buildReadiness(cli, {
+      installed: { status: 'failed', reason: 'binary not found on PATH' },
+      authenticated: { status: 'not-attempted', reason: NOT_REACHED },
+      serves: { status: 'not-attempted', reason: `skipped (not configured): ${NOT_REACHED}` },
+    });
+  }
+  const installed: LevelOutcome = { status: 'verified' };
+
+  // `unknown` (#4391: a CLI exposing no readable auth signal) is admitted
+  // optimistically at this level, exactly as the auth probe requires — but it
+  // is the live probe below that then actually settles the question.
+  const authenticated: LevelOutcome =
+    auth === 'not-ok'
+      ? { status: 'failed', reason: 'no usable credentials found' }
+      : { status: 'verified' };
+
+  if (authenticated.status !== 'verified') {
+    return buildReadiness(cli, {
+      installed,
+      authenticated,
+      serves: {
+        status: 'not-attempted',
+        reason: `skipped (credentials unavailable): ${NOT_REACHED}`,
+      },
+    });
+  }
+
+  return buildReadiness(cli, { installed, authenticated, serves: await probeServes(adapter) });
+}
+
+/**
+ * Collapse the auth probe's states into what the ladder needs. A CLI disabled
+ * by `NEXUS_DISABLED_CLIS` is not probed (#6720): some probes spawn the binary.
+ */
+async function readAuthStates(): Promise<
+  ReadonlyMap<CliName, 'authenticated' | 'unknown' | 'not-ok'>
+> {
+  const enabled = CLI_NAMES.filter((cli) => !isCliDisabled(cli));
+  const probes = await Promise.all(enabled.map((cli) => probeCli(cli)));
+  const states = new Map<CliName, 'authenticated' | 'unknown' | 'not-ok'>();
+  for (const probe of probes) {
+    // This report measures local CLI authentication, never endpoint auth.
+    if (!isCliName(probe.cli)) continue;
+    if (probe.state === 'authenticated') states.set(probe.cli, 'authenticated');
+    else if (probe.state === 'unknown') states.set(probe.cli, 'unknown');
+    else states.set(probe.cli, 'not-ok');
+  }
+  return states;
+}
+
+/** Render the live report, with a heading that says what was and was not proven. */
+export function formatLiveReadiness(report: readonly CliReadiness[]): string {
+  if (report.length === 0) {
+    return '\nLive readiness: no adapters configured — nothing was probed.';
+  }
+  return [
+    '',
+    'Live readiness (--live: a real completion per adapter)',
+    ...report.map(formatReadiness),
+  ].join('\n');
+}

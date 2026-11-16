@@ -1,0 +1,25 @@
+---
+// Callout / status banner (#7199, #7285). Same markup and styles as the
+// Markdown alerts (src/plugins/hast-alerts.ts), so a callout written in a
+// page template and one written as `> [!NOTE]` read alike. Styles live in
+// src/styles/components.css, keyed on data-kind; the vocabulary, labels and
+// icons in src/plugins/callout-kinds.ts.
+//
+// The title is visible text, so the kind is never carried by colour alone;
+// the icon is decorative. role="note" keeps callouts out of the landmark
+// list, and the title names the note.
+import { calloutIconSvg } from '../plugins/callout-kinds.ts';
+
+interface Props {
+  title: string;
+  tone?: 'note' | 'success' | 'warning' | 'error';
+}
+
+const { title, tone = 'note' } = Astro.props;
+const titleId = `callout-${Math.random().toString(36).slice(2, 10)}`;
+---
+
+<aside class="callout" data-kind={tone} role="note" aria-labelledby={titleId}>
+  <p class="callout-title" id={titleId}><Fragment set:html={calloutIconSvg(tone)} />{title}</p>
+  <div class="callout-body"><slot /></div>
+</aside>

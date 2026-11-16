@@ -1,0 +1,151 @@
+/**
+ * Base Evaluator for Self-Evaluation MVP
+ *
+ * Abstract base class for all evaluation agents.
+ * Provides common evaluation infrastructure.
+ *
+ * @module self-eval/base-evaluator
+ * (Source: Issue #138, Multi-Agent Evaluation research)
+ */
+
+import type { ComponentInfo } from './component-scanner.js';
+import { getErrorMessage, createLogger, getTimeProvider } from '../core/index.js';
+import { clamp01 } from '../utils/math-utils.js';
+import type {
+  Recommendation,
+  MetricSource,
+  MetricCitation,
+  EvaluationResult,
+  EvaluatorRole,
+  EvaluatorConfig,
+  EvaluationThresholds,
+} from './evaluation-agents-types.js';
+import { DEFAULT_THRESHOLDS, DEFAULT_TIMEOUT_MS } from './evaluation-agents-types.js';
+
+/**
+ * Base class for evaluation agents.
+ */
+export abstract class BaseEvaluator {
+  protected readonly log;
+  protected readonly thresholds: Required<EvaluationThresholds>;
+  protected readonly timeoutMs: number;
+
+  constructor(
+    protected readonly role: EvaluatorRole,
+    config?: EvaluatorConfig
+  ) {
+    this.log = config?.logger ?? createLogger({ component: `evaluator-${role}` });
+    this.thresholds = { ...DEFAULT_THRESHOLDS, ...config?.thresholds };
+    this.timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  }
+
+  /**
+   * Evaluate a component and return recommendation.
+   */
+  async evaluate(component: ComponentInfo): Promise<EvaluationResult> {
+    const startTime = getTimeProvider().now();
+
+    // Racing a timeout promise against work: if work wins, we must clear the
+    // timeout or the setTimeout keeps the event loop alive + eventually fires
+    // an unhandled rejection (#1913 wave 5).
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error('Evaluation timeout'));
+      }, this.timeoutMs);
+    });
+    try {
+      const result = await Promise.race([
+        this.performEvaluation(component),
+        timeoutPromise,
+      ]).finally(() => {
+        if (timeoutId !== undefined) clearTimeout(timeoutId);
+      });
+
+      this.log.debug('Evaluation complete', {
+        component: component.path,
+        recommendation: result.recommendation,
+        durationMs: getTimeProvider().now() - startTime,
+      });
+
+      return result;
+    } catch (error) {
+      // On timeout or error, return a "review" recommendation
+      return this.createResult(
+        component,
+        'review',
+        0.3,
+        [],
+        [`Evaluation failed: ${getErrorMessage(error)}`]
+      );
+    }
+  }
+
+  /**
+   * Template method for specific evaluation logic.
+   */
+  protected abstract performEvaluation(component: ComponentInfo): Promise<EvaluationResult>;
+
+  /**
+   * Create a standardized result.
+   */
+  protected createResult(
+    component: ComponentInfo,
+    recommendation: Recommendation,
+    confidence: number,
+    metrics: MetricCitation[],
+    concerns: string[]
+  ): EvaluationResult {
+    return {
+      component: component.path,
+      recommendation,
+      confidence: clamp01(confidence),
+      metrics,
+      concerns,
+      isRecommendation: true,
+      agent: this.role,
+      timestamp: new Date(getTimeProvider().now()),
+    };
+  }
+
+  /**
+   * Create a metric citation.
+   */
+  protected cite(
+    metric: string,
+    value: number | string,
+    source: MetricSource,
+    threshold?: number | string
+  ): MetricCitation {
+    return { metric, value, source, ...(threshold !== undefined ? { threshold } : {}) };
+  }
+
+  /**
+   * Shared per-role confidence rubric: `base + min(metricCap, metricCount *
+   * metricCoeff) - concernPenalty`. More observed metrics ⇒ higher confidence
+   * (bonus capped); more concerns ⇒ lower confidence (penalty capped).
+   *
+   * Each evaluator role passes its OWN base/cap/coeff — the constants are
+   * intentionally NOT unified (architecture-fit, practical-value, and
+   * code-quality each weight evidence differently). Omit the concern fields to
+   * skip the penalty entirely (roles that judge on positive signals only).
+   *
+   * The returned value is later clamped to [0, 1] by {@link createResult}.
+   */
+  protected computeConfidence(opts: {
+    base: number;
+    metricCount: number;
+    metricCap: number;
+    metricCoeff: number;
+    concernCount?: number;
+    concernCap?: number;
+    concernCoeff?: number;
+  }): number {
+    const metricBonus = Math.min(opts.metricCap, opts.metricCount * opts.metricCoeff);
+    const concernPenalty =
+      opts.concernCount !== undefined && opts.concernCoeff !== undefined
+        ? Math.min(opts.concernCap ?? Infinity, opts.concernCount * opts.concernCoeff)
+        : 0;
+    return opts.base + metricBonus - concernPenalty;
+  }
+}

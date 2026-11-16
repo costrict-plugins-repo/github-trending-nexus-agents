@@ -1,0 +1,338 @@
+/**
+ * Persistent StrategyDistiller — JSON-backed cross-session persistence.
+ *
+ * Extends StrategyDistiller with atomic disk writes (write tmp + rename)
+ * for distilled rules. Hydrates from a versioned JSON snapshot on
+ * construction; saves after every distill() call.
+ *
+ * @module learning/strategy-distiller-persistence
+ * (Source: Issue #1009 — Cross-session persistence)
+ */
+
+import { writeFileSync, readFileSync, renameSync, unlinkSync, existsSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { z } from 'zod';
+import { RoutingArmIdSchema } from '../cli-adapters/types.js';
+
+import type { ILogger } from '../core/index.js';
+import { createLogger } from '../core/index.js';
+import type { OutcomeStore } from '../orchestration/outcomes/outcome-store.js';
+import type {
+  DistilledRule,
+  DistillerConfig,
+  EffectThresholds,
+} from './strategy-distiller-types.js';
+import { DEFAULT_DISTILLER_CONFIG } from './strategy-distiller-types.js';
+import {
+  StrategyDistiller,
+  registerPersistentDistillerFactory,
+  sigmoidConfidence,
+  effectFor,
+} from './strategy-distiller.js';
+import { ensureLearningDir, getRulesFile } from '../config/learning-persistence.js';
+
+// ============================================================================
+// Versioned Schema
+// ============================================================================
+
+const DistilledRuleSchema = z.object({
+  id: z.string(),
+  patternType: z.enum(['failure-rate', 'success-rate', 'latency-spike']),
+  cli: RoutingArmIdSchema,
+  category: z.string(),
+  action: z.enum(['penalize', 'boost', 'avoid']),
+  confidence: z.number(),
+  // Optional only for records written before #5004 finding 3, when
+  // `confidence` was the sigmoid alone. `hydrateRule` fills them in; a
+  // current-shape record always carries both.
+  support: z.number().optional(),
+  effect: z.number().optional(),
+  observationCount: z.number(),
+  metric: z.number(),
+  // Read-only legacy alias (#5467): old stores must still validate. hydrateRule
+  // maps 'promoted' to 'active'; in-memory rules and snapshot writers never emit it.
+  status: z.enum(['draft', 'active', 'promoted', 'expired']),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
+
+/** Versioned snapshot schema for atomic saves. */
+export const RulesSnapshotSchema = z.object({
+  version: z.literal(1),
+  savedAt: z.string(),
+  rules: z.array(DistilledRuleSchema),
+  /**
+   * Eligible outcomes the distill that wrote this snapshot trained on (#6512).
+   * Optional: snapshots written before it do not carry the count.
+   */
+  eligibleOutcomes: z.number().int().nonnegative().optional(),
+});
+
+export type RulesSnapshot = z.infer<typeof RulesSnapshotSchema>;
+
+type PersistedRule = z.infer<typeof DistilledRuleSchema>;
+
+/**
+ * Lift a persisted record to the current `DistilledRule` shape.
+ *
+ * A record from before #5004 finding 3 has no `support`/`effect` and a
+ * `confidence` that was the sigmoid alone. It gets `support` from its
+ * observation count, `effect` recomputed from its persisted `metric` under
+ * `thresholds` (the live config — the threshold it was distilled under was
+ * never recorded), and `confidence` replaced by the product so routing never
+ * multiplies by a sample-size-only value again. Nothing here can produce
+ * `undefined × x = NaN`. A record that already carries both fields is
+ * returned with its existing confidence fields. Legacy 'promoted' status is
+ * always mapped to 'active', so routing can apply the rule and expiry can retire it.
+ */
+function hydrateRule(
+  raw: PersistedRule,
+  thresholds: EffectThresholds
+): { rule: DistilledRule; legacy: boolean } {
+  const { support, effect, status: persistedStatus, ...fields } = raw;
+  const status = persistedStatus === 'promoted' ? 'active' : persistedStatus;
+  const rest = { ...fields, status };
+  if (support !== undefined && effect !== undefined) {
+    return { rule: { ...rest, support, effect }, legacy: false };
+  }
+  const derivedSupport = support ?? sigmoidConfidence(raw.observationCount);
+  const derivedEffect = effect ?? effectFor(raw.patternType, raw.metric, thresholds);
+  return {
+    rule: {
+      ...rest,
+      support: derivedSupport,
+      effect: derivedEffect,
+      confidence: derivedSupport * derivedEffect,
+    },
+    legacy: true,
+  };
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+export interface PersistentDistillerConfig {
+  /** Override the file path (useful for testing). */
+  readonly filePath?: string;
+  /** Override the data directory (useful for testing). */
+  readonly dataDir?: string;
+}
+
+// ============================================================================
+// Implementation
+// ============================================================================
+
+/**
+ * StrategyDistiller that persists distilled rules to a JSON file.
+ *
+ * - Construction: hydrates from rules.json via Zod validation
+ * - distill(): calls super.distill() then atomically saves snapshot
+ * - Corruption: warn + start fresh (no partial loads)
+ */
+export class PersistentStrategyDistiller extends StrategyDistiller {
+  private readonly filePath: string;
+  private readonly persistLogger: ILogger;
+  /** rules.json existed but could not be read or validated (#6512). */
+  private snapshotUnreadable = false;
+
+  constructor(
+    outcomeStore: OutcomeStore,
+    persistConfig?: PersistentDistillerConfig,
+    logger?: ILogger,
+    distillerConfig?: Partial<DistillerConfig>
+  ) {
+    super(outcomeStore, logger, distillerConfig);
+    this.filePath = persistConfig?.filePath ?? getRulesFile();
+    this.persistLogger = logger ?? createLogger({ component: 'PersistentStrategyDistiller' });
+
+    const dataDir = persistConfig?.dataDir;
+    ensureLearningDir(dataDir);
+    this.hydrate();
+  }
+
+  /**
+   * An existing but unreadable rules.json is not overwritten by the first-route
+   * trigger: it may hold rules written by a newer build, or be recoverable by
+   * hand. It is logged and skipped; the in-process counter still distills.
+   */
+  override checkPersistedTrigger(): boolean {
+    if (!this.snapshotUnreadable) return super.checkPersistedTrigger();
+    this.persistLogger.warn('rules.json is unreadable; first-route distill skipped', {
+      path: this.filePath,
+    });
+    return false;
+  }
+
+  /** Override distill to persist rules after each run. */
+  override distill(): void {
+    super.distill();
+    this.saveSnapshot();
+  }
+
+  // ==========================================================================
+  // Private
+  // ==========================================================================
+
+  private hydrate(): void {
+    if (!existsSync(this.filePath)) {
+      this.persistLogger.debug('No rules file found, starting fresh', {
+        path: this.filePath,
+      });
+      return;
+    }
+
+    try {
+      const content = readFileSync(this.filePath, 'utf-8');
+      const parsed: unknown = JSON.parse(content);
+      const result = RulesSnapshotSchema.safeParse(parsed);
+
+      if (!result.success) {
+        this.snapshotUnreadable = true;
+        this.persistLogger.warn('Rules file failed validation, starting fresh', {
+          path: this.filePath,
+          error: result.error.message,
+        });
+        return;
+      }
+
+      const hydrated = result.data.rules.map((raw) => hydrateRule(raw, this.config));
+      const legacyIds = hydrated.filter((h) => h.legacy).map((h) => h.rule.id);
+      if (legacyIds.length > 0) {
+        this.persistLogger.debug(
+          'Hydrated legacy rules without support/effect; derived them under the current thresholds (#5004)',
+          { legacyCount: legacyIds.length, ruleIds: legacyIds, path: this.filePath }
+        );
+      }
+
+      this.loadRules(hydrated.map((h) => h.rule));
+      this.restoreSnapshotTime(result.data);
+      this.persistLogger.info('Hydrated distilled rules from disk', {
+        ruleCount: hydrated.length,
+        savedAt: result.data.savedAt,
+        path: this.filePath,
+      });
+    } catch (error: unknown) {
+      this.snapshotUnreadable = true;
+      const msg = error instanceof Error ? error.message : String(error);
+      this.persistLogger.warn('Failed to hydrate rules from disk', {
+        error: msg,
+        path: this.filePath,
+      });
+    }
+  }
+
+  /**
+   * The snapshot's `savedAt` is the last distill time the first-route trigger
+   * compares outcomes against (#6512). An unparseable one restores nothing, so
+   * every eligible outcome counts, which errs toward distilling.
+   */
+  private restoreSnapshotTime(snapshot: RulesSnapshot): void {
+    const savedAtMs = Date.parse(snapshot.savedAt);
+    if (Number.isNaN(savedAtMs)) return;
+    this.restoreDistillState(savedAtMs, snapshot.eligibleOutcomes);
+  }
+
+  private saveSnapshot(): void {
+    const rules = this.getRules();
+    const stats = this.getStats();
+    const snapshot: RulesSnapshot = {
+      version: 1,
+      savedAt: new Date(stats.lastDistillAt ?? Date.now()).toISOString(),
+      rules: rules as DistilledRule[],
+      ...(stats.eligibleOutcomesAtLastDistill === undefined
+        ? {}
+        : { eligibleOutcomes: stats.eligibleOutcomesAtLastDistill }),
+    };
+
+    // PID-suffixed temp path so two processes saving concurrently don't truncate each
+    // other's temp file mid-renameSync. Matches the convention in correlation-persistence.ts
+    // and research-auto-catalog.ts. Closes #2972.
+    const tmpPath = `${this.filePath}.tmp.${String(process.pid)}`;
+    try {
+      // Ensure parent directory exists
+      ensureLearningDir(dirname(this.filePath));
+      // Atomic write: temp file + rename
+      writeFileSync(tmpPath, JSON.stringify(snapshot, null, 2), 'utf-8');
+      renameSync(tmpPath, this.filePath);
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.persistLogger.warn('Failed to persist rules to disk', {
+        error: msg,
+        path: this.filePath,
+      });
+      // Clean up temp file on failure
+      try {
+        if (existsSync(tmpPath)) unlinkSync(tmpPath);
+      } catch (cleanupErr: unknown) {
+        const msg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+        this.persistLogger.debug('Failed to clean up temp file during persist', {
+          path: tmpPath,
+          error: msg,
+        });
+      }
+    }
+  }
+}
+
+// Self-register factory so CompositeRouter can create PersistentStrategyDistiller
+// without a circular top-level import.
+registerPersistentDistillerFactory(
+  (outcomeStore, logger) => new PersistentStrategyDistiller(outcomeStore, undefined, logger)
+);
+
+/**
+ * Phase 5 of #2792 — read the persisted distilled rules from disk
+ * without needing a live `StrategyDistiller` instance.
+ *
+ * `ContextRetriever` uses this so `UnifiedContext.priorStrategies`
+ * surfaces the routing learnings the CompositeRouter has already
+ * derived, even when the consumer is in a different process / scope
+ * (e.g. an `orchestrate` invocation that hasn't constructed its own
+ * router yet).
+ *
+ * Returns `[]` when the file is missing, corrupt, or unreadable; never
+ * throws. The caller is responsible for filtering to status / category as
+ * appropriate — this loader returns the raw rule set so future consumers can
+ * apply their own predicates.
+ *
+ * Legacy records (no `support`/`effect`, #5004) are lifted under
+ * `DEFAULT_DISTILLER_CONFIG` thresholds: there is no distiller instance here
+ * to read a live config from.
+ */
+export function loadPersistedRules(
+  filePath: string = getRulesFile(),
+  logger?: Pick<ILogger, 'warn'>
+): readonly DistilledRule[] {
+  if (!existsSync(filePath)) return [];
+  try {
+    const content = readFileSync(filePath, 'utf-8');
+    const parsed: unknown = JSON.parse(content);
+    const result = RulesSnapshotSchema.safeParse(parsed);
+    if (!result.success) {
+      // NOT the same as an absent file. `RulesSnapshotSchema` is all-or-nothing
+      // — it pins `version: z.literal(1)` and each rule's `cli` to `RoutingArmIdSchema` —
+      // so one rule written by a newer build discards EVERY rule, including the
+      // valid ones. Returning `[]` silently would tell the consumer "nothing was
+      // learned" when the truth is "what was learned could not be read" (#5907).
+      logger?.warn('Rules file failed validation; treating as no rules', {
+        path: filePath,
+        issues: result.error.issues.length,
+      });
+      return [];
+    }
+    return result.data.rules.map((raw) => hydrateRule(raw, DEFAULT_DISTILLER_CONFIG).rule);
+  } catch (error: unknown) {
+    // Disk read / parse failures contribute an empty list — the consumer
+    // contract is "absence means no signal," never an exception. That half is
+    // right; conflating unreadable with absent is the half that was not, so the
+    // failure is now disclosed (#5907). The instance loader `hydrate()` has
+    // warned on this same case since it was written; this standalone path is the
+    // one `ContextRetriever` uses cross-process, and it stayed silent.
+    logger?.warn('Rules file could not be read; treating as no rules', {
+      path: filePath,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return [];
+  }
+}

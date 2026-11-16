@@ -1,0 +1,180 @@
+---
+diataxis: reference
+audience: user
+---
+
+# IModelAdapter Interface
+
+## Purpose
+
+`IModelAdapter` provides a unified interface for interacting with different AI model providers (Anthropic, OpenAI, Google, Ollama). It abstracts provider-specific APIs into a consistent contract.
+
+## Contract
+
+```typescript
+interface IModelAdapter {
+  /** Provider identifier (e.g., 'anthropic', 'openai') */
+  readonly providerId: string;
+
+  /** Model identifier (e.g., 'claude-sonnet-4', 'gpt-4o-2024-11-20') */
+  readonly modelId: string;
+
+  /** Capabilities this model supports */
+  readonly capabilities: readonly ModelCapability[];
+
+  /**
+   * Send a completion request.
+   * @param request - The completion request
+   * @returns Result with response or ModelError
+   */
+  complete(request: CompletionRequest): Promise<Result<CompletionResponse, ModelError>>;
+
+  /**
+   * Stream a completion request.
+   * @param request - The completion request
+   * @yields StreamChunk objects as they arrive
+   */
+  stream(request: CompletionRequest): AsyncIterable<StreamChunk>;
+
+  /**
+   * Count tokens in text.
+   * @param text - Text to count tokens for
+   * @returns Approximate token count
+   */
+  countTokens(text: string): Promise<number>;
+
+  /**
+   * Validate adapter configuration.
+   * @returns Ok if valid, ConfigError if invalid
+   */
+  validateConfig(): Result<void, ConfigError>;
+}
+```
+
+## Worker access-mode eligibility
+
+Worker dispatch queries the optional `supportsAccessMode(mode, signal)` method on the actual selected adapter before scheduling restricted work. It accepts only explicit `true`. Explicit `false` means unsupported; an absent method, unavailable adapter, malformed result, query error, or deadline leaves support unknown. If no measured compatible alternative exists, dispatch returns `UNSUPPORTED` without attempting a completion. Direct `complete` and `stream` calls retain their existing contract and enforcement checks.
+
+This is a breaking worker-availability change: custom adapters that previously participated without this query may now receive `UNSUPPORTED` with zero worker completion attempts when no measured compatible alternative exists. Forward evidence from the actual transport rather than returning a blanket `true`:
+
+```typescript
+// Inside an adapter wrapper that already holds its actual transport:
+supportsAccessMode: IModelAdapter['supportsAccessMode'] = (mode, signal) =>
+  this.transport.supportsAccessMode?.(mode, signal) ?? Promise.resolve(undefined);
+```
+
+Concrete built-in content-only API adapters declare their own support. Their subclasses remain unknown unless they explicitly implement the query for their actual execution behavior; a subclass may return `false`. CLI-backed adapters must declare native enforcement through the canonical bridge. The query does not grant permissions or replace the final access-mode enforcement check.
+
+## Supporting Types
+
+### CompletionRequest
+
+```typescript
+interface CompletionRequest {
+  messages: Message[];
+  systemPrompt?: string;
+  temperature?: number;
+  maxTokens?: number;
+  tools?: ToolDefinition[];
+  responseFormat?: ResponseFormat;
+  stop?: string[];
+}
+```
+
+### CompletionResponse
+
+```typescript
+interface CompletionResponse {
+  content: ContentBlock[];
+  usage: TokenUsage;
+  stopReason: StopReason;
+  model: string;
+}
+```
+
+### ModelCapability
+
+```typescript
+const ModelCapability = {
+  COMPLETION: 'completion',
+  STREAMING: 'streaming',
+  TOOL_USE: 'tool_use',
+  VISION: 'vision',
+  EXTENDED_THINKING: 'extended_thinking',
+} as const;
+```
+
+## Implementations
+
+| Adapter       | Provider  | Models                                               |
+| ------------- | --------- | ---------------------------------------------------- |
+| ClaudeAdapter | Anthropic | claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5 |
+| OpenAIAdapter | OpenAI    | gpt-4o-2024-11-20, gpt-4o-mini-2024-07-18, o1-pro    |
+| GeminiAdapter | Google    | gemini-3-pro, gemini-3-flash, gemini-2.5-flash       |
+| OllamaAdapter | Ollama    | llama3, mistral, codellama                           |
+
+## Usage Example
+
+Since 11.0, `OpenAIAdapter` and `createOpenAIAdapter` send `modelId` unchanged
+for both completions and streams. Use exact IDs such as `gpt-4o-2024-11-20`
+to retain the previously selected snapshot. `OPENAI_MODEL_ALIASES` and its
+rewriting are removed; `OPENAI_MODELS` remains available. Former alias names
+and unknown IDs pass through to the endpoint, which reports unsupported IDs
+through the adapter's normal error handling. The bundled registry does not map the
+former aliases to their old snapshot IDs, so no local unknown-model error is
+raised. `verbatimModelId` remains accepted as a compatibility no-op.
+
+```typescript
+import { type IModelAdapter, type Result, isOk } from 'nexus-agents';
+
+async function generateCode(adapter: IModelAdapter, prompt: string): Promise<string> {
+  const result = await adapter.complete({
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0.2,
+    maxTokens: 2000,
+  });
+
+  if (!isOk(result)) {
+    throw result.error;
+  }
+
+  const textContent = result.value.content.find((block) => block.type === 'text');
+  return textContent?.text ?? '';
+}
+```
+
+## Error Handling
+
+| Error                             | Cause           | Recovery               |
+| --------------------------------- | --------------- | ---------------------- |
+| `ModelError` (MODEL_UNAVAILABLE)  | API unavailable | Retry with backoff     |
+| `ModelError` (MODEL_RATE_LIMITED) | Rate limit hit  | Wait and retry         |
+| `ModelError` (MODEL_TIMEOUT)      | Request timeout | Retry or escalate      |
+| `ConfigError`                     | Invalid config  | Check API key/settings |
+
+## Testing
+
+```typescript
+import { describe, it, expect, vi } from 'vitest';
+import type { IModelAdapter } from 'nexus-agents';
+
+describe('IModelAdapter', () => {
+  it('should complete a request', async () => {
+    const mockAdapter: IModelAdapter = {
+      providerId: 'test',
+      modelId: 'test-model',
+      capabilities: ['completion'],
+      complete: vi.fn().mockResolvedValue({
+        ok: true,
+        value: { content: [{ type: 'text', text: 'Hello' }], ... }
+      }),
+      stream: vi.fn(),
+      countTokens: vi.fn().mockResolvedValue(10),
+      validateConfig: vi.fn().mockReturnValue({ ok: true, value: undefined }),
+    };
+
+    const result = await mockAdapter.complete({ messages: [] });
+    expect(result.ok).toBe(true);
+  });
+});
+```

@@ -1,0 +1,353 @@
+/**
+ * Readiness levels for a CLI adapter (#4376, #4351 criterion 7).
+ *
+ * Nothing in the tree could confirm that an adapter which *looks* healthy can
+ * actually serve a completion. `healthCheck()` proves the binary exists at an
+ * acceptable version; `cli-auth-probe` proves credentials are present and
+ * unexpired, and says so explicitly — "No live API calls." Neither proves the
+ * adapter serves anything.
+ *
+ * That is the state #4351 reported: every voter returned `stop_sequence` with
+ * zero tokens while every available check said healthy. The checks were not
+ * wrong; they were answering a narrower question than the caller assumed.
+ *
+ * ## Levels, and what each one actually proves
+ *
+ * | level           | proves                                    | costs |
+ * | --------------- | ----------------------------------------- | ----- |
+ * | `installed`     | the binary exists at a supported version  | none  |
+ * | `authenticated` | credentials are present and unexpired     | none  |
+ * | `serves`        | a real completion came back with content  | quota |
+ *
+ * `serves` is the only level that can catch #4351, and the only one that
+ * spends the resource it is measuring. It therefore runs **only when
+ * explicitly invoked** (`doctor --live`). Decided by a 7-voter `higher_order`
+ * panel on #4376 (5 of 6 approvers): the rejected alternative cached a probe
+ * result behind a TTL on the default path, which is a stale measurement
+ * presented as current readiness — the same defect this module exists to fix.
+ *
+ * ## Not-attempted is not a failure
+ *
+ * The load-bearing distinction. A level that was never run reports
+ * `not-attempted`, never `failed`. A reader must be able to tell "we checked
+ * and it does not serve" from "we did not check", because the second is the
+ * default state of every run that does not pass `--live`, and reporting it as
+ * either healthy or broken would be a claim nobody measured.
+ *
+ * @module cli/cli-readiness
+ * (Source: Issue #4376)
+ */
+
+import { resolveClassGuardMs } from '../config/timeouts.js';
+import type { CliName, CliTask, ExecutionOptions } from '../cli-adapters/types.js';
+import { classifyExtractedError } from '../cli-adapters/cli-error-envelope.js';
+import { isTimeoutText } from '../cli-adapters/cli-error-helpers.js';
+import { IN_FAMILY_FALLBACK_OPTION } from '../cli-adapters/adapters/claude-adapter.js';
+import { getTimeProvider } from '../core/index.js';
+import { sanitizeErrorDetails } from '../security/output-sanitizer.js';
+
+/** Ordered weakest to strongest. Each level subsumes the ones before it. */
+export const READINESS_LEVELS = ['installed', 'authenticated', 'serves'] as const;
+
+export type ReadinessLevel = (typeof READINESS_LEVELS)[number];
+
+/** Actionable failure category for a live completion. */
+type ProbeErrorClass = 'auth' | 'quota' | 'timeout' | 'sandbox' | 'execution';
+
+/** What a single level's check concluded. */
+export type LevelOutcome =
+  | { readonly status: 'verified'; readonly latencyMs?: number }
+  | { readonly status: 'failed'; readonly reason: string; readonly errorClass?: ProbeErrorClass }
+  /** Not run. Carries why, so the report can distinguish opt-out from error. */
+  | { readonly status: 'not-attempted'; readonly reason: string };
+
+/**
+ * The slot is served by a gateway model, not the CLI (#6720). Its CLI levels
+ * are not measured — the CLI is disabled or not available, and is not run —
+ * so only `serves` says anything, and it says it about the gateway model.
+ */
+export interface GatewayServedReadiness {
+  readonly gatewayModel: string;
+  /** Why the CLI does not serve the slot. */
+  readonly cliState: 'disabled' | 'not-available';
+  /**
+   * The main doctor CLI list admitted this CLI, while this run's own
+   * availability check found it not available (#6781). The two are separate
+   * health checks; this records that they disagreed.
+   */
+  readonly cliListAdmitted?: true;
+}
+
+export interface CliReadiness {
+  readonly cli: CliName;
+  readonly levels: Readonly<Record<ReadinessLevel, LevelOutcome>>;
+  /** Present when a gateway model serves the slot; the levels then describe it. */
+  readonly gateway?: GatewayServedReadiness;
+  /**
+   * The strongest level actually VERIFIED, or undefined when even `installed`
+   * failed. Never inferred from a level that was not attempted.
+   */
+  readonly reached?: ReadinessLevel;
+}
+
+/** Human-readable statement of what a level does and does not prove. */
+export const LEVEL_MEANING: Readonly<Record<ReadinessLevel, string>> = {
+  installed: 'binary present at a supported version — proves nothing about auth or serving',
+  authenticated: 'credentials present and unexpired, read locally — no API call was made',
+  serves: 'a real completion returned content — the only level that proves the adapter works',
+};
+
+/**
+ * The strongest verified level, stopping at the first gap.
+ *
+ * Stops rather than scanning for any verified level, because the ladder is
+ * cumulative: a `serves` verification below a failed `authenticated` would
+ * mean the two checks disagree, and reporting the higher one would paper over
+ * that. A `not-attempted` level stops the ladder exactly like a failure —
+ * absence of a check is not a pass.
+ */
+export function highestVerified(
+  levels: Readonly<Record<ReadinessLevel, LevelOutcome>>
+): ReadinessLevel | undefined {
+  let reached: ReadinessLevel | undefined;
+  for (const level of READINESS_LEVELS) {
+    if (levels[level].status !== 'verified') break;
+    reached = level;
+  }
+  return reached;
+}
+
+/** Assemble a readiness result, deriving `reached` from the outcomes. */
+export function buildReadiness(
+  cli: CliName,
+  levels: Readonly<Record<ReadinessLevel, LevelOutcome>>
+): CliReadiness {
+  const reached = highestVerified(levels);
+  return { cli, levels, ...(reached !== undefined ? { reached } : {}) };
+}
+
+/**
+ * Readiness of a slot a gateway model serves (#6720). `installed` and
+ * `authenticated` are the CLI's rungs and were not run — the CLI is not what
+ * serves — so they are `not-attempted` with that reason, and `reached` is
+ * `serves` exactly when the gateway model's completion came back.
+ */
+export function buildGatewayReadiness(
+  cli: CliName,
+  gateway: GatewayServedReadiness,
+  serves: LevelOutcome
+): CliReadiness {
+  const notRun: LevelOutcome = {
+    status: 'not-attempted',
+    reason: `the CLI is not run: gateway model ${gateway.gatewayModel} serves this slot`,
+  };
+  const levels = { installed: notRun, authenticated: notRun, serves };
+  return { cli, levels, gateway, ...(serves.status === 'verified' ? { reached: 'serves' } : {}) };
+}
+
+/** The header of one readiness entry. */
+function readinessSummary(readiness: CliReadiness): string {
+  const g = readiness.gateway;
+  if (g !== undefined) {
+    const why =
+      g.cliState === 'disabled'
+        ? 'CLI disabled by NEXUS_DISABLED_CLIS'
+        : g.cliListAdmitted === true
+          ? 'CLI not available: its health/auth check failed in this live run, but the CLI list above admitted it'
+          : 'CLI not available';
+    const verdict = readiness.reached === 'serves' ? 'serves' : 'not ready';
+    return `served by gateway model ${g.gatewayModel} (${why}) — ${verdict}`;
+  }
+  return readiness.reached === undefined ? 'not ready' : `ready through "${readiness.reached}"`;
+}
+
+/**
+ * Render one CLI's ladder, naming every level's state.
+ *
+ * Every level is printed, including the ones that did not run. A report that
+ * silently omitted `serves` would read as a clean bill of health from a run
+ * that never tested serving — which is precisely how #4351 went unnoticed.
+ */
+export function formatReadiness(readiness: CliReadiness): string {
+  // Exhaustive rather than a ternary chain (#4563): a new LevelOutcome status
+  // would otherwise fall into the '·' arm and render as "not attempted",
+  // quietly misreporting whatever the new state actually means.
+  const icon = (o: LevelOutcome): string => {
+    switch (o.status) {
+      case 'verified':
+        return '✓';
+      case 'failed':
+        return '✗';
+      case 'not-attempted':
+        return '·';
+      default: {
+        const exhaustive: never = o;
+        throw new Error(`Unhandled level outcome: ${JSON.stringify(exhaustive)}`);
+      }
+    }
+  };
+
+  const lines = READINESS_LEVELS.map((level) => {
+    const outcome = readiness.levels[level];
+    const detail =
+      outcome.status === 'verified'
+        ? outcome.latencyMs === undefined
+          ? ''
+          : ` — ok (${String(outcome.latencyMs)}ms)`
+        : ` — ${outcome.status === 'failed' && outcome.errorClass !== undefined ? `failed (${outcome.errorClass}): ` : ''}${outcome.reason}`;
+    return `      ${icon(outcome)} ${level}${detail}`;
+  });
+
+  return [`  ${readiness.cli}: ${readinessSummary(readiness)}`, ...lines].join('\n');
+}
+
+/** The minimal adapter surface the `serves` probe needs. */
+export interface ServesProbeTarget {
+  execute(
+    task: CliTask,
+    options?: ExecutionOptions
+  ): Promise<
+    { ok: true; value: { text: string } } | { ok: false; error: { message: string; code?: string } }
+  >;
+}
+
+/**
+ * The smallest prompt that still proves generation happened.
+ *
+ * Short on purpose — this level spends real quota, so it asks for the least
+ * that can distinguish "served content" from "returned nothing".
+ */
+export const SERVES_PROBE_PROMPT = 'Reply with the single word: ok';
+
+/**
+ * Probe whether an adapter actually serves a completion.
+ *
+ * The check that matters is **non-empty content**, not a successful exit.
+ * #4351's signature was every voter returning `stop_sequence` with zero
+ * tokens: the call succeeded and produced nothing. An adapter that returns
+ * `ok` with empty text has not served, and saying otherwise would reproduce
+ * the exact reading that made the incident invisible.
+ *
+ * Bounded by the `interactive` operation-class guard. Found by running it: an
+ * unbounded ladder over four adapters hung past two minutes with no output,
+ * and a readiness check that never returns is worse than one that reports a
+ * failure — the operator learns nothing either way, but waits for it. A
+ * timeout is itself a legitimate not-ready result, not an error.
+ *
+ * @param adapter - The adapter to probe.
+ * @param timeoutMs - Per-adapter ceiling; defaults to the interactive guard.
+ */
+export async function probeServes(
+  adapter: ServesProbeTarget,
+  timeoutMs: number = resolveClassGuardMs('interactive')
+): Promise<LevelOutcome> {
+  const startedAt = getTimeProvider().now();
+  const controller = new AbortController();
+  let result: Awaited<ReturnType<ServesProbeTarget['execute']>>;
+  try {
+    result = await withDeadline(
+      adapter.execute(
+        {
+          content: SERVES_PROBE_PROMPT,
+          maxTokens: 16,
+          timeoutMs,
+          options: { [IN_FAMILY_FALLBACK_OPTION]: false },
+        },
+        { timeoutMs, allowRetry: false, maxRetries: 0, signal: controller.signal }
+      ),
+      timeoutMs,
+      controller
+    );
+  } catch (caught: unknown) {
+    if (caught instanceof ProbeTimeout) {
+      return {
+        status: 'failed',
+        errorClass: 'timeout',
+        reason: `no response within ${String(Math.round(timeoutMs / 1000))}s`,
+      };
+    }
+    const message = caught instanceof Error ? caught.message : String(caught);
+    return probeFailure(message);
+  }
+
+  if (!result.ok) {
+    return probeFailure(result.error.message, result.error.code);
+  }
+  if (result.value.text.trim() === '') {
+    return {
+      status: 'failed',
+      errorClass: 'execution',
+      reason: 'call succeeded but returned no content — the #4351 signature',
+    };
+  }
+  return { status: 'verified', latencyMs: getTimeProvider().now() - startedAt };
+}
+
+/** Classify before redacting so secrets cannot reach a report or change its category. */
+function probeFailure(message: string, code?: string): LevelOutcome {
+  const classified = classifyExtractedError(message, '');
+  const errorClass: ProbeErrorClass =
+    code === 'TIMEOUT' || isTimeoutText(message)
+      ? 'timeout'
+      : code === 'RATE_LIMITED' || classified.code === 'RATE_LIMITED'
+        ? 'quota'
+        : code === 'NOT_AUTHENTICATED' || classified.code === 'NOT_AUTHENTICATED'
+          ? 'auth'
+          : /sandbox|permission denied|eacces/i.test(message)
+            ? 'sandbox'
+            : 'execution';
+  return { status: 'failed', errorClass, reason: sanitizeProbeMessage(message) };
+}
+
+/** Redact configured credentials by value as well as recognizable credential shapes. */
+/**
+ * Shorter values are not redacted by value: a flag-like `X_KEY=1` would
+ * otherwise overwrite every "1" in the message. Real credentials are longer,
+ * and recognizable credential shapes are still caught by `sanitizeErrorDetails`.
+ */
+const MIN_REDACTED_VALUE_LENGTH = 8;
+
+function sanitizeProbeMessage(message: string): string {
+  let sanitized = sanitizeErrorDetails(message);
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value === undefined || value.length < MIN_REDACTED_VALUE_LENGTH) continue;
+    if (/(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?)$/i.test(name)) {
+      sanitized = sanitizeErrorDetails(sanitized, value);
+    }
+  }
+  return sanitized;
+}
+
+/** Raised when a probe outlives its ceiling. */
+class ProbeTimeout extends Error {}
+
+/**
+ * Race a promise against a deadline.
+ *
+ * The deadline also aborts the adapter's subprocess. Racing still bounds the
+ * wait when an adapter does not settle after cancellation.
+ */
+async function withDeadline<T>(
+  work: Promise<T>,
+  timeoutMs: number,
+  controller: AbortController
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new ProbeTimeout());
+      controller.abort(new DOMException('Live probe timed out', 'TimeoutError'));
+    }, timeoutMs);
+    // Deliberately NOT unref'd. An unref'd timer does not hold the event loop
+    // open, so if the probed call never settles and nothing else is pending,
+    // Node can exit at the await before the deadline fires — the guarantee
+    // voiding itself in precisely the case it exists for. `clearTimeout` in
+    // the finally is what stops it outliving a call that did settle.
+  });
+
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}

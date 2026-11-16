@@ -1,0 +1,797 @@
+/**
+ * Tests for Codex CLI Adapter (Subprocess)
+ *
+ * Verifies subprocess-based Codex adapter functionality.
+ * Now extends SubprocessCliAdapter (Issue #1140).
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { CodexCliAdapter } from './codex-adapter.js';
+import type { CliTask } from '../types.js';
+import {
+  getDefaultModelForCli,
+  getCliModelName,
+  getModelPricing,
+} from '../../config/model-config-helpers.js';
+import { getDefaultRegistry } from '../../config/model-registry.js';
+
+/** Expected default CLI model name, derived from the canonical registry. */
+const EXPECTED_DEFAULT_ID = getCliModelName(getDefaultModelForCli('codex'));
+
+/** A minimal successful `codex exec --json` stream. */
+const COMPLETED_NDJSON = [
+  JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+  JSON.stringify({
+    type: 'item.completed',
+    item: { id: 'item-1', type: 'agent_message', text: 'Done!' },
+  }),
+  JSON.stringify({ type: 'turn.completed' }),
+].join('\n');
+
+// Hoist the mock function so it's available during vi.mock()
+const mockExecAsync = vi.hoisted(() => vi.fn());
+
+// Mock child_process for subprocess execution
+vi.mock('node:child_process', () => ({
+  spawn: vi.fn(),
+  exec: vi.fn(),
+  execFile: vi.fn(),
+}));
+
+// Transport tests use a measured healthy host; sandbox behavior has its own suite.
+vi.mock('../codex-sandbox-preflight.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../codex-sandbox-preflight.js')>()),
+  codexSandboxPreflight: () => Promise.resolve({ status: 'ok' as const }),
+}));
+
+// Mock util.promisify to return our controlled async mock
+vi.mock('node:util', () => ({
+  promisify: vi.fn((_fn: unknown) => mockExecAsync),
+}));
+
+import { spawn } from 'node:child_process';
+
+type EventCallback = (...args: unknown[]) => void;
+
+function createMockProcess(
+  stdout: string,
+  stderr: string = '',
+  exitCode: number | null = 0
+): ReturnType<typeof spawn> {
+  const events: Record<string, EventCallback[]> = {};
+
+  const mockProcess = {
+    stdin: {
+      write: vi.fn(),
+      end: vi.fn(),
+    },
+    stdout: {
+      on: vi.fn((event: string, cb: EventCallback) => {
+        const key = `stdout_${event}`;
+        events[key] ??= [];
+        events[key].push(cb);
+        if (event === 'data') {
+          setTimeout(() => {
+            cb(Buffer.from(stdout));
+          }, 0);
+        }
+      }),
+    },
+    stderr: {
+      on: vi.fn((event: string, cb: EventCallback) => {
+        const key = `stderr_${event}`;
+        events[key] ??= [];
+        events[key].push(cb);
+        if (event === 'data' && stderr !== '') {
+          setTimeout(() => {
+            cb(Buffer.from(stderr));
+          }, 0);
+        }
+      }),
+    },
+    on: vi.fn((event: string, cb: EventCallback) => {
+      events[event] ??= [];
+      events[event].push(cb);
+      if (event === 'close') {
+        setTimeout(() => {
+          cb(exitCode);
+        }, 10);
+      }
+    }),
+    kill: vi.fn(),
+  };
+
+  return mockProcess as unknown as ReturnType<typeof spawn>;
+}
+
+describe('CodexCliAdapter (Subprocess)', () => {
+  let adapter: CodexCliAdapter;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    adapter = new CodexCliAdapter();
+  });
+
+  afterEach(async () => {
+    await adapter.dispose();
+  });
+
+  describe('constructor', () => {
+    it('should create adapter with default model', () => {
+      expect(adapter.name).toBe('codex');
+      expect(adapter.transport).toBe('subprocess');
+    });
+
+    it('should use custom model when provided', () => {
+      const customAdapter = new CodexCliAdapter({ model: 'o3-mini' });
+      expect(customAdapter.getModelInfo().id).toBe('o3-mini');
+    });
+
+    it('should accept custom logger', () => {
+      const mockLogger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        child: vi.fn().mockReturnThis(),
+        setLevel: vi.fn(),
+      };
+      const adapterWithLogger = new CodexCliAdapter({ logger: mockLogger });
+      expect(adapterWithLogger).toBeDefined();
+    });
+  });
+
+  describe('capabilities', () => {
+    it('should return correct capability profile', () => {
+      const caps = adapter.capabilities;
+
+      expect(caps.reasoning).toBe(10);
+      expect(caps.contextWindow).toBe(1_050_000);
+      expect(caps.codeGeneration).toBe(10);
+      expect(caps.speed).toBe(7);
+      // gpt-6.1-sol carries gpt-5.6-sol's unmeasured cost score 4 (#6842).
+      expect(caps.cost).toBe(4);
+    });
+  });
+
+  describe('getModelInfo()', () => {
+    it('omits cost info when the registry explicitly leaves the default unpriced', () => {
+      const registry = getDefaultRegistry();
+      const getEntry = registry.getEntry.bind(registry);
+      const modelId = getDefaultModelForCli('codex');
+      const spy = vi.spyOn(registry, 'getEntry').mockImplementation((id) => {
+        const entry = { ...getEntry(id) };
+        if (id === modelId) delete entry.pricing;
+        return entry;
+      });
+      try {
+        const info = adapter.getModelInfo();
+        expect(info.costPerMillionInput).toBeUndefined();
+        expect(info.costPerMillionOutput).toBeUndefined();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('should return correct model info for default model (from registry)', () => {
+      const info = adapter.getModelInfo();
+
+      // Default model is derived from canonical registry (gpt-6.1-sol → 'gpt-6.1-sol', #6842)
+      expect(info.id).toBe(EXPECTED_DEFAULT_ID);
+      expect(info.contextWindow).toBe(1_050_000);
+      expect(info.maxOutput).toBe(128_000);
+    });
+
+    it('should report canonical registry cost info for the default model', () => {
+      const info = adapter.getModelInfo();
+
+      const pricing = getModelPricing(getDefaultModelForCli('codex'));
+      expect(info.costPerMillionInput).toBe(pricing?.inputPer1M);
+      expect(info.costPerMillionOutput).toBe(pricing?.outputPer1M);
+    });
+
+    it('should return correct info for gpt-6-luna model (from registry)', () => {
+      const miniAdapter = new CodexCliAdapter({ model: 'gpt-6-luna' });
+      const info = miniAdapter.getModelInfo();
+
+      expect(info.id).toBe('gpt-6-luna');
+      // gpt-6-luna is codex-5.1-mini's cliModelName since codex-cli 0.155.1
+      // stopped serving gpt-5.4-mini (#5091 → 2026-09-23 remap): models.dev /
+      // LiteLLM pricing {0.1, 0.5}, 1.05M context.
+      expect(info.costPerMillionInput).toBe(0.1);
+      expect(info.costPerMillionOutput).toBe(0.5);
+      expect(info.contextWindow).toBe(1_050_000);
+    });
+
+    it('should return legacy costs for non-canonical model', () => {
+      const o4Adapter = new CodexCliAdapter({ model: 'o4-mini' });
+      const info = o4Adapter.getModelInfo();
+
+      expect(info.id).toBe('o4-mini');
+      expect(info.name).toBe('O4 Mini');
+      // o4-mini not in registry — uses legacy fallback
+      expect(info.costPerMillionInput).toBe(1.1);
+      expect(info.costPerMillionOutput).toBe(4.4);
+    });
+
+    it('should use default costs for unknown model', () => {
+      const unknownAdapter = new CodexCliAdapter({ model: 'codex-unknown' });
+      const info = unknownAdapter.getModelInfo();
+
+      expect(info.costPerMillionInput).toBe(1.1);
+      expect(info.costPerMillionOutput).toBe(4.4);
+    });
+  });
+
+  describe('argument building', () => {
+    it('should build correct arguments for basic task', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'Hello from Codex!' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = {
+        content: 'Say hello',
+      };
+
+      await adapter.execute(task);
+
+      // Default model from registry is always passed via -m flag
+      expect(spawn).toHaveBeenCalledWith(
+        'codex',
+        expect.arrayContaining([
+          'exec',
+          '--json',
+          '-m',
+          EXPECTED_DEFAULT_ID,
+          '--skip-git-repo-check',
+        ]),
+        expect.any(Object)
+      );
+
+      // The sandbox flag is a SAFETY control, and arrayContaining cannot catch
+      // its removal or loosening (#5723): every other assertion in this file is
+      // omission-free, so `-s danger-full-access` — write access to the user's
+      // tree on every routed codex exec — passed the whole suite.
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      expect(args[args.indexOf('-s') + 1]).toBe('read-only');
+    });
+
+    it('passes prompt through stdin without putting prompt text in argv', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'Done!' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = {
+        content: 'Complex "task" with quotes',
+      };
+
+      await adapter.execute(task);
+
+      const calls = vi.mocked(spawn).mock.calls;
+      const args = calls[0]?.[1] as string[];
+      expect(args).not.toContain(task.content);
+      expect(args.at(-1)).toBe('-');
+      expect(mockProcess.stdin?.write).toHaveBeenCalledWith(task.content);
+      expect(mockProcess.stdin?.end).toHaveBeenCalled();
+    });
+
+    it('keeps a 200 KiB prompt out of spawned argv and writes it intact to stdin', async () => {
+      const mockProcess = createMockProcess(COMPLETED_NDJSON);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+      const content = 'x'.repeat(200 * 1024);
+
+      expect((await adapter.execute({ content })).ok).toBe(true);
+
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      expect(args.includes(content)).toBe(false);
+      expect(args.at(-1)).toBe('-');
+      expect(mockProcess.stdin?.write).toHaveBeenCalledWith(content);
+      expect(mockProcess.stdin?.end).toHaveBeenCalled();
+    });
+
+    it('should always skip git repo check', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'Done!' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = { content: 'Test' };
+      await adapter.execute(task);
+
+      const calls = vi.mocked(spawn).mock.calls;
+      const args = calls[0]?.[1] as string[];
+      expect(args).toContain('--skip-git-repo-check');
+    });
+
+    it('should use task model over default when provided', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'From mini!' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = {
+        content: 'Quick task',
+        model: 'o3-mini',
+      };
+
+      await adapter.execute(task);
+
+      const calls = vi.mocked(spawn).mock.calls;
+      const args = calls[0]?.[1] as string[];
+      expect(args).toContain('-m');
+      expect(args).toContain('o3-mini');
+    });
+
+    // #5091: task.model carries the canonical registry id (resolve-model-for-tier →
+    // composite-router → orchestrate-command), which the codex binary rejects.
+    it('translates a registry id in task.model to the codex slug (#5091)', async () => {
+      const mockProcess = createMockProcess(COMPLETED_NDJSON);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      await adapter.execute({ content: 'Task', model: 'codex-5.3' });
+
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      expect(args[args.indexOf('-m') + 1]).toBe('gpt-5.6-terra');
+      expect(args).not.toContain('codex-5.3');
+    });
+
+    it('passes a task.model that is already a codex slug through unchanged (#5091)', async () => {
+      const mockProcess = createMockProcess(COMPLETED_NDJSON);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      await adapter.execute({ content: 'Task', model: 'gpt-5.6-terra' });
+
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      expect(args[args.indexOf('-m') + 1]).toBe('gpt-5.6-terra');
+    });
+
+    it('passes a model unknown to the registry through verbatim and warns (#5091)', async () => {
+      const mockLogger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        child: vi.fn().mockReturnThis(),
+        setLevel: vi.fn(),
+      };
+      const loggedAdapter = new CodexCliAdapter({ logger: mockLogger });
+      const mockProcess = createMockProcess(COMPLETED_NDJSON);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      await loggedAdapter.execute({ content: 'Task', model: 'codex-unknown-xyz' });
+
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      expect(args[args.indexOf('-m') + 1]).toBe('codex-unknown-xyz');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('not in the model registry'),
+        expect.objectContaining({ model: 'codex-unknown-xyz' })
+      );
+    });
+
+    it('should include -m flag with model when model is specified', async () => {
+      const customAdapter = new CodexCliAdapter({ model: 'o3-mini' });
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'Safe!' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = { content: 'Test' };
+      await customAdapter.execute(task);
+
+      const calls = vi.mocked(spawn).mock.calls;
+      const args = calls[0]?.[1] as string[];
+      expect(args).toContain('-m');
+      expect(args).toContain('o3-mini');
+    });
+
+    it('should always include -m flag with registry default model', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'Default!' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = { content: 'Test' };
+      await adapter.execute(task);
+
+      const calls = vi.mocked(spawn).mock.calls;
+      const args = calls[0]?.[1] as string[];
+      // Default model from registry is always passed
+      expect(args).toContain('-m');
+      expect(args).toContain(EXPECTED_DEFAULT_ID);
+    });
+
+    it('honors task.systemPrompt via model_instructions_file (#1886)', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'ok' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = {
+        content: 'do the thing',
+        systemPrompt: 'You are a strict reviewer.',
+      };
+      await adapter.execute(task);
+
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      const cVal = args.find((a) => a.startsWith('model_instructions_file='));
+      expect(cVal).toMatch(/^model_instructions_file=.+instructions\.md$/);
+      // It is a `-c` override, not a bare positional (#6093 added a second
+      // `-c` on linux, so locate it by value rather than by first `-c`).
+      expect(args[args.indexOf(cVal as string) - 1]).toBe('-c');
+    });
+
+    it('cleans up tempdir parent after systemPrompt run (#2824 — file + dir, not just file)', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-tempdir' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'ok' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = {
+        content: 'whatever',
+        systemPrompt: 'You are a strict reviewer.',
+      };
+      await adapter.execute(task);
+
+      // Locate the tempdir from the spawned args, then confirm BOTH the
+      // file AND the parent dir are gone post-cleanup. Pre-fix the file
+      // was unlinked but the empty parent dir was leaked.
+      const args = vi.mocked(spawn).mock.calls.at(-1)?.[1] as string[];
+      const cVal = args.find((a) => a.startsWith('model_instructions_file=')) as string;
+      const match = cVal.match(/^model_instructions_file=(.+\/instructions\.md)$/);
+      expect(match).not.toBeNull();
+      const file = match![1] as string;
+      const dir = file.replace(/\/instructions\.md$/, '');
+      const { existsSync } = await import('node:fs');
+      expect(existsSync(file)).toBe(false);
+      expect(existsSync(dir)).toBe(false);
+    });
+
+    it('omits -c model_instructions_file when systemPrompt is empty', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'ok' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = { content: 'do the thing' };
+      await adapter.execute(task);
+
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      expect(args.some((a) => a.startsWith('model_instructions_file='))).toBe(false);
+    });
+  });
+
+  // #6093: on hosts with `kernel.apparmor_restrict_unprivileged_userns=1`
+  // every bwrap-backed codex sandbox fails before the model sees the tree.
+  // The legacy landlock backend reads and still refuses writes; it is only
+  // meaningful on Linux, so the token must be absent everywhere else.
+  describe('legacy landlock on linux (#6093)', () => {
+    const argvFor = async (platform: NodeJS.Platform): Promise<string[]> => {
+      vi.mocked(spawn).mockReturnValue(createMockProcess(COMPLETED_NDJSON));
+      const platformAdapter = new CodexCliAdapter({ platform });
+      await platformAdapter.execute({ content: 'Say hello' });
+      await platformAdapter.dispose();
+      return vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+    };
+
+    it('passes -c features.use_legacy_landlock=true after the sandbox flag on linux', async () => {
+      expect(await argvFor('linux')).toEqual([
+        'exec',
+        '--json',
+        '-m',
+        EXPECTED_DEFAULT_ID,
+        '-s',
+        'read-only',
+        '-c',
+        'features.use_legacy_landlock=true',
+        '--skip-git-repo-check',
+        '-',
+      ]);
+    });
+
+    it.each(['darwin', 'win32'] as const)('passes no landlock override on %s', async (platform) => {
+      expect(await argvFor(platform)).toEqual([
+        'exec',
+        '--json',
+        '-m',
+        EXPECTED_DEFAULT_ID,
+        '-s',
+        'read-only',
+        '--skip-git-repo-check',
+        '-',
+      ]);
+    });
+
+    it('defaults the platform gate to process.platform', async () => {
+      vi.mocked(spawn).mockReturnValue(createMockProcess(COMPLETED_NDJSON));
+      await adapter.execute({ content: 'Say hello' });
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      expect(args.includes('features.use_legacy_landlock=true')).toBe(process.platform === 'linux');
+    });
+  });
+
+  describe('selected sandbox args (#6841 item 3)', () => {
+    it.each([
+      { status: 'ok' as const, sandboxArgs: [] },
+      { status: 'ok' as const, sandboxArgs: ['-c', 'features.use_legacy_landlock=true'] },
+      { status: 'unknown' as const, reason: 'unmeasured', sandboxArgs: [] },
+    ])('uses the selected args for $status', async (measurement) => {
+      vi.mocked(spawn).mockReturnValue(createMockProcess(COMPLETED_NDJSON));
+      const selected = new CodexCliAdapter({ platform: 'linux', sandboxProbe: () => measurement });
+      const result = await selected.execute({ content: 'review' });
+      expect(result.ok).toBe(true);
+      expect(vi.mocked(spawn).mock.calls[0]?.[1]).toEqual([
+        'exec',
+        '--json',
+        '-m',
+        EXPECTED_DEFAULT_ID,
+        '-s',
+        'read-only',
+        ...measurement.sandboxArgs,
+        '--skip-git-repo-check',
+        '-',
+      ]);
+      await selected.dispose();
+    });
+
+    it.each(['linux', 'darwin'] as const)(
+      'retains compatibility for an injected unknown without args on %s',
+      async (platform) => {
+        vi.mocked(spawn).mockReturnValue(createMockProcess(COMPLETED_NDJSON));
+        const selected = new CodexCliAdapter({
+          platform,
+          sandboxProbe: () => ({ status: 'unknown', reason: 'injected old shape' }),
+        });
+        expect((await selected.execute({ content: 'review' })).ok).toBe(true);
+        const argv = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+        expect(argv.includes('features.use_legacy_landlock=true')).toBe(platform === 'linux');
+        await selected.dispose();
+      }
+    );
+  });
+
+  describe('execute()', () => {
+    it('should return successful response', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-123' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'Hello from Codex!' },
+        }),
+        JSON.stringify({
+          type: 'turn.completed',
+          usage: { input_tokens: 15, output_tokens: 25 },
+        }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = { content: 'Greet me' };
+      const result = await adapter.execute(task);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.text).toBe('Hello from Codex!');
+      }
+    });
+
+    it('should extract session ID from response', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'codex-session-789' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'Continuing...' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = { content: 'Continue' };
+      const result = await adapter.execute(task);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.sessionId).toBe('codex-session-789');
+      }
+    });
+
+    it('should handle parse errors gracefully', async () => {
+      const mockProcess = createMockProcess('not valid json', '', 0);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = { content: 'Test' };
+      const result = await adapter.execute(task);
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe('PARSE_ERROR');
+      }
+    });
+
+    it('should handle ENOENT errors', async () => {
+      const errorProcess = {
+        stdin: { write: vi.fn(), end: vi.fn() },
+        stdout: { on: vi.fn() },
+        stderr: { on: vi.fn() },
+        on: vi.fn((event: string, cb: EventCallback) => {
+          if (event === 'error') {
+            setTimeout(() => {
+              cb(new Error('spawn codex ENOENT'));
+            }, 0);
+          }
+        }),
+        kill: vi.fn(),
+      } as unknown as ReturnType<typeof spawn>;
+
+      vi.mocked(spawn).mockReturnValue(errorProcess);
+
+      const task: CliTask = { content: 'Test' };
+      const result = await adapter.execute(task);
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe('NOT_FOUND');
+        expect(result.error.message).toContain('codex CLI not found');
+      }
+    });
+
+    it('should handle non-zero exit codes with stderr', { timeout: 15_000 }, async () => {
+      const mockProcess = createMockProcess('', 'API rate limit exceeded', 1);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      const task: CliTask = { content: 'Test' };
+      const result = await adapter.execute(task);
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        // Stderr "rate limit" classified as RATE_LIMITED (#1401)
+        expect(result.error.code).toBe('RATE_LIMITED');
+        expect(result.error.message).toContain('API rate limit exceeded');
+      }
+    });
+  });
+
+  describe('healthCheck()', () => {
+    it('should return healthy status when CLI is available', async () => {
+      // BaseCliAdapter.getVersion() uses execAsync (promisified exec)
+      mockExecAsync.mockResolvedValue({ stdout: 'codex version 0.77.0' });
+
+      const status = await adapter.healthCheck();
+
+      expect(status.healthy).toBe(true);
+      expect(status.version).toBe('0.77.0');
+    });
+
+    it('should return unhealthy status when CLI is not found', async () => {
+      mockExecAsync.mockRejectedValue(new Error('ENOENT'));
+
+      const status = await adapter.healthCheck();
+
+      expect(status.healthy).toBe(false);
+      expect(status.message).toBeDefined();
+    });
+  });
+
+  describe('getVersion()', () => {
+    it('should extract version from CLI output', async () => {
+      mockExecAsync.mockResolvedValue({ stdout: 'codex version 0.77.0' });
+
+      const version = await adapter.getVersion();
+
+      expect(version).toBe('0.77.0');
+    });
+
+    it('should cache version after first call', async () => {
+      mockExecAsync.mockResolvedValue({ stdout: 'codex version 0.77.0' });
+
+      await adapter.getVersion();
+      await adapter.getVersion();
+
+      // execAsync should only be called once due to caching
+      expect(mockExecAsync).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('getCapacity()', () => {
+    it('should lazy-init the tracker and return real codex defaults (#2714)', async () => {
+      // Pre-#2714 this test asserted the 100k DEFAULT_CAPACITY_FALLBACK
+      // because getCapacity() bailed when tracker was null without ever
+      // initializing it (Issue #1463 framed that as intentional, but
+      // doctor never called initialize() before getCapacity() so the
+      // fallback fired every time and produced fictional "100%" output).
+      // getCapacity() now lazy-inits — assert the real codex defaults.
+      const capacity = await adapter.getCapacity();
+
+      expect(capacity.remainingTokens).toBe(500_000); // codex DEFAULT_TOKEN_LIMIT
+      expect(capacity.remainingRequests).toBe(500); // codex DEFAULT_REQUEST_LIMIT
+      expect(capacity.rateLimited).toBe(false);
+      expect(capacity.utilizationPercent).toBe(0);
+    });
+  });
+
+  describe('lifecycle', () => {
+    it('should initialize successfully', async () => {
+      await expect(adapter.initialize()).resolves.not.toThrow();
+    });
+
+    it('should dispose successfully', async () => {
+      await adapter.initialize();
+      await expect(adapter.dispose()).resolves.not.toThrow();
+    });
+
+    it('should auto-initialize on first execute', async () => {
+      const ndjsonResponse = [
+        JSON.stringify({ type: 'thread.started', thread_id: 'auto-init-thread' }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item-1', type: 'agent_message', text: 'Auto-init!' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n');
+      const mockProcess = createMockProcess(ndjsonResponse);
+      vi.mocked(spawn).mockReturnValue(mockProcess);
+
+      // Don't call initialize explicitly
+      const task: CliTask = { content: 'Test auto-init' };
+      const result = await adapter.execute(task);
+
+      expect(result.ok).toBe(true);
+    });
+  });
+});

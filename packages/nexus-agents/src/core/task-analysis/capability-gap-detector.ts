@@ -1,0 +1,204 @@
+/**
+ * Capability Gap Detector (Issue #906)
+ *
+ * Cross-checks required capabilities from SharedTaskAnalyzer against
+ * available system capabilities (MCP tools, expert roles, workflows).
+ *
+ * Deterministic — no external calls needed. Uses static registries.
+ *
+ * @module core/task-analysis/capability-gap-detector
+ */
+
+import type { RequiredCapabilities } from './task-analysis-advocate.js';
+import { SUPPORTED_EXTENSIONS } from '../../indexer/supported-extensions.js';
+import { TOOL_MANIFEST } from '../../mcp/tools/tool-manifest.js';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/**
+ * Result of capability gap analysis.
+ */
+export interface CapabilityGapReport {
+  /** Capabilities that exist and can fulfill the request */
+  readonly available: AvailableCapabilities;
+  /** Capabilities needed but not available */
+  readonly gaps: readonly CapabilityGap[];
+  /** Whether all required capabilities are available */
+  readonly allSatisfied: boolean;
+}
+
+/**
+ * Available capabilities that matched requirements.
+ */
+export interface AvailableCapabilities {
+  readonly tools: readonly string[];
+  readonly experts: readonly string[];
+}
+
+/**
+ * Every kind of capability gap, as runtime data.
+ *
+ * The array is the single source and {@link CapabilityGapType} derives from it,
+ * so a validator that needs to check a type at runtime cannot drift from the
+ * union. It did: the persistence layer hardcoded `'tool' | 'expert'`, so every
+ * persisted `tool_refusal` was discarded as malformed on load — the producer
+ * wrote three entries and the next process read zero (#4651).
+ */
+export const CAPABILITY_GAP_TYPES = ['tool', 'expert', 'tool_refusal'] as const;
+
+/** What kind of capability gap this is. Derived from {@link CAPABILITY_GAP_TYPES}. */
+export type CapabilityGapType = (typeof CAPABILITY_GAP_TYPES)[number];
+
+/**
+ * A single capability gap with suggestion.
+ */
+export interface CapabilityGap {
+  /**
+   * What kind of gap this is.
+   *
+   * `tool` and `expert` are *registry* gaps — a task required something the
+   * registry does not contain. They are produced by {@link detectCapabilityGaps},
+   * including qualified requirements such as `extract_symbols:.py` whose
+   * tool exists but does not support the requested extension (#6930).
+   *
+   * `tool_refusal` is a *capability* gap of a different kind — a tool that
+   * exists, ran, and declined the work for a reason it can name. It is not
+   * derived from the registry diff; producers record it directly at the point
+   * of refusal. Added by the #4651 panel decision (option C, unanimous among
+   * approvers) because the registry diff could not represent it.
+   */
+  readonly type: CapabilityGapType;
+  readonly name: string;
+  readonly suggestion: string;
+  /**
+   * Inferred requirements versus refusals observed during execution.
+   * Undefined means legacy/unspecified provenance, retained by the recording
+   * flag filter without being relabeled as observed.
+   */
+  readonly origin?: 'inferred' | 'observed';
+}
+
+// ============================================================================
+// Static Registries — kept in sync with canonical sources
+// ============================================================================
+
+/**
+ * All registered MCP tool names — derived directly from the canonical
+ * {@link TOOL_MANIFEST} (#3566). Previously a hand-maintained copy guarded by a
+ * freshness test (#3553); now a one-way derivation. `tool-manifest.ts` is a
+ * pure-data leaf (imports nothing), so deriving from it keeps this hot-path,
+ * low-level analyzer module free of the MCP tool dependency graph — no cycle.
+ * Drift is impossible by construction.
+ */
+// #3597: manifest entries are now `{ name, ... }` objects — derive the name set.
+const AVAILABLE_TOOLS: ReadonlySet<string> = new Set(TOOL_MANIFEST.map((t) => t.name));
+
+/**
+ * All built-in expert role names (`{type}_expert`).
+ *
+ * Kept in lockstep with `BuiltInExpertTypeSchema` (`src/agents/experts/expert-config.ts`);
+ * enforced by the freshness assertions in `capability-gap-detector.test.ts` (#3553).
+ */
+const AVAILABLE_EXPERTS: ReadonlySet<string> = new Set([
+  'code_expert',
+  'architecture_expert',
+  'security_expert',
+  'documentation_expert',
+  'testing_expert',
+  'devops_expert',
+  'research_expert',
+  'pm_expert',
+  'ux_expert',
+  'infrastructure_expert',
+  'qa_expert',
+  'data-visualization_expert',
+]);
+
+/** Suggestions for common gaps */
+const TOOL_SUGGESTIONS: Readonly<Record<string, string>> = {
+  code_analysis: 'Use create_expert with code_expert role instead',
+  deploy: 'Use run_graph_workflow with a custom deployment template',
+  monitor: 'Use weather_report for CLI performance monitoring',
+};
+
+const EXPERT_SUGGESTIONS: Readonly<Record<string, string>> = {
+  data_expert: 'Use research_expert for data analysis tasks',
+  ml_expert: 'Use code_expert with ML-focused system prompt',
+  frontend_expert: 'Use ux_expert for UI concerns, code_expert for implementation',
+};
+
+// ============================================================================
+// Gap Detection
+// ============================================================================
+
+/** Qualified requirements need both a registered tool and supported qualifier. */
+function isToolAvailable(requirement: string): boolean {
+  const separator = requirement.indexOf(':');
+  if (separator === -1) return AVAILABLE_TOOLS.has(requirement);
+  const tool = requirement.slice(0, separator);
+  const qualifier = requirement.slice(separator + 1);
+  return (
+    AVAILABLE_TOOLS.has(tool) &&
+    tool === 'extract_symbols' &&
+    SUPPORTED_EXTENSIONS.includes(qualifier)
+  );
+}
+
+/**
+ * Detect capability gaps by comparing required vs available.
+ */
+export function detectCapabilityGaps(required: RequiredCapabilities): CapabilityGapReport {
+  const availableTools: string[] = [];
+  const availableExperts: string[] = [];
+  const gaps: CapabilityGap[] = [];
+
+  for (const tool of required.tools) {
+    if (isToolAvailable(tool)) {
+      availableTools.push(tool);
+    } else {
+      gaps.push({
+        type: 'tool',
+        origin: 'inferred',
+        name: tool,
+        suggestion:
+          TOOL_SUGGESTIONS[tool] ?? 'No direct equivalent — consider orchestrate for complex tasks',
+      });
+    }
+  }
+
+  for (const expert of required.experts) {
+    if (AVAILABLE_EXPERTS.has(expert)) {
+      availableExperts.push(expert);
+    } else {
+      gaps.push({
+        type: 'expert',
+        origin: 'inferred',
+        name: expert,
+        suggestion: EXPERT_SUGGESTIONS[expert] ?? 'Use create_expert with a custom configuration',
+      });
+    }
+  }
+
+  return {
+    available: { tools: availableTools, experts: availableExperts },
+    gaps,
+    // No declared requirements means no unmet requirements.
+    allSatisfied: gaps.length === 0,
+  };
+}
+
+/**
+ * Get the count of available tools.
+ */
+export function getAvailableToolCount(): number {
+  return AVAILABLE_TOOLS.size;
+}
+
+/**
+ * Get the count of available experts.
+ */
+export function getAvailableExpertCount(): number {
+  return AVAILABLE_EXPERTS.size;
+}

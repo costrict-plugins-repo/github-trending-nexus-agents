@@ -1,0 +1,259 @@
+/**
+ * nexus-agents/audit - Reasoning commitment for the vote record (#6263,
+ * #5748 step 1; panel decision 2026-09-14, option A amended with a salt)
+ *
+ * The committed governance ledger holds each voter's model-written reasoning
+ * INSIDE the record hash, so nothing can ever be removed from it without a
+ * `hash_mismatch`. On the digest tier (schema 1.13) a voter entry instead
+ * carries a per-entry salt, `reasoningNonce`, and a commitment to the text,
+ * `reasoningDigest = sha256(reasoningNonce ‖ reasoning)`; the record hash
+ * folds ONLY the digest. The OPENING — the text AND the nonce — travels on
+ * the record outside the hash, and the verifier re-opens the commitment
+ * whenever both are present — so while the opening is there the tier is
+ * exactly as tamper-evident as the one before it (editing text or nonce
+ * alone breaks the re-opening; editing both to another opening is a second
+ * preimage), and when a redaction drops text and nonce together (#6264)
+ * the original hash, and any signature over it, still verifies.
+ *
+ * The salt is the contrarian's amendment, and it is the SECRET, which is why
+ * it must be outside the hash (#6274 panel 1 rejected the fold that hashed
+ * it): an unsalted or public-salted digest over low-entropy boilerplate
+ * prose is dictionary-attackable once the plaintext is gone —
+ * `sha256(nonce ‖ guess)` confirms the guess — while a hashed salt could not
+ * be dropped at redaction without breaking the hash and the signature. With
+ * the 256-bit nonce dropped alongside the text the digest is an opaque
+ * commitment: no offline guessing. One fresh nonce per ENTRY, not per record,
+ * so two seats that answered with the same boilerplate do not reveal it
+ * through equal digests.
+ *
+ * Tier 1.15 (#7134) commits JSON.stringify({reasoning, conditions}) under
+ * the same per-entry nonce and digest. The full opening includes conditions;
+ * redaction removes them with the reasoning and nonce. 1.13/1.14 keep their
+ * original plain-reasoning preimages.
+ *
+ * Split out of `vote-record.ts` when the tier pushed that file past the
+ * line cap. Structural parameter types (not `VoterSummary`) so this module
+ * imports nothing from the record module and there is no cycle.
+ *
+ * @module audit/reasoning-commitment
+ */
+
+import * as crypto from 'node:crypto';
+
+/** A 32-byte value as lowercase hex — the shape of `reasoningNonce` and `reasoningDigest`. */
+export const HEX_256_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * A fresh per-entry salt for the reasoning commitment: 32 bytes from
+ * `crypto.randomBytes`, as lowercase hex.
+ */
+export function mintReasoningNonce(): string {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+/**
+ * The commitment a digest-tier voter entry makes to its reasoning:
+ * `sha256(reasoningNonce ‖ reasoning)`, over the UTF-8 bytes of the 64-char
+ * hex nonce followed by the UTF-8 bytes of the text AS STORED (already
+ * clipped by `clipForRecord`), so anyone can re-open it from the record
+ * alone on 1.13/1.14: `printf '%s%s' "$nonce" "$reasoning" | sha256sum`. The nonce is
+ * fixed-width, so the concatenation is unambiguous. On 1.15 callers pass
+ * the canonical JSON bundle from reasoningCommitmentText instead of plain text.
+ */
+export function computeReasoningDigest(reasoningNonce: string, reasoning: string): string {
+  return crypto.createHash('sha256').update(reasoningNonce).update(reasoning).digest('hex');
+}
+
+/**
+ * Canonical opening text: 1.15 bundles reasoning and conditions in fixed key
+ * order under the existing nonce/digest. Undefined conditions are omitted;
+ * [] stays explicit. Every older tier retains its plain-reasoning preimage.
+ */
+export function reasoningCommitmentText(
+  version: string,
+  reasoning: string,
+  conditions?: readonly string[]
+): string {
+  return version === '1.15' ? JSON.stringify({ reasoning, conditions }) : reasoning;
+}
+
+/**
+ * The tiers whose voter hash folds the salted reasoning digest instead of the
+ * text. A set, not an equality, so a later tier can keep the same fold rule
+ * without a version comparison (step 2, #6264, needed no new tier: a redacted
+ * record keeps its version because the hash covers it). Tiers are labels:
+ * membership here is the ONLY thing that decides the fold, so an older record
+ * is never re-projected by a version comparison.
+ */
+const REASONING_DIGEST_TIERS: ReadonlySet<string> = new Set(['1.13', '1.14', '1.15']);
+
+/** True when `version` is a tier whose voter hash folds the digest, not the text. */
+export function isReasoningDigestTier(version: string): boolean {
+  return REASONING_DIGEST_TIERS.has(version);
+}
+
+/** Construct a commitment to the stored, already-clipped reasoning and conditions. */
+export function buildReasoningCommitment(
+  clipped: { text: string; truncated?: true },
+  version: string,
+  conditions?: readonly string[]
+): {
+  reasoning: string;
+  reasoningTruncated?: true;
+  reasoningNonce: string;
+  reasoningDigest: string;
+} {
+  const reasoningNonce = mintReasoningNonce();
+  return {
+    reasoning: clipped.text,
+    ...(clipped.truncated === true ? { reasoningTruncated: true as const } : {}),
+    reasoningNonce,
+    reasoningDigest: computeReasoningDigest(
+      reasoningNonce,
+      reasoningCommitmentText(version, clipped.text, conditions)
+    ),
+  };
+}
+
+/**
+ * Opening fields stay outside digest-tier hashes; commitment fields stay
+ * outside older text-tier hashes. 1.15 adds conditions to the opening.
+ * The clipping marker stays hashed on every tier (#6274).
+ */
+export function isUnhashedReasoningField(version: string, key: string): boolean {
+  if (!isReasoningDigestTier(version)) return key === 'reasoningNonce' || key === 'reasoningDigest';
+  return (
+    key === 'reasoning' || key === 'reasoningNonce' || (version === '1.15' && key === 'conditions')
+  );
+}
+
+/** Voter fields read by the reasoning commitment (including conditions on 1.15). */
+export interface ReasoningCommitmentFields {
+  readonly role: string;
+  readonly reasoning?: string | undefined;
+  readonly reasoningNonce?: string | undefined;
+  readonly reasoningDigest?: string | undefined;
+  readonly conditions?: readonly string[] | undefined;
+}
+
+/** A broken commitment SHAPE, at the voter key that is wrong. */
+export interface ReasoningCommitmentShapeDefect {
+  readonly key: 'reasoning' | 'reasoningNonce' | 'reasoningDigest' | 'conditions';
+  readonly message: string;
+}
+
+/** On a text-hashing tier the digest keys are unhashed decoration: neither may be present. */
+function textTierShapeDefect(v: ReasoningCommitmentFields): ReasoningCommitmentShapeDefect | null {
+  if (v.reasoningNonce !== undefined) {
+    return { key: 'reasoningNonce', message: 'reasoningNonce is a 1.13 key' };
+  }
+  if (v.reasoningDigest !== undefined) {
+    return { key: 'reasoningDigest', message: 'reasoningDigest is a 1.13 key' };
+  }
+  return null;
+}
+
+/**
+ * On the digest tier two rules hold the keys together. The OPENING rule:
+ * text ⇔ nonce — both present or both absent, because the two are opened and
+ * dropped as one (a text without its salt cannot be re-opened; a salt without
+ * its text opens nothing). The COMMITMENT rule: any entry that has reasoning
+ * carries `reasoningDigest`, the one hash-covered key. A digest with NO
+ * opening at all (text and nonce both absent) is a SHAPE this tier admits
+ * (#6264): it is what a redacted entry looks like, and whether it IS one is
+ * not a question of shape — {@link findReasoningCommitmentDefect} answers it
+ * from the redaction records in the set, and refuses it when none names the
+ * entry.
+ */
+function digestTierShapeDefect(
+  v: ReasoningCommitmentFields
+): ReasoningCommitmentShapeDefect | null {
+  const hasText = v.reasoning !== undefined;
+  const hasNonce = v.reasoningNonce !== undefined;
+  if (hasText && !hasNonce) {
+    return { key: 'reasoningNonce', message: 'reasoning without its reasoningNonce' };
+  }
+  if (hasNonce && !hasText) {
+    return { key: 'reasoning', message: 'reasoningNonce without the reasoning it opens' };
+  }
+  if (hasText && v.reasoningDigest === undefined) {
+    return { key: 'reasoningDigest', message: 'reasoning without its reasoningDigest' };
+  }
+  return null;
+}
+
+/**
+ * What a voter entry's reasoning commitment must look like on its tier, or
+ * `null` when it does. One rule, two consumers: the record schema's
+ * refinement turns a defect into a parse issue at the named key (so the
+ * write path and every reader refuse the line), and the verifier turns it
+ * into a `hash_mismatch` (so a typed record that never went through the
+ * schema still cannot verify).
+ */
+export function reasoningCommitmentShapeDefect(
+  digestTier: boolean,
+  v: ReasoningCommitmentFields,
+  conditionsTier = false
+): ReasoningCommitmentShapeDefect | null {
+  if (conditionsTier && v.conditions !== undefined && v.reasoning === undefined) {
+    return { key: 'conditions', message: 'conditions without the reasoning opening they share' };
+  }
+  return digestTier ? digestTierShapeDefect(v) : textTierShapeDefect(v);
+}
+
+/**
+ * The first voter entry whose reasoning commitment is broken, as a message
+ * naming the entry, or `null` when every commitment is sound.
+ *
+ * Three checks per entry: the shape rule ({@link reasoningCommitmentShapeDefect});
+ * when nonce and text are both present, the commitment itself,
+ * `reasoningDigest === sha256(nonce ‖ opening)` (plain reasoning before 1.15,
+ * bundled reasoning and conditions on 1.15); and when the digest is
+ * present with NO opening, that `redactedRoles` names the entry's role —
+ * the roles the redaction records in the set name on THIS record (#6264).
+ * The last is the named empty case: an opening gone with nothing recording
+ * its removal is the defect, not a redaction. On the digest tier the record
+ * hash cannot see the text OR the nonce, so THIS is what makes a text or
+ * nonce edited or dropped in place a verification failure rather than a
+ * silent change: the hash still matches, the commitment does not. A digest
+ * nobody re-opens would be a check that cannot fail.
+ *
+ * Used by `verifyVoteRecordSet` and by the caller-commits append script,
+ * which vets a source record's self-hash alone (its sequence census would
+ * misread a lone record) and needs the same commitment check so an edited
+ * text is refused BEFORE the committed line is written, not by the
+ * read-back afterwards. `redactedRoles` is REQUIRED so every caller states
+ * what it knows: the append script passes the empty set, because a record
+ * copied into the committed ledger must carry its openings.
+ */
+export function findReasoningCommitmentDefect(
+  record: {
+    readonly version: string;
+    readonly voters: readonly ReasoningCommitmentFields[];
+  },
+  redactedRoles: ReadonlySet<string>
+): string | null {
+  const digestTier = isReasoningDigestTier(record.version);
+  for (const [i, v] of record.voters.entries()) {
+    const where = `voters[${String(i)}] (${v.role})`;
+    const shape = reasoningCommitmentShapeDefect(digestTier, v, record.version === '1.15');
+    if (shape !== null) return `${where}: ${shape.message}`;
+    if (v.reasoningNonce === undefined || v.reasoning === undefined) {
+      if (v.reasoningDigest !== undefined && !redactedRoles.has(v.role)) {
+        return `${where}: reasoning commitment with its opening absent and no redaction record naming it (#6264)`;
+      }
+      continue;
+    }
+    const recomputed = computeReasoningDigest(
+      v.reasoningNonce,
+      reasoningCommitmentText(record.version, v.reasoning, v.conditions)
+    );
+    if (recomputed !== v.reasoningDigest) {
+      return (
+        `${where}: stored reasoningDigest=${String(v.reasoningDigest)} does not match ` +
+        `sha256(reasoningNonce ‖ opening)=${recomputed} — the opening was edited without re-committing`
+      );
+    }
+  }
+  return null;
+}

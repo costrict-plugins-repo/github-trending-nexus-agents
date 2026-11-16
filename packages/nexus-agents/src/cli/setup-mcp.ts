@@ -1,0 +1,557 @@
+/**
+ * nexus-agents setup MCP configuration
+ *
+ * MCP configuration helpers using Claude CLI's `claude mcp` commands.
+ *
+ * @module cli/setup-mcp
+ * (Source: Issue #363 - Auto-configure Claude CLI integration)
+ */
+
+import { execSync, execFileSync } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import type { McpJsonConfig, McpServerEntry } from './setup-types.js';
+import { getErrorMessage } from '../core/index.js';
+
+/** MCP entry for nexus-agents */
+export const NEXUS_AGENTS_MCP_ENTRY: McpServerEntry = {
+  command: 'nexus-agents',
+  args: ['--mode=server'],
+};
+
+/** MCP entry with npx for users who install globally */
+export const NEXUS_AGENTS_MCP_NPX_ENTRY: McpServerEntry = {
+  command: 'npx',
+  args: ['-y', 'nexus-agents@latest', '--mode=server'],
+};
+
+/**
+ * Result of MCP configuration attempt.
+ */
+export interface McpConfigResult {
+  success: boolean;
+  alreadyConfigured: boolean;
+  message: string;
+}
+
+/**
+ * Checks if nexus-agents MCP server is already configured in Claude CLI.
+ */
+export function isMcpServerConfigured(): boolean {
+  try {
+    const result = execSync('claude mcp get nexus-agents', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return result.includes('nexus-agents');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Maps scope option to Claude CLI `-s` flag value.
+ */
+function scopeToFlag(scope: 'user' | 'project'): string {
+  return scope === 'project' ? 'local' : 'user';
+}
+
+/**
+ * Removes existing MCP server configuration if present.
+ */
+function removeExistingMcpServer(scope: 'user' | 'project' = 'user'): void {
+  try {
+    execSync(`claude mcp remove nexus-agents -s ${scopeToFlag(scope)}`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    // Ignore removal errors
+  }
+}
+
+/**
+ * Adds MCP server to Claude CLI.
+ */
+function addMcpServer(useNpx: boolean, scope: 'user' | 'project' = 'user'): McpConfigResult {
+  const entry = useNpx ? NEXUS_AGENTS_MCP_NPX_ENTRY : NEXUS_AGENTS_MCP_ENTRY;
+  const jsonConfig = JSON.stringify(entry);
+  const scopeLabel = scope === 'project' ? 'project' : 'global';
+
+  try {
+    execFileSync(
+      'claude',
+      ['mcp', 'add-json', 'nexus-agents', jsonConfig, '-s', scopeToFlag(scope)],
+      {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }
+    );
+    return {
+      success: true,
+      alreadyConfigured: false,
+      message: `Added nexus-agents MCP server to Claude Code (${scopeLabel})`,
+    };
+  } catch (error) {
+    const errorMsg = getErrorMessage(error);
+    return {
+      success: false,
+      alreadyConfigured: false,
+      message: `Failed to add MCP server: ${errorMsg}`,
+    };
+  }
+}
+
+/**
+ * Configures nexus-agents MCP server using Claude CLI.
+ *
+ * Uses `claude mcp add-json` to register the server.
+ * @param useNpx - Register via `npx -y nexus-agents` instead of a global binary
+ * @param force - Overwrite an existing nexus-agents MCP server entry
+ * @param scope - 'user' for global (~/.claude/mcp.json), 'project' for local (.mcp.json)
+ */
+export function configureMcpServer(
+  useNpx: boolean = false,
+  force: boolean = false,
+  scope: 'user' | 'project' = 'user'
+): McpConfigResult {
+  const isConfigured = isMcpServerConfigured();
+
+  // Check if already configured
+  if (!force && isConfigured) {
+    return {
+      success: true,
+      alreadyConfigured: true,
+      message: 'nexus-agents MCP server already configured (use --force to reconfigure)',
+    };
+  }
+
+  // Remove existing if forcing
+  if (force && isConfigured) {
+    removeExistingMcpServer(scope);
+  }
+
+  return addMcpServer(useNpx, scope);
+}
+
+/**
+ * Generates MCP configuration snippet for manual setup (fallback).
+ */
+export function generateMcpSnippet(useNpx: boolean = false): string {
+  const entry = useNpx ? NEXUS_AGENTS_MCP_NPX_ENTRY : NEXUS_AGENTS_MCP_ENTRY;
+  const config: McpJsonConfig = {
+    mcpServers: {
+      'nexus-agents': entry,
+    },
+  };
+
+  return JSON.stringify(config, null, 2);
+}
+
+/**
+ * Generates the full MCP config path based on scope.
+ *
+ * Claude Code uses:
+ * - Project scope: `.mcp.json` in project root
+ * - User scope: `~/.claude.json` (stores MCP config under `projects` key)
+ */
+export function getMcpJsonPath(scope: 'user' | 'project', projectRoot: string): string {
+  if (scope === 'project') {
+    return join(projectRoot, '.mcp.json');
+  }
+  return join(homedir(), '.claude.json');
+}
+
+// ============================================================================
+// Hook Configuration (Issue #411, #416)
+// ============================================================================
+
+/**
+ * Generates hook configuration for Claude CLI settings.json.
+ * (Source: Issue #411 - Claude CLI Hook Integration)
+ */
+export function generateHookConfig(): HookSettingsConfig {
+  return {
+    hooks: {
+      SessionStart: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: 'nexus-agents hooks session-start',
+            },
+          ],
+        },
+      ],
+      PreToolUse: [
+        {
+          matcher: 'Bash',
+          hooks: [
+            {
+              type: 'command',
+              command: 'nexus-agents hooks pre-tool --tool Bash --validate',
+            },
+          ],
+        },
+      ],
+      PostToolUse: [
+        {
+          matcher: '*',
+          hooks: [
+            {
+              type: 'command',
+              command: 'nexus-agents hooks post-tool --track-metrics',
+            },
+          ],
+        },
+      ],
+      Stop: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: 'nexus-agents hooks stop --check-tasks',
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * Hook command entry structure.
+ */
+interface HookCommandEntry {
+  type: 'command';
+  command: string;
+}
+
+/**
+ * Hook matcher entry structure.
+ */
+interface HookMatcherEntry {
+  matcher?: string;
+  hooks: HookCommandEntry[];
+}
+
+/**
+ * Hook settings configuration structure.
+ */
+export interface HookSettingsConfig {
+  hooks: {
+    SessionStart?: HookMatcherEntry[];
+    SessionEnd?: HookMatcherEntry[];
+    PreToolUse?: HookMatcherEntry[];
+    PostToolUse?: HookMatcherEntry[];
+    Stop?: HookMatcherEntry[];
+  };
+}
+
+/**
+ * Result of hook configuration attempt.
+ */
+export interface HookConfigResult {
+  success: boolean;
+  alreadyConfigured: boolean;
+  message: string;
+}
+
+/**
+ * Checks if hooks are already configured in Claude CLI settings.
+ */
+export function areHooksConfigured(): boolean {
+  try {
+    const result = execSync('claude config get hooks', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    // If we get output that includes nexus-agents, hooks are configured
+    return result.includes('nexus-agents');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detailed result of reading existing hooks. Distinguishes "no hooks set" from
+ * "the claude CLI returned content we couldn't parse" — they look the same to
+ * `getExistingHooks()` (both undefined) but mean very different things to the
+ * caller. Closes #2975: collapsing both into undefined caused `configureHooks`
+ * to silently overwrite the user's existing hooks when the claude CLI's JSON
+ * shape drifted (regressed #420 on the parse-failure path).
+ */
+export type ReadHooksResult =
+  | { kind: 'absent' }
+  | { kind: 'present'; hooks: HookSettingsConfig['hooks'] }
+  | { kind: 'unreadable'; reason: string }
+  | { kind: 'parse_failed'; reason: string; raw: string };
+
+/**
+ * Reads existing hooks from Claude CLI settings with full result detail.
+ * Callers should branch on `kind` before deciding whether to merge or abort.
+ */
+export function readExistingHooks(): ReadHooksResult {
+  let raw: string;
+  try {
+    raw = execSync('claude config get hooks', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    return { kind: 'unreadable', reason: getErrorMessage(error) };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === 'null' || trimmed === 'undefined') {
+    return { kind: 'absent' };
+  }
+  try {
+    return { kind: 'present', hooks: JSON.parse(trimmed) as HookSettingsConfig['hooks'] };
+  } catch (error) {
+    return { kind: 'parse_failed', reason: getErrorMessage(error), raw: trimmed };
+  }
+}
+
+/**
+ * Reads existing hooks from Claude CLI settings.
+ *
+ * Returns parsed hooks object or undefined if no hooks exist, the CLI call
+ * fails, or the response cannot be parsed. Loses the distinction between
+ * those cases — for the merge-vs-abort decision in `configureHooks` use
+ * `readExistingHooks()` directly. Kept for backward compatibility.
+ */
+export function getExistingHooks(): HookSettingsConfig['hooks'] | undefined {
+  const result = readExistingHooks();
+  return result.kind === 'present' ? result.hooks : undefined;
+}
+
+/**
+ * Hook commands earlier releases of `setup` installed. A re-run replaces a hook
+ * only when its command is one of these or a currently generated one (#6679).
+ * The strings did not change when #6679 fixed the parser that rejected them;
+ * add the old string here whenever `generateHookConfig` changes one.
+ */
+const LEGACY_NEXUS_HOOK_COMMANDS: readonly string[] = [
+  'nexus-agents hooks session-start',
+  'nexus-agents hooks pre-tool --tool Bash --validate',
+  'nexus-agents hooks post-tool --track-metrics',
+  'nexus-agents hooks stop --check-tasks',
+];
+
+/** The command of a hook, or undefined for hooks without one (e.g. `type: "prompt"`). */
+function hookCommandOf(hook: unknown): string | undefined {
+  if (typeof hook !== 'object' || hook === null) return undefined;
+  const command = (hook as { command?: unknown }).command;
+  return typeof command === 'string' ? command : undefined;
+}
+
+/** Every command string `setup` generates now or generated before. */
+function knownNexusCommands(generated: HookSettingsConfig['hooks']): ReadonlySet<string> {
+  const known = new Set(LEGACY_NEXUS_HOOK_COMMANDS);
+  for (const entries of Object.values(generated)) {
+    for (const entry of entries) {
+      for (const hook of entry.hooks) known.add(hook.command);
+    }
+  }
+  return known;
+}
+
+/**
+ * True only for a hook exactly as `setup` writes it: `{type, command}` with a
+ * known command and nothing else. A hook the user customized (a `timeout`, a
+ * different flag) is theirs and is never replaced.
+ */
+function isManagedHook(hook: unknown, known: ReadonlySet<string>): boolean {
+  const command = hookCommandOf(hook);
+  if (command === undefined || !known.has(command)) return false;
+  const keys = Object.keys(hook as object).sort();
+  return keys.length === 2 && keys[0] === 'command' && keys[1] === 'type';
+}
+
+/**
+ * Merges two hook arrays (#420, #6679). Removes only the individual hooks
+ * `setup` manages; every other hook stays, including the others in the same
+ * matcher entry. An entry is dropped only when nothing is left in it. The
+ * generated entries are appended last, so a second merge changes nothing.
+ */
+function mergeHookArrays(
+  existing: HookMatcherEntry[] | undefined,
+  newHooks: HookMatcherEntry[],
+  known: ReadonlySet<string>
+): HookMatcherEntry[] {
+  if (!existing || existing.length === 0) {
+    return newHooks;
+  }
+  const kept: HookMatcherEntry[] = [];
+  for (const entry of existing) {
+    const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
+    const remaining = hooks.filter((h) => !isManagedHook(h, known));
+    if (remaining.length === hooks.length) kept.push(entry);
+    else if (remaining.length > 0) kept.push({ ...entry, hooks: remaining });
+  }
+  return [...kept, ...newHooks];
+}
+
+/**
+ * nexus-agents hook commands a merge leaves alone because `setup` did not
+ * write them in that form. Reported so the user can reconcile them (#6679).
+ */
+function findUnmanagedNexusHooks(
+  existing: HookSettingsConfig['hooks'] | undefined,
+  generated: HookSettingsConfig['hooks']
+): string[] {
+  if (!existing) return [];
+  const known = knownNexusCommands(generated);
+  const found: string[] = [];
+  for (const entries of Object.values(existing)) {
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      for (const hook of Array.isArray(entry.hooks) ? entry.hooks : []) {
+        const command = hookCommandOf(hook);
+        if (command?.startsWith('nexus-agents') === true && !isManagedHook(hook, known)) {
+          found.push(command);
+        }
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Merges nexus-agents hooks with existing hooks configuration.
+ * Preserves existing user hooks while adding/updating nexus-agents hooks.
+ */
+export function mergeHookConfigs(
+  existing: HookSettingsConfig['hooks'] | undefined,
+  newConfig: HookSettingsConfig['hooks']
+): HookSettingsConfig['hooks'] {
+  if (!existing) {
+    return newConfig;
+  }
+
+  const hookTypes = ['SessionStart', 'SessionEnd', 'PreToolUse', 'PostToolUse', 'Stop'] as const;
+
+  // Start from a copy so hook types this merge does not manage (e.g. a user's
+  // UserPromptSubmit) survive: `setup` now rewrites on re-run (#6679), and a
+  // merge that dropped unknown types would delete them on every run.
+  const merged: HookSettingsConfig['hooks'] = { ...existing };
+  const known = knownNexusCommands(newConfig);
+
+  for (const hookType of hookTypes) {
+    const existingHooks = existing[hookType];
+    const newHooks = newConfig[hookType];
+
+    if (newHooks) {
+      merged[hookType] = mergeHookArrays(existingHooks, newHooks, known);
+    } else if (existingHooks) {
+      merged[hookType] = existingHooks;
+    }
+  }
+
+  return merged;
+}
+
+const ALREADY_CONFIGURED: HookConfigResult = {
+  success: true,
+  alreadyConfigured: true,
+  message: 'Hooks already configured (use --force to reconfigure)',
+};
+
+/**
+ * True when merging `generated` into `existing` would change nothing — the
+ * installed nexus-agents entries already match what `setup` generates.
+ */
+function hooksAreCurrent(
+  existing: HookSettingsConfig['hooks'],
+  generated: HookSettingsConfig['hooks']
+): boolean {
+  return JSON.stringify(mergeHookConfigs(existing, generated)) === JSON.stringify(existing);
+}
+
+/**
+ * Merges `generated` into `existing` and writes the result, unless `skipIfCurrent`
+ * and the merge would change nothing. Warns about nexus-agents hooks it kept
+ * because `setup` did not write them in that form (#6679). May throw.
+ */
+function mergeAndWriteHooks(
+  existing: HookSettingsConfig['hooks'] | undefined,
+  generated: HookSettingsConfig['hooks'],
+  skipIfCurrent: boolean
+): HookConfigResult {
+  const unmanaged = findUnmanagedNexusHooks(existing, generated);
+  const warning =
+    unmanaged.length === 0
+      ? ''
+      : ` Warning: left unrecognized nexus-agents hook(s) unchanged: ${unmanaged.join('; ')}.`;
+  if (skipIfCurrent && existing !== undefined && hooksAreCurrent(existing, generated)) {
+    return { ...ALREADY_CONFIGURED, message: ALREADY_CONFIGURED.message + warning };
+  }
+  const configJson = JSON.stringify(mergeHookConfigs(existing, generated));
+  execFileSync('claude', ['config', 'set', 'hooks', configJson], {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const base = existing
+    ? 'Merged nexus-agents hooks with existing hooks in Claude Code settings'
+    : 'Configured nexus-agents hooks in Claude Code settings';
+  return { success: true, alreadyConfigured: false, message: base + warning };
+}
+
+/**
+ * Configures hooks in Claude CLI settings.
+ * Uses `claude config set hooks` to register hook commands.
+ * Merges with existing hooks instead of overwriting them (Issue #420).
+ *
+ * A re-run without `force` rewrites nexus-agents entries that drifted from
+ * {@link generateHookConfig} and leaves current ones untouched (#6679), so an
+ * install from an older release converges instead of reporting "already
+ * configured" forever. When the existing hooks cannot be read as JSON the old
+ * short-circuit stands: there is nothing safe to merge into.
+ */
+export function configureHooks(force: boolean = false): HookConfigResult {
+  const isConfigured = areHooksConfigured();
+  const nexusHookConfig = generateHookConfig();
+
+  // Read existing hooks first to merge (Issue #420). Closes #2975: on
+  // parse_failed we MUST NOT proceed — silently overwriting an unparseable
+  // response is exactly how user hooks got wiped after claude-cli JSON-shape
+  // drifts. Surface the problem so the operator can fix the underlying
+  // condition (or pass --force after backing up their hooks).
+  const existing = readExistingHooks();
+
+  if (!force && isConfigured && existing.kind !== 'present') {
+    return ALREADY_CONFIGURED;
+  }
+  if (existing.kind === 'parse_failed') {
+    return {
+      success: false,
+      alreadyConfigured: false,
+      message:
+        'Refusing to configure hooks: existing hooks could not be parsed. ' +
+        'Overwriting would wipe your current settings. ' +
+        `Inspect with \`claude config get hooks\` and resolve manually. (parse error: ${existing.reason})`,
+    };
+  }
+  const existingHooks = existing.kind === 'present' ? existing.hooks : undefined;
+
+  try {
+    // Inside the try: the existing hooks are user JSON of any shape, and a
+    // throw here must fail this step, not crash `setup` (#6679).
+    return mergeAndWriteHooks(existingHooks, nexusHookConfig.hooks, !force && isConfigured);
+  } catch (error) {
+    const errorMsg = getErrorMessage(error);
+    return {
+      success: false,
+      alreadyConfigured: false,
+      message: `Failed to configure hooks: ${errorMsg}`,
+    };
+  }
+}
+
+/**
+ * Generates hook configuration snippet for manual setup.
+ */
+export function generateHookSnippet(): string {
+  const config = generateHookConfig();
+  return JSON.stringify(config, null, 2);
+}

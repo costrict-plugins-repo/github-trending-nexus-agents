@@ -1,0 +1,206 @@
+/**
+ * Loader for the bundled generated model registry (#3293).
+ *
+ * `model-registry.generated.json` is the broad (~1071-entry) LiteLLM/models.dev
+ * catalog that the legacy `CapabilityDiscovery` T2 tier resolved against. To
+ * complete the CapabilityDiscovery → ModelRegistry consolidation WITHOUT losing
+ * that breadth (owner decision: "connect the 1071, don't drop it"), the registry
+ * ingests these entries as a LOWEST-priority breadth tier: anything also present
+ * in-tree / manifest / models-dev wins; otherwise the registry now has real
+ * (litellm-sourced) context-window + pricing for the long tail instead of a bare
+ * derived default.
+ *
+ * Each raw record is converted to a full `ModelEntry` by deriving the behavior
+ * fields (`deriveEntry`) from the id's identity, then overlaying the catalog's
+ * concrete data (displayName, contextWindow, maxOutputTokens, pricing). The
+ * loader is fail-soft: a missing/malformed file yields no entries.
+ *
+ * @module config/models-generated-loader
+ */
+
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createLogger } from '../core/logger.js';
+import { previewNexusDataPath } from './nexus-data-dir.js';
+import { resolveModelIdentitySync } from './model-identity.js';
+import { deriveEntry } from './model-derivation.js';
+import type { ModelEntry, ModelPricingProvenance } from './model-registry.js';
+
+/** Shape of a record in `model-registry.generated.json`'s `entries` array. */
+interface GeneratedRecord {
+  readonly id?: unknown;
+  readonly displayName?: unknown;
+  readonly contextWindow?: unknown;
+  readonly maxOutputTokens?: unknown;
+  readonly pricing?: {
+    readonly inputPer1M?: unknown;
+    readonly outputPer1M?: unknown;
+    readonly cacheReadPer1M?: unknown;
+    readonly cacheWritePer1M?: unknown;
+  };
+  readonly pricingProvenance?: unknown;
+}
+
+interface GeneratedShape {
+  readonly version?: unknown;
+  readonly entries?: unknown;
+}
+
+export interface GeneratedLoadResult {
+  readonly entries: readonly ModelEntry[];
+  readonly path: string;
+  readonly status: 'loaded' | 'missing' | 'malformed';
+}
+
+function defaultGeneratedPath(): string {
+  // #3707: `registry refresh` writes the regenerated catalog to the DATA dir
+  // (nexusDataPath), but this loader historically read only the bundled PACKAGE
+  // copy — so a refresh was silently never picked up (even after #3185's
+  // reloadDefaultRegistry, which re-reads via this path). Prefer a refreshed file
+  // in the data dir when present, falling back to the bundled copy — the same
+  // data-dir > package precedence the overlay path already uses. The package dir
+  // is also often read-only under a global npm install, so the data dir is the
+  // only writable target a refresh has.
+  try {
+    const dataPath = previewNexusDataPath('model-registry.generated.json');
+    if (existsSync(dataPath)) return dataPath;
+  } catch {
+    // Fall through to the bundled package copy on any data-dir resolution error.
+  }
+  const here = dirname(fileURLToPath(import.meta.url));
+  return join(here, 'model-registry.generated.json');
+}
+
+/**
+ * Cache rates from a record, carried only when numeric (#5170).
+ *
+ * Spread-if-defined, deliberately: an absent rate must stay ABSENT rather than
+ * become 0. A zero would price a cache-heavy call as free, where absent makes
+ * `computeTokenCost` report the component unpriced. Roughly half the catalogue
+ * publishes no cache rate, so the absent path is the common one.
+ */
+function cacheRates(rec: GeneratedRecord): {
+  cacheReadPer1M?: number;
+  cacheWritePer1M?: number;
+} {
+  const read = rec.pricing?.cacheReadPer1M;
+  const write = rec.pricing?.cacheWritePer1M;
+  return {
+    ...(typeof read === 'number' && { cacheReadPer1M: read }),
+    ...(typeof write === 'number' && { cacheWritePer1M: write }),
+  };
+}
+
+/**
+ * Extract usable pricing from a raw catalog record.
+ *
+ * #4176: litellm carries placeholder $0/$0 rows for models it has no pricing
+ * for (e.g. `amazon-bedrock/anthropic.claude-mythos-preview`). Treating that
+ * as real pricing makes `computeCostDetail` report priced:true costUsd:0 — a
+ * measured $0 for what is actually UNMEASURED (#4165). Drop BOTH-zero pricing
+ * so the entry stays unpriced; one-sided zeros (free input tiers) are real
+ * and kept.
+ *
+ * #4209 exception: ids ending in `:free` (openrouter free tiers, e.g.
+ * `openrouter/meta-llama/llama-3.3-70b-instruct:free`) are GENUINELY free —
+ * their $0/$0 is real pricing, not a placeholder, and they exist ONLY in this
+ * generated catalog (not in-tree). They keep their pricing so the cost chain
+ * reports a measured $0 (priced: true) instead of falling to UNPRICED.
+ */
+function extractPricing(
+  rec: GeneratedRecord,
+  id: string
+):
+  | {
+      inputPer1M: number;
+      outputPer1M: number;
+      cacheReadPer1M?: number;
+      cacheWritePer1M?: number;
+    }
+  | undefined {
+  const inputPer1M = rec.pricing?.inputPer1M;
+  const outputPer1M = rec.pricing?.outputPer1M;
+  if (typeof inputPer1M !== 'number' || typeof outputPer1M !== 'number') return undefined;
+  if (inputPer1M === 0 && outputPer1M === 0 && !id.endsWith(':free')) return undefined;
+  return { inputPer1M, outputPer1M, ...cacheRates(rec) };
+}
+
+/** Keep the pricing caveat only when its official source and scope are intact. */
+function extractPricingProvenance(raw: unknown): ModelPricingProvenance | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  if (
+    value['source'] !== 'anthropic' ||
+    value['scope'] !== 'project-glasswing-participants' ||
+    value['upstreamUrl'] !== 'https://www.anthropic.com/project/glasswing'
+  ) {
+    return undefined;
+  }
+  return {
+    source: 'anthropic',
+    scope: 'project-glasswing-participants',
+    upstreamUrl: 'https://www.anthropic.com/project/glasswing',
+  };
+}
+
+/** Convert one raw catalog record into a `ModelEntry` (derived base + overlay). */
+function toModelEntry(rec: GeneratedRecord): ModelEntry | undefined {
+  if (typeof rec.id !== 'string' || rec.id === '') return undefined;
+  const id = rec.id;
+  const base = deriveEntry(id, resolveModelIdentitySync(id));
+  const pricing = extractPricing(rec, id);
+  const pricingProvenance =
+    pricing === undefined ? undefined : extractPricingProvenance(rec.pricingProvenance);
+  return {
+    ...base,
+    source: 'generated',
+    ...(typeof rec.displayName === 'string' ? { displayName: rec.displayName } : {}),
+    ...(typeof rec.contextWindow === 'number' ? { contextWindow: rec.contextWindow } : {}),
+    ...(typeof rec.maxOutputTokens === 'number' ? { maxOutputTokens: rec.maxOutputTokens } : {}),
+    ...(pricing !== undefined ? { pricing } : {}),
+    ...(pricingProvenance !== undefined ? { pricingProvenance } : {}),
+  };
+}
+
+/**
+ * Load the generated catalog as `ModelEntry[]`. Fail-soft: missing/malformed →
+ * empty (logged at warn). Records without a string `id` are skipped.
+ */
+export function loadGeneratedRegistryEntries(options?: {
+  readonly path?: string;
+}): GeneratedLoadResult {
+  const logger = createLogger({ component: 'models-generated' });
+  const path = options?.path ?? defaultGeneratedPath();
+
+  let exists = false;
+  try {
+    exists = existsSync(path);
+  } catch {
+    return { entries: [], path, status: 'missing' };
+  }
+  if (!exists) return { entries: [], path, status: 'missing' };
+
+  let parsed: GeneratedShape;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf-8')) as GeneratedShape;
+  } catch (e: unknown) {
+    logger.warn('generated registry parse failure; skipping', {
+      path,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return { entries: [], path, status: 'malformed' };
+  }
+
+  if (!Array.isArray(parsed.entries)) {
+    logger.warn('generated registry missing entries array; skipping', { path });
+    return { entries: [], path, status: 'malformed' };
+  }
+
+  const entries: ModelEntry[] = [];
+  for (const raw of parsed.entries as readonly GeneratedRecord[]) {
+    const entry = toModelEntry(raw);
+    if (entry !== undefined) entries.push(entry);
+  }
+  return { entries, path, status: 'loaded' };
+}

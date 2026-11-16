@@ -1,0 +1,146 @@
+---
+// Section index pages (#7199): /docs/start-here/, /docs/how-to/,
+// /docs/reference/, /docs/concepts/. The Primary nav links here. Each lists
+// its section's pages with their descriptions, from the same nav the rail
+// renders (getSiteNav), so the two cannot disagree.
+//
+// A docs page whose collection id equals a section slug would be shadowed by
+// this route; the build fails instead of silently dropping that page.
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import Callout from '../../components/Callout.astro';
+import { getPublishedDocs, getSiteNav } from '../../lib/docs-collection.ts';
+import {
+  PRIMARY_SECTIONS,
+  navLabel,
+  pageTypeLabel,
+  sectionIntro,
+  sectionLabel,
+  sectionListing,
+  sectionRouteCollisions,
+  sectionSlug,
+  type NavPage,
+  type PrimarySectionKey,
+} from '../../lib/docs-nav.ts';
+
+export async function getStaticPaths() {
+  const collisions = sectionRouteCollisions((await getPublishedDocs()).map((entry) => entry.id));
+  if (collisions.length > 0) {
+    throw new Error(
+      `docs page id(s) collide with section index routes: ${collisions.join(', ')}. ` +
+        'Rename the page or change the slug in website/src/lib/docs-nav.ts.',
+    );
+  }
+  return PRIMARY_SECTIONS.map((key) => ({ params: { section: sectionSlug(key) }, props: { key } }));
+}
+
+interface Props {
+  key: PrimarySectionKey;
+}
+
+const { key } = Astro.props;
+const label = sectionLabel(key);
+const intro = sectionIntro(key);
+const listing = sectionListing(await getSiteNav(), key);
+
+// Collection pattern (#7285, finding 14): each page is a heading link, its
+// description and plain-language tags. An unclassified or `none` page gets
+// no type tag (pageTypeLabel has none for `none`).
+const AUDIENCE_TAGS = { user: 'For users', project: 'For contributors' } as const;
+function tagsFor(page: NavPage): string[] {
+  const tags: string[] = [];
+  const typeTag = page.diataxis === undefined ? undefined : pageTypeLabel(page.diataxis);
+  if (typeTag !== undefined) tags.push(typeTag);
+  if (page.audience !== undefined) tags.push(AUDIENCE_TAGS[page.audience]);
+  return tags;
+}
+---
+
+<DocsLayout title={label} description={intro.summary} diataxis="none" sectionIndex={key}>
+  <h1>{label}</h1>
+  <p class="section-lead">{intro.summary}</p>
+
+  {listing.provisional && (
+    <Callout title="Provisional list">
+      <p>
+        No page has been classified into this section yet, so this list shows the unclassified
+        pages from the matching directory. It is replaced by the classified pages as the Diátaxis
+        backfill lands (<a href="https://github.com/nexus-substrate/nexus-agents/issues/7198">issue 7198</a>).
+      </p>
+    </Callout>
+  )}
+
+  {listing.pages.length === 0 ? (
+    <p>
+      No pages are classified into this section yet. Every published page is still reachable from
+      the documentation index.
+    </p>
+  ) : (
+    <ul class="collection">
+      {listing.pages.map((page) => {
+        const tags = tagsFor(page);
+        return (
+          <li class="collection-item">
+            {/* An H2 in the outline (it follows the page H1), sized as a sub-heading. */}
+            <h2 class="collection-heading"><a href={page.href}>{navLabel(page)}</a></h2>
+            <p class="collection-description">{page.description ?? 'No description yet.'}</p>
+            {tags.length > 0 && (
+              <ul class="collection-tags" aria-label="Page details">
+                {tags.map((tag) => <li>{tag}</li>)}
+              </ul>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  )}
+</DocsLayout>
+
+<style>
+  .section-lead {
+    font-size: var(--text-body-lg);
+    color: var(--color-fg-muted);
+  }
+  /* USWDS collection pattern on remarque tokens: hairline-separated items,
+     an upright sans heading link (remarque's h3 voice, not the serif-italic
+     definition-list term), description, then tags. */
+  .collection {
+    list-style: none;
+    margin: var(--space-6) 0 0;
+    padding: 0;
+    border-top: var(--border-width) var(--border-style) var(--color-border);
+  }
+  .collection-item {
+    margin: 0;
+    padding-block: var(--space-4);
+    border-bottom: var(--border-width) var(--border-style) var(--color-border);
+  }
+  .collection-heading {
+    margin: 0;
+    font-family: var(--font-body);
+    font-size: var(--text-body-lg);
+    font-style: normal;
+    font-weight: var(--weight-semibold);
+    line-height: var(--leading-meta);
+  }
+  .collection-description {
+    margin: var(--space-1) 0 0;
+    color: var(--color-fg-muted);
+  }
+  .collection-tags {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin: var(--space-2) 0 0;
+    padding: 0;
+  }
+  .collection-tags li {
+    margin: 0;
+    padding: 0 var(--space-2);
+    font-size: var(--text-meta);
+    line-height: 1.6;
+    color: var(--color-fg);
+    border: var(--border-width) var(--border-style) var(--color-border-bold);
+    border-radius: var(--radius-sm);
+  }
+</style>

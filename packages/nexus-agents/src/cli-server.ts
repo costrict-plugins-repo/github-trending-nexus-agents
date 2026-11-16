@@ -1,0 +1,598 @@
+/**
+ * nexus-agents CLI Server
+ *
+ * Server startup and shutdown handling for the CLI.
+ *
+ * @module cli-server
+ */
+
+import { createServer, connectTransport, type EventBusBridgeResult } from './mcp/index.js';
+import { initializeBuiltInTemplates } from './workflows/index.js';
+import { createUnifiedRegistry, type UnifiedAdapterRegistry } from './adapters/unified-registry.js';
+import { MCP_TIMEOUTS } from './config/timeouts.js';
+import { exitIfNestedSubprocessServer } from './cli-server-nesting-guard.js';
+import { registerMcpTools } from './cli-server-tools.js';
+import { parseTierOverrides, type GatewayConfig } from './mcp/gateway/index.js';
+import { StdioServerTransport } from './mcp/sdk-facade/index.js';
+import type { McpServer } from './mcp/sdk-types.js';
+import { createLogger, type ILogger, type LogDestination } from './core/index.js';
+import { beginWorkspaceRootResolution } from './mcp/workspace-roots.js';
+import { VERSION } from './version.js';
+import { warnIfVersionStale } from './cli/version-check.js';
+import { detectMode, type ServerMode, type ModeDetectionResult } from './cli/index.js';
+import { EXIT_CODES } from './cli-types.js';
+import type { SwarmObserver } from './observability/index.js';
+import { initializeSandbox, getSandboxMode } from './security/sandbox/index.js';
+import {
+  initializeSwarmObserver,
+  initializeEventBus,
+  recordServerStartup,
+  watchParentProcess,
+  createGracefulShutdown,
+  routeStderrEpipeToShutdown,
+  type ShutdownRequest,
+} from './cli-server-lifecycle.js';
+import { startOrchestratorMode, type OrchestratorModeOptions } from './cli-orchestrator.js';
+import {
+  loadConfig,
+  validateNexusEnv,
+  type ConfigLoadResult,
+  type AppConfig,
+} from './config/index.js';
+import { initializeExperts } from './cli-server-experts.js';
+import { wireGateway, resolveDefaultModelAdapter } from './cli-server-gateway.js';
+import { initializeSkillLibrary } from './cli-server-skills.js';
+import { initializeSica } from './cli-server-sica.js';
+import { initializeAuth } from './cli-server-auth.js';
+import { configureToolMemory } from './mcp/tools/tool-memory.js';
+import {
+  createShutdownCleanup,
+  trackInFlightToolCalls,
+  type InFlightToolCalls,
+} from './cli-server-shutdown.js';
+import {
+  initializeAuditLogger,
+  recordStartupComplete,
+  recordStartupFailure,
+  logSecurityConfig,
+  getPolicyValues,
+} from './cli-server-audit.js';
+import type { AuditLogger } from './audit/index.js';
+
+// Re-export for backward compatibility
+export { type OrchestratorModeOptions } from './cli-orchestrator.js';
+
+/**
+ * Sets up graceful shutdown handlers.
+ *
+ * @param cleanup - Async cleanup function to call on shutdown
+ * @param logger - Logger instance
+ * @returns The shared, bounded, run-once shutdown request. Parent death
+ *   (`watchParentProcess`) must call this too, not `process.exit` (#6560).
+ */
+export function setupShutdownHandlers(
+  cleanup: () => Promise<void>,
+  logger: ILogger
+): ShutdownRequest {
+  const handleShutdown = createGracefulShutdown({ cleanup, logger });
+  // A dead host's closed stderr pipe must not crash shutdown before the audit
+  // flush (#6573).
+  routeStderrEpipeToShutdown(handleShutdown);
+
+  // `handleShutdown` has an internal try/catch that calls `process.exit` on
+  // both success and failure, so the chance of an unhandled rejection is
+  // low. Attach `.catch` anyway — defence against future edits that might
+  // throw synchronously before the try block, and to make the error path
+  // explicit (#2163).
+  const onSignal = (signal: string) => (): void => {
+    handleShutdown(signal).catch((err: unknown) => {
+      logger.error('Shutdown handler crashed', err instanceof Error ? err : new Error(String(err)));
+      process.exit(EXIT_CODES.SHUTDOWN_ERROR);
+    });
+  };
+  process.on('SIGINT', onSignal('SIGINT'));
+  process.on('SIGTERM', onSignal('SIGTERM'));
+
+  // Handle uncaught errors
+  process.on('uncaughtException', (error: Error) => {
+    logger.error('Uncaught exception', error);
+    process.exit(EXIT_CODES.SERVER_START_FAILED);
+  });
+
+  process.on('unhandledRejection', (reason: unknown) => {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    logger.error('Unhandled rejection', error);
+    process.exit(EXIT_CODES.SERVER_START_FAILED);
+  });
+
+  return handleShutdown;
+}
+
+/**
+ * Logs startup information and mode detection details.
+ */
+export function logStartupInfo(
+  logger: ILogger,
+  detectionResult: ModeDetectionResult,
+  verbose: boolean
+): void {
+  logger.info('Starting Nexus Agents', {
+    version: VERSION,
+    mode: detectionResult.mode,
+    modeSource: detectionResult.source,
+    modeReason: detectionResult.reason,
+    detectionTimeMs: detectionResult.detectionTimeMs.toFixed(2),
+    nodeVersion: process.version,
+    platform: process.platform,
+  });
+
+  if (verbose) {
+    logger.debug('Mode detection signals', {
+      stdinIsTty: detectionResult.signals.stdinIsTty,
+      stdoutIsTty: detectionResult.signals.stdoutIsTty,
+      mcpClientName: detectionResult.signals.mcpClientName,
+      isCI: detectionResult.signals.isCI,
+      ciPlatform: detectionResult.signals.ciPlatform,
+      isContainer: detectionResult.signals.isContainer,
+    });
+  }
+}
+
+/**
+ * Validates that the requested mode is implemented.
+ * Exits with error for unimplemented modes (mesh only now).
+ *
+ * (Source: Issue #443 - Make unimplemented modes fail fast)
+ * (Source: Issue #446 - Implement orchestrator mode)
+ * (Source: Issue #932 - Remove misleading mesh claims)
+ */
+export function validateModeOrExit(logger: ILogger, mode: ServerMode): void {
+  if (mode === 'mesh') {
+    logger.error('Mesh mode is not yet implemented. Use --mode=server or --mode=orchestrator.');
+    process.exit(EXIT_CODES.INVALID_ARGS);
+  }
+  // Orchestrator mode is now implemented (Issue #446)
+}
+
+/**
+ * Loads and validates configuration from nexus-agents.yaml.
+ * (Source: Issue #472 - Wire AppConfigSchema to runtime)
+ */
+function loadAndLogConfig(logger: ILogger): ConfigLoadResult {
+  const result = loadConfig({ logger });
+
+  if (!result.ok) {
+    logger.error('Failed to load configuration', new Error(result.error.message));
+    process.exit(EXIT_CODES.SERVER_START_FAILED);
+  }
+
+  const configResult = result.value;
+  logger.info('Configuration loaded', {
+    configPath: configResult.configPath ?? '(defaults)',
+    usingDefaults: configResult.usingDefaults,
+    warningCount: configResult.warnings.length,
+    hasExperts: configResult.config.experts !== undefined,
+    hasWorkflows: configResult.config.workflows !== undefined,
+    hasSecurity: configResult.config.security !== undefined,
+  });
+
+  for (const warning of configResult.warnings) {
+    logger.warn(warning);
+  }
+
+  return configResult;
+}
+
+/**
+ * Creates the MCP server and handles creation failure.
+ * Exits process with SERVER_START_FAILED if creation fails.
+ *
+ * @returns The server instance with server and logger properties
+ */
+function createAndValidateMcpServer(logger: ILogger): {
+  readonly server: McpServer;
+  readonly logger: ILogger;
+} {
+  const serverResult = createServer({
+    name: 'nexus-agents',
+    version: VERSION,
+    logger,
+  });
+
+  if (!serverResult.ok) {
+    logger.error('Failed to create MCP server', new Error(serverResult.error.message));
+    process.exit(EXIT_CODES.SERVER_START_FAILED);
+  }
+
+  return serverResult.value;
+}
+
+/**
+ * Initializes the sandbox for agent execution isolation.
+ * Logs the sandbox configuration after initialization.
+ *
+ * @param logger - Logger for initialization messages
+ * @param sandboxConfig - Optional sandbox configuration from security config (Issue #483)
+ */
+async function initializeAndLogSandbox(
+  logger: ILogger,
+  sandboxConfig?: import('./config/index.js').SandboxConfig
+): Promise<void> {
+  const sandboxResult = await initializeSandbox(sandboxConfig);
+  logger.info('Sandbox initialized', {
+    mode: getSandboxMode(),
+    executor: sandboxResult.executor.name,
+    usedFallback: sandboxResult.usedFallback,
+    configuredMode: sandboxConfig?.mode ?? 'default',
+  });
+}
+
+/**
+ * Connects the MCP server to stdio transport.
+ * Exits process with SERVER_START_FAILED if connection fails.
+ */
+async function connectToStdioTransport(
+  server: McpServer,
+  logger: ILogger,
+  serverLogger: ILogger
+): Promise<void> {
+  // Defense-in-depth: stdio transport owns stdout for JSON-RPC frames.
+  // Force stderr before the transport opens so no log line can corrupt it.
+  logger.setDestination?.('stderr');
+  serverLogger.setDestination?.('stderr');
+  logger.info('Connecting to stdio transport');
+  // Resolve workspace root synchronously before transport opens (#5166).
+  // Precedence: NEXUS_PROJECT_DIR > CLAUDE_PROJECT_DIR (#7044) > process.cwd() > homedir.
+  beginWorkspaceRootResolution(serverLogger);
+  const transport = new StdioServerTransport();
+  const connectResult = await connectTransport(server, transport, serverLogger);
+
+  if (!connectResult.ok) {
+    logger.error('Failed to connect MCP server', new Error(connectResult.error.message));
+    process.exit(EXIT_CODES.SERVER_START_FAILED);
+  }
+
+  logger.info('MCP server started successfully');
+}
+
+/**
+ * Creates the unified adapter registry with pre-computed task routing.
+ * Adapter detection is still lazy (first use), but routing decisions
+ * are computed once at startup from the canonical model registry.
+ * (Source: Issue #1149 - Unified Adapter Registry)
+ */
+function createAdapterRegistry(logger: ILogger): UnifiedAdapterRegistry {
+  // The server default adapter has always used a flat orchestrate timeout.
+  // Global consumers keep their separate per-complexity CLI timeouts.
+  return createUnifiedRegistry({
+    logger,
+    defaultCliTimeoutMs: MCP_TIMEOUTS.perTool['orchestrate'] ?? MCP_TIMEOUTS.defaultMs,
+  });
+}
+
+/**
+ * Builds gateway config from application config + runtime logger.
+ * Converts schema-level string tier names to RequestTier enum values.
+ * (Source: Issue #897)
+ */
+function buildGatewayConfig(config: AppConfig, logger: ILogger): GatewayConfig {
+  const gatewaySection = config.gateway;
+  const enabled = gatewaySection?.enabled !== false;
+  const tierOverrides = parseTierOverrides(gatewaySection?.tierOverrides);
+  return {
+    enabled,
+    logger,
+    ...(tierOverrides !== undefined && { tierOverrides }),
+  };
+}
+
+/**
+ * Initializes and registers MCP tools with the server.
+ * Handles template loading, model adapter detection, and tool registration.
+ *
+ * @param server - MCP server instance
+ * @param logger - Logger for registration messages
+ * @param policyFirewall - Policy firewall for authorization
+ * @param config - Application configuration
+ * @param deps - Optional dependencies
+ */
+async function initializeAndRegisterTools(
+  server: McpServer,
+  logger: ILogger,
+  policyFirewall: import('./mcp/middleware/index.js').IPolicyFirewall,
+  config: import('./config/index.js').AppConfig,
+  deps?: {
+    auditLogger?: AuditLogger | null;
+  }
+): Promise<void> {
+  const { auditLogger } = deps ?? {};
+  logger.info('Loading built-in workflow templates');
+  const builtInTemplates = await initializeBuiltInTemplates();
+  logger.info('Loaded built-in templates', { count: builtInTemplates.size });
+
+  // Issue #1149: Unified registry — task routing computed at startup, detection lazy
+  const adapterRegistry = createAdapterRegistry(logger);
+  // #2502 (epic #2500 child 2): when the OpenAI-compat gateway is configured,
+  // it becomes the default model adapter. In sandbox mode the gateway is the
+  // only available channel to LLMs, so a missing or unreachable gateway is a
+  // hard startup failure (see tryWireGatewayAdapters for the matrix). Outside
+  // sandbox mode it's optional — falls through to the CLI-based default.
+  // #4392 inc 2 step 2: the same models are also registered once as the
+  // gateway's `api:<endpoint>` arm in `adapterRegistry` (breaker, cost
+  // declaration, later routing) — in any billing mode. The per-model adapters
+  // still go to the tools below.
+  const gatewayAdapters = await wireGateway(logger, adapterRegistry);
+  const modelAdapter = resolveDefaultModelAdapter(gatewayAdapters, adapterRegistry);
+  const toolsOptions = buildToolsOptions({
+    server,
+    logger,
+    builtInTemplates,
+    policyFirewall,
+    config,
+    modelAdapter,
+    gatewayAdapters,
+    auditLogger,
+  });
+  registerMcpTools(toolsOptions);
+}
+
+interface BuildToolsOptionsArgs {
+  server: McpServer;
+  logger: ILogger;
+  builtInTemplates: Awaited<ReturnType<typeof initializeBuiltInTemplates>>;
+  policyFirewall: import('./mcp/middleware/index.js').IPolicyFirewall;
+  config: AppConfig;
+  modelAdapter: unknown;
+  gatewayAdapters: unknown;
+  auditLogger?: AuditLogger | null | undefined;
+}
+
+/** Assembles options for registerMcpTools. */
+function buildToolsOptions(args: BuildToolsOptionsArgs): Parameters<typeof registerMcpTools>[0] {
+  const {
+    server,
+    logger,
+    builtInTemplates,
+    policyFirewall,
+    config,
+    modelAdapter,
+    gatewayAdapters,
+    auditLogger,
+  } = args;
+  const policyVals = getPolicyValues(config);
+  const options: Record<string, unknown> = {
+    server,
+    logger,
+    builtInTemplates,
+    policyFirewall,
+    executionMode: policyVals.defaultExec,
+    modelAdapter,
+    gatewayConfig: buildGatewayConfig(config, logger),
+  };
+  if (gatewayAdapters !== undefined) options['gatewayAdapters'] = gatewayAdapters;
+  if (config.security?.allowedPaths !== undefined) {
+    options['allowedPaths'] = config.security.allowedPaths;
+  }
+  if (config.security?.blockedPatterns !== undefined) {
+    options['blockedPatterns'] = config.security.blockedPatterns;
+  }
+  if (config.security !== undefined) options['securityConfig'] = config.security;
+  if (config.workflows !== undefined) options['workflowConfig'] = config.workflows;
+  if (auditLogger !== null && auditLogger !== undefined) options['auditLogger'] = auditLogger;
+  return options as unknown as Parameters<typeof registerMcpTools>[0];
+}
+
+/** Resolves the stdio log destination, warning once when stdout is requested. */
+function resolveStdioLogDestination(destination: LogDestination): LogDestination {
+  if (destination !== 'stdout') return destination;
+  // This startup warning must survive logging.level: error.
+  process.stderr.write(
+    'Warning: logging.destination: stdout coerced to stderr; ' +
+      'stdout carries MCP JSON-RPC in server mode.\n'
+  );
+  return 'stderr';
+}
+
+/**
+ * Applies logging configuration for the stdio server, reserving stdout for MCP.
+ * (Source: Issue #485 - Wire logging config)
+ */
+function applyLoggingConfig(logger: ILogger, verbose: boolean, config: AppConfig): void {
+  // Apply logging level from config - verbose flag takes precedence
+  if (!verbose && config.logging?.level !== undefined) {
+    logger.setLevel(config.logging.level);
+    logger.debug('Log level set from configuration', { level: config.logging.level });
+  }
+
+  // Wire logging format (Issue #485)
+  if (config.logging?.format !== undefined && logger.setFormat !== undefined) {
+    logger.setFormat(config.logging.format);
+    logger.debug('Log format set from configuration', { format: config.logging.format });
+  }
+
+  // Wire logging destination (Issue #485)
+  if (config.logging?.destination !== undefined && logger.setDestination !== undefined) {
+    const destination = resolveStdioLogDestination(config.logging.destination);
+    logger.setDestination(destination, config.logging.filePath);
+    logger.debug('Log destination set from configuration', {
+      destination,
+      filePath: config.logging.filePath,
+    });
+  }
+}
+
+/**
+ * Initializes all subsystems from configuration.
+ *
+ * Returns ONLY the components the caller (startServer) actually consumes
+ * downstream. `policyFirewall` and `authInit` are used during tool
+ * registration and auth wiring inside this function but are not referenced
+ * after return — they stayed on the return shape historically and the
+ * caller silently dropped them. Narrowed per #2154.
+ */
+async function initializeSubsystems(
+  config: AppConfig,
+  logger: ILogger
+): Promise<{
+  server: McpServer;
+  serverLogger: ILogger;
+  observer: SwarmObserver;
+  eventBusBridge: EventBusBridgeResult;
+  auditLogger: AuditLogger | null;
+  inFlightToolCalls: InFlightToolCalls;
+}> {
+  // Initialize experts from configuration (Issue #486)
+  const expertResult = initializeExperts({ expertConfig: config.experts, logger });
+  logger.debug('Expert system initialized', {
+    builtIn: expertResult.builtInCount,
+    custom: expertResult.customCount,
+  });
+
+  // #5097: memory.decay must reach the (still lazy) tool-memory singleton before
+  // the skill library, whose belief promoter is the first thing that constructs
+  // it. The only non-trivial outcome (already constructed) warns inside.
+  configureToolMemory({ memoryConfig: config.memory, logger });
+
+  // Initialize skill library from configuration (Issue #491)
+  const skillsResult = await initializeSkillLibrary({ skillsConfig: config.skills, logger });
+  logger.debug('Skill library initialization', {
+    initialized: skillsResult.initialized,
+    reason: skillsResult.reason,
+  });
+
+  // Initialize SICA self-improvement from configuration (Issue #492)
+  const sicaResult = initializeSica({ sicaConfig: config.sica, logger });
+  logger.debug('SICA initialization', {
+    enabled: sicaResult.enabled,
+    reason: sicaResult.reason,
+  });
+
+  const { server, logger: serverLogger } = createAndValidateMcpServer(logger);
+  // Before any tool is registered, so shutdown can drain every call (#6573).
+  const inFlightToolCalls = trackInFlightToolCalls(server);
+
+  // Wire observability config to SwarmObserver (Issue #493)
+  const observer = initializeSwarmObserver(serverLogger, {
+    maxEvents: config.observability?.swarmObserverMaxEvents,
+  });
+  // Wire EventBus config for A2A communication settings
+  const eventBusBridge = initializeEventBus(observer, serverLogger, config.observability?.eventBus);
+
+  await initializeAndLogSandbox(serverLogger, config.security?.sandbox);
+  const policyFirewall = logSecurityConfig(serverLogger, config);
+  const auditLogger = initializeAuditLogger(config.security, serverLogger);
+
+  // Everything inside can throw, and a throw must reach the audit log as a
+  // FAILED startup rather than leaving the earlier begin record unanswered
+  // (#5577).
+  await recordStartupFailure(auditLogger, 'subsystem_init', async () => {
+    // Initialize authentication handler (Issue #739). Side effects only —
+    // auth state is wired into the request pipeline inside initializeAuth.
+    initializeAuth(config, serverLogger);
+    await initializeAndRegisterTools(server, serverLogger, policyFirewall, config, {
+      auditLogger,
+    });
+  });
+
+  return { server, serverLogger, observer, eventBusBridge, auditLogger, inFlightToolCalls };
+}
+
+/**
+ * Starts the MCP server with stdio transport.
+ *
+ * @param verbose - Whether to enable verbose logging
+ * @param mode - Server mode (server or orchestrator)
+ * @param modeWasExplicit - Whether mode was explicitly set via --mode flag
+ * @param orchestratorOptions - Options for orchestrator mode (when mode is 'orchestrator')
+ */
+/**
+ * Watchdog timeout for the server-mode startup sequence (#2163).
+ *
+ * If subsystem init, transport connect, or anything else on the path to
+ * "waiting for requests" hangs past this deadline, we log and exit rather
+ * than leave a zombie process. Chosen conservatively — subsystem init on
+ * a fresh install has been observed ~5-8s, so 30s leaves ample headroom.
+ */
+const SERVER_STARTUP_TIMEOUT_MS = 30_000;
+
+export async function startServer(
+  verbose: boolean,
+  mode: ServerMode,
+  modeWasExplicit: boolean = false,
+  orchestratorOptions?: OrchestratorModeOptions
+): Promise<void> {
+  const logger = createLogger({ component: 'cli' });
+  if (verbose) logger.setLevel('debug');
+
+  validateModeOrExit(logger, mode); // Fail fast for unimplemented modes (Issue #443)
+
+  // Handle orchestrator mode separately (Issue #446)
+  if (mode === 'orchestrator') {
+    await startOrchestratorMode(orchestratorOptions ?? { verbose });
+    return;
+  }
+
+  exitIfNestedSubprocessServer(logger); // #4033: server mode only (deadlock is stdio-bound)
+
+  // Watchdog: if startup hangs, surface it rather than hang indefinitely
+  // (#2163). Cleared once we reach "waiting for requests".
+  const startupWatchdog = setTimeout(() => {
+    logger.error(
+      `Server startup exceeded ${String(SERVER_STARTUP_TIMEOUT_MS)}ms — aborting. ` +
+        'Common causes: hung config load, blocked subsystem init, stdio transport stall.'
+    );
+    process.exit(EXIT_CODES.SERVER_START_FAILED);
+  }, SERVER_STARTUP_TIMEOUT_MS);
+  // Prevent the watchdog from keeping the process alive if everything shuts
+  // down cleanly before it fires (for short-lived test harnesses).
+  startupWatchdog.unref();
+
+  logStartupInfo(logger, detectMode({ explicitMode: modeWasExplicit ? mode : undefined }), verbose);
+
+  // Surface stale long-lived servers (#3283): best-effort, non-blocking warn if
+  // the running build is behind the latest published version. Fire-and-forget —
+  // never gates startup; fail-soft on offline/CI/dev.
+  void warnIfVersionStale(logger);
+
+  // Load and validate configuration (Issue #472)
+  const configResult = loadAndLogConfig(logger);
+  applyLoggingConfig(logger, verbose, configResult.config);
+
+  validateNexusEnv(logger); // Warn-only env var validation (Issue #1016)
+
+  // Initialize all subsystems
+  const { server, serverLogger, observer, eventBusBridge, auditLogger, inFlightToolCalls } =
+    await initializeSubsystems(configResult.config, logger);
+
+  // Connect to transport
+  await connectToStdioTransport(server, logger, serverLogger);
+
+  // Record server startup event for observability
+  const eventContext = recordServerStartup(observer);
+
+  // Setup graceful shutdown with observer and EventBus cleanup
+  const cleanup = createShutdownCleanup({
+    eventBusBridge,
+    observer,
+    eventContext,
+    server,
+    serverLogger,
+    logger,
+    auditLogger,
+    inFlightToolCalls,
+  });
+  const requestShutdown = setupShutdownHandlers(cleanup, logger);
+  // Issue #810: shut down when the parent closes stdin — through the same
+  // bounded cleanup as the signals, so the audit log is flushed (#6560).
+  // Registered after the cleanup exists; nothing between here and the startup
+  // record below awaits, so a close event cannot run before that record is
+  // queued.
+  watchParentProcess(logger, requestShutdown);
+
+  // Startup complete — cancel the watchdog so it can't fire during request
+  // handling (#2163).
+  clearTimeout(startupWatchdog);
+  // The startup COMPLETION record, written only here (#5577).
+  recordStartupComplete(auditLogger, mode);
+  logger.debug('Server running, waiting for requests...');
+}

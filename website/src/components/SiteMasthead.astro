@@ -1,0 +1,72 @@
+---
+// Site header shared by every page (#7199): wordmark, Primary nav, search,
+// color theme (Palette Deck) and light/dark toggle. The four section links go to the generated section index
+// pages (src/pages/docs/[section].astro).
+//
+// Layout: one row at every width. From 64rem it is wordmark, Primary nav,
+// search and theme (#7285). Below 64rem (#7308) it is wordmark, search,
+// theme and a "Menu" button that opens a navigation drawer; below 40rem
+// search is an icon button.
+//
+// The Menu button and the drawer are the MenuDrawer island (#7313), which
+// moves the Primary nav below (data-menu-part) and, on docs pages, the side
+// nav into the drawer while it is open, so there is one nav in the DOM and
+// one source for it. Without JS the Menu button and the drawer stay hidden,
+// the Primary nav wraps under the row, and the side nav keeps its "Section
+// navigation" disclosure. ThemeInit's pre-paint script marks the page as
+// having JS, so the narrow layout never flashes the fallback.
+//
+// `current` marks the section the reader is in. On that section's own index
+// page the link IS the page, so it gets aria-current="page"; on a page inside
+// the section it gets aria-current="true".
+import SearchBox from './SearchBox.svelte';
+import ThemeToggle from './ThemeToggle.svelte';
+import PalettePicker from './PalettePicker.astro';
+import MenuDrawer from './MenuDrawer.svelte';
+import { BASE } from '../lib/docs-collection.ts';
+import {
+  PRIMARY_SECTIONS,
+  sectionIndexHref,
+  sectionLabel,
+  type PrimarySectionKey,
+} from '../lib/docs-nav.ts';
+
+interface Props {
+  current?: PrimarySectionKey | undefined;
+  /** True on the current section's index page itself. */
+  currentIsPage?: boolean | undefined;
+}
+
+const { current, currentIsPage = false } = Astro.props;
+const currentToken: 'page' | 'true' = currentIsPage ? 'page' : 'true';
+const links = PRIMARY_SECTIONS.map((key) => ({
+  key,
+  label: sectionLabel(key),
+  href: sectionIndexHref(BASE, key),
+  ariaCurrent: key === current ? currentToken : undefined,
+}));
+---
+
+<header class="docs-masthead">
+  <div class="docs-masthead-inner">
+    <a class="docs-wordmark" href={`${BASE}/`}>nexus-agents</a>
+    <nav class="docs-primary-nav" aria-label="Primary" data-menu-part>
+      <ul>
+        {links.map((link) => (
+          <li>
+            <a href={link.href} aria-current={link.ariaCurrent}>{link.label}</a>
+          </li>
+        ))}
+        <li>
+          <a href="https://github.com/nexus-substrate/nexus-agents">GitHub</a>
+        </li>
+      </ul>
+    </nav>
+    <div class="docs-masthead-tools">
+      <SearchBox base={BASE} client:load />
+      <PalettePicker />
+      <ThemeToggle client:load />
+      <MenuDrawer client:load />
+    </div>
+  </div>
+</header>

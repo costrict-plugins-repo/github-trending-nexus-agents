@@ -1,0 +1,533 @@
+/**
+ * CLI Server Audit Integration Tests
+ *
+ * Tests for audit logger initialization from security configuration.
+ * (Source: Issue #740 Phase 2)
+ */
+
+import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  getPolicyValues,
+  initializeAuditLogger,
+  logSecurityConfig,
+  recordStartupComplete,
+  recordStartupFailure,
+} from './cli-server-audit.js';
+import type { ILogger } from './core/index.js';
+import { VERSION } from './version.js';
+import { PolicyConfigSchema } from './config/schemas-security.js';
+
+function createMockLogger(): ILogger {
+  const mock: ILogger = {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    child: vi.fn(),
+    setLevel: vi.fn(),
+  };
+  (mock.child as ReturnType<typeof vi.fn>).mockReturnValue(mock);
+  return mock;
+}
+
+/** Every recorded event under `dir`, parsed. */
+function readEvents(
+  dir: string
+): { action?: string; outcome?: string; metadata?: Record<string, unknown> }[] {
+  return readdirSync(dir)
+    .filter((f) => f.endsWith('.jsonl'))
+    .flatMap((f) =>
+      readFileSync(join(dir, f), 'utf-8')
+        .split('\n')
+        .filter((line) => line.trim().length > 0)
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              action?: string;
+              outcome?: string;
+              metadata?: Record<string, unknown>;
+            }
+        )
+    );
+}
+
+/** Every `action` recorded in the audit files written under `dir`. */
+function readActions(dir: string): string[] {
+  return readdirSync(dir)
+    .filter((f) => f.endsWith('.jsonl'))
+    .flatMap((f) =>
+      readFileSync(join(dir, f), 'utf-8')
+        .split('\n')
+        .filter((line) => line.trim().length > 0)
+        .map((line) => String((JSON.parse(line) as { action?: unknown }).action))
+    );
+}
+
+describe('initializeAuditLogger', () => {
+  it('resolves its default audit directory only when audit logging is enabled', async () => {
+    const resolveDataPath = vi.fn(() => 'test-audit-directory');
+    vi.doMock('./config/nexus-data-dir.js', async () => ({
+      ...(await vi.importActual<typeof import('./config/nexus-data-dir.js')>(
+        './config/nexus-data-dir.js'
+      )),
+      nexusDataPath: resolveDataPath,
+    }));
+    vi.resetModules();
+    try {
+      const auditModule = await import('./cli-server-audit.js');
+      expect(resolveDataPath).not.toHaveBeenCalledWith('audit');
+      expect(auditModule.initializeAuditLogger(undefined, createMockLogger())).toBeNull();
+      expect(resolveDataPath).not.toHaveBeenCalledWith('audit');
+    } finally {
+      vi.doUnmock('./config/nexus-data-dir.js');
+      vi.resetModules();
+    }
+  });
+
+  it('should return null when security config is undefined', () => {
+    const logger = createMockLogger();
+    const result = initializeAuditLogger(undefined, logger);
+    expect(result).toBeNull();
+  });
+
+  it('should return null when audit config is not present', () => {
+    const logger = createMockLogger();
+    const result = initializeAuditLogger(
+      {
+        allowedPaths: ['./'],
+        blockedPatterns: [],
+        rateLimit: { enabled: true, requestsPerMinute: 60 },
+      },
+      logger
+    );
+    expect(result).toBeNull();
+  });
+
+  it('should return null when audit is disabled', () => {
+    const logger = createMockLogger();
+    const result = initializeAuditLogger(
+      {
+        allowedPaths: ['./'],
+        blockedPatterns: [],
+        rateLimit: { enabled: true, requestsPerMinute: 60 },
+        audit: {
+          enabled: false,
+          minSeverity: 'info',
+          enableHashChain: false,
+          maxFileSizeBytes: 10 * 1024 * 1024,
+          maxFiles: 10,
+        },
+      },
+      logger
+    );
+    expect(result).toBeNull();
+  });
+
+  // The directory was previously `/tmp/nexus-audit-test-<pid>`, hardcoded and
+  // never removed. Closing the logger is not the same as deleting what it
+  // wrote into, and the pid meant runs never reused a path — so the directory
+  // count grew once per test run, forever. 73 had accumulated on the dev box
+  // before anyone noticed (#4603). `mkdtempSync` makes the path unique by
+  // construction rather than by pid, and the `finally` removes it on every
+  // path including a failing assertion.
+  it('should return AuditLogger when audit is enabled', async () => {
+    const logger = createMockLogger();
+    const tmpDir = mkdtempSync(join(tmpdir(), 'nexus-audit-test-'));
+    try {
+      const result = initializeAuditLogger(
+        {
+          allowedPaths: ['./'],
+          blockedPatterns: [],
+          rateLimit: { enabled: true, requestsPerMinute: 60 },
+          audit: {
+            enabled: true,
+            logDir: tmpDir,
+            minSeverity: 'info',
+            enableHashChain: false,
+            maxFileSizeBytes: 10 * 1024 * 1024,
+            maxFiles: 10,
+          },
+        },
+        logger
+      );
+      expect(result).not.toBeNull();
+
+      // Awaited, not fire-and-forget. `void result.close()` returned before
+      // the log stream had flushed; removing the directory underneath it then
+      // surfaced as an unhandled `AuditError: Failed to flush audit log`. The
+      // old code never deleted the directory, so this race was invisible —
+      // the leak was hiding a second defect (#4603).
+      if (result !== null) {
+        await result.close();
+      }
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('audit bootstrap records a BEGIN, not a completed startup (#5577)', () => {
+  /**
+   * `initializeAuditLogger` runs before authentication, tool registration and
+   * transport connect. It used to write `system.startup` with outcome
+   * `success` — a durable "startup succeeded" record for a server that had
+   * not started, and that survived a throw in any later step.
+   */
+  it('writes system.startup.begin and no system.startup record', async () => {
+    const logger = createMockLogger();
+    const tmpDir = mkdtempSync(join(tmpdir(), 'nexus-audit-begin-'));
+    try {
+      const result = initializeAuditLogger(
+        {
+          allowedPaths: ['./'],
+          blockedPatterns: [],
+          rateLimit: { enabled: true, requestsPerMinute: 60 },
+          audit: {
+            enabled: true,
+            logDir: tmpDir,
+            minSeverity: 'info',
+            enableHashChain: false,
+            maxFileSizeBytes: 10 * 1024 * 1024,
+            maxFiles: 10,
+          },
+        },
+        logger
+      );
+      expect(result).not.toBeNull();
+      if (result === null) return;
+      await result.flush();
+
+      const actions = readActions(tmpDir);
+      expect(actions).toContain('system.startup.begin');
+      // The completion record belongs to startServer, not to this function.
+      expect(actions).not.toContain('system.startup');
+
+      await result.close();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('recordStartupFailure / recordStartupComplete (#5577)', () => {
+  function auditConfig(logDir: string): Parameters<typeof initializeAuditLogger>[0] {
+    return {
+      allowedPaths: ['./'],
+      blockedPatterns: [],
+      rateLimit: { enabled: true, requestsPerMinute: 60 },
+      audit: {
+        enabled: true,
+        logDir,
+        minSeverity: 'info' as const,
+        enableHashChain: false,
+        maxFileSizeBytes: 10 * 1024 * 1024,
+        maxFiles: 10,
+      },
+    };
+  }
+
+  it('records a FAILED startup when a step throws, and rethrows', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'nexus-audit-fail-'));
+    try {
+      const auditLogger = initializeAuditLogger(auditConfig(tmpDir), createMockLogger());
+      expect(auditLogger).not.toBeNull();
+
+      await expect(
+        recordStartupFailure(auditLogger, 'subsystem_init', () =>
+          Promise.reject(new Error('tool registration exploded'))
+        )
+      ).rejects.toThrow('tool registration exploded');
+
+      await auditLogger?.flush();
+      const events = readEvents(tmpDir);
+      const startup = events.filter((e) => e.action === 'system.startup');
+      expect(startup).toHaveLength(1);
+      expect(startup[0]?.outcome).toBe('failure');
+      // No success record anywhere: the server never started.
+      expect(events.some((e) => e.action === 'system.startup' && e.outcome === 'success')).toBe(
+        false
+      );
+
+      await auditLogger?.close();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('is pass-through on success and writes no startup record', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'nexus-audit-pass-'));
+    try {
+      const auditLogger = initializeAuditLogger(auditConfig(tmpDir), createMockLogger());
+
+      const value = await recordStartupFailure(auditLogger, 'subsystem_init', () =>
+        Promise.resolve('wired')
+      );
+      expect(value).toBe('wired');
+
+      await auditLogger?.flush();
+      expect(readActions(tmpDir)).not.toContain('system.startup');
+
+      await auditLogger?.close();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('recordStartupComplete writes the success record', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'nexus-audit-done-'));
+    try {
+      const auditLogger = initializeAuditLogger(auditConfig(tmpDir), createMockLogger());
+
+      recordStartupComplete(auditLogger, 'server');
+
+      await auditLogger?.flush();
+      const startup = readEvents(tmpDir).filter((e) => e.action === 'system.startup');
+      expect(startup).toHaveLength(1);
+      expect(startup[0]?.outcome).toBe('success');
+
+      await auditLogger?.close();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('is a no-op when audit is disabled', async () => {
+    const value = await recordStartupFailure(null, 'subsystem_init', () => Promise.resolve(7));
+    expect(value).toBe(7);
+    expect(() => {
+      recordStartupComplete(null, 'server');
+    }).not.toThrow();
+  });
+});
+
+describe('getPolicyValues', () => {
+  it('falls back to the schema default when no config was loaded (#6431)', () => {
+    // Two defaults for one setting is how the old `?? 'read-only'` drifted from
+    // what the schema said: with a parsed config the schema wins, without one
+    // the literal did. Both paths must answer the same, and the answer is the
+    // schema's — read-write, so the mutation rule is an opt-in lock.
+    const fromSchema = PolicyConfigSchema.parse({}).defaultMode;
+    expect(fromSchema).toBe('read-write');
+    expect(getPolicyValues(undefined).defaultExec).toBe(fromSchema);
+  });
+
+  it('honours an explicit read-only lock', () => {
+    const config = { security: { policy: { defaultMode: 'read-only', policyMode: 'enforce' } } };
+    expect(getPolicyValues(config as never).defaultExec).toBe('read-only');
+  });
+});
+
+describe('logSecurityConfig', () => {
+  function securityLine(logger: ILogger): Record<string, unknown> {
+    const line = (logger.info as ReturnType<typeof vi.fn>).mock.calls.find(
+      (call: unknown[]) => call[0] === 'Security configuration'
+    );
+    expect(line).toBeDefined();
+    return (line as unknown[])[1] as Record<string, unknown>;
+  }
+
+  it('names the EFFECTIVE policy mode and why, not the configured value (#4888, #6431)', () => {
+    // This runs at startup, before `stagePolicyFirewallForRollout` stages the
+    // firewall. It used to report `configuredPolicyMode: 'enforce'` — the
+    // config value the staging then ignored — which is a field a spot-check
+    // trusts and an enforcement that did not happen. It now resolves the mode
+    // the same way the staging will and says what decided it.
+    vi.stubEnv('NEXUS_MCP_POLICY_ENFORCE', '');
+    try {
+      const logger = createMockLogger();
+      logSecurityConfig(logger);
+      const ctx = securityLine(logger);
+      expect(ctx['policyMode']).toBe('warn (rollout default)');
+      expect(ctx).not.toHaveProperty('configuredPolicyMode');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('reports enforce when NEXUS_MCP_POLICY_ENFORCE opts in (#6431)', () => {
+    vi.stubEnv('NEXUS_MCP_POLICY_ENFORCE', '1');
+    try {
+      const logger = createMockLogger();
+      logSecurityConfig(logger);
+      expect(securityLine(logger)['policyMode']).toBe('enforce (NEXUS_MCP_POLICY_ENFORCE)');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('reports the default execution mode the handlers will apply (#6431)', () => {
+    const logger = createMockLogger();
+    logSecurityConfig(logger);
+    expect(securityLine(logger)['defaultExecutionMode']).toBe('read-write');
+  });
+
+  it('reports whether audit logging is on, alongside the other controls (#4990)', () => {
+    // Audit was the only security control missing from this line. Its absence
+    // was announced at `debug`, which the default `info` level drops — so a
+    // startup log that confirmed four controls and said nothing about the
+    // tamper-evident chain read as "fine" rather than "not running".
+    const logger = createMockLogger();
+
+    logSecurityConfig(logger);
+
+    const line = (logger.info as ReturnType<typeof vi.fn>).mock.calls.find(
+      (call: unknown[]) => call[0] === 'Security configuration'
+    );
+    expect((line as unknown[])[1]).toMatchObject({ auditEnabled: false });
+  });
+
+  it('warns when the audit chain is not being written', () => {
+    // The same treatment auth already gets. A boolean on an info line is easy
+    // to scroll past; the control being absent deserves the same visibility as
+    // authentication being absent.
+    const logger = createMockLogger();
+
+    logSecurityConfig(logger);
+
+    const warned = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.some((call: unknown[]) =>
+      String(call[0]).includes('Audit logging is disabled')
+    );
+    expect(warned).toBe(true);
+  });
+
+  it('reports auth the way initializeAuth resolves it: on by default, token method (#5663)', () => {
+    // Two resolvers disagreed about the default: this line said auth was off
+    // and warned about unprotected endpoints, while initializeAuth — five
+    // lines later in startServer — defaulted to enabled + token and enforced it.
+    const saved = process.env['NEXUS_AUTH_ENABLED'];
+    delete process.env['NEXUS_AUTH_ENABLED'];
+    try {
+      const logger = createMockLogger();
+
+      logSecurityConfig(logger);
+
+      const line = (logger.info as ReturnType<typeof vi.fn>).mock.calls.find(
+        (call: unknown[]) => call[0] === 'Security configuration'
+      );
+      expect((line as unknown[])[1]).toMatchObject({ authEnabled: true, authMethod: 'token' });
+      const warned = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.some((call: unknown[]) =>
+        String(call[0]).includes('Authentication explicitly disabled')
+      );
+      expect(warned).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env['NEXUS_AUTH_ENABLED'];
+      else process.env['NEXUS_AUTH_ENABLED'] = saved;
+    }
+  });
+
+  it('reports auth off, and warns, when NEXUS_AUTH_ENABLED=false (#5663)', () => {
+    const saved = process.env['NEXUS_AUTH_ENABLED'];
+    process.env['NEXUS_AUTH_ENABLED'] = 'false';
+    try {
+      const logger = createMockLogger();
+
+      logSecurityConfig(logger);
+
+      const line = (logger.info as ReturnType<typeof vi.fn>).mock.calls.find(
+        (call: unknown[]) => call[0] === 'Security configuration'
+      );
+      expect((line as unknown[])[1]).toMatchObject({ authEnabled: false });
+      const warned = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.some((call: unknown[]) =>
+        String(call[0]).includes('Authentication explicitly disabled')
+      );
+      expect(warned).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env['NEXUS_AUTH_ENABLED'];
+      else process.env['NEXUS_AUTH_ENABLED'] = saved;
+    }
+  });
+
+  it('says audit is on, and does not warn, when it is enabled', () => {
+    // The pair. A hardcoded `false` plus an unconditional warning would pass
+    // both tests above while reporting a running audit chain as absent.
+    const logger = createMockLogger();
+
+    logSecurityConfig(logger, {
+      security: { audit: { enabled: true } },
+    } as unknown as Parameters<typeof logSecurityConfig>[1]);
+
+    const line = (logger.info as ReturnType<typeof vi.fn>).mock.calls.find(
+      (call: unknown[]) => call[0] === 'Security configuration'
+    );
+    expect((line as unknown[])[1]).toMatchObject({ auditEnabled: true });
+    const warned = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.some((call: unknown[]) =>
+      String(call[0]).includes('Audit logging is disabled')
+    );
+    expect(warned).toBe(false);
+  });
+
+  it('reports configured blockedPatterns and wires them into the policy firewall', () => {
+    const logger = createMockLogger();
+
+    const firewall = logSecurityConfig(logger, {
+      security: {
+        blockedPatterns: ['**/*.env*', '**/credentials*'],
+      },
+    } as unknown as Parameters<typeof logSecurityConfig>[1]);
+
+    const line = (logger.info as ReturnType<typeof vi.fn>).mock.calls.find(
+      (call: unknown[]) => call[0] === 'Security configuration'
+    );
+    expect((line as unknown[])[1]).toMatchObject({
+      blockedPatterns: ['**/*.env*', '**/credentials*'],
+    });
+
+    // Verify firewall returned by logSecurityConfig enforces the blocked patterns
+    const decision = firewall.evaluate({
+      toolName: 'read_file',
+      args: { path: './prod.env' },
+      mode: 'read-only',
+    });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toContain("matches blocked pattern '**/*.env*'");
+  });
+});
+
+describe('startup records carry the package version (#6509)', () => {
+  it('stamps begin, completion and failure records with the running VERSION', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'nexus-audit-version-'));
+    try {
+      const auditLogger = initializeAuditLogger(
+        {
+          allowedPaths: ['./'],
+          blockedPatterns: [],
+          rateLimit: { enabled: true, requestsPerMinute: 60 },
+          audit: {
+            enabled: true,
+            logDir: tmpDir,
+            minSeverity: 'info' as const,
+            enableHashChain: false,
+            maxFileSizeBytes: 10 * 1024 * 1024,
+            maxFiles: 10,
+          },
+        },
+        createMockLogger()
+      );
+      recordStartupComplete(auditLogger, 'server');
+      await expect(
+        recordStartupFailure(auditLogger, 'subsystem_init', () => Promise.reject(new Error('x')))
+      ).rejects.toThrow('x');
+      await auditLogger?.flush();
+
+      const startup = readEvents(tmpDir).filter(
+        (e) => e.action?.startsWith('system.startup') === true
+      );
+      // begin + success + failure: an empty list must not pass vacuously.
+      expect(startup.map((e) => e.action)).toEqual([
+        'system.startup.begin',
+        'system.startup',
+        'system.startup',
+      ]);
+      for (const event of startup) {
+        expect(event.metadata?.['packageVersion']).toBe(VERSION);
+      }
+      expect(VERSION.length).toBeGreaterThan(0);
+      await auditLogger?.close();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});

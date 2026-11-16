@@ -1,0 +1,41 @@
+---
+// Shell for the pages outside the docs reading layout — the landing page and
+// the 404 page (#7199). Same remarque tokens, header, theme handling and
+// footer as DocsLayout, without the nav rail, so the whole site is one design.
+//
+// ClientRouter (Astro View Transitions) stays out: it wedged the Chrome
+// renderer for 30s+ after every internal navigation (#3058, #3051, #3056).
+import SiteHead from '../components/SiteHead.astro';
+import SiteMasthead from '../components/SiteMasthead.astro';
+import SiteFooter from '../components/SiteFooter.astro';
+import PageScripts from '../components/PageScripts.astro';
+import ThemeInit from '../components/ThemeInit.astro';
+import DeckInit from '../components/DeckInit.astro';
+import '../styles/docs.css';
+
+interface Props {
+  title: string;
+  description?: string;
+  noindex?: boolean;
+}
+
+const { title, description, noindex = false } = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <SiteHead title={title} description={description} noindex={noindex} />
+    <ThemeInit />
+    <DeckInit />
+  </head>
+  <body>
+    <a class="docs-skip-link" href="#main">Skip to content</a>
+    <SiteMasthead />
+    <main id="main">
+      <slot />
+    </main>
+    <SiteFooter />
+    <PageScripts />
+  </body>
+</html>

@@ -1,0 +1,256 @@
+/**
+ * decision-cost-store — durable per-decision cost rollups.
+ *
+ * Source: Issue #3855 (epic #3854 child, M4).
+ *
+ * Persists one {@link DecisionCostRecord} per governed decision (a
+ * `consensus_vote` / `pr_review` run) so the question "what did this decision
+ * cost?" can be answered from recorded data later — feeding Epic G's
+ * weather_report / manifest cost profiles (#3856) and the governed-decision
+ * cost doc (#3857).
+ *
+ * Mirrors the established persistence idiom: it reuses the shared
+ * {@link JsonlStore} primitive ({@link module:config/jsonl-store}, #3762) rather
+ * than re-forking the hydrate/append/rotate fs plumbing, and writes under the
+ * shared learning dir like {@link module:orchestration/outcomes/outcome-store}.
+ * Record + measure ONLY — no routing or weighting change (#3855 acceptance).
+ *
+ * @module observability/decision-cost-store
+ */
+
+import { z } from 'zod';
+
+import { JsonlStore } from '../config/jsonl-store.js';
+import { ensureLearningDir, getDecisionCostFile } from '../config/learning-persistence.js';
+import { PriceBasisSchema } from '../core/price-basis.js';
+import {
+  AttemptTelemetrySchema,
+  AttemptUsageSchema,
+  ObservedAttemptUsageSchema,
+  type AttemptTelemetry,
+} from './attempt-usage.js';
+import {
+  DECISION_COST_MODEL_MAX_LENGTH,
+  DECISION_COST_ROLE_MAX_LENGTH,
+  PricingProvenanceSchema,
+  rollupDecisionCost,
+  UndeclaredOptionsDetectorSchema,
+} from './decision-cost.js';
+import type {
+  DecisionBillingMode,
+  DecisionCostSummary,
+  UndeclaredOptionsDetectorRecord,
+  VoterCostInput,
+} from './decision-cost.js';
+
+/** Decision surface that incurred the cost — the gate type (#3854). */
+/**
+ * Which caller made the decision. `dev_pipeline_vote` is the dev pipeline's
+ * plan vote (#6872), kept apart from MCP `consensus_vote` calls so reports do
+ * not merge the two populations.
+ */
+export const DecisionGateSchema = z.enum(['consensus_vote', 'pr_review', 'dev_pipeline_vote']);
+export type DecisionGate = z.infer<typeof DecisionGateSchema>;
+
+const VoterCostBreakdownSchema = z.object({
+  role: z.string().min(1).max(DECISION_COST_ROLE_MAX_LENGTH),
+  model: z.string().min(1).max(DECISION_COST_MODEL_MAX_LENGTH),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  // #4435 — optional: absent means the adapter reported no cache activity,
+  // which is a different claim from "zero cache tokens were used".
+  cachedInputTokens: z.number().int().nonnegative().optional(),
+  cacheCreationInputTokens: z.number().int().nonnegative().optional(),
+  costUsd: z.number().nonnegative(),
+  unmeasured: z.boolean(),
+  // Optional only for pre-#6809 records: absence is unmeasured, never zero usage.
+  tokenUsageMeasured: z.boolean().optional(),
+  // #4406 — optional: records written before the basis existed carry no
+  // provenance at all, and absent must stay absent rather than becoming the
+  // positive claim 'unknown'.
+  priceBasis: PriceBasisSchema.optional(),
+  // Absent on legacy/unscoped rows: scope was not recorded, never inferred.
+  // A scope this reader has no literal for drops only this decorative field,
+  // never the cost record it rides on (#6830).
+  pricingProvenance: PricingProvenanceSchema.optional().catch(undefined),
+  // #6821 — absent on rows written before attempt usage was observed: not
+  // observed, never zero attempts. A malformed value drops only this field.
+  attemptUsage: AttemptUsageSchema.optional().catch(undefined),
+});
+
+const ModelCostBreakdownSchema = z.object({
+  model: z.string().min(1).max(DECISION_COST_MODEL_MAX_LENGTH),
+  voterCount: z.number().int().nonnegative(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  costUsd: z.number().nonnegative(),
+});
+
+const DecisionCostSummarySchema = z.object({
+  billingMode: z.enum(['plan', 'api']),
+  voterCount: z.number().int().nonnegative(),
+  measuredVoters: z.number().int().nonnegative(),
+  unmeasuredVoters: z.number().int().nonnegative(),
+  tokenMeasuredVoters: z.number().int().nonnegative().optional(),
+  tokenUnmeasuredVoters: z.number().int().nonnegative().optional(),
+  totalInputTokens: z.number().int().nonnegative(),
+  totalOutputTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  totalCostUsd: z.number().nonnegative(),
+  // #4406 — optional for the same reason as the per-voter field above.
+  priceBasis: PriceBasisSchema.optional(),
+  // #6821 — absent ⇒ no seat carried attempt usage (legacy row or none observed).
+  observedAttemptUsage: ObservedAttemptUsageSchema.optional().catch(undefined),
+  perVoter: z.array(VoterCostBreakdownSchema).readonly(),
+  perModel: z.array(ModelCostBreakdownSchema).readonly(),
+});
+
+/** One persisted per-decision cost rollup. */
+export const DecisionCostRecordSchema = z
+  .object({
+    /** Stable decision correlation id, independent of the async job id. */
+    decisionId: z.string().min(1).max(160),
+    /** Actual async job id; malformed metadata drops only this field. */
+    jobId: z.string().min(1).max(200).optional().catch(undefined),
+    /** Which gate type incurred the cost. */
+    gate: DecisionGateSchema,
+    /** ISO 8601 timestamp the rollup was recorded. */
+    timestamp: z.string().min(1).max(40),
+    /** The rolled-up cost summary. */
+    summary: DecisionCostSummarySchema,
+    /** Immutable settled-response events; malformed history drops only telemetry. */
+    attemptTelemetry: AttemptTelemetrySchema.optional().catch(undefined),
+    /** #5422 — optional: absent means no verdict was recorded, not "not fired". */
+    undeclaredOptionsDetector: UndeclaredOptionsDetectorSchema.optional(),
+  })
+  .transform((record) => {
+    if (record.attemptTelemetry === undefined) return record;
+    const roles = new Set(record.summary.perVoter.map((v) => v.role));
+    for (const event of record.attemptTelemetry.events) {
+      if (!roles.has(event.role)) return { ...record, attemptTelemetry: undefined };
+    }
+    return record;
+  });
+export type DecisionCostRecord = z.infer<typeof DecisionCostRecordSchema>;
+
+/** Bounded retention — keep the most recent N decision rollups. */
+const MAX_DECISION_COST_RECORDS = 5000;
+
+export interface DecisionCostStoreConfig {
+  /** Override the JSONL file path (defaults to the shared learning dir). */
+  readonly filePath?: string;
+  /** Override the data directory used for `ensureLearningDir` (testing). */
+  readonly dataDir?: string;
+  /** Override retention cap. */
+  readonly maxRecords?: number;
+}
+
+export interface RecordDecisionCostInput {
+  /** Actual async job id; omitted for synchronous decisions. */
+  readonly jobId?: string;
+  readonly decisionId: string;
+  readonly gate: DecisionGate;
+  readonly voters: readonly VoterCostInput[];
+  readonly billingMode: DecisionBillingMode;
+  /** ISO timestamp; the caller supplies the clock (keeps the store deterministic). */
+  readonly timestamp: string;
+  /** The detector verdict for this vote (#5422); omit when none was computed. */
+  readonly undeclaredOptionsDetector?: UndeclaredOptionsDetectorRecord;
+}
+
+/**
+ * Append-only, JSONL-backed store of per-decision cost rollups, built on the
+ * shared {@link JsonlStore} primitive.
+ *
+ * `record` rolls the per-voter inputs up (via the pure {@link rollupDecisionCost})
+ * and persists the resulting summary; `query` filters the in-memory window;
+ * `report` re-derives the cross-decision rollup the caller asks for.
+ */
+export class DecisionCostStore {
+  private readonly store: JsonlStore<DecisionCostRecord>;
+
+  constructor(config?: DecisionCostStoreConfig) {
+    ensureLearningDir(config?.dataDir);
+    this.store = new JsonlStore<DecisionCostRecord>({
+      filePath: config?.filePath ?? getDecisionCostFile(),
+      schema: DecisionCostRecordSchema,
+      maxRecords: config?.maxRecords ?? MAX_DECISION_COST_RECORDS,
+      component: 'DecisionCostStore',
+    });
+  }
+
+  get size(): number {
+    return this.store.count();
+  }
+
+  /** False when any persisted row could not be loaded, including invalid JSON. */
+  get hydrationComplete(): boolean {
+    return this.store.hydrationComplete;
+  }
+
+  /**
+   * Roll up one decision's per-voter costs and persist the summary. Returns the
+   * persisted record so the caller can attach `record.summary` to the existing
+   * decision response (riding the existing surface — no new MCP tool, #3855).
+   *
+   * The boolean `persisted` flag (#3910) tells the caller whether the rollup was
+   * durably written: the underlying {@link JsonlStore} never throws on an fs/
+   * validation failure (an observability sink must not break the decision), so
+   * `false` is the ONLY signal that billing data was dropped (including an
+   * incompletely hydrated cost file) — the recording bridge logs + counts it
+   * rather than letting it vanish silently.
+   */
+  record(input: RecordDecisionCostInput): { record: DecisionCostRecord; persisted: boolean } {
+    const summary = rollupDecisionCost(input.voters, input.billingMode);
+    const telemetry = combineAttemptTelemetry(input.voters);
+    const record: DecisionCostRecord = {
+      decisionId: input.decisionId,
+      ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
+      gate: input.gate,
+      timestamp: input.timestamp,
+      summary,
+      ...(telemetry !== undefined ? { attemptTelemetry: telemetry } : {}),
+      // Spread conditionally so an absent verdict stays absent on disk (#5422).
+      ...(input.undeclaredOptionsDetector !== undefined
+        ? { undeclaredOptionsDetector: input.undeclaredOptionsDetector }
+        : {}),
+    };
+    // Do not let generic append/retention rewrite erase malformed historical
+    // cost rows: a later report must still know the provenance is incomplete.
+    const persisted = this.store.hydrationComplete && this.store.append(record);
+    return { record, persisted };
+  }
+
+  /** All retained records, oldest first. */
+  all(): readonly DecisionCostRecord[] {
+    return this.store.all();
+  }
+
+  /** Filter retained records by gate and/or a since-timestamp. */
+  query(filter?: { gate?: DecisionGate; since?: string }): readonly DecisionCostRecord[] {
+    const records = this.store.all();
+    if (filter === undefined) return records;
+    return records.filter((r) => {
+      if (filter.gate !== undefined && r.gate !== filter.gate) return false;
+      if (filter.since !== undefined && r.timestamp < filter.since) return false;
+      return true;
+    });
+  }
+}
+
+/** Re-export the summary type for ergonomic consumer imports. */
+export type { DecisionCostSummary };
+
+/** Preserve response identity and count observable calls; never add legacy token sums. */
+function combineAttemptTelemetry(voters: readonly VoterCostInput[]): AttemptTelemetry | undefined {
+  const recorded = voters.flatMap((v) =>
+    v.attemptTelemetry !== undefined ? [v.attemptTelemetry] : []
+  );
+  if (recorded.length === 0) return undefined;
+  return {
+    events: recorded.flatMap((t) => t.events),
+    observableAttempts: recorded.reduce((sum, t) => sum + t.observableAttempts, 0),
+  };
+}

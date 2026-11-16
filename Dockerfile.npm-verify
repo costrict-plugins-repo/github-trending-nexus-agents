@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1.7
+# Verify a clean global install of nexus-agents.
+#
+# Package-source modes:
+#   1. Latest published (default):
+#        docker build -t nexus-verify -f Dockerfile.npm-verify .
+#        docker run --rm nexus-verify
+#   2. Pinned version:
+#        docker build --build-arg NEXUS_VERSION=2.29.0 -t nexus-verify -f Dockerfile.npm-verify .
+#   3. Pre-publish tarball (catches packaging bugs before they ship — #1841):
+#        cd packages/nexus-agents && pnpm build && npm pack --pack-destination /tmp
+#        docker build -t nexus-verify -f Dockerfile.npm-verify .
+#        docker run --rm -v /tmp/nexus-agents-2.29.0.tgz:/pkg.tgz nexus-verify bash /home/verifier/verify.sh /pkg.tgz
+#
+# Set NEXUS_VERIFY_INSTALL_MODE to exercise npm defaults, npm 12, an in-place
+# update, or pnpm. PNPM_HOME lives under this user's writable home, so package
+# installation stays non-root.
+FROM node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
+
+ARG NEXUS_VERSION=latest
+ENV NEXUS_LOG_LEVEL=warn
+ENV NEXUS_AUTH_ENABLED=false
+
+# Deliberately NO build toolchain (#5427). It used to install python3 +
+# build-essential "as a defensive fallback for native-module rebuilds during
+# npm install", which described `better-sqlite3` — removed in #5388 — and
+# contradicted the install two files over: verify.sh passes --ignore-scripts,
+# so nothing rebuilds anything.
+#
+# Keeping it would have been worse than stale. The whole point of this image is
+# to mirror a constrained end-user machine; a compiler sitting in it is exactly
+# what would let a future native dependency quietly build its way out of a
+# failure the gate exists to catch.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Create the Corepack shims while /usr/local/bin is writable. The pnpm mode
+# re-enables and activates pnpm as the unprivileged verifier user.
+RUN corepack enable
+
+# Run as non-root to mirror the marketplace install path
+RUN useradd -m -s /bin/bash verifier
+USER verifier
+WORKDIR /home/verifier
+
+# Copy the smoke-test script
+COPY --chown=verifier:verifier scripts/verify-npm-install.sh /home/verifier/verify.sh
+
+# Ensure global npm installs go to user-writable prefix (no sudo needed)
+ENV NPM_CONFIG_PREFIX=/home/verifier/.npm-global
+ENV PATH=/home/verifier/.npm-global/bin:$PATH
+
+# Re-export build arg so CMD shell form can read it
+ENV NEXUS_VERSION=${NEXUS_VERSION}
+
+# Default command runs the verification at the pinned version. Override:
+#   docker run --rm nexus-verify bash -c 'nexus-agents --version'
+CMD bash /home/verifier/verify.sh "$NEXUS_VERSION"

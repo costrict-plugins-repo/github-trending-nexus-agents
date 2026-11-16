@@ -1,0 +1,543 @@
+/**
+ * Fixture tests for the pure per-decision cost rollup (#3855).
+ *
+ * Pins the acceptance-criteria math:
+ *  - per-voter → per-decision totals
+ *  - per-model breakdown
+ *  - missing-cost handling as UNMEASURED, not zero
+ *  - plan mode records 0-cost but keeps token counts
+ *
+ * @module observability/decision-cost.test
+ */
+
+import { describe, it, expect } from 'vitest';
+
+import {
+  rollupDecisionCost,
+  DecisionCostSummarySchema,
+  UNKNOWN_MODEL,
+  type VoterCostInput,
+} from './decision-cost.js';
+
+describe('rollupDecisionCost', () => {
+  describe('per-voter → per-decision totals (api mode)', () => {
+    it('sums tokens and cost across measured voters', () => {
+      const voters: VoterCostInput[] = [
+        {
+          role: 'architect',
+          model: 'claude-sonnet',
+          inputTokens: 1000,
+          outputTokens: 200,
+          costUsd: 0.006,
+        },
+        {
+          role: 'security',
+          model: 'claude-sonnet',
+          inputTokens: 500,
+          outputTokens: 100,
+          costUsd: 0.003,
+        },
+        {
+          role: 'devex',
+          model: 'gemini-flash',
+          inputTokens: 2000,
+          outputTokens: 400,
+          costUsd: 0.0016,
+        },
+      ];
+
+      const summary = rollupDecisionCost(voters, 'api');
+
+      expect(summary.voterCount).toBe(3);
+      expect(summary.measuredVoters).toBe(3);
+      expect(summary.unmeasuredVoters).toBe(0);
+      expect(summary.totalInputTokens).toBe(3500);
+      expect(summary.totalOutputTokens).toBe(700);
+      expect(summary.totalTokens).toBe(4200);
+      expect(summary.totalCostUsd).toBeCloseTo(0.0106, 9);
+      expect(summary.perVoter).toHaveLength(3);
+    });
+
+    it('preserves per-voter breakdown in input order', () => {
+      const voters: VoterCostInput[] = [
+        {
+          role: 'architect',
+          model: 'claude-opus',
+          inputTokens: 10,
+          outputTokens: 5,
+          costUsd: 0.001,
+        },
+        {
+          role: 'catfish',
+          model: 'gemini-flash',
+          inputTokens: 20,
+          outputTokens: 8,
+          costUsd: 0.0001,
+        },
+      ];
+
+      const summary = rollupDecisionCost(voters, 'api');
+
+      expect(summary.perVoter[0]?.role).toBe('architect');
+      expect(summary.perVoter[0]?.totalTokens).toBe(15);
+      expect(summary.perVoter[0]?.unmeasured).toBe(false);
+      expect(summary.perVoter[1]?.role).toBe('catfish');
+      expect(summary.perVoter[1]?.totalTokens).toBe(28);
+    });
+  });
+
+  describe('per-model breakdown', () => {
+    it('groups voters by model and sums per model', () => {
+      const voters: VoterCostInput[] = [
+        {
+          role: 'architect',
+          model: 'claude-sonnet',
+          inputTokens: 1000,
+          outputTokens: 200,
+          costUsd: 0.006,
+        },
+        {
+          role: 'security',
+          model: 'claude-sonnet',
+          inputTokens: 500,
+          outputTokens: 100,
+          costUsd: 0.003,
+        },
+        {
+          role: 'devex',
+          model: 'gemini-flash',
+          inputTokens: 2000,
+          outputTokens: 400,
+          costUsd: 0.0016,
+        },
+      ];
+
+      const summary = rollupDecisionCost(voters, 'api');
+
+      expect(summary.perModel).toHaveLength(2);
+      const sonnet = summary.perModel.find((m) => m.model === 'claude-sonnet');
+      const flash = summary.perModel.find((m) => m.model === 'gemini-flash');
+      expect(sonnet?.voterCount).toBe(2);
+      expect(sonnet?.inputTokens).toBe(1500);
+      expect(sonnet?.outputTokens).toBe(300);
+      expect(sonnet?.totalTokens).toBe(1800);
+      expect(sonnet?.costUsd).toBeCloseTo(0.009, 9);
+      expect(flash?.voterCount).toBe(1);
+      expect(flash?.totalTokens).toBe(2400);
+    });
+
+    it('sorts per-model breakdown by cost desc (highest spend first)', () => {
+      const voters: VoterCostInput[] = [
+        {
+          role: 'devex',
+          model: 'cheap-model',
+          inputTokens: 100,
+          outputTokens: 50,
+          costUsd: 0.0001,
+        },
+        {
+          role: 'architect',
+          model: 'pricey-model',
+          inputTokens: 100,
+          outputTokens: 50,
+          costUsd: 0.5,
+        },
+      ];
+
+      const summary = rollupDecisionCost(voters, 'api');
+
+      expect(summary.perModel[0]?.model).toBe('pricey-model');
+      expect(summary.perModel[1]?.model).toBe('cheap-model');
+    });
+  });
+
+  describe('missing-cost handling: UNMEASURED, not zero', () => {
+    it('counts a voter with no usage as unmeasured, not a measured $0', () => {
+      const voters: VoterCostInput[] = [
+        {
+          role: 'architect',
+          model: 'claude-sonnet',
+          inputTokens: 1000,
+          outputTokens: 200,
+          costUsd: 0.006,
+        },
+        // A CLI-subscription / error voter that reported NO usage:
+        { role: 'security', model: 'claude-cli' },
+      ];
+
+      const summary = rollupDecisionCost(voters, 'api');
+
+      expect(summary.voterCount).toBe(2);
+      expect(summary.measuredVoters).toBe(1);
+      expect(summary.unmeasuredVoters).toBe(1);
+      // The total is a FLOOR — the unmeasured voter contributes 0, not its
+      // unknown real cost.
+      expect(summary.totalCostUsd).toBeCloseTo(0.006, 9);
+      const unmeasured = summary.perVoter.find((v) => v.role === 'security');
+      expect(unmeasured?.unmeasured).toBe(true);
+      expect(unmeasured?.costUsd).toBe(0);
+      expect(unmeasured?.totalTokens).toBe(0);
+    });
+
+    it('treats a voter with no model as the unknown-model sentinel', () => {
+      const voters: VoterCostInput[] = [{ role: 'catfish' }];
+
+      const summary = rollupDecisionCost(voters, 'api');
+
+      expect(summary.perVoter[0]?.model).toBe(UNKNOWN_MODEL);
+      expect(summary.perVoter[0]?.unmeasured).toBe(true);
+      expect(summary.perModel[0]?.model).toBe(UNKNOWN_MODEL);
+    });
+
+    it('a token-reporting voter WITHOUT a computable cost is unmeasured (#4165)', () => {
+      // Unpriced model: the bridge omits costUsd but keeps the tokens. The
+      // tokens still count toward consumption totals, but the voter's unknown
+      // cost must surface as UNMEASURED — a measured $0 would silently
+      // understate spend.
+      const voters: VoterCostInput[] = [
+        { role: 'devex', model: 'unpriced-model', inputTokens: 500, outputTokens: 100 },
+      ];
+
+      const summary = rollupDecisionCost(voters, 'api');
+
+      expect(summary.measuredVoters).toBe(0);
+      expect(summary.unmeasuredVoters).toBe(1);
+      expect(summary.perVoter[0]?.unmeasured).toBe(true);
+      expect(summary.totalTokens).toBe(600);
+      expect(summary.totalCostUsd).toBe(0);
+    });
+
+    it('a measured voter with zero cost (free model) is NOT unmeasured', () => {
+      // Reported tokens but a free model ⇒ measured, cost genuinely 0.
+      const voters: VoterCostInput[] = [
+        { role: 'devex', model: 'free-model', inputTokens: 500, outputTokens: 100, costUsd: 0 },
+      ];
+
+      const summary = rollupDecisionCost(voters, 'api');
+
+      expect(summary.measuredVoters).toBe(1);
+      expect(summary.unmeasuredVoters).toBe(0);
+      expect(summary.perVoter[0]?.unmeasured).toBe(false);
+      expect(summary.totalTokens).toBe(600);
+      expect(summary.totalCostUsd).toBe(0);
+    });
+  });
+
+  describe('plan mode: 0-cost recorded, token counts kept', () => {
+    it('zeroes every cost but preserves tokens', () => {
+      const voters: VoterCostInput[] = [
+        {
+          role: 'architect',
+          model: 'claude-sonnet',
+          inputTokens: 1000,
+          outputTokens: 200,
+          costUsd: 0.006,
+        },
+        {
+          role: 'security',
+          model: 'claude-sonnet',
+          inputTokens: 500,
+          outputTokens: 100,
+          costUsd: 0.003,
+        },
+      ];
+
+      const summary = rollupDecisionCost(voters, 'plan');
+
+      expect(summary.billingMode).toBe('plan');
+      expect(summary.totalCostUsd).toBe(0);
+      expect(summary.perVoter.every((v) => v.costUsd === 0)).toBe(true);
+      expect(summary.perModel.every((m) => m.costUsd === 0)).toBe(true);
+      // Tokens are KEPT — plan mode still measures consumption.
+      expect(summary.totalInputTokens).toBe(1500);
+      expect(summary.totalOutputTokens).toBe(300);
+      expect(summary.totalTokens).toBe(1800);
+      // Token-reporting voters are still measured in plan mode.
+      expect(summary.measuredVoters).toBe(2);
+    });
+  });
+
+  describe('edge cases', () => {
+    it('handles an empty panel (all zeros, no NaN)', () => {
+      const summary = rollupDecisionCost([], 'api');
+
+      expect(summary.voterCount).toBe(0);
+      expect(summary.measuredVoters).toBe(0);
+      expect(summary.unmeasuredVoters).toBe(0);
+      expect(summary.totalTokens).toBe(0);
+      expect(summary.totalCostUsd).toBe(0);
+      expect(summary.perVoter).toEqual([]);
+      expect(summary.perModel).toEqual([]);
+    });
+
+    it('rounds totals to micro-USD to avoid float drift', () => {
+      const voters: VoterCostInput[] = [
+        { role: 'a', model: 'm', inputTokens: 1, outputTokens: 1, costUsd: 0.1 },
+        { role: 'b', model: 'm', inputTokens: 1, outputTokens: 1, costUsd: 0.2 },
+      ];
+
+      const summary = rollupDecisionCost(voters, 'api');
+
+      // 0.1 + 0.2 = 0.30000000000000004 in IEEE-754; rounded to micro-USD = 0.3.
+      expect(summary.totalCostUsd).toBe(0.3);
+    });
+  });
+});
+
+describe('DecisionCostSummarySchema (#4032 — pins the MCP cost-summary shape)', () => {
+  // This schema rides consensus_vote/pr_review `outputSchema`. A strict MCP client
+  // validates the cost summary recursively, so any field the producer emits that
+  // the schema does not declare → `-32602 additional properties`. Validate a REAL
+  // rollup output strictly so producer↔schema drift fails the test, not a client.
+  it('strictly accepts a real rollup output, top-level and per-row', () => {
+    const voters: VoterCostInput[] = [
+      {
+        role: 'architect',
+        model: 'claude-sonnet',
+        inputTokens: 1000,
+        outputTokens: 200,
+        costUsd: 0.006,
+        priceBasis: 'list',
+      },
+      { role: 'security', model: 'gemini-flash' }, // unmeasured (no token/cost report)
+    ];
+    const summary = rollupDecisionCost(voters, 'api');
+
+    expect(() => DecisionCostSummarySchema.strict().parse(summary)).not.toThrow();
+    // Repointed for #4406: the per-voter line now also carries `priceBasis`
+    // when the caller stated one. It previously pinned a provenance-free key
+    // set (costUsd/inputTokens/model/outputTokens/role/totalTokens/unmeasured),
+    // which is exactly the shape that recorded a list-derived cost identically
+    // to a contract-accurate one. The strict parse above is the real guard.
+    expect(Object.keys(summary.perVoter[0]!).sort()).toEqual([
+      'costUsd',
+      'inputTokens',
+      'model',
+      'outputTokens',
+      'priceBasis',
+      'role',
+      'tokenUsageMeasured',
+      'totalTokens',
+      'unmeasured',
+    ]);
+    expect(Object.keys(summary.perModel[0]!).sort()).toEqual([
+      'costUsd',
+      'inputTokens',
+      'model',
+      'outputTokens',
+      'totalTokens',
+      'voterCount',
+    ]);
+  });
+});
+
+describe('price basis (#4406 — a list-derived cost is not a contract-accurate one)', () => {
+  it('omits the basis for an empty voter set', () => {
+    expect(rollupDecisionCost([], 'api').priceBasis).toBeUndefined();
+  });
+
+  it.each([
+    { bases: ['declared'], expected: 'declared' },
+    { bases: ['unknown', 'declared'], expected: 'declared' },
+    { bases: ['declared', 'list'], expected: 'list' },
+    { bases: ['list', 'declared'], expected: 'list' },
+  ] as const)('rolls up $bases as $expected', ({ bases, expected }) => {
+    const summary = rollupDecisionCost(
+      bases.map((priceBasis) => ({
+        role: 'architect',
+        model: 'gateway-model',
+        inputTokens: 10,
+        costUsd: 0.01,
+        priceBasis,
+      })),
+      'api'
+    );
+    expect(summary.priceBasis).toBe(expected);
+    expect(summary.perVoter.map((v) => v.priceBasis)).toEqual(bases);
+  });
+
+  it('echoes a stated per-voter basis onto the breakdown line', () => {
+    const summary = rollupDecisionCost(
+      [
+        {
+          role: 'architect',
+          model: 'claude-sonnet',
+          inputTokens: 1000,
+          outputTokens: 200,
+          costUsd: 0.006,
+          priceBasis: 'list',
+        },
+      ],
+      'api'
+    );
+    expect(summary.perVoter[0]?.priceBasis).toBe('list');
+    expect(summary.perVoter[0]?.unmeasured).toBe(false);
+  });
+
+  it('OMITS the basis when the caller stated none — absent is not a claim', () => {
+    // Mirrors the cache-token treatment (#4439): a field the producer never
+    // learned must stay absent rather than defaulting to 'unknown', which
+    // would assert that no price existed.
+    const summary = rollupDecisionCost(
+      [{ role: 'architect', model: 'claude-sonnet', inputTokens: 10, outputTokens: 5, costUsd: 0 }],
+      'api'
+    );
+    expect(Object.keys(summary.perVoter[0] ?? {})).not.toContain('priceBasis');
+    expect(Object.keys(summary)).not.toContain('priceBasis');
+  });
+
+  it('carries a basis independently of `unmeasured` — a priced voter with no tokens', () => {
+    // The two say different things: `unmeasured` is about evidence of
+    // consumption, `priceBasis` is about what kind of rate the money figure
+    // rests on. A voter whose adapter reported no tokens is unmeasured, yet
+    // its cost (which DOES reach totalCostUsd) is still list-derived.
+    const summary = rollupDecisionCost(
+      [{ role: 'architect', model: 'claude-sonnet', costUsd: 0.01, priceBasis: 'list' }],
+      'api'
+    );
+    expect(summary.perVoter[0]?.unmeasured).toBe(true);
+    expect(summary.perVoter[0]?.priceBasis).toBe('list');
+    expect(summary.totalCostUsd).toBe(0.01);
+    expect(summary.priceBasis).toBe('list');
+  });
+
+  it("reports the decision total as list-derived when ANY contributing voter's price was", () => {
+    const summary = rollupDecisionCost(
+      [
+        {
+          role: 'architect',
+          model: 'claude-sonnet',
+          inputTokens: 1000,
+          outputTokens: 200,
+          costUsd: 0.006,
+          priceBasis: 'list',
+        },
+        { role: 'security', model: 'mystery-xyz', inputTokens: 50, priceBasis: 'unknown' },
+      ],
+      'api'
+    );
+    expect(summary.priceBasis).toBe('list');
+  });
+
+  it('reports unknown when every voter that spoke had no price at all', () => {
+    const summary = rollupDecisionCost(
+      [
+        { role: 'architect', model: 'mystery-xyz', inputTokens: 50, priceBasis: 'unknown' },
+        { role: 'security', model: 'mystery-abc', outputTokens: 20, priceBasis: 'unknown' },
+      ],
+      'api'
+    );
+    expect(summary.priceBasis).toBe('unknown');
+    expect(summary.totalCostUsd).toBe(0);
+  });
+
+  it('omits the basis in plan mode at EVERY level — the recorded $0 rests on no price', () => {
+    // Plan mode zeroes cost by construction; `billingMode: 'plan'` already
+    // explains the figure, and labelling it 'list' would claim a list price
+    // produced a total that no price produced.
+    //
+    // Extended by the #4406 review: this previously asserted only
+    // `Object.keys(summary)` — the decision level, where the rule already held
+    // — and never inspected `summary.perVoter[0]`, the rows the total is built
+    // from, where it did not. Plan mode is the DEFAULT billing mode, so those
+    // rows were most persisted records, each reading
+    // `{costUsd: 0, unmeasured: false, priceBasis: 'list'}`: a $0 attributed to
+    // a list rate that produced nothing.
+    const summary = rollupDecisionCost(
+      [
+        {
+          role: 'architect',
+          model: 'claude-sonnet',
+          inputTokens: 1000,
+          outputTokens: 200,
+          costUsd: 0.006,
+          priceBasis: 'list',
+        },
+        { role: 'security', model: 'mystery-xyz', inputTokens: 50, priceBasis: 'unknown' },
+      ],
+      'plan'
+    );
+    expect(summary.totalCostUsd).toBe(0);
+    expect(Object.keys(summary)).not.toContain('priceBasis');
+    for (const voter of summary.perVoter) {
+      expect(voter.costUsd).toBe(0);
+      expect(Object.keys(voter)).not.toContain('priceBasis');
+    }
+  });
+
+  it('keeps the per-voter basis in api mode, where the cost is a real priced figure', () => {
+    // The counterpart to the plan-mode case above: the row-level suppression is
+    // conditional on the cost having been forced to 0, not a blanket drop.
+    const summary = rollupDecisionCost(
+      [
+        {
+          role: 'architect',
+          model: 'claude-sonnet',
+          inputTokens: 1000,
+          outputTokens: 200,
+          costUsd: 0.006,
+          priceBasis: 'list',
+        },
+      ],
+      'api'
+    );
+    expect(summary.perVoter[0]?.costUsd).toBe(0.006);
+    expect(summary.perVoter[0]?.priceBasis).toBe('list');
+  });
+
+  it('omits the decision basis for an empty panel rather than reporting a pass', () => {
+    const summary = rollupDecisionCost([], 'api');
+    expect(Object.keys(summary)).not.toContain('priceBasis');
+  });
+});
+
+// #6821: observed outer-attempt usage rides beside the answering-completion
+// totals; it is never summed into them.
+describe('observed attempt usage (#6821)', () => {
+  const retried: VoterCostInput = {
+    role: 'architect',
+    model: 'claude-sonnet',
+    inputTokens: 100,
+    outputTokens: 20,
+    costUsd: 0.001,
+    attemptUsage: { completions: 3, reportedCompletions: 3, inputTokens: 300, outputTokens: 60 },
+  };
+
+  it('leaves the answering-completion totals unchanged', () => {
+    const summary = rollupDecisionCost([retried], 'api');
+    expect(summary.totalInputTokens).toBe(100);
+    expect(summary.totalOutputTokens).toBe(20);
+    expect(summary.perVoter[0]?.attemptUsage).toEqual(retried.attemptUsage);
+  });
+
+  it('totals the observed attempts separately and counts incomplete seats', () => {
+    const summary = rollupDecisionCost(
+      [
+        retried,
+        {
+          role: 'pm',
+          model: 'gpt-5.5',
+          attemptUsage: { completions: 2, reportedCompletions: 0 },
+        },
+        { role: 'security', model: 'gemini-flash' },
+      ],
+      'api'
+    );
+    expect(summary.observedAttemptUsage).toEqual({
+      seats: 2,
+      incompleteSeats: 1,
+      completions: 5,
+      reportedCompletions: 3,
+      inputTokens: 300,
+      outputTokens: 60,
+      totalTokens: 360,
+    });
+    expect(() => DecisionCostSummarySchema.strict().parse(summary)).not.toThrow();
+  });
+
+  it('omits the observed total when no seat carried attempt usage', () => {
+    const summary = rollupDecisionCost([{ role: 'security', model: 'gemini-flash' }], 'plan');
+    expect(summary).not.toHaveProperty('observedAttemptUsage');
+    expect(summary.perVoter[0]).not.toHaveProperty('attemptUsage');
+  });
+});

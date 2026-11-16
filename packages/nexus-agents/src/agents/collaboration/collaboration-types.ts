@@ -1,0 +1,337 @@
+/**
+ * nexus-agents/agents - Collaboration Types
+ *
+ * Type definitions for expert collaboration protocol.
+ * Defines patterns for sequential, parallel, review, and consensus collaboration.
+ */
+
+import type { Task, TaskResult, AgentRole, IAgent, Result, ILogger } from '../../core/index.js';
+import type { AgentError } from '../../core/index.js';
+
+// Re-export schemas and constants from collaboration-schemas.ts
+export {
+  CollaborationPatternSchema,
+  SessionStatusSchema,
+  VoteDecisionSchema,
+  CollaborationConfigSchema,
+  ExpertParticipationSchema,
+  VoteMessageSchema,
+  ReviewResponseMessageSchema,
+  DEFAULT_TIMEOUTS,
+  DEFAULT_MAX_RETRIES,
+  MIN_EXPERTS_FOR_PATTERN,
+} from './collaboration-schemas.js';
+
+/**
+ * Collaboration pattern types.
+ * - sequential: Experts work in order, passing results forward
+ * - parallel: Experts work simultaneously on the same task
+ * - review: One expert reviews another's work
+ * - consensus: Voting-based decision making
+ * - reflexion: Multi-agent reflexion with persona-based critics (arxiv:2512.20845)
+ * - aegean: Byzantine-fault-tolerant consensus (arxiv:2512.20184)
+ * - self-refine: Iterative refinement with self-feedback (arxiv:2303.17651)
+ * - self-debug: Automatic error detection and repair (arxiv:2304.05128)
+ */
+export type CollaborationPattern =
+  | 'sequential'
+  | 'parallel'
+  | 'review'
+  | 'consensus'
+  | 'reflexion'
+  | 'aegean'
+  | 'self-refine'
+  | 'self-debug';
+
+/**
+ * Session status during collaboration lifecycle.
+ */
+export type SessionStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'awaiting_review'
+  | 'voting'
+  | 'finalizing'
+  | 'completed'
+  | 'failed'
+  | 'timed_out';
+
+/**
+ * Vote decision options for consensus protocol.
+ */
+export type VoteDecision = 'approve' | 'reject' | 'abstain';
+
+/**
+ * Configuration for a collaboration session.
+ */
+export interface CollaborationConfig {
+  sessionId: string;
+  pattern: CollaborationPattern;
+  experts: string[];
+  task: Task;
+  timeout?: number;
+  minVotes?: number;
+  requireUnanimous?: boolean;
+  maxRetries?: number;
+}
+
+/**
+ * Expert participation record in a session.
+ */
+export interface ExpertParticipation {
+  expertId: string;
+  role: AgentRole;
+  joinedAt: string;
+  status: 'pending' | 'working' | 'submitted' | 'reviewing' | 'voted' | 'failed';
+  submittedAt?: string;
+  retryCount: number;
+}
+
+/**
+ * Collaboration message types for inter-expert communication.
+ */
+export type CollaborationMessage =
+  | TaskAssignmentMessage
+  | ResultSubmissionMessage
+  | ReviewRequestMessage
+  | ReviewResponseMessage
+  | FeedbackMessage
+  | VoteMessage
+  | StatusUpdateMessage;
+
+/**
+ * Task assignment message sent to an expert.
+ */
+export interface TaskAssignmentMessage {
+  type: 'task_assignment';
+  expertId: string;
+  task: Task;
+  sequencePosition?: number;
+  previousResults?: TaskResult[];
+  deadline?: string;
+}
+
+/**
+ * Result submission from an expert.
+ */
+export interface ResultSubmissionMessage {
+  type: 'result_submission';
+  expertId: string;
+  result: TaskResult;
+  confidence?: number;
+  notes?: string;
+}
+
+/**
+ * Review request from one expert to another.
+ */
+export interface ReviewRequestMessage {
+  type: 'review_request';
+  fromExpert: string;
+  toExpert: string;
+  artifact: unknown;
+  criteria?: string[];
+  deadline?: string;
+}
+
+/**
+ * Review response from a reviewer.
+ */
+export interface ReviewResponseMessage {
+  type: 'review_response';
+  reviewerId: string;
+  requesterId: string;
+  approved: boolean;
+  feedback: string;
+  suggestions?: string[];
+  severity?: 'none' | 'minor' | 'major' | 'critical';
+}
+
+/**
+ * General feedback message.
+ */
+export interface FeedbackMessage {
+  type: 'feedback';
+  expertId: string;
+  targetExpertId?: string;
+  feedback: string;
+  category?: 'improvement' | 'concern' | 'praise' | 'question';
+}
+
+/**
+ * Vote message for consensus protocol.
+ */
+export interface VoteMessage {
+  type: 'vote';
+  expertId: string;
+  decision: VoteDecision;
+  reasoning: string;
+  conditions?: string[];
+}
+
+/**
+ * Status update message.
+ */
+export interface StatusUpdateMessage {
+  type: 'status_update';
+  expertId: string;
+  status: ExpertParticipation['status'];
+  progress?: number;
+  estimatedTimeRemaining?: number;
+}
+
+/**
+ * Aggregated session status.
+ */
+export interface SessionState {
+  config: CollaborationConfig;
+  status: SessionStatus;
+  participants: ExpertParticipation[];
+  results: Map<string, TaskResult>;
+  reviews: ReviewResponseMessage[];
+  votes: VoteMessage[];
+  startedAt: string;
+  completedAt?: string;
+  error?: string;
+  messageLog: CollaborationMessage[];
+}
+
+/**
+ * Final collaboration result.
+ */
+export interface CollaborationResult {
+  sessionId: string;
+  pattern: CollaborationPattern;
+  aggregatedResult: AggregatedResult;
+  expertResults: ExpertResultSummary[];
+  durationMs: number;
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * Summary of an expert's contribution.
+ */
+export interface ExpertResultSummary {
+  expertId: string;
+  role: AgentRole;
+  result?: TaskResult;
+  contributionScore: number;
+  executionTimeMs: number;
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * Aggregated result from multiple experts.
+ */
+export interface AggregatedResult {
+  output: unknown;
+  strategy: 'merge' | 'select_best' | 'consensus' | 'sequential_chain';
+  qualityScore: number;
+  conflicts: ResultConflict[];
+  metadata: AggregationMetadata;
+}
+
+/**
+ * Conflict between expert results.
+ */
+export interface ResultConflict {
+  expert1Id: string;
+  expert2Id: string;
+  /** Original values before conflict resolution; absent on older records. */
+  expert1Value?: unknown;
+  expert2Value?: unknown;
+  field: string;
+  description: string;
+  resolution: 'expert1' | 'expert2' | 'merged' | 'unresolved';
+  resolutionReason?: string;
+}
+
+/**
+ * Metadata about the aggregation process.
+ */
+export interface AggregationMetadata {
+  resultCount: number;
+  conflictCount: number;
+  averageConfidence: number;
+  totalTokensUsed: number;
+  /**
+   * How many contributors reported no measured usage (#4743).
+   *
+   * `totalTokensUsed` sums what was measured. A contributor whose adapter
+   * reported nothing carries a placeholder `0` (`ResultMetadata.tokensMeasured
+   * === false`), so without this count the total reads as complete when it is a
+   * LOWER BOUND. Absent means the aggregate predates the distinction — unknown,
+   * not zero.
+   */
+  unmeasuredResults?: number;
+  /**
+   * Whether `averageConfidence` is a measurement (#4831).
+   *
+   * `false` means no contributor carried a confidence signal, so
+   * `averageConfidence` is a placeholder `0` and NOT a score — a session whose
+   * confidence was never assessed must not read as a confident one. The
+   * collaboration-session builder is in that position: `TaskResult` has no
+   * confidence field, while the `ResultAggregator` path computes the value
+   * from `ExpertResult.confidence`.
+   *
+   * Absent means the producer predates the distinction — unknown, not
+   * measured. Mirrors `ResultMetadata.tokensMeasured` (#4734).
+   */
+  confidenceMeasured?: boolean;
+  /**
+   * Whether `conflicts` is the outcome of a comparison (#4854).
+   *
+   * `false` means nothing was compared, so an empty `conflicts` list and a
+   * `conflictCount` of 0 are the absence of a check — not the absence of
+   * disagreement. They are byte-identical to what a genuinely unanimous
+   * session produces, which is exactly why the distinction has to be stated
+   * rather than inferred. Sessions compare independent object contributions
+   * using the shared object-merge helper. Sequential, reflexion, self-refine,
+   * and self-debug outputs supersede earlier drafts and remain unchecked, as
+   * do zero or one result and non-object outputs.
+   *
+   * Comparison covers shared top-level keys only. A nested difference is
+   * reported on the parent field with both original values; a key missing
+   * on one side is not a conflict. Arrays are compared by order.
+   *
+   * Absent means the producer predates the distinction — unknown, not
+   * checked. Mirrors `confidenceMeasured` (#4831).
+   */
+  conflictsDetected?: boolean;
+  /** Why comparison was skipped, e.g. "not compared: sequential refinement". */
+  conflictsDetectionReason?: string;
+  aggregatedAt: string;
+}
+
+/**
+ * Base interface for collaboration protocols.
+ *
+ * NOTE: This interface is defined here (not in collaboration-protocol.ts) to avoid
+ * circular dependencies. Protocol implementations import this interface, and
+ * collaboration-protocol.ts imports the implementations.
+ */
+export interface ICollaborationProtocol {
+  readonly pattern: CollaborationConfig['pattern'];
+  execute(
+    config: CollaborationConfig,
+    agents: Map<string, IAgent>
+  ): Promise<Result<CollaborationResult, AgentError>>;
+  cancel(reason: string): void;
+}
+
+/**
+ * Options for protocol execution.
+ *
+ * NOTE: sessionOptions uses a generic Record type to avoid circular dependency
+ * with collaboration-session.ts. The actual type is CollaborationSessionOptions
+ * which is defined in collaboration-session.ts.
+ */
+export interface ProtocolOptions {
+  logger?: ILogger;
+  /** Session options - accepts CollaborationSessionOptions from collaboration-session.ts */
+  sessionOptions?: Record<string, unknown>;
+  sequentialDelay?: number;
+  continueOnFailure?: boolean;
+}

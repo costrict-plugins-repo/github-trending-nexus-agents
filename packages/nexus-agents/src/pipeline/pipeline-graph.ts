@@ -1,0 +1,235 @@
+/**
+ * Pipeline Graph Compiler — Build executable graphs from templates (#1735, Phase 2)
+ *
+ * Compiles a PipelineTemplate + IPipelineStage implementations into a
+ * CompiledGraph that can be executed by the GraphExecutor.
+ *
+ * @module pipeline/pipeline-graph
+ */
+
+import { GraphBuilder } from '../orchestration/graph/graph-builder.js';
+import type { CompiledGraph } from '../orchestration/graph/graph-types.js';
+import { START, END, formatCompileError } from '../orchestration/graph/graph-types.js';
+import { createLogger } from '../core/index.js';
+import { GRAPH_TIMEOUTS } from '../config/timeouts.js';
+import { resolveStageTimeoutMs } from './stage-deadline.js';
+import type { IPipelineStage, PipelineTemplate, PipelineContext } from './stage-types.js';
+import { PIPELINE_STATE_KEYS } from './stage-types.js';
+
+const logger = createLogger({ component: 'pipeline-graph' });
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/** Result of compiling a pipeline template into a graph. */
+export interface PipelineGraphResult {
+  readonly ok: boolean;
+  readonly graph?: CompiledGraph | undefined;
+  readonly error?: string | undefined;
+}
+
+/** Map of stage ID → stage implementation. */
+export type StageRegistry = ReadonlyMap<string, IPipelineStage>;
+
+/** Options for {@link compilePipelineGraph}. */
+export interface PipelineGraphCompileOptions {
+  /**
+   * Deadline for EACH stage node, in ms (#6730). Replaces every stage's default,
+   * including the vote stage's panel-sized one, and is clamped to the
+   * `pipeline` class guard. Absent: the vote stage gets the `multi-llm-panel`
+   * class guard and every other stage `GRAPH_TIMEOUTS.defaultMs`.
+   */
+  readonly stageTimeoutMs?: number | undefined;
+}
+
+/**
+ * Thrown by a node handler when its stage reported `success: false` (#4362).
+ *
+ * The graph executor has exactly one failure channel — it catches a thrown
+ * handler and records the node as `NodeResult.status: 'failed'` with this
+ * message. Throwing routes stage failure through that existing channel instead
+ * of adding a second, parallel one in graph state (`consensus_vote`,
+ * `higher_order`, 7/0 on #4362).
+ */
+export class StageFailureError extends Error {
+  constructor(
+    readonly stageId: string,
+    stageError: string | undefined,
+    readonly errorDetail?: Readonly<Record<string, unknown>>
+  ) {
+    // Carries only what the stage already reported — stage errors can embed
+    // command output, so this must not widen the message beyond `output.error`.
+    super(`Stage '${stageId}' failed: ${stageError ?? 'no error message'}`);
+    this.name = 'StageFailureError';
+  }
+}
+
+// ============================================================================
+// Graph Compilation
+// ============================================================================
+
+/**
+ * Compile a pipeline template + stages into an executable graph.
+ *
+ * Each IPipelineStage is wrapped as a GraphBuilder node handler.
+ * Linear edges are auto-generated from template.stages order.
+ * Custom edges override the linear flow for feedback loops.
+ */
+export function compilePipelineGraph(
+  template: PipelineTemplate,
+  stages: StageRegistry,
+  options?: PipelineGraphCompileOptions
+): PipelineGraphResult {
+  const missing = findMissingStages(template, stages);
+  if (missing.length > 0) {
+    const available = [...stages.keys()].sort().join(', ');
+    return {
+      ok: false,
+      error:
+        `Pipeline template '${template.id}' references stage(s) with no implementation ` +
+        `in the selected registry: ${missing.join(', ')}. ` +
+        `Available stages: ${available || '(none)'}. ` +
+        `Pick a different \`template\` whose stages are all implemented, or implement the missing stage(s).`,
+    };
+  }
+
+  const builder = new GraphBuilder();
+  registerStateFields(builder);
+  registerNodes(builder, template, stages, options?.stageTimeoutMs);
+  registerEdges(builder, template);
+
+  const result = builder.compile();
+  if (!result.ok) {
+    const errMsg = formatCompileError(result.error);
+    logger.warn('Pipeline graph compilation failed', { error: errMsg });
+    return { ok: false, error: errMsg };
+  }
+
+  logger.info('Pipeline graph compiled', {
+    template: template.id,
+    stages: template.stages.length,
+  });
+  return { ok: true, graph: result.value };
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Stage IDs a template references that the registry doesn't implement. Empty
+ * when the registry can run the whole template. Exported so the orchestrator
+ * can pre-check runnability and fall back to a satisfiable template (#3487).
+ */
+export function findMissingStages(
+  template: PipelineTemplate,
+  stages: StageRegistry
+): readonly string[] {
+  return template.stages.filter((id) => !stages.has(id));
+}
+
+/** Register standard state fields on the graph builder. */
+function registerStateFields(builder: GraphBuilder): void {
+  const keys = PIPELINE_STATE_KEYS;
+  builder.addState(keys.TASK, { defaultValue: '', reducer: { type: 'overwrite' } });
+  builder.addState(keys.RESEARCH, { defaultValue: '', reducer: { type: 'overwrite' } });
+  builder.addState(keys.PLAN, { defaultValue: '', reducer: { type: 'overwrite' } });
+  builder.addState(keys.VOTE_RESULT, { defaultValue: null, reducer: { type: 'overwrite' } });
+  builder.addState(keys.VOTE_FEEDBACK, { defaultValue: '', reducer: { type: 'overwrite' } });
+  builder.addState(keys.VOTE_ITERATIONS, { defaultValue: 0, reducer: { type: 'overwrite' } });
+  builder.addState(keys.TASKS, { defaultValue: [], reducer: { type: 'overwrite' } });
+  builder.addState(keys.IMPLEMENTATIONS, { defaultValue: [], reducer: { type: 'overwrite' } });
+  builder.addState(keys.QA_ITERATIONS, { defaultValue: 0, reducer: { type: 'overwrite' } });
+  builder.addState(keys.SECURITY_PASSED, { defaultValue: false, reducer: { type: 'overwrite' } });
+  builder.addState(keys.FINDINGS, { defaultValue: [], reducer: { type: 'overwrite' } });
+  builder.addState(keys.PARSED_SPEC, { defaultValue: null, reducer: { type: 'overwrite' } });
+  builder.addState(keys.SCAFFOLD_OUTPUT, { defaultValue: null, reducer: { type: 'overwrite' } });
+  builder.addState(keys.COMPLETED, { defaultValue: false, reducer: { type: 'overwrite' } });
+}
+
+/** Register graph nodes from template stages. */
+function registerNodes(
+  builder: GraphBuilder,
+  template: PipelineTemplate,
+  stages: StageRegistry,
+  stageTimeoutMs: number | undefined
+): void {
+  for (const stageId of template.stages) {
+    const stage = stages.get(stageId);
+    if (stage === undefined) continue;
+    builder.addNode(stageId, createNodeHandler(stage, template), {
+      timeout: resolveStageTimeoutMs(stageId, stageTimeoutMs, GRAPH_TIMEOUTS.defaultMs),
+    });
+  }
+}
+
+/** Create a GraphBuilder NodeHandler from an IPipelineStage. */
+function createNodeHandler(
+  stage: IPipelineStage,
+  template: PipelineTemplate
+): (state: Readonly<Record<string, unknown>>) => Promise<Partial<Record<string, unknown>>> {
+  // The pre-#2937 implementation reused a SharedMemoryStore across stages
+  // by stashing it under PIPELINE_STATE_KEYS.SHARED_MEMORY in graph state.
+  // Removed along with the rest of the write-only SharedMemoryStore
+  // plumbing — cross-stage data flows through `ctx.state` only now.
+  return async (state) => {
+    const context: PipelineContext = {
+      executionId: `${template.id}-${stage.id}`,
+      task:
+        typeof state[PIPELINE_STATE_KEYS.TASK] === 'string'
+          ? (state[PIPELINE_STATE_KEYS.TASK] as string)
+          : '',
+      templateId: template.id,
+      state,
+    };
+
+    const output = await stage.execute(context);
+    // #4362: `output.success`/`output.error` used to be discarded here, so a
+    // stage that failed cleanly (returned rather than threw) was indistinguishable
+    // from one that succeeded — and every caller up the chain reported success.
+    // Throwing hands the failure to the executor's own channel; it records this
+    // node `status: 'failed'`. Its output is error evidence, never a state update.
+    if (!output.success) {
+      throw new StageFailureError(stage.id, output.error, { [output.stateKey]: output.value });
+    }
+    return { [output.stateKey]: output.value };
+  };
+}
+
+/** Register edges (linear auto-generation + custom overrides). */
+function registerEdges(builder: GraphBuilder, template: PipelineTemplate): void {
+  // Auto-generate linear edges from stage order
+  if (template.edges === undefined || template.edges.length === 0) {
+    registerLinearEdges(builder, template.stages);
+    return;
+  }
+
+  // Use custom edges
+  for (const edge of template.edges) {
+    if (edge.type === 'fixed') {
+      builder.addEdge(edge.from, edge.to);
+    } else {
+      const routerKey = edge.routerKey;
+      builder.addConditionalEdge(
+        edge.from,
+        (state) => {
+          const val = state[routerKey];
+          if (typeof val === 'string') return val;
+          return edge.targets[0] ?? '';
+        },
+        [...edge.targets]
+      );
+    }
+  }
+}
+
+/** Register linear START→stage1→stage2→...→END edges. */
+function registerLinearEdges(builder: GraphBuilder, stages: readonly string[]): void {
+  if (stages.length === 0) return;
+  builder.addEdge(START, stages[0] as string);
+  for (let i = 0; i < stages.length - 1; i++) {
+    builder.addEdge(stages[i] as string, stages[i + 1] as string);
+  }
+  builder.addEdge(stages[stages.length - 1] as string, END);
+}

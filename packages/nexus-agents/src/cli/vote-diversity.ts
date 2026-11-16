@@ -1,0 +1,334 @@
+/**
+ * Panel model diversity (#6115).
+ *
+ * `costSummary.perModel` showed the final model per seat but not the ASSIGNED
+ * one, so "7 of 7 on gemini" was visible only to someone who knew the
+ * round-robin. This module measures what the response and the summary line
+ * disclose: model attribution among answering seats, the coverage of raw
+ * serving reports, and how many seats
+ * answered somewhere other than where they were assigned, and the distinct
+ * assigned models and families across the full roster.
+ *
+ * Shared by the MCP response (`consensus-vote-types`) and the CLI / GitHub
+ * renderings (`vote-summary-lines`) so the two cannot drift.
+ *
+ * @module cli/vote-diversity
+ */
+
+import { CliNameSchema } from '../config/model-capabilities-types.js';
+import { findCanonicalModel } from '../config/model-config-helpers.js';
+import { CLI_TO_MODELSDEV_VENDOR } from '../config/models-dev-by-vendor.js';
+import { countDistinctModels, UNRESOLVED_MODEL_ID } from '../config/model-equivalence.js';
+import type { AgentVoteResult, SeatFallback } from './vote-types.js';
+import { bareCliName } from './voter-fallback.js';
+import { vendorFamilyOf } from './voter-family-dealing.js';
+import { preserveVoterAttemptTelemetry } from './voter-attempt-events.js';
+import { validatedModelIdentity } from '../cli-adapters/model-identity.js';
+
+/**
+ * Always present on the response, explicit zeros included: an absent key
+ * would read as a healthy spread, which is exactly what the three
+ * single-model panels looked like.
+ */
+export interface PanelDiversity {
+  /** Report coverage among answering seats; total zero is unmeasured, not complete. */
+  readonly reportCoverage?: { readonly reported: number; readonly total: number };
+  /** Distinct resolved attributions; reportCoverage separates reports from selection fallback. */
+  readonly distinctModels: number;
+  /**
+   * Distinct model families — vendors: anthropic, openai, google, ... (#6606) —
+   * among the seats that answered. A seat whose model names no recognised
+   * vendor is counted in {@link unclassifiedSeats}, never as a family.
+   */
+  readonly distinctFamilies: number;
+  /** Answering seats whose resolved model names no recognised vendor (#6606). */
+  readonly unclassifiedSeats: number;
+  /**
+   * Answering seats whose model never resolved — absent, empty, or the
+   * `pending-detection` placeholder (#6660). They sit in none of the other
+   * counts, so without this one "1 distinct, 1 family" could describe a panel
+   * where six of seven answering seats named no model at all.
+   * {@link panelDiversityOf} always sets it, explicit zero included; optional
+   * in the type only so the published shape widens additively.
+   */
+  readonly unresolvedSeats?: number;
+  /** Seats that answered on a CLI or model other than the one assigned. */
+  readonly fallbacks: number;
+}
+
+/** Assigned-roster diversity; coverage names assignments that remain unmeasured. */
+interface AssignedPanelDiversity {
+  /** Distinct assigned models, including seats that errored or abstained. */
+  readonly assignedDistinctModels?: number;
+  /** Recognised vendor families among all assigned models. */
+  readonly assignedDistinctFamilies?: number;
+  /** Resolved assignments out of the entire roster, including non-answering seats. */
+  readonly assignedCoverage?: { readonly reported: number; readonly total: number };
+}
+
+/** A seat that answered elsewhere, with where it landed. */
+export interface SeatFallbackDetail {
+  readonly role: AgentVoteResult['role'];
+  readonly fallback: SeatFallback;
+  /** The CLI that answered, bare (`gemini`), or `?` when the result carries none. */
+  readonly toCli: string;
+  readonly toModel: string | undefined;
+}
+
+/** The answering seats; only those with explicit reports support independence measurement. */
+function answeringSeats(votes: readonly AgentVoteResult[]): AgentVoteResult[] {
+  return votes.filter((v) => v.source === 'llm');
+}
+
+/** A model id when it names one; absent, empty and the placeholder are not models. */
+function realModel(id: string | undefined): string | undefined {
+  return id === undefined || id === '' || id === UNRESOLVED_MODEL_ID ? undefined : id;
+}
+
+/** The model the seat REQUESTED — the adapter's construction-time id. */
+function requestedModel(v: Pick<AgentVoteResult, 'model'>): string | undefined {
+  return realModel(v.model);
+}
+
+/**
+ * The primary assignment, even when its launch-time pin preceded lazy detection.
+ * Fallback provenance names the primary; a non-fallback request names itself.
+ * Never infer an assignment from the served model or an untraced fallback.
+ */
+export function assignedModel(v: AgentVoteResult): string | undefined {
+  const pinned = realModel(v.pinnedModel);
+  if (pinned !== undefined) return pinned;
+  const from = realModel(v.fallback?.fromModel);
+  if (from !== undefined) return qualifiedModel(from, v.fallback?.fromCli);
+  return v.fallback === undefined ? requestedModel(v) : undefined;
+}
+
+/** Resolve the launch-time assignment without losing deferred attempt telemetry. */
+export function withResolvedAssignment(vote: AgentVoteResult): AgentVoteResult {
+  return preserveVoterAttemptTelemetry(vote, { ...vote, pinnedModel: assignedModel(vote) });
+}
+
+/**
+ * Canonically qualified `servedModel`, else per-completion operational selection,
+ * else the configured request. Diversity and display use this attribution; an
+ * absent report's selection fallback is not a transport measurement. The ledger preserves its
+ * configured `model` separately and stores this as `resolvedModel` (#7333).
+ */
+export function resolvedModel(v: AgentVoteResult): string | undefined {
+  const served = validatedModelIdentity(v.servedModel);
+  const operational = validatedModelIdentity(v.operationalModel);
+  const attributed = served ?? operational;
+  return attributed === undefined ? requestedModel(v) : qualifiedModel(attributed, v.cli);
+}
+
+/**
+ * An id as a canonical model id. The claude transport may select a bare
+ * CLI alias (`opus`), which the identity resolver deliberately leaves
+ * unresolvable (#4390) — so an id that names no vendor on its own is qualified
+ * against its originating CLI, never globally. A resolvable id, or one no
+ * entry of that CLI claims, is returned unchanged.
+ */
+function qualifiedModel(model: string, cliName: string | undefined): string {
+  if (vendorFamilyOf(model) !== 'unknown') return model;
+  const cli = CliNameSchema.safeParse(cliName === undefined ? undefined : bareCliName(cliName));
+  if (!cli.success) return model;
+  return findCanonicalModel(cli.data, model)?.id ?? model;
+}
+
+/** True when the seat was served on a model other than the one it requested. */
+function servedElsewhere(v: AgentVoteResult): boolean {
+  const requested = requestedModel(v);
+  if (requested === undefined || validatedModelIdentity(v.servedModel) === undefined) return false;
+  return countDistinctModels([requested, resolvedModel(v) ?? '']) > 1;
+}
+
+/** A seat served off-request with no recorded fallback: requested and served model. */
+interface ServedSubstitution {
+  readonly role: AgentVoteResult['role'];
+  readonly requested: string;
+  readonly served: string;
+}
+
+/**
+ * Answering seats whose reported served model differs from the requested one
+ * but carry no {@link SeatFallback} — {@link seatFallbacks} already discloses
+ * the ones that do. Panel order; empty when every seat answered as requested.
+ */
+export function servedSubstitutions(votes: readonly AgentVoteResult[]): ServedSubstitution[] {
+  const out: ServedSubstitution[] = [];
+  for (const v of answeringSeats(votes)) {
+    if (v.fallback !== undefined || !servedElsewhere(v)) continue;
+    out.push({ role: v.role, requested: v.model ?? '', served: resolvedModel(v) ?? '' });
+  }
+  return out;
+}
+
+/**
+ * The single-model warning's model label: the served model, preceded by the
+ * requested models when any seat asked for something else
+ * (`claude-fable-5 → served claude-opus`).
+ */
+function servedModelLabel(answered: readonly AgentVoteResult[], served: string): string {
+  const requested = [
+    ...new Set(
+      answered
+        .filter(servedElsewhere)
+        .map(requestedModel)
+        .filter((m): m is string => m !== undefined)
+    ),
+  ];
+  return requested.length === 0 ? served : `${requested.join(', ')} → served ${served}`;
+}
+
+/** Every answering seat that carries a fallback, in panel order. */
+export function seatFallbacks(votes: readonly AgentVoteResult[]): SeatFallbackDetail[] {
+  const out: SeatFallbackDetail[] = [];
+  for (const v of answeringSeats(votes)) {
+    if (v.fallback === undefined) continue;
+    out.push({
+      role: v.role,
+      fallback: v.fallback,
+      toCli: v.cli === undefined ? '?' : bareCliName(v.cli),
+      toModel: resolvedModel(v),
+    });
+  }
+  return out;
+}
+
+/**
+ * Distinct answering model attributions, explicit report coverage, and fallback count. A panel nobody answered is
+ * `{ 0, 0 }` — `countDistinctModels([])` is 0 and no seat can have fallen
+ * over — which is the named empty case, not a claim of diversity.
+ */
+export function panelDiversityOf(votes: readonly AgentVoteResult[]): PanelDiversity {
+  const resolved = answeringSeats(votes).map(resolvedModel);
+  const models = resolved.filter((m): m is string => m !== undefined);
+  const families = models.map(vendorFamilyOf);
+  const classified = families.filter((f) => f !== 'unknown');
+  return {
+    reportCoverage: modelReportCoverage(votes),
+    distinctModels: countDistinctModels(models),
+    distinctFamilies: new Set(classified).size,
+    unclassifiedSeats: families.length - classified.length,
+    unresolvedSeats: resolved.length - models.length,
+    fallbacks: seatFallbacks(votes).length,
+  };
+}
+
+/** Explicit counts: an empty answering set is zero coverage, never a healthy panel. */
+export function modelReportCoverage(votes: readonly AgentVoteResult[]): {
+  reported: number;
+  total: number;
+} {
+  const answered = answeringSeats(votes);
+  const reported = answered.filter(
+    (v) => validatedModelIdentity(v.servedModel) !== undefined
+  ).length;
+  return { reported, total: answered.length };
+}
+
+/** A missing report cannot be repaired by configured or operational model attribution. */
+export function modelReportCoverageWarning(votes: readonly AgentVoteResult[]): string | undefined {
+  const { reported, total } = modelReportCoverage(votes);
+  if (total === 0) return 'Serving-model reports UNMEASURED: no answering seats.';
+  if (reported === total) return undefined;
+  return `Serving-model reports ${String(reported)}/${String(total)}; unreported serving identities are UNMEASURED. Model/family counts include operational attribution.`;
+}
+
+/**
+ * Count the assigned roster independently of execution outcomes. An empty
+ * roster, or one with no resolved assignments, is unmeasured: omit the counts
+ * and disclose zero reported assignments. Partial counts carry their coverage.
+ */
+export function assignedPanelDiversityOf(
+  votes: readonly AgentVoteResult[]
+): AssignedPanelDiversity {
+  const models = votes.map(assignedModel).filter((m): m is string => m !== undefined);
+  const assignedCoverage = { reported: models.length, total: votes.length };
+  if (models.length === 0) return { assignedCoverage };
+  const families = models.map(vendorFamilyOf).filter((family) => family !== 'unknown');
+  return {
+    assignedDistinctModels: countDistinctModels(models),
+    assignedDistinctFamilies: new Set(families).size,
+    assignedCoverage,
+  };
+}
+
+/** Panels smaller than this cannot make a meaningful independence claim to weaken. */
+const MIN_PANEL_FOR_DIVERSITY_WARNING = 3;
+
+/**
+ * The warning for a panel of 3+ seats whose every answering seat ran on ONE
+ * model. Undefined on a diverse panel, a small panel, a panel nobody answered
+ * (the degradation warning already covers that one), and a panel where an
+ * answering seat never resolved its model — "all on one model" is a claim,
+ * and an unresolved seat is a seat the claim cannot cover (#4983).
+ */
+export function singleModelPanelWarning(votes: readonly AgentVoteResult[]): string | undefined {
+  if (votes.length < MIN_PANEL_FOR_DIVERSITY_WARNING) return undefined;
+  const answered = answeringSeats(votes);
+  const models = answered.map(resolvedModel);
+  const model = models[0];
+  if (model === undefined || models.includes(undefined)) return undefined;
+  if (panelDiversityOf(votes).distinctModels !== 1) return undefined;
+  const silent = votes.length - answered.length;
+  const missing = silent > 0 ? ` (${String(silent)} did not answer)` : '';
+  const coverage = modelReportCoverage(votes);
+  const complete = coverage.total > 0 && coverage.reported === coverage.total;
+  const label = complete ? servedModelLabel(answered, model) : model;
+  return (
+    `All ${String(answered.length)} answering seats ${complete ? 'reported' : 'attributed to'} ${label}${missing}; ` +
+    `serving-model reports ${String(coverage.reported)}/${String(coverage.total)}; ` +
+    'independence is weaker than assigned.'
+  );
+}
+
+/**
+ * The warning for a 3+ panel whose answering seats ran SEVERAL models of ONE
+ * family (#6606): three Anthropic models are one vendor's judgement, however
+ * distinct their ids. Undefined when the panel spans families, runs a single
+ * model (the single-model warning names that one), is under 3 seats, or has
+ * nobody answering — and when any answering seat is unresolved or
+ * unclassified, because "all one family" is a claim that seat cannot support.
+ */
+export function singleFamilyPanelWarning(votes: readonly AgentVoteResult[]): string | undefined {
+  if (votes.length < MIN_PANEL_FOR_DIVERSITY_WARNING) return undefined;
+  const answered = answeringSeats(votes);
+  const models = answered.map(resolvedModel);
+  const model = models[0];
+  if (model === undefined || models.includes(undefined)) return undefined;
+  const { distinctModels, distinctFamilies, unclassifiedSeats } = panelDiversityOf(votes);
+  if (distinctFamilies !== 1 || unclassifiedSeats > 0 || distinctModels < 2) return undefined;
+  const coverage = modelReportCoverage(votes);
+  const complete = coverage.total > 0 && coverage.reported === coverage.total;
+  return (
+    `All ${String(answered.length)} answering seats ${complete ? 'reported' : 'attributed to'} ${vendorFamilyOf(model)} models ` +
+    `(${String(distinctModels)} distinct); serving-model reports ${String(coverage.reported)}/${String(coverage.total)}; independence is weaker than assigned.`
+  );
+}
+
+/** The assigned vendor, using the CLI vendor only when its model never resolved. */
+function assignedFallbackFamily(v: AgentVoteResult, fallback: SeatFallback): string {
+  const model = requestedModel({ model: fallback.fromModel ?? v.pinnedModel });
+  return vendorFamilyOf(model ?? CLI_TO_MODELSDEV_VENDOR[fallback.fromCli] ?? '');
+}
+
+/**
+ * Disclose answering fallback seats whose vendor family changed (#7106), even
+ * if the remaining panel is diverse. An undetected assignment uses its known
+ * CLI vendor; an unknown served model cannot establish a family change.
+ * Empty panels and same-family fallbacks produce no warning.
+ */
+export function crossFamilyFallbackWarning(votes: readonly AgentVoteResult[]): string | undefined {
+  const changes: string[] = [];
+  for (const v of answeringSeats(votes)) {
+    if (v.fallback === undefined) continue;
+    const assigned = assignedFallbackFamily(v, v.fallback);
+    const served = vendorFamilyOf(resolvedModel(v) ?? '');
+    if (assigned === 'unknown' || served === 'unknown' || assigned === served) continue;
+    const basis =
+      validatedModelIdentity(v.servedModel) === undefined ? 'attributed to' : 'reported';
+    changes.push(`${v.role}: assigned ${assigned}, ${basis} ${served}`);
+  }
+  return changes.length === 0 ? undefined : `Cross-family fallback: ${changes.join('; ')}.`;
+}

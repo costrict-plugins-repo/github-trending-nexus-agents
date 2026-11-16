@@ -1,0 +1,321 @@
+---
+title: Custom OpenAI-Compatible Endpoint Setup
+description: Configure nexus-agents to use an OpenAI-compatible gateway directly or through OpenCode
+diataxis: how-to
+audience: user
+prerequisites:
+  - 'Path A: a gateway URL and API key; no CLI subprocess or OpenCode is required.'
+  - 'Path B: the OpenCode CLI installed and on PATH.'
+  - 'Path B: a custom gateway that speaks the OpenAI-compatible chat completions API.'
+  - 'Path B: an API key for the gateway, stored in `opencode.json` or an environment variable.'
+tier: 2
+keywords: [custom, openai-compatible, gateway, opencode, endpoint, proxy]
+---
+
+# Custom OpenAI-Compatible Endpoint Setup
+
+Route nexus-agents tasks through a custom OpenAI-compatible API gateway. Two paths are supported — pick based on whether you want nexus-agents to hold the credentials directly.
+
+## Path A: Direct gateway adapter (recommended for most cases)
+
+```
+nexus-agents → Gateway adapter → Custom Gateway → Model Provider
+                (HTTP POST)       (OpenAI-compat)   (Claude, Gemini, etc.)
+```
+
+Set the URL and key; optionally pin the model:
+
+```bash
+export NEXUS_OPENAI_COMPAT_URL="https://your-gateway.example.com/v1"
+export NEXUS_OPENAI_COMPAT_KEY="your-api-key"
+export NEXUS_CUSTOM_MODEL="claude-opus-4-5"   # optional; without a catalogue, default: gpt-5.5
+```
+
+The URL/key pair configures model discovery (`GET $NEXUS_OPENAI_COMPAT_URL/models`, so the URL must already end in `/v1`), in-process voters and the `api:<endpoint>` routing arm. Since #7150, the `custom-openai` auto-adapter is a thin alias over that gateway adapter, retaining `api:custom-openai` usage attribution. With a catalogue it uses the resolved gateway default: `NEXUS_CUSTOM_MODEL` pins a listed model, and an unavailable pin falls back to the catalogue default. Without a catalogue it sends `NEXUS_CUSTOM_MODEL` or `gpt-5.5`; failed discovery marks the model unverified.
+
+> **Removed in 10.0 (#7144):** `NEXUS_CUSTOM_API_BASE_URL` and `NEXUS_CUSTOM_API_KEY` are ignored and reported as unknown variables by environment validation. Rename them to `NEXUS_OPENAI_COMPAT_URL` and `NEXUS_OPENAI_COMPAT_KEY`; normal startup validation warns about the old names. The canonical pair configures discovery and the direct gateway alias. Other `NEXUS_CUSTOM_*` settings, including `NEXUS_CUSTOM_MODEL` and `NEXUS_CUSTOM_API_ALLOW_PRIVATE`, remain supported.
+
+The adapter validates the base URL through an SSRF guard before making any request — loopback, RFC 1918 private ranges, and link-local (incl. AWS IMDS `169.254.169.254`) are rejected by default. Set `NEXUS_CUSTOM_API_ALLOW_PRIVATE=1` if your gateway runs on a trusted internal host.
+
+Gateway calls default to `<base>/chat/completions`. Set `NEXUS_CUSTOM_API_SURFACE=responses` for a gateway that serves `<base>/responses`; the setting applies to the `custom-openai` alias only; discovered per-model clients keep chat completions. Both surfaces support streaming and tool calls. Auth headers (`NEXUS_OPENAI_COMPAT_AUTH_HEADER` and `NEXUS_OPENAI_COMPAT_EXTRA_HEADERS`) and proxy settings use the same client path; see [CORPORATE_GATEWAY.md](./CORPORATE_GATEWAY.md).
+
+No CLI subprocess or OpenCode is required for this path. The alias uses the same URL validation and bounded DNS/private-host guard as other gateway clients. See [gateway-client-guard.ts](../../packages/nexus-agents/src/adapters/gateway-client-guard.ts) for request-time guards and [openai-compat-adapter.ts](../../packages/nexus-agents/src/adapters/openai-compat-adapter.ts) for discovery.
+
+## Path B: OpenCode transport (for environments already managing creds in OpenCode)
+
+```
+nexus-agents → OpenCode CLI → Custom Gateway → Model Provider
+                (subprocess)    (OpenAI-compat)   (Claude, etc.)
+```
+
+nexus-agents invokes `opencode run --model custom/<model-name> <prompt>` as a subprocess. OpenCode handles the HTTP transport to the custom gateway. No API keys or credentials are managed by nexus-agents — handy when the user's gateway credentials are already in `opencode.json` and you don't want a second copy.
+
+## Step 1: Configure OpenCode
+
+Create or edit `opencode.json` in your project root:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "custom": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Custom Gateway",
+      "options": {
+        "baseURL": "https://your-gateway.example.com/v1",
+        "apiKey": "{env:CUSTOM_API_KEY}"
+      },
+      "models": {
+        "claude-opus-4-6": {
+          "name": "Claude Opus 4.6",
+          "limit": { "context": 200000, "output": 65536 }
+        },
+        "claude-sonnet-4-6": {
+          "name": "Claude Sonnet 4.6",
+          "limit": { "context": 200000, "output": 65536 }
+        }
+      }
+    }
+  }
+}
+```
+
+Set the API key as an environment variable:
+
+```bash
+export CUSTOM_API_KEY="your-api-key"
+```
+
+Config files are merged across three locations (project overrides global):
+
+1. **Global:** `~/.config/opencode/opencode.json` (or `opencode.jsonc`)
+2. **Project:** `opencode.json` (or `opencode.jsonc`) in project root
+3. **Environment:** `OPENCODE_CONFIG` path
+
+> **JSONC support:** OpenCode and `nexus-agents setup` both support `.jsonc` files (JSON with comments). Comments are preserved when nexus-agents merges its MCP entry.
+
+## Step 2: Verify OpenCode Can Reach the Gateway
+
+Test model connectivity:
+
+```bash
+opencode run --model custom/claude-sonnet-4-6 "Hello, respond with OK"
+```
+
+You should receive a response from the model via the gateway.
+
+To verify which models the gateway exposes (standard OpenAI-compatible endpoint):
+
+```bash
+curl -H "Authorization: Bearer $CUSTOM_API_KEY" https://your-gateway.example.com/v1/models
+```
+
+Or list models via OpenCode:
+
+```bash
+opencode models custom --verbose
+```
+
+## Step 3: Model Registry
+
+nexus-agents includes two pre-configured model profiles for custom endpoints:
+
+| Model ID                 | CLI Model Name             | Quality Profile                  |
+| ------------------------ | -------------------------- | -------------------------------- |
+| `opencode-custom-opus`   | `custom/claude-opus-4-6`   | reasoning: 10, code: 9, speed: 5 |
+| `opencode-custom-sonnet` | `custom/claude-sonnet-4-6` | reasoning: 9, code: 9, speed: 7  |
+
+These are registered in `config/in-tree-data.ts` with `provider: 'custom-openai'` and `cliName: 'opencode'`.
+
+## Step 4: Routing
+
+The routing pipeline automatically discovers custom models via `cliName: 'opencode'`. When OpenCode is available and the task profile matches, custom models participate in model scoring alongside direct-access models.
+
+The opencode fallback chain prioritizes custom models:
+
+```
+opencode-custom-opus → opencode-custom-sonnet → opencode-default
+```
+
+To force routing through a custom model, use `delegate_to_model` with `model_hint`:
+
+```bash
+nexus-agents orchestrate --model opencode-custom-opus "Your task here"
+```
+
+Or via MCP:
+
+```json
+{
+  "tool": "delegate_to_model",
+  "arguments": {
+    "task": "Your task here",
+    "model_hint": "opencode-custom-opus"
+  }
+}
+```
+
+## Customizing Model Names
+
+If your gateway uses different model identifiers, two changes are needed:
+
+**1. OpenCode config** (`opencode.json`) — model keys must match the gateway's model IDs:
+
+```json
+{
+  "provider": {
+    "custom": {
+      "models": {
+        "your-model-id": { "name": "Your Model" }
+      }
+    }
+  }
+}
+```
+
+**2. nexus-agents registry** (`config/in-tree-data.ts`) — `cliModelName` must match `<provider>/<model-key>`:
+
+```typescript
+{
+  id: 'opencode-custom-opus',
+  // ...
+  cliModelName: 'custom/your-model-id',
+}
+```
+
+The `cliModelName` is passed directly to `opencode run --model <cliModelName>`.
+
+## Advanced Options
+
+nexus-agents passes optional flags to OpenCode when specified in task options:
+
+| Option     | Values                   | Description                    |
+| ---------- | ------------------------ | ------------------------------ |
+| `variant`  | `high`, `max`, `minimal` | Reasoning effort level         |
+| `thinking` | `true`                   | Show model thinking blocks     |
+| `workDir`  | path string              | Working directory for the task |
+
+Example via MCP:
+
+```json
+{
+  "tool": "delegate_to_model",
+  "arguments": {
+    "task": "Review this code for security issues",
+    "model_hint": "opencode-custom-opus"
+  }
+}
+```
+
+The `variant` flag uses a strict allowlist — non-allowlisted values are silently dropped for security.
+
+## Using nexus-agents as MCP Server Inside OpenCode
+
+nexus-agents can run as an MCP server inside OpenCode, giving OpenCode access to every nexus-agents MCP tool (orchestrate, consensus vote, memory, research, etc.; full list in [ENTRYPOINTS.md](../ENTRYPOINTS.md)).
+
+Add the `mcp` section to your `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "nexus-agents": {
+      "type": "local",
+      "command": ["node", "/path/to/nexus-agents/dist/cli.js", "--mode=server"],
+      "enabled": true,
+      "environment": {
+        "NEXUS_OPENAI_COMPAT_URL": "{env:NEXUS_OPENAI_COMPAT_URL}",
+        "NEXUS_OPENAI_COMPAT_KEY": "{env:NEXUS_OPENAI_COMPAT_KEY}"
+      }
+    }
+  }
+}
+```
+
+Do not set `NEXUS_ALLOW_MOCK_ORCHESTRATION` here: the code marks it not for production, because mock orchestration returns heuristic results instead of model output. With the gateway variables passed through, orchestration uses real model calls. For a gateway-only setup (no local CLIs), see [Corporate OpenAI-spec gateway](./CORPORATE_GATEWAY.md).
+
+Verify the connection:
+
+```bash
+opencode mcp list
+# Should show: nexus-agents connected
+```
+
+Then use nexus-agents tools from within OpenCode sessions. The model will automatically discover and call available MCP tools.
+
+## Docker Container Testing
+
+Run OpenCode + nexus-agents MCP in an isolated Docker container for reproducible testing.
+
+### Quick Start
+
+```bash
+# Build the image
+docker build -f Dockerfile.opencode -t nexus-opencode .
+
+# Smoke test: confirm the nexus-agents MCP server connects (no API key needed)
+docker run --rm nexus-opencode mcp list
+
+# Interactive session with Anthropic
+docker run -it --rm -e ANTHROPIC_API_KEY nexus-opencode
+
+# Run with custom OpenAI-compatible endpoint
+docker run -it --rm \
+  -e CUSTOM_API_BASE_URL=https://your-gateway.example.com/v1 \
+  -e CUSTOM_API_KEY=your-key \
+  nexus-opencode run --format json -m custom/claude-opus "your prompt"
+
+# Test MCP integration with free model (no API key)
+docker run --rm nexus-opencode run --format json -m opencode/big-pickle \
+  "Use the list_experts MCP tool"
+```
+
+### What the Container Includes
+
+- **Node.js 24** + built nexus-agents with all dependencies
+- **OpenCode v1.2.15** (pinned for reproducibility)
+- **MCP config** (`opencode.json`): nexus-agents connected via stdio local transport
+- **Provider config**: Anthropic + custom OpenAI-compatible endpoint preconfigured
+- Runs as non-root `nexus` user
+
+### Docker Desktop Sandbox (with nexus-agents MCP)
+
+For stronger isolation via microVM, Docker Desktop users can run OpenCode with nexus-agents MCP inside a Docker Sandbox. The sandbox provides hypervisor-level isolation, credential proxying (API keys never enter the VM), and filesystem mounting.
+
+**Prerequisites:** Docker Desktop with Sandbox v0.12.0+ (`docker sandbox version`)
+
+```bash
+# Build the sandbox template (extends official opencode sandbox image)
+docker build -f Dockerfile.sandbox -t nexus-sandbox:latest .
+
+# Create and run sandbox with nexus-agents MCP
+docker sandbox run -t nexus-sandbox:latest opencode .
+
+# Or create first, then run separately
+docker sandbox create -t nexus-sandbox:latest opencode .
+docker sandbox run <sandbox-name>
+
+# Verify MCP inside sandbox
+docker sandbox exec <sandbox-name> opencode mcp list
+# Should show: nexus-agents connected
+
+# Test MCP tool call inside sandbox (no API key needed)
+docker sandbox exec <sandbox-name> bash -c \
+  'opencode run --format json -m opencode/big-pickle "Use the list_experts MCP tool"'
+```
+
+The `Dockerfile.sandbox` extends `docker/sandbox-templates:opencode` with nexus-agents dist, node_modules, and MCP config baked in. Every nexus-agents MCP tool is accessible inside the sandbox.
+
+## Troubleshooting
+
+**"No model adapter configured"**: OpenCode is not on PATH or not installed. Install it and verify with `which opencode`.
+
+**Gateway connection errors**: Check `opencode.json` baseURL and API key. Verify with `opencode run --model custom/... "test"` directly.
+
+**Model not selected by router**: Custom models default to `cliName: 'opencode'`. If OpenCode is unavailable, the router skips opencode models entirely. Check `nexus-agents doctor` for adapter status.
+
+**Wrong model used**: Verify `cliModelName` in `in-tree-data.ts` matches the provider ID in `opencode.json`. The format is `<provider-id>/<model-id>`.
+
+## Related
+
+- [CLOUD_PROVIDERS.md](./CLOUD_PROVIDERS.md) — picking between OpenRouter / LiteLLM / custom-gateway for Bedrock, Vertex, Azure access

@@ -1,0 +1,574 @@
+/**
+ * Tests for the JSONL-backed per-decision cost store (#3855).
+ *
+ * Round-trip persistence (write → hydrate from disk → query), corruption
+ * tolerance (inherited from the shared JsonlStore primitive), and the
+ * record-via-rollup path.
+ *
+ * @module observability/decision-cost-store.test
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { PriceBasisSchema } from '../core/price-basis.js';
+import { DecisionCostRecordSchema, DecisionCostStore } from './decision-cost-store.js';
+import type { VoterCostInput } from './decision-cost.js';
+
+const TS = '2026-06-17T00:00:00.000Z';
+
+const VOTERS: VoterCostInput[] = [
+  {
+    role: 'architect',
+    model: 'claude-sonnet',
+    inputTokens: 1000,
+    outputTokens: 200,
+    costUsd: 0.006,
+  },
+  { role: 'security', model: 'claude-sonnet' }, // unmeasured
+];
+
+describe('DecisionCostStore', () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'decision-cost-store-'));
+    file = join(dir, 'decision-costs.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('records a rollup and returns the persisted summary', () => {
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    const { record, persisted } = store.record({
+      decisionId: 'd1',
+      gate: 'consensus_vote',
+      voters: VOTERS,
+      billingMode: 'api',
+      timestamp: TS,
+    });
+
+    expect(persisted).toBe(true);
+    expect(record.decisionId).toBe('d1');
+    expect(record.gate).toBe('consensus_vote');
+    expect(record.summary.voterCount).toBe(2);
+    expect(record.summary.measuredVoters).toBe(1);
+    expect(record.summary.unmeasuredVoters).toBe(1);
+    expect(record.summary.tokenMeasuredVoters).toBe(1);
+    expect(record.summary.tokenUnmeasuredVoters).toBe(1);
+    expect(record.summary.totalCostUsd).toBeCloseTo(0.006, 9);
+    expect(store.size).toBe(1);
+  });
+
+  it('round-trips a job join key independently of its decision id (#6858)', () => {
+    const writer = new DecisionCostStore({ filePath: file, dataDir: dir });
+    const input = {
+      decisionId: 'decision-6858-unusual',
+      jobId: 'job-vote-6858-unusual',
+      gate: 'consensus_vote' as const,
+      voters: VOTERS,
+      billingMode: 'api' as const,
+      timestamp: TS,
+    };
+    const result = writer.record(input);
+    expect(result.persisted).toBe(true);
+    expect(result.record).toMatchObject({ decisionId: input.decisionId, jobId: input.jobId });
+    expect(new DecisionCostStore({ filePath: file, dataDir: dir }).all()[0]).toMatchObject({
+      decisionId: input.decisionId,
+      jobId: input.jobId,
+    });
+  });
+
+  it.each([undefined, 42, {}, '', 'x'.repeat(201)])(
+    'preserves the cost row when jobId is absent or malformed: %s',
+    (jobId) => {
+      const writer = new DecisionCostStore({ filePath: file, dataDir: dir });
+      const { record } = writer.record({
+        decisionId: 'legacy-job-6858',
+        gate: 'pr_review',
+        voters: VOTERS,
+        billingMode: 'api',
+        timestamp: TS,
+      });
+      expect(record).not.toHaveProperty('jobId');
+      writeFileSync(file, `${JSON.stringify({ ...record, jobId })}\n`, 'utf-8');
+      const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+      expect(reader.hydrationComplete).toBe(true);
+      expect(reader.size).toBe(1);
+      expect(reader.all()[0]).toMatchObject({
+        decisionId: record.decisionId,
+        summary: record.summary,
+      });
+      expect(reader.all()[0]?.jobId).toBeUndefined();
+    }
+  );
+
+  it('round-trips through disk: a fresh store hydrates the same records', () => {
+    const writer = new DecisionCostStore({ filePath: file, dataDir: dir });
+    writer.record({
+      decisionId: 'd1',
+      gate: 'consensus_vote',
+      voters: VOTERS,
+      billingMode: 'api',
+      timestamp: TS,
+    });
+    writer.record({
+      decisionId: 'd2',
+      gate: 'pr_review',
+      voters: VOTERS,
+      billingMode: 'plan',
+      timestamp: TS,
+    });
+
+    const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(reader.size).toBe(2);
+    expect(reader.all().map((r) => r.decisionId)).toEqual(['d1', 'd2']);
+    // Plan-mode record persisted 0 cost but kept tokens.
+    const planRec = reader.all().find((r) => r.decisionId === 'd2');
+    expect(planRec?.summary.totalCostUsd).toBe(0);
+    expect(planRec?.summary.totalTokens).toBe(1200);
+    expect(planRec?.summary.tokenMeasuredVoters).toBe(1);
+  });
+
+  it('hydrates legacy rows without inventing token coverage', () => {
+    const writer = new DecisionCostStore({ filePath: file, dataDir: dir });
+    writer.record({
+      decisionId: 'legacy',
+      gate: 'consensus_vote',
+      voters: VOTERS,
+      billingMode: 'api',
+      timestamp: TS,
+    });
+    const raw = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+    const summary = raw['summary'] as Record<string, unknown>;
+    delete summary['tokenMeasuredVoters'];
+    delete summary['tokenUnmeasuredVoters'];
+    for (const line of summary['perVoter'] as Record<string, unknown>[]) {
+      delete line['tokenUsageMeasured'];
+    }
+    writeFileSync(file, `${JSON.stringify(raw)}\n`, 'utf-8');
+
+    const record = new DecisionCostStore({ filePath: file, dataDir: dir }).all()[0];
+    expect(record?.summary.tokenMeasuredVoters).toBeUndefined();
+    expect(record?.summary.perVoter[0]?.tokenUsageMeasured).toBeUndefined();
+  });
+
+  it('parses and reports legacy pricing scope as absent without inferring it (#6830)', () => {
+    const legacy = {
+      decisionId: 'legacy-scope',
+      gate: 'consensus_vote',
+      timestamp: TS,
+      summary: {
+        billingMode: 'api',
+        voterCount: 1,
+        measuredVoters: 1,
+        unmeasuredVoters: 0,
+        totalInputTokens: 1000,
+        totalOutputTokens: 500,
+        totalTokens: 1500,
+        totalCostUsd: 0.0875,
+        priceBasis: 'list',
+        perVoter: [
+          {
+            role: 'architect',
+            model: 'anthropic/claude-mythos-preview',
+            inputTokens: 1000,
+            outputTokens: 500,
+            totalTokens: 1500,
+            costUsd: 0.0875,
+            unmeasured: false,
+            priceBasis: 'list',
+          },
+        ],
+        perModel: [],
+      },
+    };
+    const parsed = DecisionCostRecordSchema.parse(legacy);
+    expect(parsed.summary.perVoter[0]?.pricingProvenance).toBeUndefined();
+    expect(parsed.summary.perVoter[0]).not.toHaveProperty('pricingProvenance');
+    writeFileSync(file, `${JSON.stringify(legacy)}\n`, 'utf-8');
+
+    const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(reader.hydrationComplete).toBe(true);
+    expect(reader.size).toBe(1);
+    expect(reader.query()[0]?.summary.perVoter[0]).not.toHaveProperty('pricingProvenance');
+    expect(reader.query()[0]?.summary.perVoter[0]?.pricingProvenance).toBeUndefined();
+    expect(reader.query()[0]?.summary.totalCostUsd).toBe(0.0875);
+  });
+
+  it('keeps a record whose attempt usage this version rejects (#6821)', () => {
+    // A malformed or newer-shaped usage field is decorative: dropping it must
+    // not drop the final-seat cost the record carries.
+    const record = {
+      decisionId: 'malformed-attempts',
+      gate: 'consensus_vote',
+      timestamp: TS,
+      summary: {
+        billingMode: 'api',
+        voterCount: 1,
+        measuredVoters: 1,
+        unmeasuredVoters: 0,
+        totalInputTokens: 10,
+        totalOutputTokens: 5,
+        totalTokens: 15,
+        totalCostUsd: 0.01,
+        observedAttemptUsage: { seats: 0 },
+        perVoter: [
+          {
+            role: 'architect',
+            model: 'claude-sonnet',
+            inputTokens: 10,
+            outputTokens: 5,
+            totalTokens: 15,
+            costUsd: 0.01,
+            unmeasured: false,
+            attemptUsage: { completions: 1, reportedCompletions: 2 },
+          },
+        ],
+        perModel: [],
+      },
+    };
+    writeFileSync(file, `${JSON.stringify(record)}\n`, 'utf-8');
+
+    const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(reader.size).toBe(1);
+    const summary = reader.query()[0]?.summary;
+    expect(summary?.totalTokens).toBe(15);
+    expect(summary?.observedAttemptUsage).toBeUndefined();
+    expect(summary?.perVoter[0]?.attemptUsage).toBeUndefined();
+  });
+
+  it('keeps a record whose pricing scope this version does not recognise (#6830)', () => {
+    // A newer writer may record a scope this reader has no literal for. The
+    // provenance is decorative: dropping it must not drop the cost it rides on.
+    const newer = {
+      decisionId: 'newer-scope',
+      gate: 'consensus_vote',
+      timestamp: TS,
+      summary: {
+        billingMode: 'api',
+        voterCount: 1,
+        measuredVoters: 1,
+        unmeasuredVoters: 0,
+        totalInputTokens: 1000,
+        totalOutputTokens: 500,
+        totalTokens: 1500,
+        totalCostUsd: 0.0875,
+        perVoter: [
+          {
+            role: 'architect',
+            model: 'anthropic/claude-mythos-preview',
+            inputTokens: 1000,
+            outputTokens: 500,
+            totalTokens: 1500,
+            costUsd: 0.0875,
+            unmeasured: false,
+            pricingProvenance: {
+              source: 'anthropic',
+              scope: 'some-future-participant-program',
+              upstreamUrl: 'https://example.com/pricing',
+            },
+          },
+        ],
+        perModel: [],
+      },
+    };
+    writeFileSync(file, `${JSON.stringify(newer)}\n`, 'utf-8');
+
+    const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(reader.size).toBe(1);
+    const voter = reader.query()[0]?.summary.perVoter[0];
+    expect(voter?.costUsd).toBe(0.0875);
+    expect(voter?.pricingProvenance).toBeUndefined();
+  });
+
+  it('skips corrupt lines on hydrate (graceful degradation)', () => {
+    const writer = new DecisionCostStore({ filePath: file, dataDir: dir });
+    writer.record({
+      decisionId: 'd1',
+      gate: 'consensus_vote',
+      voters: VOTERS,
+      billingMode: 'api',
+      timestamp: TS,
+    });
+
+    // Inject a malformed line + a schema-invalid line.
+    const good = readFileSync(file, 'utf-8').trim();
+    writeFileSync(file, `${good}\nnot-json{{\n${JSON.stringify({ decisionId: 'd2' })}\n`, 'utf-8');
+
+    const reader = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(reader.size).toBe(1);
+    expect(reader.all()[0]?.decisionId).toBe('d1');
+  });
+
+  it('filters by gate and since-timestamp', () => {
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    store.record({
+      decisionId: 'a',
+      gate: 'consensus_vote',
+      voters: VOTERS,
+      billingMode: 'api',
+      timestamp: '2026-06-15T00:00:00.000Z',
+    });
+    store.record({
+      decisionId: 'b',
+      gate: 'pr_review',
+      voters: VOTERS,
+      billingMode: 'api',
+      timestamp: '2026-06-17T00:00:00.000Z',
+    });
+
+    expect(store.query({ gate: 'pr_review' }).map((r) => r.decisionId)).toEqual(['b']);
+    expect(store.query({ since: '2026-06-16T00:00:00.000Z' }).map((r) => r.decisionId)).toEqual([
+      'b',
+    ]);
+    expect(store.query()).toHaveLength(2);
+  });
+});
+
+describe('DecisionCostStore price-basis persistence (#4406)', () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'decision-cost-basis-'));
+    file = join(dir, 'decision-costs.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('round-trips the per-voter and decision-level basis through the JSONL schema', () => {
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    store.record({
+      decisionId: 'd-basis',
+      gate: 'consensus_vote',
+      voters: [
+        {
+          role: 'architect',
+          model: 'claude-sonnet',
+          inputTokens: 1000,
+          outputTokens: 200,
+          costUsd: 0.006,
+          priceBasis: 'list',
+        },
+      ],
+      billingMode: 'api',
+      timestamp: TS,
+    });
+
+    const rehydrated = new DecisionCostStore({ filePath: file, dataDir: dir });
+    const record = rehydrated.all()[0];
+    expect(record?.summary.priceBasis).toBe('list');
+    expect(record?.summary.perVoter[0]?.priceBasis).toBe('list');
+  });
+
+  it.each(['list', 'declared', 'unknown'] as const)(
+    'persists a %s basis without the store rejecting the whole record (#4406 review)',
+    (basis) => {
+      // Explicit members keep declared covered even if the schema regresses.
+      // The store schema used to hand-mirror the union; a stale mirror made
+      // `JsonlStore.safeParse` reject the ENTIRE decision record — `append`
+      // returning persisted:false and the line skipped on read with only an
+      // aggregate debug count. Whole-record governance/billing data loss from
+      // one unrecognised field value.
+      expect(PriceBasisSchema.safeParse(basis).success).toBe(true);
+      const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+      const { persisted } = store.record({
+        decisionId: `d-${basis}`,
+        gate: 'consensus_vote',
+        voters: [
+          {
+            role: 'architect',
+            model: 'claude-sonnet',
+            inputTokens: 10,
+            costUsd: 0.001,
+            priceBasis: basis,
+          },
+        ],
+        billingMode: 'api',
+        timestamp: TS,
+      });
+      expect(persisted).toBe(true);
+
+      const rehydrated = new DecisionCostStore({ filePath: file, dataDir: dir });
+      expect(rehydrated.all()).toHaveLength(1);
+      expect(rehydrated.all()[0]?.summary.perVoter[0]?.priceBasis).toBe(basis);
+      expect(rehydrated.all()[0]?.summary.priceBasis).toBe(basis);
+    }
+  );
+
+  it('still parses records written BEFORE the basis existed (additive + optional)', () => {
+    // A pre-#4406 line carries no priceBasis at any level. The schema change
+    // must not orphan the existing history, so it stays optional.
+    const legacy = {
+      decisionId: 'd-legacy',
+      gate: 'consensus_vote',
+      timestamp: TS,
+      summary: {
+        billingMode: 'api',
+        voterCount: 1,
+        measuredVoters: 1,
+        unmeasuredVoters: 0,
+        totalInputTokens: 1000,
+        totalOutputTokens: 200,
+        totalTokens: 1200,
+        totalCostUsd: 0.006,
+        perVoter: [
+          {
+            role: 'architect',
+            model: 'claude-sonnet',
+            inputTokens: 1000,
+            outputTokens: 200,
+            totalTokens: 1200,
+            costUsd: 0.006,
+            unmeasured: false,
+          },
+        ],
+        perModel: [
+          {
+            model: 'claude-sonnet',
+            voterCount: 1,
+            inputTokens: 1000,
+            outputTokens: 200,
+            totalTokens: 1200,
+            costUsd: 0.006,
+          },
+        ],
+      },
+    };
+    writeFileSync(file, `${JSON.stringify(legacy)}\n`, 'utf-8');
+
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(store.all()).toHaveLength(1);
+    expect(store.all()[0]?.decisionId).toBe('d-legacy');
+    expect(store.all()[0]?.summary.priceBasis).toBeUndefined();
+  });
+});
+
+describe('DecisionCostStore undeclared-options detector verdict (#5422)', () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'decision-cost-store-detector-'));
+    file = join(dir, 'decision-costs.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const base = { gate: 'consensus_vote' as const, voters: VOTERS, billingMode: 'plan' as const };
+
+  it('round-trips a FIRED verdict with its pattern and excerpt', () => {
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    const { persisted } = store.record({
+      ...base,
+      decisionId: 'fired',
+      timestamp: TS,
+      undeclaredOptionsDetector: {
+        fired: true,
+        pattern: '/\\bchoose between\\b/i',
+        excerpt: 'please choose between the two',
+        declaredOptionCount: 0,
+      },
+    });
+    expect(persisted).toBe(true);
+    const fresh = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(fresh.all()[0]?.undeclaredOptionsDetector).toEqual({
+      fired: true,
+      pattern: '/\\bchoose between\\b/i',
+      excerpt: 'please choose between the two',
+      declaredOptionCount: 0,
+    });
+  });
+
+  it('keeps legacy declared-option rows parsing', () => {
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    store.record({
+      ...base,
+      decisionId: 'quiet',
+      timestamp: TS,
+      undeclaredOptionsDetector: { fired: false, declaredOptionCount: 2 },
+    });
+    const fresh = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(fresh.all()[0]?.undeclaredOptionsDetector).toEqual({
+      fired: false,
+      declaredOptionCount: 2,
+    });
+  });
+
+  it('round-trips a not-applicable verdict with no fired field', () => {
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    const verdict = { applicable: false as const, declaredOptionCount: 2 };
+    const { persisted } = store.record({
+      ...base,
+      decisionId: 'declared',
+      timestamp: TS,
+      undeclaredOptionsDetector: verdict,
+    });
+    expect(persisted).toBe(true);
+    const fresh = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect(fresh.all()[0]?.undeclaredOptionsDetector).toEqual(verdict);
+  });
+
+  it('leaves the field ABSENT when the caller recorded no verdict (pr_review rows, older writers)', () => {
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    store.record({ ...base, gate: 'pr_review', decisionId: 'no-verdict', timestamp: TS });
+    const line = readFileSync(file, 'utf-8').trim();
+    expect(line).not.toContain('undeclaredOptionsDetector');
+    const fresh = new DecisionCostStore({ filePath: file, dataDir: dir });
+    expect('undeclaredOptionsDetector' in (fresh.all()[0] ?? {})).toBe(false);
+  });
+
+  it('rejects an excerpt longer than the 120-char window rather than persisting an unbounded proposal', () => {
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    const { persisted } = store.record({
+      ...base,
+      decisionId: 'too-long',
+      timestamp: TS,
+      undeclaredOptionsDetector: {
+        fired: true,
+        pattern: 'p',
+        excerpt: 'x'.repeat(121),
+        declaredOptionCount: 0,
+      },
+    });
+    expect(persisted).toBe(false);
+  });
+});
+
+describe('DecisionCostStore attempt usage (#6821)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'decision-cost-attempts-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('persists and re-reads the observed attempt usage', () => {
+    const file = join(dir, 'decision-costs.jsonl');
+    const store = new DecisionCostStore({ filePath: file, dataDir: dir });
+    const attemptUsage = { completions: 2, reportedCompletions: 1, inputTokens: 90 };
+    const { persisted } = store.record({
+      decisionId: 'd-attempts',
+      gate: 'consensus_vote',
+      voters: [{ ...VOTERS[0]!, attemptUsage }],
+      billingMode: 'api',
+      timestamp: TS,
+    });
+    expect(persisted).toBe(true);
+    const line = JSON.parse(readFileSync(file, 'utf8').trim()) as unknown;
+    const reread = DecisionCostRecordSchema.parse(line);
+    expect(reread.summary.perVoter[0]?.attemptUsage).toEqual(attemptUsage);
+    expect(reread.summary.observedAttemptUsage?.incompleteSeats).toBe(1);
+  });
+});

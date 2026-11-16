@@ -1,0 +1,546 @@
+/**
+ * nexus-agents/dogfooding - PR Reviewer
+ *
+ * Multi-agent PR review orchestrator using collaboration protocols.
+ *
+ * @module dogfooding/pr-reviewer
+ * (Source: Issue #161, Alignment Roadmap Phase 3)
+ */
+
+import type { Result, Task, TaskResult, IModelAdapter } from '../core/index.js';
+import { ok, err, createLogger, getTimeProvider } from '../core/index.js';
+import { sanitizeInput } from '../security/input-sanitizer.js';
+import type { FirewallResult } from '../security/firewall/firewall-pipeline.js';
+import { firewallInputFor, runUntrustedInputFirewall } from './untrusted-input-firewall.js';
+import { auditReviewAction } from './pr-review-posting-gate.js';
+import { DRAFT_REPLY_BODY_MAX_LENGTH, type SourceCitation } from '../security/action-schema.js';
+import { truncateText } from '../utils/text-utils.js';
+import { ReputationCache } from '../security/reputation-model.js';
+import type { ReputationAssessment, ReputationGateDecision } from '../security/reputation-model.js';
+import { createSecurityExpert } from '../agents/experts/security-expert.js';
+import { createCodeExpert } from '../agents/experts/code-expert.js';
+import { createTestingExpert } from '../agents/experts/testing-expert.js';
+import { SwarmObserver } from '../observability/swarm-observer.js';
+import type {
+  PRMetadata,
+  PRReviewConfig,
+  PRReviewResult,
+  PRReviewDraft,
+  ReviewPostOutcome,
+  PRTrustAssessment,
+  PRFetchData,
+  ExpertReviewResult,
+  ReviewCategory,
+} from './pr-review-types.js';
+import { DEFAULT_PR_REVIEW_CONFIG, CATEGORY_DISPLAY_NAMES } from './pr-review-types.js';
+import { parsePRUrl } from '../scm/url-parsers.js';
+import { createFullGitHubProvider } from '../scm/github-provider-traits.js';
+import type { FullCapableProvider } from '../scm/types.js';
+import { getFileReviewCoverage } from './pr-review-stats.js';
+import {
+  parseExpertReview,
+  extractSummary,
+  determineApproval,
+  determineDecision,
+  calculateConsensus,
+  countBySeverity,
+  countByCategory,
+  sumFindings,
+  generateSummary,
+  createFailedReview,
+  gatePRAuthor,
+  assessPRReputation,
+  fetchAccountAgeDays,
+  formatDiffs,
+  fenceExternalContent,
+  reviewPostingBlock,
+} from './pr-reviewer-helpers.js';
+import { buildReviewCitations } from './pr-review-citations.js';
+
+// Re-export for convenience
+export { formatReviewComment } from './pr-reviewer-helpers.js';
+
+const logger = createLogger({ component: 'PRReviewer' });
+
+/**
+ * The access posture a PR review runs under, for the Rule of Two. Hardcoded
+ * to the conservative answer: the reviewer can post under the project's
+ * identity and the SCM provider resolves a live token. Passed to every
+ * firewall run (#4992, #5383) so the classification and the DraftReply's
+ * policy check cannot disagree on it — the comment on `postReviewToGitHub`
+ * explains why RULE_OF_TWO firing at tier 3+ depends on both conjuncts
+ * staying `true`.
+ */
+const REVIEW_ACCESS_CONTEXT = { hasWriteAccess: true, hasSecretAccess: true } as const;
+
+/**
+ * Multi-agent PR reviewer.
+ */
+export class PRReviewer {
+  private readonly config: PRReviewConfig;
+  private readonly observer: SwarmObserver;
+  private readonly adapter: IModelAdapter | undefined;
+  private readonly reputationCache: ReputationCache;
+
+  constructor(config?: Partial<PRReviewConfig>, adapter?: IModelAdapter) {
+    this.config = { ...DEFAULT_PR_REVIEW_CONFIG, ...config };
+    this.observer = new SwarmObserver();
+    this.adapter = adapter ?? undefined;
+    this.reputationCache = new ReputationCache();
+  }
+
+  /**
+   * Reviews a pull request using multi-agent collaboration.
+   */
+  async reviewPR(prUrl: string): Promise<Result<PRReviewResult, Error>> {
+    const startTime = getTimeProvider().now();
+    const traceId = SwarmObserver.generateTraceId();
+
+    logger.info('Starting PR review', { prUrl, traceId });
+
+    const parseResult = parsePRUrl(prUrl);
+    if (!parseResult.ok) return parseResult;
+
+    const { owner, repo, prNumber } = parseResult.value;
+
+    const fetchResult = await this.fetchPRData(owner, repo, prNumber);
+    if (!fetchResult.ok) return fetchResult;
+
+    const { metadata: prMetadata, provider, accountAgeDays } = fetchResult.value;
+
+    // #3123: reputation is measured here, with the author's real account age,
+    // and handed to the firewall per call so ONE gate decides the enforced tier.
+    const reputation = assessPRReputation(
+      prMetadata,
+      this.reputationCache,
+      this.config.enableReputation,
+      accountAgeDays
+    );
+
+    // #4992: classify through the shared HostileInputFirewall so the trust
+    // decision reaches the security audit trail (originally Issue #828 —
+    // defense-in-depth). Refuses only under NEXUS_FIREWALL_POLICY=enforce;
+    // `auditReviewAction` re-enters the firewall with the DraftReply for the
+    // policy decision (#5383).
+    const firewall = this.classifyPRAuthor(prMetadata, reputation);
+    if (!firewall.ok) return firewall;
+    const trustResult = firewall.value.trust;
+    logger.info('PR author trust classified', {
+      prNumber,
+      author: prMetadata.author,
+      trustTier: trustResult.trustTier,
+      userRole: trustResult.userRole,
+      // Logged only when measured (#4992).
+      ...(firewall.value.isAllowlisted !== undefined
+        ? { isAllowlisted: firewall.value.isAllowlisted }
+        : {}),
+    });
+
+    // #3123: apply the gating rollout mode (off/audit/enforce), mirroring
+    // issue_triage — closes the PR-path equivalent of the #828/#3106 dead-end
+    // (reputation was classified but never gated here).
+    const gated = gatePRAuthor(prMetadata, firewall.value, reputation);
+    if (!gated.ok) return gated;
+    const { gateDecision, trustAssessment } = gated.value;
+
+    const expertReviews = await this.runExpertReviews(prMetadata, traceId);
+    const result = this.aggregateReviews(prMetadata, expertReviews, startTime, trustAssessment);
+
+    const postOutcome: ReviewPostOutcome = this.config.dryRun
+      ? { status: 'skipped', reason: 'dry-run' }
+      : await this.postReviewToGitHub(provider, prMetadata, result, {
+          gateDecision,
+          reputation,
+          firewallResult: firewall.value,
+        });
+
+    logger.info('PR review completed', {
+      prNumber,
+      decision: result.decision,
+      findingsCount: sumFindings(result.findingsBySeverity),
+      durationMs: result.totalDurationMs,
+      postStatus: postOutcome.status,
+    });
+
+    return ok({ ...result, postOutcome });
+  }
+
+  /**
+   * Runs all expert reviews in parallel.
+   */
+  private async runExpertReviews(pr: PRMetadata, traceId: string): Promise<ExpertReviewResult[]> {
+    const reviewPromises = this.config.experts.map((category) =>
+      this.runSingleExpertReview(pr, category, traceId)
+    );
+
+    const results = await Promise.allSettled(reviewPromises);
+
+    return results
+      .filter((r): r is PromiseFulfilledResult<ExpertReviewResult> => r.status === 'fulfilled')
+      .map((r) => r.value);
+  }
+
+  /**
+   * Runs a single expert review.
+   */
+  private async runSingleExpertReview(
+    pr: PRMetadata,
+    category: ReviewCategory,
+    traceId: string
+  ): Promise<ExpertReviewResult> {
+    const startTime = getTimeProvider().now();
+    const expertId = `${category}-expert`;
+
+    logger.debug('Running expert review', { expertId, category });
+
+    const expert = this.createExpert(category);
+    const task = this.createReviewTask(pr, category);
+
+    const result = await expert.execute(task);
+    const durationMs = getTimeProvider().now() - startTime;
+
+    this.observer.recordInteraction({
+      from: 'pr-reviewer',
+      to: expertId,
+      interactionType: 'delegate',
+      outcome: result.ok ? 'success' : 'failure',
+      traceId,
+      durationMs,
+    });
+
+    if (!result.ok) {
+      return createFailedReview(expertId, category, durationMs, result.error.message);
+    }
+
+    return this.parseExpertResult(expertId, category, result.value, durationMs);
+  }
+
+  /**
+   * Creates the appropriate expert for a category.
+   */
+  private createExpert(category: ReviewCategory): {
+    execute: (task: Task) => Promise<Result<TaskResult, Error>>;
+  } {
+    const baseOptions = {
+      ...(this.adapter !== undefined && { adapter: this.adapter }),
+      ...(this.config.modelConfig !== undefined && {
+        temperature: this.config.modelConfig.temperature,
+        maxTokens: this.config.modelConfig.maxTokens,
+      }),
+    };
+
+    switch (category) {
+      case 'security':
+        return createSecurityExpert(baseOptions);
+      case 'testing':
+        return createTestingExpert(baseOptions);
+      case 'code_quality':
+      case 'performance':
+      case 'documentation':
+      case 'architecture':
+      default:
+        return createCodeExpert(baseOptions);
+    }
+  }
+
+  /**
+   * Creates a review task for an expert.
+   */
+  private createReviewTask(pr: PRMetadata, category: ReviewCategory): Task {
+    return {
+      id: `review-${String(pr.number)}-${category}`,
+      description: this.buildTaskDescription(pr, category),
+      context: { files: pr.files.map((f) => f.filename) },
+      constraints: { maxTokens: this.config.modelConfig?.maxTokens ?? 8192 },
+    };
+  }
+
+  /**
+   * Classifies the PR author's trust tier through the shared firewall (#4992;
+   * originally Issue #828 — Wire security modules into production pipeline).
+   *
+   * No maintainer allowlist is passed: there is no source for one today (no
+   * config field, no env var), so none is consulted and `isAllowlisted` stays
+   * absent on the result rather than being recorded as `false`.
+   */
+  private classifyPRAuthor(
+    pr: PRMetadata,
+    reputation: ReputationAssessment | undefined
+  ): Result<FirewallResult, Error> {
+    return runUntrustedInputFirewall(firewallInputFor('pull_request', pr), {
+      context: REVIEW_ACCESS_CONTEXT,
+      reputation: { assessment: reputation },
+    });
+  }
+
+  /**
+   * Sanitizes untrusted PR content (body/title) before embedding in expert tasks.
+   * Uses the security/input-sanitizer pipeline to strip injection vectors.
+   * (Source: Issue #828 — Wire security modules into production pipeline)
+   */
+  private sanitizePRContent(text: string, author: string): string {
+    if (text.length === 0) return text;
+    const result = sanitizeInput(text, 'unknown', author);
+    if (result.wasModified) {
+      logger.warn('PR content sanitized before expert review', {
+        author,
+        strippedCount: result.strippedElements.length,
+        injectionFlags: result.injectionFlags,
+        trustTier: result.trustTier,
+      });
+    }
+    return result.content;
+  }
+
+  /**
+   * Builds the task description for an expert.
+   */
+  private buildTaskDescription(pr: PRMetadata, category: ReviewCategory): string {
+    const filesSummary = pr.files
+      .map((f) => `- ${f.filename} (+${String(f.additions)}/-${String(f.deletions)})`)
+      .join('\n');
+
+    // Sanitize untrusted PR content before embedding in expert task (Issue #828)
+    const safeTitle = this.sanitizePRContent(pr.title, pr.author);
+    const safeBody = this.sanitizePRContent(pr.body, pr.author);
+    const fencedTitle = fenceExternalContent(safeTitle).text;
+    const fencedBody = fenceExternalContent(safeBody || 'No description provided.').text;
+
+    return `Review this pull request for ${CATEGORY_DISPLAY_NAMES[category]} concerns:
+
+## PR:
+${fencedTitle}
+
+**Author:** ${pr.author}
+**Branch:** ${pr.head} → ${pr.base}
+**Changes:** +${String(pr.additions)} / -${String(pr.deletions)} lines
+
+### Description
+${fencedBody}
+
+### Changed Files
+${filesSummary}
+
+### File Diffs
+${formatDiffs(pr).text}
+
+Provide a structured review with:
+1. Overall approval (APPROVED/CHANGES_REQUESTED)
+2. Summary of findings
+3. Specific issues with severity (critical/high/medium/low/info)
+4. Suggested improvements`;
+  }
+
+  /**
+   * Parses expert result into structured review.
+   */
+  private parseExpertResult(
+    expertId: string,
+    category: ReviewCategory,
+    result: TaskResult,
+    durationMs: number
+  ): ExpertReviewResult {
+    const output = result.output as Record<string, unknown> | undefined;
+
+    if (output === undefined) {
+      return createFailedReview(expertId, category, durationMs, 'No output');
+    }
+
+    const parsed = parseExpertReview(output, expertId, this.config.minSeverity);
+    if (parsed.verdict === 'errored') {
+      return createFailedReview(expertId, category, durationMs, 'Unrecognised review output');
+    }
+    const { findings } = parsed;
+    const approved = determineApproval(findings, parsed.verdict);
+    // Default confidence - ResultMetadata doesn't track per-result confidence
+    const confidence = 0.7;
+
+    return {
+      expertId,
+      expertType: category,
+      approved,
+      summary: extractSummary(output),
+      findings,
+      durationMs,
+      confidence,
+    };
+  }
+
+  /**
+   * Aggregates individual expert reviews into final result.
+   */
+  private aggregateReviews(
+    pr: PRMetadata,
+    reviews: ExpertReviewResult[],
+    startTime: number,
+    trustAssessment: PRTrustAssessment
+  ): PRReviewDraft {
+    const allFindings = reviews.flatMap((r) => r.findings);
+    const decision = determineDecision(reviews, allFindings);
+
+    return {
+      prNumber: pr.number,
+      repository: `${pr.owner}/${pr.repo}`,
+      decision,
+      summary: generateSummary(pr, reviews, decision),
+      expertReviews: reviews,
+      findingsBySeverity: countBySeverity(allFindings),
+      findingsByCategory: countByCategory(allFindings),
+      totalDurationMs: getTimeProvider().now() - startTime,
+      expertCount: reviews.length,
+      ...getFileReviewCoverage(pr, reviews, formatDiffs(pr).filesIncluded),
+      consensusScore: calculateConsensus(reviews),
+      debateRounds: 1,
+      timestamp: getTimeProvider().nowIso(),
+      trustAssessment,
+    };
+  }
+
+  /**
+   * Posts review to GitHub after policy gate validation.
+   *
+   * The gate is the firewall's (#5383): `auditReviewAction`
+   * (`pr-review-posting-gate.ts`) runs the DraftReply through it and reads
+   * `policy.allowed`. This method blocks on that verdict
+   * whatever `NEXUS_FIREWALL_POLICY` is — the mode only decides whether the
+   * firewall refuses on its own (`enforce`), and such a refusal arrives here
+   * as the same `allowed: false` with its rules.
+   *
+   * Blocks on the gate's own `allowed` verdict rather than re-deriving a
+   * narrower condition. It previously blocked on `hasRuleOfTwoViolation` alone
+   * while `evaluatePolicy` had already computed `allowed`, on the rationale
+   * that "the review itself is our internal analysis, not content from the
+   * untrusted PR author".
+   *
+   * For this action's policy decision alone, tiers 1-2 produce no violations
+   * and tiers 3-4 produce INSUFFICIENT_TRUST + UNTRUSTED_INFLUENCE + RULE_OF_TWO
+   * together. The posting verdict also checks corroboration and refuses
+   * `reviewCoverage: 'none'` under NO_REVIEW_COVERAGE (#5796), even when the
+   * policy decision allows. The review decision itself remains unchanged.
+   *
+   * `requiresApproval` deliberately does NOT gate: it is true exactly when
+   * `policy.allowed` is true (DraftReply is always approval-required), so blocking on
+   * it would refuse every review that passed.
+   * (Source: Issue #828 — Wire policy gate into production pipeline)
+   */
+  private async postReviewToGitHub(
+    provider: FullCapableProvider,
+    pr: PRMetadata,
+    result: PRReviewDraft,
+    context: {
+      readonly gateDecision: ReputationGateDecision;
+      readonly reputation: ReputationAssessment | undefined;
+      readonly firewallResult?: FirewallResult;
+    }
+  ): Promise<ReviewPostOutcome> {
+    const { formatReviewComment } = await import('./pr-reviewer-helpers.js');
+    const formattedBody = formatReviewComment(result);
+    const body = truncateText(formattedBody, DRAFT_REPLY_BODY_MAX_LENGTH, '…[review truncated]');
+    const sources: SourceCitation[] = buildReviewCitations(pr.files);
+    const policyResult = auditReviewAction(
+      { body, sources, reviewCoverage: result.reviewCoverage },
+      context.firewallResult ?? firewallInputFor('pull_request', pr),
+      {
+        context: REVIEW_ACCESS_CONTEXT,
+        reputation: { assessment: context.reputation },
+        enforcedTier: context.gateDecision.enforcedTier,
+      },
+      logger
+    );
+    const blocked = reviewPostingBlock(policyResult);
+    if (blocked !== undefined) {
+      logger.warn(`${blocked.label}: review posting blocked`, {
+        prNumber: pr.number,
+        violations: policyResult.violations,
+      });
+      return { status: 'skipped', reason: blocked.reason };
+    }
+    if (policyResult.violations.length > 0) {
+      logger.info('Policy gate warnings for review posting', {
+        prNumber: pr.number,
+        violations: policyResult.violations,
+      });
+    }
+
+    const postResult = await provider.createReview(pr.number, body, result.decision);
+    if (!postResult.ok) {
+      logger.error('Failed to post review', postResult.error);
+      // #4354: this used to end here. The rejection was logged and dropped, the
+      // review resolved ok, and the CLI printed "Review posted to GitHub." over
+      // a review GitHub had refused to create (HTTP 422 when the reviewer is the
+      // PR author, for instance).
+      return { status: 'failed', error: postResult.error.message };
+    }
+    return { status: 'posted' };
+  }
+
+  /**
+   * Fetches PR data from the SCM provider and maps to dogfooding types.
+   */
+  private async fetchPRData(
+    owner: string,
+    repo: string,
+    prNumber: number
+  ): Promise<Result<PRFetchData, Error>> {
+    const provider = createFullGitHubProvider(`${owner}/${repo}`);
+
+    const detailResult = await provider.getPullRequestDetail(prNumber);
+    if (!detailResult.ok) return err(detailResult.error);
+
+    const detail = detailResult.value;
+    // #3133: best-effort real account age for the new_account reputation signal.
+    // Skip the lookup entirely when reputation is disabled — the value would be
+    // discarded by assessPRReputation's early-return anyway.
+    const accountAgeDays = this.config.enableReputation
+      ? await fetchAccountAgeDays(provider, detail.author)
+      : undefined;
+    const metadata: PRMetadata = {
+      number: detail.number,
+      title: detail.title,
+      body: detail.body,
+      author: detail.author,
+      authorAssociation: detail.authorAssociation,
+      base: detail.base,
+      head: detail.head,
+      headSha: detail.headSha,
+      owner,
+      repo,
+      url: detail.url,
+      draft: detail.draft,
+      labels: [...detail.labels],
+      files: detail.files.map((f) => ({
+        filename: f.filename,
+        status: f.status,
+        additions: f.additions,
+        deletions: f.deletions,
+        ...(f.patch !== undefined ? { patch: f.patch } : {}),
+        ...(f.previousFilename !== undefined ? { previousFilename: f.previousFilename } : {}),
+      })),
+      additions: detail.additions,
+      deletions: detail.deletions,
+    };
+
+    return ok({
+      metadata,
+      provider,
+      ...(accountAgeDays !== undefined ? { accountAgeDays } : {}),
+    });
+  }
+
+  /**
+   * Gets the SwarmObserver for debugging.
+   */
+  getObserver(): SwarmObserver {
+    return this.observer;
+  }
+}
+
+/**
+ * Creates a PR reviewer instance.
+ */
+export function createPRReviewer(
+  config?: Partial<PRReviewConfig>,
+  adapter?: IModelAdapter
+): PRReviewer {
+  return new PRReviewer(config, adapter);
+}

@@ -1,0 +1,458 @@
+/**
+ * nexus-agents/adapters - Retry Logic with Exponential Backoff
+ *
+ * Provides generic, type-parameterized retry functionality for fallible
+ * operations with exponential backoff and jitter to prevent thundering
+ * herd problems. Returns Result<T, RetryExhaustedError> — type-safe error
+ * boundary suitable for cross-layer use.
+ *
+ * Sibling implementation (see #2230): cli-retry-loop.ts holds a CLI-specific
+ * retry loop with built-in circuit-breaker integration, FailureCategory
+ * mapping, and CliResponse return shape. Don't reach for that one from
+ * non-CLI code; don't reach for this one when you need circuit-breaker
+ * coupling. Math primitives differ deliberately:
+ *   - this file: 0-indexed attempt, ±jitterFactor, cap-before-jitter
+ *   - cli-retry-loop.ts: 1-indexed attempt, +0..30% jitter, cap-after
+ *
+ * If you find yourself writing a third retry loop: stop, run
+ * `consensus_vote` with scope_steward in the panel, and pick whichever
+ * of these two fits — don't add a third.
+ *
+ * (Source: AWS Architecture Blog - Exponential Backoff and Jitter)
+ * (Source: Google Cloud API Design Guide - Retry Strategy)
+ */
+
+import {
+  type Result,
+  type NexusErrorOptions,
+  err,
+  ok,
+  NexusError,
+  ErrorCode,
+  getErrorMessage,
+  getRandomProvider,
+} from '../core/index.js';
+import { DEFAULTS } from '../config/defaults.js';
+import { sleep } from '../utils/async-utils.js';
+
+/**
+ * Configuration for retry behavior.
+ */
+export interface RetryConfig {
+  /** Maximum number of retry attempts. Default: 3 */
+  readonly maxRetries: number;
+  /** Base delay in milliseconds between retries. Default: 1000 */
+  readonly baseDelayMs: number;
+  /** Maximum delay in milliseconds between retries. Default: 30000 */
+  readonly maxDelayMs: number;
+  /** Jitter factor (0-1) to randomize delay. Default: 0.1 (10%) */
+  readonly jitterFactor: number;
+}
+
+/**
+ * Default retry configuration.
+ * Derived from canonical source: config/defaults.ts RETRY_DEFAULTS
+ */
+export const DEFAULT_RETRY_CONFIG: Readonly<RetryConfig> = {
+  maxRetries: DEFAULTS.RETRY_DEFAULTS.maxRetries,
+  baseDelayMs: DEFAULTS.RETRY_DEFAULTS.baseDelayMs,
+  maxDelayMs: DEFAULTS.RETRY_DEFAULTS.maxDelayMs,
+  jitterFactor: DEFAULTS.RETRY_DEFAULTS.jitterFactor,
+} as const;
+
+/**
+ * Information about a retry attempt for logging/debugging.
+ */
+export interface RetryAttemptInfo {
+  /** Current attempt number (1-based) */
+  readonly attempt: number;
+  /** Maximum attempts allowed */
+  readonly maxAttempts: number;
+  /** Delay before next retry in milliseconds */
+  readonly delayMs: number;
+  /** The error that triggered the retry */
+  readonly error: unknown;
+}
+
+/**
+ * Error thrown when all retry attempts are exhausted.
+ */
+export class RetryExhaustedError extends NexusError {
+  /** Number of attempts made */
+  readonly attempts: number;
+  /** The last error encountered */
+  readonly lastError: unknown;
+
+  constructor(attempts: number, lastError: unknown) {
+    const message = `All ${String(attempts)} retry attempts exhausted`;
+    const options: NexusErrorOptions = {
+      code: ErrorCode.MODEL_ERROR,
+      context: {
+        attempts,
+        // Through getErrorMessage so a throwing `.message` getter cannot reject
+        // withRetry from outside its own try/catch (#4308).
+        lastErrorMessage: getErrorMessage(lastError),
+      },
+    };
+    // Only set cause if lastError is an Error (exactOptionalPropertyTypes compliance)
+    if (lastError instanceof Error) {
+      options.cause = lastError;
+    }
+    super(message, options);
+    this.name = 'RetryExhaustedError';
+    this.attempts = attempts;
+    this.lastError = lastError;
+  }
+}
+
+/**
+ * Calculates delay with exponential backoff and jitter.
+ *
+ * Uses full jitter strategy: delay = random(0, min(maxDelay, baseDelay * 2^attempt))
+ *
+ * @param attempt - Current attempt number (0-based)
+ * @param config - Retry configuration
+ * @returns Delay in milliseconds
+ */
+export function calculateDelay(attempt: number, config: RetryConfig): number {
+  // Exponential backoff: baseDelay * 2^attempt
+  const exponentialDelay = config.baseDelayMs * Math.pow(2, attempt);
+
+  // Cap at maximum delay
+  const cappedDelay = Math.min(exponentialDelay, config.maxDelayMs);
+
+  // Apply jitter: delay +/- (delay * jitterFactor)
+  const jitterRange = cappedDelay * config.jitterFactor;
+  const jitter = (getRandomProvider().random() * 2 - 1) * jitterRange;
+
+  return Math.max(0, Math.floor(cappedDelay + jitter));
+}
+
+// Re-export sleep from canonical source for backward compatibility
+export { sleep } from '../utils/async-utils.js';
+
+/**
+ * HTTP status codes that indicate a retryable error.
+ */
+const RETRYABLE_STATUS_CODES = new Set([
+  408, // Request Timeout
+  429, // Too Many Requests
+  500, // Internal Server Error
+  502, // Bad Gateway
+  503, // Service Unavailable
+  504, // Gateway Timeout
+]);
+
+/**
+ * HTTP status codes that should NOT be retried.
+ */
+const NON_RETRYABLE_STATUS_CODES = new Set([
+  400, // Bad Request
+  401, // Unauthorized
+  403, // Forbidden
+  404, // Not Found
+  405, // Method Not Allowed
+  409, // Conflict
+  410, // Gone
+  422, // Unprocessable Entity
+]);
+
+/**
+ * Error message patterns that indicate retryable network errors.
+ */
+const RETRYABLE_ERROR_PATTERNS = [
+  /ECONNRESET/i,
+  /ECONNREFUSED/i,
+  /ETIMEDOUT/i,
+  /ENOTFOUND/i,
+  /ENETUNREACH/i,
+  /EAI_AGAIN/i,
+  /socket hang up/i,
+  /network/i,
+  /timeout/i,
+  /timed out/i,
+  /aborted/i,
+] as const;
+
+/**
+ * Extracts HTTP status code from an error if available.
+ *
+ * @param error - The error to check
+ * @returns The status code or undefined
+ */
+function getStatusCode(error: unknown): number | undefined {
+  if (error === null || error === undefined) {
+    return undefined;
+  }
+
+  // Check common error object shapes
+  if (typeof error === 'object') {
+    const errorObj = error as Record<string, unknown>;
+
+    // Direct status property
+    if (typeof errorObj['status'] === 'number') {
+      return errorObj['status'];
+    }
+
+    // Nested in response
+    if (typeof errorObj['response'] === 'object' && errorObj['response'] !== null) {
+      const response = errorObj['response'] as Record<string, unknown>;
+      if (typeof response['status'] === 'number') {
+        return response['status'];
+      }
+    }
+
+    // statusCode property (some HTTP clients)
+    if (typeof errorObj['statusCode'] === 'number') {
+      return errorObj['statusCode'];
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Determines if an error is retryable based on its type, status code, or message.
+ *
+ * Retryable errors include:
+ * - HTTP 429 (Too Many Requests)
+ * - HTTP 5xx (Server Errors)
+ * - HTTP 408 (Request Timeout)
+ * - Network errors (connection reset, timeout, etc.)
+ * - NexusError with rate limit or timeout codes
+ *
+ * Non-retryable errors include:
+ * - HTTP 400, 401, 403, 404 (Client Errors)
+ * - Validation errors
+ * - Authentication errors
+ *
+ * @param error - The error to check
+ * @returns True if the error is retryable
+ */
+export function isRetryableError(error: unknown): boolean {
+  // Null/undefined are not retryable
+  if (error === null || error === undefined) {
+    return false;
+  }
+
+  // Check HTTP status code first
+  const statusCode = getStatusCode(error);
+  if (statusCode !== undefined) {
+    if (NON_RETRYABLE_STATUS_CODES.has(statusCode)) {
+      return false;
+    }
+    if (RETRYABLE_STATUS_CODES.has(statusCode)) {
+      return true;
+    }
+  }
+
+  // Check NexusError codes
+  if (error instanceof NexusError) {
+    const retryableCodes: ReadonlyArray<string> = [
+      ErrorCode.MODEL_RATE_LIMITED,
+      ErrorCode.MODEL_TIMEOUT,
+      ErrorCode.TIMEOUT_ERROR,
+      ErrorCode.RATE_LIMIT_ERROR,
+      // #3317 finding #7: a model temporarily unavailable (503/overloaded) is
+      // transient — retry. (MODEL_NOT_FOUND stays non-retryable: retry won't help.)
+      ErrorCode.MODEL_UNAVAILABLE,
+    ];
+    return retryableCodes.includes(error.code);
+  }
+
+  // Check error message patterns for network errors. Read through
+  // getErrorMessage: this runs inside withRetry's catch block, so a throwing
+  // `.message` getter would otherwise escape the loop as a rejection (#4308).
+  // An unreadable message matches no pattern.
+  if (error instanceof Error) {
+    const message = getErrorMessage(error, '');
+    for (const pattern of RETRYABLE_ERROR_PATTERNS) {
+      if (pattern.test(message)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Merges partial retry config with defaults.
+ *
+ * @param config - Partial configuration to merge
+ * @returns Complete retry configuration
+ */
+function mergeConfig(config: Partial<RetryConfig>): RetryConfig {
+  return {
+    maxRetries: config.maxRetries ?? DEFAULT_RETRY_CONFIG.maxRetries,
+    baseDelayMs: config.baseDelayMs ?? DEFAULT_RETRY_CONFIG.baseDelayMs,
+    maxDelayMs: config.maxDelayMs ?? DEFAULT_RETRY_CONFIG.maxDelayMs,
+    jitterFactor: config.jitterFactor ?? DEFAULT_RETRY_CONFIG.jitterFactor,
+  };
+}
+
+/**
+ * Options for withRetry function.
+ */
+export interface WithRetryOptions {
+  /** Retry configuration. Defaults to DEFAULT_RETRY_CONFIG. */
+  readonly config?: Partial<RetryConfig>;
+  /** Custom predicate to determine if an error is retryable. Defaults to isRetryableError. */
+  readonly isRetryable?: (error: unknown) => boolean;
+  /** Callback invoked before each retry attempt. Useful for logging. */
+  readonly onRetry?: (info: RetryAttemptInfo) => void;
+  /**
+   * Aborts the retry loop, including the backoff wait (#4293 item 5).
+   *
+   * Without this the backoff was a bare `await sleep(delayMs)`: a cancelled
+   * operation still held real wall-clock time before the loop noticed, and with
+   * the default profile a caller could wait out the full delay for work nobody
+   * wanted any more.
+   *
+   * On abort the loop returns `err(RetryExhaustedError)` rather than throwing —
+   * `withRetry`'s never-throws contract is what `execute_expert` relies on, so
+   * the abort path must be an error VALUE. `RetryExhaustedError.cause` carries
+   * whichever error the last attempt produced, or the signal's abort reason when
+   * the abort arrived before any attempt failed.
+   */
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * The error to return when `signal` was ALREADY aborted before the first
+ * attempt, or `undefined` when the loop should run.
+ *
+ * `attemptsMade` is 0 because none were: reporting 1 would claim an attempt the
+ * operation never got.
+ */
+function alreadyAborted(signal: AbortSignal | undefined): RetryExhaustedError | undefined {
+  if (signal?.aborted !== true) return undefined;
+  return new RetryExhaustedError(0, signal.reason);
+}
+
+/** Invoke the optional retry callback. Extracted to keep `withRetry` inside the complexity cap. */
+function notifyRetry(
+  onRetry: ((info: RetryAttemptInfo) => void) | undefined,
+  info: RetryAttemptInfo
+): void {
+  if (onRetry !== undefined) onRetry(info);
+}
+
+/**
+ * Sleep for `ms`, resolving early if `signal` aborts.
+ *
+ * Returns `true` when the full delay elapsed and `false` when the wait was cut
+ * short by an abort, so the caller can tell "backoff finished, try again" from
+ * "stop". Always clears the timer and removes the listener, so an aborted retry
+ * leaves nothing pending — a leaked timer would keep the process alive past the
+ * work it belonged to.
+ */
+function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<boolean> {
+  if (signal === undefined) return sleep(ms).then(() => true);
+  if (signal.aborted) return Promise.resolve(false);
+
+  return new Promise<boolean>((resolve) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Executes an operation with retry logic using exponential backoff.
+ *
+ * @template T - The return type of the operation
+ * @param operation - The async operation to execute
+ * @param options - Retry options (config, isRetryable predicate, onRetry callback)
+ * @returns A Result containing either the operation result or a RetryExhaustedError
+ *
+ * @example
+ * ```typescript
+ * const result = await withRetry(
+ *   () => fetchData('/api/data'),
+ *   { config: { maxRetries: 5 } }
+ * );
+ *
+ * if (result.ok) {
+ *   console.log(result.value);
+ * } else {
+ *   console.error('All retries failed:', result.error);
+ * }
+ * ```
+ */
+export async function withRetry<T>(
+  operation: () => Promise<T>,
+  options: WithRetryOptions = {}
+): Promise<Result<T, RetryExhaustedError>> {
+  const config = mergeConfig(options.config ?? {});
+  const isRetryable = options.isRetryable ?? isRetryableError;
+  const onRetry = options.onRetry;
+  const signal = options.signal;
+
+  const maxAttempts = config.maxRetries + 1; // Initial attempt + retries
+  let lastError: unknown;
+  let attemptsMade = 0;
+
+  // Already aborted before the first attempt: do not run the operation at all.
+  const preAborted = alreadyAborted(signal);
+  if (preAborted !== undefined) return err(preAborted);
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    attemptsMade = attempt + 1;
+    try {
+      const result = await operation();
+      return ok(result);
+    } catch (error: unknown) {
+      lastError = error;
+
+      // Check if we have more attempts and error is retryable
+      const isLastAttempt = attempt === maxAttempts - 1;
+      if (isLastAttempt || !isRetryable(error)) {
+        break;
+      }
+
+      // Calculate delay for next retry
+      const delayMs = calculateDelay(attempt, config);
+
+      notifyRetry(onRetry, { attempt: attempt + 1, maxAttempts, delayMs, error });
+
+      // Wait before next attempt — interruptible (#4293 item 5).
+      const waited = await sleepUnlessAborted(delayMs, signal);
+      if (!waited) break;
+    }
+  }
+
+  return err(new RetryExhaustedError(attemptsMade, lastError));
+}
+
+/**
+ * Wraps an async function with retry logic.
+ *
+ * @template TArgs - The argument types of the function
+ * @template TReturn - The return type of the function
+ * @param fn - The function to wrap
+ * @param options - Retry options
+ * @returns A wrapped function that will retry on failure
+ *
+ * @example
+ * ```typescript
+ * const fetchWithRetry = withRetryWrapper(
+ *   async (url: string) => fetch(url),
+ *   { config: { maxRetries: 3 } }
+ * );
+ *
+ * const result = await fetchWithRetry('https://api.example.com/data');
+ * ```
+ */
+export function withRetryWrapper<TArgs extends unknown[], TReturn>(
+  fn: (...args: TArgs) => Promise<TReturn>,
+  options: WithRetryOptions = {}
+): (...args: TArgs) => Promise<Result<TReturn, RetryExhaustedError>> {
+  return (...args: TArgs) => withRetry(() => fn(...args), options);
+}

@@ -1,0 +1,1264 @@
+/* eslint-disable max-lines -- Above the 600-line ceiling (.rules/governance.md); the canonical CompositeRouter class (CLAUDE.md entry point): construction, the route/execute path and outcome recording for the whole chain. The #6148 seam (model-selection-shadow glue) moved to composite-router-model-shadow.ts; what remains is the class itself, and no further dependency-driven seam is identified */
+/**
+ * CompositeRouter — chains the full routing pipeline.
+ *
+ * Stage order (executed by `composite-router-stages.ts:runPipeline`):
+ *   1. Budget — eliminate CLIs that exceed session token/cost budget
+ *   2. Scoring (sequential, dependency-ordered) — ConfidenceCascade / CapabilityMatch / KnnRouting /
+ *      DistilledRule / ResourceStrategy / ZeroRouter / Preference
+ *   3. QualityConstraint — constraint-first filter; can short-circuit (#1686)
+ *   4. CategoryOverride — `CATEGORY_CHAIN_OVERRIDES` per task category; can
+ *      short-circuit for sensitive categories whose override chain is
+ *      exhausted (#2414, #2417)
+ *   5. TOPSIS — multi-criteria ranking; quality profiles adjusted by stage-2
+ *      scores and penalized by performance-floor data (#1354, #1401)
+ *   6. LinUCB — bandit selection from TOPSIS ranking
+ *   7. PerfFloorOverride — reject LinUCB pick if CLI is below 50% success at
+ *      ≥20 samples; promote TOPSIS top-ranked alternative (#1790)
+ *   8. Latency — record per-CLI latency for the recommended-mapping feedback loop
+ *
+ * The pre-2026 docstring claimed 5 stages (Budget → ZeroRouter → Preference →
+ * TOPSIS → LinUCB), pre-dating #755 / #1350 / #1686 / #1790 / #2414. A
+ * maintainer debugging "why was my model rejected?" reading that line would
+ * never have found the constraint/override stages that actually short-circuit.
+ * Updated in #2947.
+ *
+ * @module cli-adapters/composite-router
+ * (Source: Issue #166, Epic #164, Issue #347, arXiv:2509.07571)
+ */
+import type { Result } from '../core/index.js';
+import {
+  getErrorMessage,
+  ok,
+  err,
+  createLogger,
+  getTimeProvider,
+  getRandomProvider,
+} from '../core/index.js';
+
+import type { ILogger } from '../core/index.js';
+import type {
+  ICliAdapter,
+  CliName,
+  RoutingArmId,
+  CliTask,
+  CliResponse,
+  CliError,
+  ExecutionOptions,
+} from './types.js';
+import { mapObserverRoutingDecision } from '../learning/routing-decision-mappers.js';
+import { routingArmCliSlot } from './types.js';
+import { armsForAccessMode } from './composite-router-access-mode.js';
+import { lookupInTreeCapability } from '../config/model-config-helpers.js';
+import { UNRESOLVED_MODEL_ID } from '../config/model-equivalence.js';
+import type { IOrchestrationObserver } from '../agents/observability/orchestration-observer-types.js';
+import { BudgetRouter } from './budget-router.js';
+import { TopsisRouter } from './topsis-router.js';
+import type { TopsisConfig } from './topsis-types.js';
+import { LinUCBBandit } from './linucb-bandit.js';
+import { PreferenceRouter } from './preference-router.js';
+import type { PreferenceRouterConfig } from './preference-router-types.js';
+import { ZeroRouter, type IZeroRouter } from './zero-router.js';
+import type { ZeroRouterConfig } from './zero-router-types.js';
+import { LatencyTracker, type ILatencyTracker } from './latency-tracker.js';
+import type { LatencyTrackerConfig } from './latency-tracker-types.js';
+import {
+  RoutingMemory,
+  type IRoutingMemory,
+  type RoutingMemoryConfig,
+  type ModelPerformance,
+} from '../context/routing-memory.js';
+import {
+  ConfidenceCascadeStage,
+  CapabilityMatchStage,
+  QualityConstraintStage,
+  ResourceStrategyStage,
+  CapacityFilterStage,
+  DistilledRuleStage,
+  KnnRoutingStage,
+  type ConfidenceCascadeConfig,
+  type CapabilityMatchConfig,
+  type QualityConstraintConfig,
+  type CapacityStageConfig,
+  type ResourceStrategyConfig,
+  type DistilledRuleStageConfig,
+} from './routing/stages/index.js';
+import {
+  StrategyDistiller,
+  createPersistentDistillerOrFallback,
+} from '../learning/strategy-distiller.js';
+import { getOutcomeStore } from '../orchestration/outcomes/outcome-store.js';
+import {
+  isPersistenceEnabled,
+  isStrategyDistillationEnabled,
+} from '../config/learning-persistence.js';
+import { getPipelineEventBus } from '../pipeline/event-bus.js';
+import { warmStartBandit } from './bandit-warm-start.js';
+import {
+  CompositeRouterConfigSchema,
+  CompositeRoutingError,
+  type CompositeRouterConfig,
+  type CompositeRouterConfigWithPreference,
+  type CompositeRoutingDecision,
+  type CompositeRouterStats,
+  type BuildDecisionParams,
+  type PipelineResult,
+  type IRoutingMetricsCollector,
+} from './composite-router-types.js';
+import { buildDecisionFields, buildPreferenceStats } from './composite-router-helpers.js';
+import { analyzeTaskProfile, runPipeline } from './composite-router-stages.js';
+import type { StageDependencies } from './composite-router-scoring-stages.js';
+import { getDefaultAvailableModelsCache } from '../config/available-models-cache.js';
+import {
+  isDynamicModelsEnabled,
+  registerDefaultModelSources,
+} from '../config/register-model-sources.js';
+import {
+  cliBinaryAdapterOf,
+  gatewayServedSlotOf,
+  resolveGatewayServedSlot,
+} from './gateway-slot-arm.js';
+import { AGY_MODEL_SLUGS, fromAgyModelSlug } from '../config/agy-model-map.js';
+import { resolveModelForTier, isRouteModelSelectionEnabled } from './resolve-model-for-tier.js';
+import {
+  PendingRoutingOutcomes,
+  type PendingRoutingOutcome,
+} from './composite-router-model-shadow.js';
+import {
+  recordBanditOutcome,
+  recordPreferenceSignal,
+  recordZeroRouterOutcome,
+  hasMinimumPreferenceData,
+  computeQualityReward,
+  type OutcomeDependencies,
+} from './composite-router-outcome.js';
+import {
+  recordDecisionToMetrics,
+  recordOutcomeToMetrics,
+  generateTraceId,
+} from './composite-router-metrics.js';
+import { servedCostDetail } from './budget-arm-cost.js';
+import { getDefaultModelForCli } from '../config/model-config-helpers.js';
+
+// Re-export types for consumers
+export {
+  CompositeRouterConfigSchema,
+  DEFAULT_COMPOSITE_CONFIG,
+  CompositeRoutingError,
+  type CompositeRouterConfig,
+  type CompositeRouterConfigWithPreference,
+  type CompositeRoutingDecision,
+  type CompositeRouterStats,
+  type IRoutingMetricsCollector,
+} from './composite-router-types.js';
+
+/** Quality score assigned to failed routing decisions for memory recording. */
+const FAILURE_QUALITY_SCORE = 0.3;
+
+/** Default token count estimate when task.maxTokens is not specified. */
+const DEFAULT_TOKEN_ESTIMATE = 1000;
+
+/** Composite router interface for dependency injection. */
+export interface ICompositeRouter {
+  route(task: CliTask): Promise<Result<CompositeRoutingDecision, CompositeRoutingError>>;
+  executeTask(
+    task: CliTask,
+    options?: ExecutionOptions
+  ): Promise<Result<CliResponse, CliError | CompositeRoutingError>>;
+  /**
+   * Run a decision `route()` returned and feed the outcome back, exactly as
+   * {@link executeTask} does after routing (#6533). Optional so existing
+   * implementors of this DI seam stay valid; `CompositeRouter` implements it.
+   */
+  executeDecision?(
+    decision: CompositeRoutingDecision,
+    task: CliTask,
+    runTask?: CliTask,
+    options?: ExecutionOptions
+  ): Promise<Result<CliResponse, CliError>>;
+  /** Record a routing outcome for a distinct routing arm (CLI slot or api:* arm) (#3422). */
+  recordOutcome(cliName: RoutingArmId, task: CliTask, reward: number, success?: boolean): void;
+  recordPreference(
+    query: string,
+    strongPreferred: boolean,
+    quality?: { strong?: number; weak?: number }
+  ): void;
+  recordDifficultyOutcome(
+    task: CliTask,
+    success: boolean,
+    qualityScore?: number,
+    costUsd?: number
+  ): void;
+  getStats(): CompositeRouterStats;
+  hasMinimumPreferenceData(): boolean;
+  getZeroRouter(): IZeroRouter | undefined;
+  getLatencyTracker(): ILatencyTracker | undefined;
+  getRoutingMemory(): IRoutingMemory | undefined;
+  /** Get the metrics collector (if configured) (Issue #559) */
+  getMetricsCollector(): IRoutingMetricsCollector | undefined;
+  /** Get the orchestration observer (if configured) (Issue #587) */
+  getOrchestrationObserver(): IOrchestrationObserver | undefined;
+}
+
+/**
+ * #6512 review I1: `NEXUS_STRATEGY_DISTILLATION=0` wins over config, so the
+ * distiller is never built and no distilled rule is read or applied.
+ */
+function applyDistillationSwitch(config: CompositeRouterConfig): CompositeRouterConfig {
+  return isStrategyDistillationEnabled()
+    ? config
+    : { ...config, enableStrategyDistillation: false };
+}
+
+/** Availability constrains only the actual native Gemini arm, never API/gateway slots. */
+async function nativeAgyTierOptions(
+  arm: RoutingArmId,
+  adapter: ICliAdapter
+): Promise<Parameters<typeof resolveModelForTier>[2]> {
+  if (arm !== 'gemini' || gatewayServedSlotOf(adapter) !== undefined) return {};
+  // Loading the subprocess class at module initialization would cycle through core/routing.
+  const { GeminiCliAdapter } = await import('./adapters/gemini-adapter.js');
+  if (!(cliBinaryAdapterOf(adapter) instanceof GeminiCliAdapter)) return {};
+  return {
+    liveModelIds: new Set(
+      AGY_MODEL_SLUGS.flatMap((slug) => {
+        const canonical = fromAgyModelSlug(slug);
+        return canonical === null ? [] : [canonical];
+      })
+    ),
+  };
+}
+
+/** CompositeRouter implementation. */
+export class CompositeRouter implements ICompositeRouter {
+  private readonly config: CompositeRouterConfig;
+  private readonly logger: ILogger;
+  private readonly adapters: Map<RoutingArmId, ICliAdapter>;
+  private budgetRouter?: BudgetRouter;
+  private zeroRouter?: ZeroRouter;
+  private preferenceRouter?: PreferenceRouter;
+  private topsisRouter?: TopsisRouter;
+  private linucbBandit?: LinUCBBandit;
+  private latencyTracker?: LatencyTracker;
+  private routingMemory?: RoutingMemory;
+  /**
+   * Most recently consulted unified memory context (Phase 3 of #2792).
+   * Set on every {@link route} call so tests + telemetry can inspect what
+   * the router saw at decision time. Typed as `unknown` here to avoid
+   * pulling the typed surface into this module's circular-dep zone — the
+   * field is for observability; callers that need typed reads should call
+   * `getContextForTask` directly.
+   */
+  private lastUnifiedContext?: unknown;
+  /** Metrics collector for routing observability (Issue #559) */
+  private metricsCollector?: IRoutingMetricsCollector;
+  /** Orchestration observer for routing decision tracking (Issue #587) */
+  private orchestrationObserver?: IOrchestrationObserver;
+  /** Confidence cascade stage instance (Issue #755) */
+  private confidenceCascadeStage?: ConfidenceCascadeStage;
+  /** Capability match stage instance (Issue #755) */
+  private capabilityMatchStage?: CapabilityMatchStage;
+  /** Quality constraint stage instance (Issue #755) */
+  private qualityConstraintStage?: QualityConstraintStage;
+  /** Resource strategy stage instance (Issue #998) */
+  private resourceStrategyStage?: ResourceStrategyStage;
+  /** Capacity filter stage instance (#4373, #4351 criterion 3) */
+  private capacityFilterStage?: CapacityFilterStage;
+  /** Distilled rule stage instance (Issue #999) */
+  private distilledRuleStage?: DistilledRuleStage;
+  /** KNN routing stage instance (arXiv:2505.12601) */
+  private knnRoutingStage?: KnnRoutingStage;
+  /** Strategy distiller instance (Issue #999) */
+  private strategyDistiller?: StrategyDistiller;
+  private readonly cliNames: RoutingArmId[];
+  /**
+   * (#2540 PR 7) Optional harness-driven availability gate. When set,
+   * `executeRouting` filters the candidate CLI list to only those with
+   * ≥1 routable model per the cache. See `getCandidateCliNames`.
+   */
+  private readonly availableModelsCache?: import('../config/available-models-cache.js').AvailableModelsCache;
+
+  // Statistics tracking
+  private totalDecisions = 0;
+  private decisionsPerCli: Record<CliName, number> = {
+    claude: 0,
+    gemini: 0,
+    codex: 0,
+    opencode: 0,
+  };
+  private totalDecisionTimeMs = 0;
+  private budgetRejections = 0;
+
+  // Track last traceId for metrics correlation (Issue #559)
+  private lastTraceId?: string;
+
+  /**
+   * Route-time outcome data keyed by the exact task object for execution-safe
+   * feedback joins (#4197 shadow glue + difficulty attribution; #6148 split).
+   */
+  private readonly pendingRoutingOutcomes: PendingRoutingOutcomes;
+
+  constructor(
+    adapters: Map<RoutingArmId, ICliAdapter>,
+    config?: Partial<CompositeRouterConfigWithPreference>,
+    logger?: ILogger
+  ) {
+    const {
+      preferenceRouterConfig,
+      zeroRouterConfig,
+      topsisConfig,
+      latencyTrackerConfig,
+      routingMemoryConfig,
+      confidenceCascadeConfig,
+      capabilityMatchConfig,
+      qualityConstraintConfig,
+      resourceStrategyConfig,
+      distilledRuleStageConfig,
+      capacityStageConfig,
+      metricsCollector,
+      orchestrationObserver,
+      availableModelsCache,
+      ...baseConfig
+    } = config ?? {};
+    this.config = applyDistillationSwitch(CompositeRouterConfigSchema.parse(baseConfig));
+    this.logger = logger ?? createLogger({ component: 'CompositeRouter' });
+    this.pendingRoutingOutcomes = new PendingRoutingOutcomes(this.logger);
+    this.adapters = adapters;
+    this.cliNames = Array.from(adapters.keys());
+    this.assignOptionalCollaborators(metricsCollector, orchestrationObserver);
+    // (#2540 PR 7) Wire optional availability cache. Stays here: the field is
+    // readonly, so it can only be assigned in the constructor.
+    if (availableModelsCache !== undefined) {
+      this.availableModelsCache = availableModelsCache;
+      this.logger.debug('AvailableModelsCache wired to CompositeRouter');
+    }
+    this.initializeCoreRouters(
+      adapters,
+      preferenceRouterConfig,
+      zeroRouterConfig,
+      latencyTrackerConfig,
+      topsisConfig
+    );
+    this.initializeMemoryAndStages(routingMemoryConfig, {
+      confidenceCascade: confidenceCascadeConfig,
+      capabilityMatch: capabilityMatchConfig,
+      qualityConstraint: qualityConstraintConfig,
+      resourceStrategy: resourceStrategyConfig,
+      distilledRule: distilledRuleStageConfig,
+      capacity: capacityStageConfig,
+    });
+    this.logInitialization(adapters.size);
+  }
+
+  /**
+   * Optional collaborators, assigned only when supplied so an absent one stays
+   * `undefined` rather than being stored as a null-ish value. Extracted from
+   * the constructor to keep it under the function-length bar (#4658).
+   */
+  private assignOptionalCollaborators(
+    metricsCollector: CompositeRouterConfigWithPreference['metricsCollector'],
+    orchestrationObserver: CompositeRouterConfigWithPreference['orchestrationObserver']
+  ): void {
+    // Only assign metricsCollector if provided (Issue #559)
+    if (metricsCollector !== undefined) {
+      this.metricsCollector = metricsCollector;
+    }
+    // Only assign orchestrationObserver if provided (Issue #587)
+    if (orchestrationObserver !== undefined) {
+      this.orchestrationObserver = orchestrationObserver;
+      this.logger.debug('OrchestrationObserver wired to CompositeRouter');
+    }
+  }
+
+  private initializeCoreRouters(
+    adapters: Map<RoutingArmId, ICliAdapter>,
+    preferenceConfig?: Partial<PreferenceRouterConfig>,
+    zeroConfig?: Partial<ZeroRouterConfig>,
+    latencyConfig?: Partial<LatencyTrackerConfig>,
+    topsisConfig?: Partial<TopsisConfig>
+  ): void {
+    if (this.config.enableBudgetFilter && adapters.size > 0) {
+      this.budgetRouter = this.buildBudgetRouter(adapters);
+    }
+    if (this.config.enableZeroRouter) this.zeroRouter = new ZeroRouter(zeroConfig, this.logger);
+    if (this.config.enablePreferenceRouting)
+      this.preferenceRouter = new PreferenceRouter(preferenceConfig);
+    // #5785: pass the configured block. This was `new TopsisRouter()`, so a
+    // `routing.topsis` section in nexus-agents.yaml never reached the stage.
+    if (this.config.enableTopsisRanking) this.topsisRouter = new TopsisRouter(topsisConfig);
+    if (this.config.enableLinUCBSelection && this.cliNames.length > 0) {
+      // Arms include distinct api:* arms (#3422). Routed outcome rows record
+      // the arm that ran (#6554), so warm start credits an api:* arm from its
+      // own rows; rows a slot-only writer recorded credit the slot. Do NOT
+      // collapse the arm names here, that would destroy the CLI-vs-API
+      // distinct learning this migration exists to enable.
+      this.linucbBandit = new LinUCBBandit(this.cliNames, { alpha: this.config.linucbAlpha });
+      warmStartBandit(this.linucbBandit, this.logger);
+    }
+    if (this.config.enableLatencyTracking) this.latencyTracker = new LatencyTracker(latencyConfig);
+  }
+
+  /** #4196: plumb per-task-class cost ceilings into the BudgetRouter.
+   * Absent → defaults (no ceiling configured). */
+  private buildBudgetRouter(adapters: Map<RoutingArmId, ICliAdapter>): BudgetRouter {
+    const ceilings = this.config.budgetConstraints?.taskClassMaxCostUsd;
+    return ceilings !== undefined
+      ? new BudgetRouter(adapters, { taskClassCostCeilings: ceilings })
+      : new BudgetRouter(adapters);
+  }
+
+  private initializeMemoryAndStages(
+    routingMemoryConfig?: Partial<RoutingMemoryConfig>,
+    stageConfigs?: {
+      confidenceCascade?: Partial<ConfidenceCascadeConfig> | undefined;
+      capabilityMatch?: Partial<CapabilityMatchConfig> | undefined;
+      qualityConstraint?: Partial<QualityConstraintConfig> | undefined;
+      resourceStrategy?: Partial<ResourceStrategyConfig> | undefined;
+      distilledRule?: Partial<DistilledRuleStageConfig> | undefined;
+      capacity?: Partial<CapacityStageConfig> | undefined;
+    }
+  ): void {
+    if (this.config.enableRoutingMemory) {
+      this.routingMemory = new RoutingMemory(routingMemoryConfig);
+      this.logger.info('RoutingMemory enabled for learned routing', {
+        minObservations: this.routingMemory.getStats().totalPreferences,
+      });
+    }
+    if (this.config.enableKnnRouting && this.routingMemory !== undefined) {
+      this.knnRoutingStage = new KnnRoutingStage(this.routingMemory);
+    }
+    this.initializeOptionalStages(stageConfigs);
+  }
+
+  private initializeOptionalStages(
+    stageConfigs: {
+      confidenceCascade?: Partial<ConfidenceCascadeConfig> | undefined;
+      capabilityMatch?: Partial<CapabilityMatchConfig> | undefined;
+      qualityConstraint?: Partial<QualityConstraintConfig> | undefined;
+      resourceStrategy?: Partial<ResourceStrategyConfig> | undefined;
+      distilledRule?: Partial<DistilledRuleStageConfig> | undefined;
+      capacity?: Partial<CapacityStageConfig> | undefined;
+    } = {}
+  ): void {
+    if (this.config.enableConfidenceCascade) {
+      this.confidenceCascadeStage = new ConfidenceCascadeStage(stageConfigs.confidenceCascade);
+    }
+    if (this.config.enableCapabilityMatch) {
+      this.capabilityMatchStage = new CapabilityMatchStage(stageConfigs.capabilityMatch);
+    }
+    if (this.config.enableQualityConstraint) {
+      this.qualityConstraintStage = new QualityConstraintStage(stageConfigs.qualityConstraint);
+    }
+    if (this.config.enableResourceStrategy) {
+      this.resourceStrategyStage = new ResourceStrategyStage(stageConfigs.resourceStrategy);
+    }
+    if (this.config.enableCapacityBalancing) {
+      // #4658: was a hardcoded `{}`, so `enforceHardLimits` — documented as
+      // "available for callers who have a real quota signal" — could not be set
+      // by any caller. The signal now exists (`recordProviderQuotaExhaustion`
+      // fires from two adapters on a durable RATE_LIMITED), so the opt-in is
+      // threaded. The default stays `false`: #4456's signal-only posture is
+      // unchanged, it is now a choice rather than a hardcoding.
+      this.capacityFilterStage = new CapacityFilterStage(
+        this.adapters,
+        stageConfigs.capacity ?? {},
+        this.logger
+      );
+    }
+    if (this.config.enableStrategyDistillation) {
+      this.strategyDistiller = isPersistenceEnabled()
+        ? createPersistentDistillerOrFallback(getOutcomeStore(), this.logger)
+        : new StrategyDistiller(getOutcomeStore(), this.logger);
+      this.distilledRuleStage = new DistilledRuleStage(
+        this.strategyDistiller,
+        stageConfigs.distilledRule
+      );
+    }
+  }
+
+  /** Emit routing.decision event to pipeline event bus (#1687). */
+  private emitRoutingDecision(decision: CompositeRoutingDecision, taskDescription: string): void {
+    getPipelineEventBus().emit({
+      type: 'routing.decision',
+      timestamp: getTimeProvider().now(),
+      taskId: taskDescription.slice(0, 100),
+      // Built-in vendor arms retain slot display; endpoints retain their own identity.
+      selectedModel: routingArmCliSlot(decision.cliName) ?? decision.cliName,
+      reasoning: decision.reason,
+      decisionPath: decision.stagesExecuted,
+    });
+  }
+
+  private logInitialization(adapterCount: number): void {
+    this.logger.info('CompositeRouter initialized', {
+      adapterCount,
+      enableBudget: this.config.enableBudgetFilter,
+      enableZeroRouter: this.config.enableZeroRouter,
+      enablePreference: this.config.enablePreferenceRouting,
+      enableTopsis: this.config.enableTopsisRanking,
+      enableLinUCB: this.config.enableLinUCBSelection,
+      enableLatencyTracking: this.config.enableLatencyTracking,
+      enableConfidenceCascade: this.config.enableConfidenceCascade,
+      enableCapabilityMatch: this.config.enableCapabilityMatch,
+      enableQualityConstraint: this.config.enableQualityConstraint,
+      enableResourceStrategy: this.config.enableResourceStrategy,
+      enableStrategyDistillation: this.config.enableStrategyDistillation,
+    });
+  }
+
+  async route(task: CliTask): Promise<Result<CompositeRoutingDecision, CompositeRoutingError>> {
+    // Phase 3 of #2792 — read accumulated memory before routing decides.
+    // Fire-and-forget for now: the call exercises the read path so beliefs,
+    // similar memories, recent learnings, and prior outcomes all get loaded
+    // and logged. Subsequent phases plumb the context into the routing
+    // stages as a quality signal.
+    void this.consultUnifiedContext(task);
+
+    const result = await this.executeRouting(task, getTimeProvider().now());
+    // Emit routing.decision to pipeline event bus for trace persistence (#1687)
+    if (result.ok) {
+      this.emitRoutingDecision(result.value, task.content);
+    }
+    return result;
+  }
+
+  /**
+   * Read the unified memory context for this task. Best-effort, never
+   * throws. Sets `this.lastUnifiedContext` so external observers (tests,
+   * telemetry) can inspect what the router consulted at decision time.
+   */
+  private async consultUnifiedContext(task: CliTask): Promise<void> {
+    try {
+      const { getContextForTask, inferTaskCategory } =
+        await import('../context/context-retriever.js');
+      const ctx = await getContextForTask({
+        task: task.content,
+        category: inferTaskCategory(task.content),
+        logger: this.logger,
+      });
+      this.lastUnifiedContext = ctx;
+      this.logger.debug('CompositeRouter: unified memory context', {
+        beliefs: ctx.beliefs.length,
+        similarMemories: ctx.similarMemories.length,
+        recentLearnings: ctx.recentLearnings.length,
+        experiencePatterns: ctx.experiencePatterns.length,
+        outcomesTotal: ctx.outcomes?.totalTasks ?? 0,
+      });
+    } catch (error: unknown) {
+      // #3699: the #3180-adopted best-effort failure policy — routing continues
+      // (lastUnifiedContext stays unset), but the failure is an observable WARN
+      // rather than a swallowed debug line: a router consulting memory blind is
+      // a condition operators should see. No event-listener channel at this
+      // site, so the structured warn IS the observable.
+      this.logger.warn('CompositeRouter: context retrieval failed; routing without context', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Unified method that routes, executes, and auto-records feedback.
+   * Use this for most cases; use route() when you need decision details without execution.
+   *
+   * @param task - Task to execute
+   * @param options - Execution options for the routed arm, e.g. an abort
+   *   `signal` (#6736); passed to the adapter unchanged.
+   * @returns Result with CLI response or error
+   */
+  async executeTask(
+    task: CliTask,
+    options?: ExecutionOptions
+  ): Promise<Result<CliResponse, CliError | CompositeRoutingError>> {
+    const routeResult = await this.route(task);
+    if (!routeResult.ok) {
+      return err(routeResult.error);
+    }
+    return this.executeDecision(routeResult.value, task, task, options);
+  }
+
+  private resolveExplicitCost(response: CliResponse | undefined): number | undefined {
+    if (response === undefined) return undefined;
+    const cost = response.costUsd;
+    if (cost !== undefined && Number.isFinite(cost) && cost >= 0) {
+      return cost;
+    }
+    return undefined;
+  }
+
+  private resolveResponseModel(
+    response: CliResponse | undefined,
+    decision: CompositeRoutingDecision
+  ): string | undefined {
+    if (response?.model !== undefined) return response.model;
+    if (decision.model !== undefined) return decision.model;
+    const slot = routingArmCliSlot(decision.cliName);
+    return slot !== undefined ? getDefaultModelForCli(slot) : undefined;
+  }
+
+  private resolveUsageCost(
+    response: CliResponse | undefined,
+    decision: CompositeRoutingDecision
+  ): number | undefined {
+    const usage = response?.usage;
+    if (usage === undefined) return undefined;
+    if (!Number.isFinite(usage.inputTokens) || !Number.isFinite(usage.outputTokens)) {
+      return undefined;
+    }
+
+    const model = this.resolveResponseModel(response, decision);
+    if (model === undefined) return undefined;
+
+    const detail = servedCostDetail(
+      response?.gatewayArm,
+      model,
+      usage.inputTokens,
+      usage.outputTokens
+    );
+    return detail.priced && detail.costUsd >= 0 ? detail.costUsd : undefined;
+  }
+
+  /**
+   * Resolves the measured execution cost (USD) for a completed CLI response (#4197).
+   * Uses explicit `costUsd` when reported; otherwise calculates cost from token usage
+   * and the serving model/gateway rate via `servedCostDetail`. Returns `undefined`
+   * when unmeasured or unpriced, preserving fail-closed telemetry.
+   */
+  private resolveExecutionCost(
+    response: CliResponse | undefined,
+    decision: CompositeRoutingDecision
+  ): number | undefined {
+    return this.resolveExplicitCost(response) ?? this.resolveUsageCost(response, decision);
+  }
+
+  /**
+   * Execute a decision `route(task)` returned and auto-record feedback (#6533).
+   *
+   * For callers that need the decision itself (to display it, or to apply the
+   * route-time model to the task) before running it. `task` must be the object
+   * passed to `route()`: route-time attribution is keyed on it. `runTask` is
+   * what the arm executes when it differs from `task` (defaults to `task`).
+   * `options` reaches the arm's `execute` unchanged (#6736).
+   * The result names the arm that ran (`routedCli`) and its own run time
+   * (`routedDurationMs`), on success and on failure.
+   */
+  async executeDecision(
+    decision: CompositeRoutingDecision,
+    task: CliTask,
+    runTask: CliTask = task,
+    options?: ExecutionOptions
+  ): Promise<Result<CliResponse, CliError>> {
+    const startTime = getTimeProvider().now();
+
+    // Generate traceId for metrics correlation (Issue #559)
+    const traceId = generateTraceId();
+    this.lastTraceId = traceId;
+    recordDecisionToMetrics(decision, traceId, {
+      metricsCollector: this.metricsCollector,
+      logger: this.logger,
+    });
+
+    // Record routing decision to orchestration observer (Issue #587)
+    this.recordToOrchestrationObserver(decision, task);
+
+    const armStart = getTimeProvider().now();
+    const executeResult =
+      options === undefined
+        ? await decision.adapter.execute(runTask)
+        : await decision.adapter.execute(runTask, options);
+    const armDurationMs = getTimeProvider().now() - armStart;
+
+    const durationMs = getTimeProvider().now() - startTime;
+    const success = executeResult.ok;
+    const costUsd = this.resolveExecutionCost(
+      executeResult.ok ? executeResult.value : undefined,
+      decision
+    );
+
+    // Auto-record feedback for learning systems
+    this.autoRecordFeedback(decision, task, success, durationMs, costUsd);
+
+    // #6521: name the arm that ran and time its call alone, on success AND on
+    // failure, so an outcome writer records both against the arm routed to.
+    // #6552: the arm id too, which the slot alone loses for an api:* arm.
+    const routedSlot = routingArmCliSlot(decision.cliName);
+    const routed = {
+      // A gateway endpoint has no routed CLI; routedArm carries its identity.
+      ...(routedSlot !== undefined && { routedCli: routedSlot }),
+      routedArm: decision.cliName,
+      routedDurationMs: armDurationMs,
+    };
+    if (!executeResult.ok) return err({ ...executeResult.error, ...routed });
+    return ok({ ...executeResult.value, ...routed });
+  }
+
+  private autoRecordFeedback(
+    decision: CompositeRoutingDecision,
+    task: CliTask,
+    success: boolean,
+    durationMs: number,
+    costUsd?: number
+  ): void {
+    // The bandit and the quality reward read the DISTINCT arm (#6552: the
+    // reward uses the arm's own history, falling back to its slot's while it
+    // has none). Slot-only sinks retain vendor mappings and skip gateway
+    // endpoints, which have no CLI slot to measure.
+    const arm = decision.cliName;
+    const slot = routingArmCliSlot(arm);
+
+    // Record bandit outcome with quality-enriched reward (Issue #929). The
+    // history is the ARM's (#6552): outcome rows are keyed on the arm id.
+    const reward = computeQualityReward(arm, success, durationMs);
+    this.recordOutcome(arm, task, reward, success);
+
+    // Record difficulty outcome for ZeroRouter learning
+    this.recordExecutedDifficultyOutcome(decision, task, success, costUsd);
+
+    this.logger.debug('Auto-recorded feedback', {
+      cli: arm,
+      success,
+      durationMs,
+      reward,
+    });
+    // Slot-only sinks cannot represent gateway outcomes.
+    if (slot === undefined) return;
+
+    // Record latency for latency-based routing (Issue #361)
+    // Slot-only learning cannot represent an endpoint; skip it explicitly.
+    if (this.latencyTracker !== undefined) {
+      this.latencyTracker.record(slot, durationMs, success);
+    }
+
+    // Record performance in routing memory for learned routing (Issue #463)
+    if (this.routingMemory !== undefined) {
+      const taskType = this.inferTaskType(task);
+      const performance: ModelPerformance = {
+        avgQuality: success ? decision.confidence : FAILURE_QUALITY_SCORE,
+        successRate: success ? 1.0 : 0.0,
+        avgLatencyMs: durationMs,
+        avgTokens: task.maxTokens ?? DEFAULT_TOKEN_ESTIMATE,
+        observations: 1,
+      };
+      this.routingMemory.storePreference(slot, taskType, performance);
+    }
+
+    // Record outcome to metrics collector (Issue #559)
+    if (this.lastTraceId !== undefined) {
+      recordOutcomeToMetrics(
+        {
+          traceId: this.lastTraceId,
+          cliName: slot,
+          success,
+          reward,
+          qualityScore: success ? decision.confidence : FAILURE_QUALITY_SCORE,
+          latencyMs: durationMs,
+        },
+        { metricsCollector: this.metricsCollector, logger: this.logger }
+      );
+    }
+  }
+
+  /** Task type inference keywords. */
+  private static readonly TASK_TYPE_KEYWORDS: ReadonlyArray<
+    readonly [string, ReadonlyArray<string>]
+  > = [
+    ['coding', ['code', 'implement']],
+    ['review', ['review', 'audit']],
+    ['testing', ['test', 'spec']],
+    ['documentation', ['document', 'explain']],
+    ['refactoring', ['refactor']],
+    ['debugging', ['debug', 'fix']],
+  ];
+
+  /**
+   * Infer task type from task content for routing memory.
+   */
+  private inferTaskType(task: CliTask): string {
+    const content = task.content.toLowerCase();
+    for (const [taskType, keywords] of CompositeRouter.TASK_TYPE_KEYWORDS) {
+      if (keywords.some((kw) => content.includes(kw))) return taskType;
+    }
+    return 'general';
+  }
+
+  private async executeRouting(
+    task: CliTask,
+    startTime: number
+  ): Promise<Result<CompositeRoutingDecision, CompositeRoutingError>> {
+    const stagesExecuted: string[] = [];
+    try {
+      const taskProfile = analyzeTaskProfile(task, stagesExecuted);
+      const deps = this.getStageDependencies();
+      // #6768: a read-only task routes only to arms that enforce the mode.
+      const candidateCliNames = armsForAccessMode(
+        task,
+        await this.getCandidateCliNames(),
+        this.adapters
+      );
+      if (!candidateCliNames.ok) return candidateCliNames;
+      // Bind existing gateway-slot target state before pricing or quality projection.
+      await Promise.all(
+        candidateCliNames.value.map((arm) => resolveGatewayServedSlot(this.adapters.get(arm)))
+      );
+      const pipelineResult = await runPipeline(
+        task,
+        taskProfile,
+        stagesExecuted,
+        candidateCliNames.value,
+        deps
+      );
+      if (!pipelineResult.ok) {
+        if (pipelineResult.error.stage === 'budget-filter') this.budgetRejections++;
+        return pipelineResult;
+      }
+
+      const decisionResult = await this.buildRoutingDecision({
+        ...pipelineResult.value,
+        taskProfile,
+        stagesExecuted,
+        startTime,
+      });
+      // #4197: SHADOW-ONLY comparison of the tier resolver's would-be model vs
+      // the model actually used. Exception-guarded inside — never alters or
+      // breaks the live decision.
+      if (decisionResult.ok) {
+        this.pendingRoutingOutcomes.track(task, decisionResult.value);
+      }
+      return decisionResult;
+    } catch (error: unknown) {
+      return this.handleRoutingError(error, stagesExecuted);
+    }
+  }
+
+  /**
+   * (#2540 PR 7) Returns the candidate routing-arm set for the routing pipeline
+   * (`RoutingArmId[]` = CLI slots plus any `api:*` arms, #3422), filtered by
+   * harness-driven availability when the cache is wired. (Name retained for
+   * history; the set is routing arms, not only CLIs.)
+   *
+   * Filtering rules:
+   *   - No cache configured → return all registered arms (prior behaviour).
+   *   - Cache configured → query getAll(); an arm is excluded only if the
+   *     cache reports zero models for it. If the cache returns an empty union
+   *     (cold start, all sources failing), fall back to all registered arms
+   *     so the router never wedges on a transient cache miss.
+   *   - Errors in the cache do not block routing — log and fall through.
+   */
+  private async getCandidateCliNames(): Promise<RoutingArmId[]> {
+    if (this.availableModelsCache === undefined) return this.cliNames;
+    try {
+      const all = await this.availableModelsCache.getAll();
+      if (all.length === 0) {
+        // The cache is wired but reports zero models — cold start, or all
+        // sources unavailable. Fall back to all CLIs so routing never wedges,
+        // but log at INFO so operators who rely on the cache can see the gate
+        // is currently a no-op (#3188).
+        this.logger.info(
+          'AvailableModelsCache returned no models; falling back to all CLIs (cold start or all sources unavailable)',
+          { candidateCount: this.cliNames.length }
+        );
+        return this.cliNames;
+      }
+      const sourcesWithModels = new Set(all.map((m) => m.source));
+      // The cache is sourced by CLI transports, not endpoint catalogues.
+      // Endpoint availability was established by gateway discovery; skip this
+      // CLI-only gate instead of aliasing an endpoint to opencode.
+      const filtered = this.cliNames.filter((name) => {
+        const slot = routingArmCliSlot(name);
+        return slot === undefined || sourcesWithModels.has(slot);
+      });
+      // Guard against fully empty filter — never let the gate wedge routing.
+      if (filtered.length === 0) {
+        this.logger.info(
+          'AvailableModelsCache filtered out all CLIs; falling back to all (possible stale/misconfigured cache)',
+          { cacheSources: [...sourcesWithModels], candidateCount: this.cliNames.length }
+        );
+        return this.cliNames;
+      }
+      return filtered;
+    } catch (e: unknown) {
+      this.logger.warn('AvailableModelsCache query failed; falling back to all CLIs', {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return this.cliNames;
+    }
+  }
+
+  /** (#2540 PR 7) Public accessor for the wired cache (or undefined). */
+  getAvailableModelsCache():
+    import('../config/available-models-cache.js').AvailableModelsCache | undefined {
+    return this.availableModelsCache;
+  }
+
+  /**
+   * The TOPSIS config the ranking stage was actually built with, or undefined
+   * when ranking is disabled (#5785).
+   *
+   * Mirrors `getAvailableModelsCache` above: a narrow accessor so the WIRING is
+   * verifiable, not just the adapter's output. The adapter used to return a
+   * `topsisConfig` that this class never read, and a test asserting only the
+   * adapter would have passed against that.
+   */
+  getTopsisConfig(): TopsisConfig | undefined {
+    return this.topsisRouter?.getConfig();
+  }
+
+  private getStageDependencies(): StageDependencies {
+    return {
+      config: this.config,
+      logger: this.logger,
+      cliNames: this.cliNames,
+      adapters: this.adapters,
+      budgetRouter: this.budgetRouter,
+      zeroRouter: this.zeroRouter,
+      preferenceRouter: this.preferenceRouter,
+      topsisRouter: this.topsisRouter,
+      linucbBandit: this.linucbBandit,
+      latencyTracker: this.latencyTracker,
+      routingMemory: this.routingMemory,
+      // Issue #755 replacement stages
+      confidenceCascadeStage: this.confidenceCascadeStage,
+      capabilityMatchStage: this.capabilityMatchStage,
+      qualityConstraintStage: this.qualityConstraintStage,
+      // Issue #998 resource strategy
+      resourceStrategyStage: this.resourceStrategyStage,
+      // #4373 capacity exclusion
+      capacityFilterStage: this.capacityFilterStage,
+      // Issue #999 distilled rule stage
+      distilledRuleStage: this.distilledRuleStage,
+      // arXiv:2505.12601 KNN routing
+      knnRoutingStage: this.knnRoutingStage,
+    };
+  }
+
+  private async buildRoutingDecision(
+    params: BuildDecisionParams & PipelineResult
+  ): Promise<Result<CompositeRoutingDecision, CompositeRoutingError>> {
+    const selectedAdapter = this.adapters.get(params.selectedCli);
+    if (selectedAdapter === undefined) {
+      return err(
+        new CompositeRoutingError('Adapter not found: ' + params.selectedCli, 'selection')
+      );
+    }
+
+    const decisionTimeMs = getTimeProvider().now() - params.startTime;
+    this.updateStats(params.selectedCli, decisionTimeMs);
+    // #4196 BINDING: plan mode must annotate the decision explicitly
+    // ('cost weighting disabled: plan mode') — never a silent no-op.
+    const { confidence, reason, alternatives, alternativeScores } = buildDecisionFields({
+      ...params,
+      decisionTimeMs,
+      billingMode: this.config.billingMode,
+    });
+
+    // #3394: pick a concrete model from the difficulty tier (opt-in, default
+    // OFF). Canonical gateway availability is resolved first. Consumers
+    // fall back to getDefaultModelForCli when absent.
+    // Concrete model resolution is registry/slot-level; collapse an api:* arm
+    // to its display slot for the lookup (#3422).
+    const modelSlot = routingArmCliSlot(params.selectedCli);
+    const model =
+      isRouteModelSelectionEnabled() &&
+      params.difficultyTier !== undefined &&
+      modelSlot !== undefined
+        ? resolveModelForTier(
+            modelSlot,
+            params.difficultyTier,
+            await nativeAgyTierOptions(params.selectedCli, selectedAdapter)
+          )
+        : undefined;
+
+    return ok({
+      adapter: selectedAdapter,
+      cliName: params.selectedCli,
+      ...(model !== undefined ? { model } : {}),
+      confidence,
+      reason,
+      stagesExecuted: params.stagesExecuted,
+      decisionTimeMs,
+      withinBudget: params.withinBudget,
+      difficultyEstimate: params.difficultyEstimate,
+      difficultyTier: params.difficultyTier,
+      preferenceScore: params.preferenceScore,
+      preferenceTier: params.preferenceTier,
+      topsisScore: params.topsisScore,
+      ucbScore: params.ucbScore,
+      latencyScore: params.latencyScore,
+      alternatives,
+      ...(alternativeScores === undefined ? {} : { alternativeScores }),
+      alternativeDescriptors: this.snapshotAlternativeDescriptors(alternatives),
+      taskProfile: params.taskProfile,
+    });
+  }
+
+  /** Copy only declared metadata from already resolved targets; never execute/probe. */
+  private snapshotAlternativeDescriptors(
+    alternatives: readonly RoutingArmId[]
+  ): NonNullable<CompositeRoutingDecision['alternativeDescriptors']> {
+    const snapshots = new Map<
+      RoutingArmId,
+      {
+        modelId: string;
+        capabilities: ICliAdapter['capabilities'];
+        hasQualityMetadata: boolean;
+      }
+    >();
+    for (const arm of alternatives) {
+      const adapter = this.adapters.get(arm);
+      if (adapter === undefined) continue;
+      try {
+        const modelId = adapter.getModelInfo().id;
+        if (modelId.trim() === '' || modelId === UNRESOLVED_MODEL_ID) continue;
+        const caps = adapter.capabilities;
+        snapshots.set(
+          arm,
+          Object.freeze({
+            modelId,
+            capabilities: Object.freeze({
+              reasoning: caps.reasoning,
+              contextWindow: caps.contextWindow,
+              codeGeneration: caps.codeGeneration,
+              speed: caps.speed,
+              cost: caps.cost,
+            }),
+            hasQualityMetadata: lookupInTreeCapability(modelId)?.qualityScores !== undefined,
+          })
+        );
+      } catch (error: unknown) {
+        this.logger.warn('Alternative metadata unavailable', {
+          arm,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+    return snapshots;
+  }
+
+  private updateStats(selectedCli: RoutingArmId, decisionTimeMs: number): void {
+    this.totalDecisions++;
+    // decisionsPerCli counts CLI slots; gateway endpoints have no slot.
+    // Gateway endpoints have no CLI counter; totalDecisions still counts them.
+    const slot = routingArmCliSlot(selectedCli);
+    if (slot !== undefined) this.decisionsPerCli[slot]++;
+    this.totalDecisionTimeMs += decisionTimeMs;
+  }
+
+  /**
+   * Record a routing decision to the orchestration observer (Issue #587).
+   */
+  private recordToOrchestrationObserver(decision: CompositeRoutingDecision, task: CliTask): void {
+    if (this.orchestrationObserver === undefined) {
+      return;
+    }
+
+    const routingDecision = mapObserverRoutingDecision(decision, {
+      timestamp: new Date().toISOString(),
+      taskId: `task-${getRandomProvider().uuid()}`,
+      query: task.content,
+    });
+
+    this.orchestrationObserver.recordRoutingDecision(routingDecision);
+    this.logger.debug('Recorded routing decision to OrchestrationObserver', {
+      cli: decision.cliName,
+      confidence: decision.confidence,
+    });
+  }
+
+  private handleRoutingError(
+    error: unknown,
+    stagesExecuted: string[]
+  ): Result<CompositeRoutingDecision, CompositeRoutingError> {
+    const stage = stagesExecuted[stagesExecuted.length - 1] ?? 'unknown';
+    const msg = 'Routing failed: ' + getErrorMessage(error);
+    return err(new CompositeRoutingError(msg, stage, error instanceof Error ? error : undefined));
+  }
+
+  recordOutcome(cliName: RoutingArmId, task: CliTask, reward: number, success?: boolean): void {
+    recordBanditOutcome(cliName, task, reward, this.getOutcomeDependencies());
+    if (
+      this.config.enableStrategyDistillation &&
+      this.distilledRuleStage !== undefined &&
+      success !== undefined
+    ) {
+      this.distilledRuleStage.recordOutcome({
+        selectedCli: cliName,
+        task: task.content,
+        success,
+      });
+    }
+  }
+
+  recordPreference(
+    query: string,
+    strongModelPreferred: boolean,
+    quality?: { strong?: number; weak?: number }
+  ): void {
+    recordPreferenceSignal(query, strongModelPreferred, quality, this.getOutcomeDependencies());
+  }
+
+  recordDifficultyOutcome(
+    task: CliTask,
+    success: boolean,
+    qualityScore?: number,
+    costUsd?: number
+  ): void {
+    const pending = this.pendingRoutingOutcomes.take(task);
+    this.finishDifficultyOutcome(task, success, qualityScore, pending, costUsd);
+  }
+
+  private recordExecutedDifficultyOutcome(
+    decision: CompositeRoutingDecision,
+    task: CliTask,
+    success: boolean,
+    costUsd?: number
+  ): void {
+    const pending = this.pendingRoutingOutcomes.take(task);
+    const difficultyAttribution =
+      decision.difficultyEstimate === undefined
+        ? undefined
+        : {
+            difficulty: decision.difficultyEstimate.aggregateScore,
+            selectedCli: decision.cliName,
+          };
+    this.finishDifficultyOutcome(
+      task,
+      success,
+      undefined,
+      {
+        difficultyAttribution,
+        modelShadow: pending?.modelShadow,
+      },
+      costUsd
+    );
+  }
+
+  private finishDifficultyOutcome(
+    task: CliTask,
+    success: boolean,
+    qualityScore: number | undefined,
+    pending: PendingRoutingOutcome | undefined,
+    costUsd?: number
+  ): void {
+    recordZeroRouterOutcome(
+      task,
+      success,
+      qualityScore,
+      this.getOutcomeDependencies(),
+      pending?.difficultyAttribution
+    );
+    this.pendingRoutingOutcomes.joinModelShadowOutcome(pending?.modelShadow, success, costUsd);
+  }
+
+  hasMinimumPreferenceData(): boolean {
+    return hasMinimumPreferenceData(this.getOutcomeDependencies());
+  }
+
+  private getOutcomeDependencies(): OutcomeDependencies {
+    return {
+      logger: this.logger,
+      cliNames: this.cliNames,
+      linucbBandit: this.linucbBandit,
+      preferenceRouter: this.preferenceRouter,
+      zeroRouter: this.zeroRouter,
+      lastRoutedTask: undefined,
+      budgetRouter: this.budgetRouter,
+      budgetConstraints: this.config.budgetConstraints,
+    };
+  }
+
+  getZeroRouter(): IZeroRouter | undefined {
+    return this.zeroRouter;
+  }
+
+  getLatencyTracker(): ILatencyTracker | undefined {
+    return this.latencyTracker;
+  }
+
+  /**
+   * Get the metrics collector (if configured).
+   * (Source: Issue #559 - Wire RoutingMetricsCollector to CompositeRouter)
+   */
+  getMetricsCollector(): IRoutingMetricsCollector | undefined {
+    return this.metricsCollector;
+  }
+
+  /**
+   * Get the orchestration observer (if configured).
+   * (Source: Issue #587 - Wire OrchestrationObserver to CompositeRouter)
+   */
+  getOrchestrationObserver(): IOrchestrationObserver | undefined {
+    return this.orchestrationObserver;
+  }
+
+  getStats(): CompositeRouterStats {
+    const preferenceStats = buildPreferenceStats(
+      this.config.enablePreferenceRouting,
+      this.preferenceRouter
+    );
+    const latencyStats = this.latencyTracker?.getTrackerStats();
+    const routingMemoryStats = this.routingMemory?.getStats();
+    const baseStats = {
+      totalDecisions: this.totalDecisions,
+      decisionsPerCli: { ...this.decisionsPerCli },
+      avgDecisionTimeMs:
+        this.totalDecisions > 0 ? this.totalDecisionTimeMs / this.totalDecisions : 0,
+      budgetRejectionRate:
+        this.totalDecisions > 0 ? this.budgetRejections / this.totalDecisions : 0,
+      banditStats: this.linucbBandit?.getStats() ?? [],
+      latencyStats,
+      routingMemoryStats,
+      ...capacityStatsOf(this.capacityFilterStage),
+    };
+
+    if (preferenceStats !== undefined) {
+      return { ...baseStats, preferenceStats };
+    }
+    return baseStats;
+  }
+
+  /** Get the routing memory instance (if enabled). */
+  getRoutingMemory(): IRoutingMemory | undefined {
+    return this.routingMemory;
+  }
+}
+
+/** Creates a CompositeRouter instance. */
+export function createCompositeRouter(
+  adapters: Map<RoutingArmId, ICliAdapter>,
+  config?: Partial<CompositeRouterConfigWithPreference>,
+  logger?: ILogger
+): ICompositeRouter {
+  // #3404: when dynamic discovery is enabled (opt-in via NEXUS_DYNAMIC_MODELS,
+  // default OFF) and the caller didn't supply a cache, attach the global
+  // AvailableModelsCache with live sources registered, so the existing CLI
+  // pre-filter (getCandidateCliNames) finally has real data. Fail-open by
+  // construction: sources return [] on error and an empty cache leaves
+  // getCandidateCliNames returning all CLIs.
+  let resolved = config;
+  if (isDynamicModelsEnabled() && config?.availableModelsCache === undefined) {
+    const cache = getDefaultAvailableModelsCache();
+    registerDefaultModelSources(cache, adapters);
+    resolved = { ...config, availableModelsCache: cache };
+  }
+  return new CompositeRouter(adapters, resolved, logger);
+}
+
+/**
+ * Capacity stats for {@link CompositeRouter.getStats}, absent when the stage is
+ * disabled (#4658).
+ *
+ * Absent means "not running", which is a different thing from "running and
+ * excluded nothing" — and both are different from "running, enforcing, and
+ * excluded nothing". `enforced` separates the last two.
+ */
+function capacityStatsOf(stage: CapacityFilterStage | undefined): {
+  capacityStats?: { enforced: boolean; excludedCount: number };
+} {
+  if (stage === undefined) return {};
+  const stats = stage.getStats();
+  return {
+    capacityStats: {
+      enforced: stats['enforced'] === true,
+      excludedCount: typeof stats['excludedCount'] === 'number' ? stats['excludedCount'] : 0,
+    },
+  };
+}

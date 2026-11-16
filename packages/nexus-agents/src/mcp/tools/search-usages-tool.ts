@@ -1,0 +1,380 @@
+/**
+ * nexus-agents/mcp - Search Usages MCP Tool (#4265 / epic #4249 Child A)
+ *
+ * Structural USAGE / call-site search for a symbol, backed by ast-grep
+ * (`@ast-grep/napi`, MIT, Rust + tree-sitter). Answers "where is X used /
+ * called" — the gap `search_codebase` cannot fill: that tool indexes declared
+ * symbol NAMES only (declarations), not usages/call-sites. This tool is
+ * additive and complementary; it does NOT replace the ts-morph symbol
+ * extractor (`indexer/symbol-extractor.ts`), which stays the type-checker-aware
+ * declaration index.
+ *
+ * Syntactic, not type-aware: matches are structural (a `foo()` call, an
+ * `obj.foo()` member call, `new foo()`, an import, a bare reference) and are
+ * NOT resolved against a type checker — a member call on an unrelated object of
+ * the same property name will match. That is the documented ast-grep trade-off
+ * (the epic keeps ts-morph for type-aware needs).
+ *
+ * **Read-only**: reads source files and walks their ASTs; performs NO writes,
+ * so the Rule-of-Two (untrusted-input + write + secrets) is not triggered.
+ *
+ * @module mcp/tools/search-usages-tool
+ */
+
+import { readFile } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { relative } from 'node:path';
+import { z } from 'zod';
+import type { McpServer } from '../sdk-types.js';
+import { createLogger, formatZodError } from '../../core/index.js';
+import { findSourceFiles } from '../../indexer/codebase-search.js';
+import { resolveInsideRoot } from '../../security/safe-path.js';
+import {
+  IDENTIFIER_RE,
+  LANG_VALUES,
+  findUsagesInSource,
+  inferLang,
+  type UsageMatch,
+} from '../../indexer/usage-ast.js';
+import { wrapToolWithTimeout, toSdkCallback, getToolTimeout } from '../middleware/tool-wrapper.js';
+import { createSecureHandler, type HandlerContext } from '../middleware/secure-handler.js';
+import {
+  toolStructuredError,
+  toolSuccess,
+  type BaseMcpToolDeps,
+  type ToolResult,
+} from './tool-result.js';
+import { getToolAnnotations } from '../tool-annotations.js';
+
+// The structural usage/call-site AST core moved to `indexer/usage-ast.ts` so a
+// second consumer (the repo-map ranker, #4268) can reuse it without going
+// through this MCP tool layer. Re-exported here so the #4265 tool module stays
+// the public import site for existing consumers (mcp/tools/index.ts, tests).
+export { findUsagesInSource };
+export type { UsageKind, UsageMatch } from '../../indexer/usage-ast.js';
+
+// ============================================================================
+// Constants + output cap (reuses the #4253 output-cap discipline)
+// ============================================================================
+
+/** Default cap on emitted usage matches. Excess is counted + reported, never silently dropped. */
+export const DEFAULT_USAGES_LIMIT = 50;
+/** Hard upper bound a caller may request for the match cap. */
+export const MAX_USAGES_LIMIT = 500;
+/** Default directory depth for the dir-scope walk. */
+const DEFAULT_USAGES_MAX_DEPTH = 24;
+/** Hard upper bound on directory walk depth (matches the symbol index clamp). */
+const MAX_USAGES_MAX_DEPTH = 64;
+/** Upper bound on files parsed in a single dir-scope search, to bound worst-case cost. */
+const MAX_FILES_SCANNED = 5000;
+
+// ============================================================================
+// Input Schema
+// ============================================================================
+
+export const SearchUsagesInputSchema = z.object({
+  symbol: z
+    .string()
+    .min(1)
+    .max(200)
+    .regex(IDENTIFIER_RE, 'symbol must be a single JS identifier (letters, digits, _ or $)')
+    .describe('Identifier to find usages/call-sites of (a single JS identifier)'),
+  path: z
+    .string()
+    .min(1)
+    .max(500)
+    .optional()
+    .describe('Restrict to a single source file (takes precedence over dir)'),
+  dir: z
+    .string()
+    .min(1)
+    .max(500)
+    .optional()
+    .describe('Directory to search recursively (default: current working directory)'),
+  lang: z
+    .enum(LANG_VALUES)
+    .optional()
+    .describe(
+      'Language override (default: inferred from each file extension, fallback typescript)'
+    ),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(MAX_USAGES_LIMIT)
+    .optional()
+    .describe(
+      `Max usage matches emitted (default ${String(DEFAULT_USAGES_LIMIT)}). Excess is reported.`
+    ),
+  maxDepth: z
+    .number()
+    .int()
+    .min(1)
+    .max(MAX_USAGES_MAX_DEPTH)
+    .optional()
+    .describe(`Directory walk depth for dir scope (default ${String(DEFAULT_USAGES_MAX_DEPTH)}).`),
+});
+
+export type SearchUsagesInput = z.infer<typeof SearchUsagesInputSchema>;
+export type SearchUsagesDeps = BaseMcpToolDeps;
+
+// ============================================================================
+// File scope resolution + gathering
+// ============================================================================
+
+/** Resolve a caller path against a path-traversal guard (must stay within cwd). */
+function resolveWithinCwd(target: string): { resolved: string } | { error: string } {
+  // Realpath-aware: a symlink inside cwd whose target is outside it is refused.
+  const resolved = resolveInsideRoot(target);
+  if (resolved === null) {
+    return { error: `Path traversal denied: scope must be within ${process.cwd()}` };
+  }
+  return { resolved };
+}
+
+interface FileScope {
+  files: string[];
+  root: string;
+  /** Subdirectories the walk did not descend because maxDepth ran out. */
+  skippedDirs: number;
+  /** Files dropped by the MAX_FILES_SCANNED cap. */
+  omittedFiles: number;
+}
+
+/** Resolve the input scope to a concrete file list (single file or a bounded dir walk). */
+async function resolveFileScope(input: SearchUsagesInput): Promise<FileScope | { error: string }> {
+  if (input.path !== undefined) {
+    const guard = resolveWithinCwd(input.path);
+    if ('error' in guard) return guard;
+    // A single named file: nothing was walked, so nothing could be skipped.
+    return {
+      files: [guard.resolved],
+      root: realpathSync(process.cwd()),
+      skippedDirs: 0,
+      omittedFiles: 0,
+    };
+  }
+  const guard = resolveWithinCwd(input.dir ?? process.cwd());
+  if ('error' in guard) return guard;
+  const walk = await findSourceFiles(guard.resolved, input.maxDepth ?? DEFAULT_USAGES_MAX_DEPTH);
+  // Both ways the scope can be smaller than the request, carried out so the
+  // output can say so. `skippedDirs` is documented by `findSourceFiles` as a
+  // truncation signal and was destructured away at the point of production;
+  // the file cap silently dropped the tail, leaving `filesScanned: 5000`
+  // indistinguishable from "there were exactly 5000 files".
+  return {
+    files: walk.files.slice(0, MAX_FILES_SCANNED),
+    root: guard.resolved,
+    skippedDirs: walk.skippedDirs,
+    omittedFiles: walk.files.length > MAX_FILES_SCANNED ? walk.files.length - MAX_FILES_SCANNED : 0,
+  };
+}
+
+interface FileUsage extends UsageMatch {
+  file: string;
+}
+
+/** Collect usages across files up to `limit`, counting the total so overflow is reported. */
+async function collectUsages(
+  input: SearchUsagesInput,
+  scope: FileScope,
+  limit: number,
+  ctx: HandlerContext
+): Promise<{ results: FileUsage[]; total: number; unreadable: number }> {
+  const results: FileUsage[] = [];
+  let total = 0;
+  // #6038: a file we could not open is not a file with no matches. The skip was
+  // logged and then vanished from the payload, so `search_usages({ symbol, path
+  // })` on a typo'd path returned `{"filesScanned":1,"totalMatches":0,
+  // "results":[]}` -- byte-identical to "I read it and the symbol is unused".
+  // For a tool asked "is this still used?" before a deletion, those two answers
+  // must never render the same.
+  let unreadable = 0;
+  for (const file of scope.files) {
+    let src: string;
+    try {
+      src = await readFile(file, 'utf8');
+    } catch {
+      ctx.logger.warn(`search_usages: skipped unreadable file ${file}`);
+      unreadable += 1;
+      continue;
+    }
+    const lang = input.lang ?? inferLang(file);
+    const rel = relative(scope.root, file) || file;
+    for (const match of findUsagesInSource(input.symbol, src, lang)) {
+      total += 1;
+      if (results.length < limit) results.push({ file: rel, ...match });
+    }
+  }
+  return { results, total, unreadable };
+}
+
+/**
+ * Say when the scan did not cover the scope it was asked about.
+ *
+ * `truncated` meant match-overflow ONLY, so a scope cut short by `maxDepth` or
+ * by the file cap reported "0 usages" with no qualifier — and `filesScanned`,
+ * being the size of the ALREADY-truncated set, corroborated the wrong answer
+ * instead of qualifying it. The sibling `search_codebase` surfaces the same
+ * walk's `skippedDirs` (#4243); this tool shares that walk precisely so their
+ * scopes stay comparable, and consumed only half the signal.
+ */
+function applyScopeTruncation(
+  payload: Record<string, unknown>,
+  scope: FileScope,
+  unreadable: number
+): void {
+  if (scope.skippedDirs === 0 && scope.omittedFiles === 0 && unreadable === 0) return;
+
+  const reasons: string[] = [];
+  if (unreadable > 0) {
+    payload['filesUnreadable'] = unreadable;
+    reasons.push(`${String(unreadable)} file(s) could not be read and were not searched`);
+  }
+  if (scope.skippedDirs > 0) {
+    payload['skippedDirs'] = scope.skippedDirs;
+    const plural = scope.skippedDirs === 1 ? 'y was' : 'ies were';
+    reasons.push(
+      `${String(scope.skippedDirs)} subdirector${plural} not walked because maxDepth was exhausted`
+    );
+  }
+  if (scope.omittedFiles > 0) {
+    payload['omittedFiles'] = scope.omittedFiles;
+    reasons.push(
+      `${String(scope.omittedFiles)} file(s) past the ${String(MAX_FILES_SCANNED)}-file cap were not read`
+    );
+  }
+
+  payload['scopeTruncated'] = true;
+  payload['scopeNote'] =
+    `The scan did not cover the whole scope: ${reasons.join('; ')}. ` +
+    'Absence of matches here is not absence of usages.';
+}
+
+function buildOutput(
+  input: SearchUsagesInput,
+  scope: FileScope,
+  limit: number,
+  collected: { results: FileUsage[]; total: number; unreadable: number }
+): string {
+  const payload: Record<string, unknown> = {
+    symbol: input.symbol,
+    scope: input.path !== undefined ? { path: input.path } : { dir: input.dir ?? '.' },
+    lang: input.lang ?? 'inferred',
+    // Files actually READ, not files intended to be read (#6038). The old
+    // value was the size of the candidate set, so it corroborated a zero-match
+    // answer that came from never opening anything.
+    filesScanned: scope.files.length - collected.unreadable,
+    totalMatches: collected.total,
+    results: collected.results,
+  };
+  if (collected.total > collected.results.length) {
+    payload['truncated'] = true;
+    payload['omittedMatches'] = collected.total - collected.results.length;
+    payload['limit'] = limit;
+  }
+  applyScopeTruncation(payload, scope, collected.unreadable);
+  return JSON.stringify(payload, null, 2);
+}
+
+// ============================================================================
+// Handler
+// ============================================================================
+
+async function searchUsagesHandler(args: unknown, ctx: HandlerContext): Promise<ToolResult> {
+  const parsed = SearchUsagesInputSchema.safeParse(args);
+  if (!parsed.success) {
+    return toolStructuredError({
+      errorCategory: 'validation',
+      message: `Validation error: ${formatZodError(parsed.error)}`,
+    });
+  }
+
+  const scope = await resolveFileScope(parsed.data);
+  if ('error' in scope) {
+    return toolStructuredError({ errorCategory: 'permission', message: scope.error });
+  }
+
+  try {
+    const limit = parsed.data.limit ?? DEFAULT_USAGES_LIMIT;
+    const collected = await collectUsages(parsed.data, scope, limit, ctx);
+    return toolSuccess(buildOutput(parsed.data, scope, limit, collected));
+  } catch (caught: unknown) {
+    const e = caught instanceof Error ? caught : new Error(String(caught));
+    ctx.logger.error('Usage search failed', e);
+    return toolStructuredError({
+      errorCategory: 'internal',
+      message: `Usage search failed: ${e.message}`,
+    });
+  }
+}
+
+// ============================================================================
+// Testing exports (#2159)
+// ============================================================================
+
+/** Test-only surface — do not import in production code. */
+export const _testing = {
+  /** Raw handler for unit testing (bypasses secure-handler + timeout middleware). */
+  searchUsagesHandler,
+};
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+/** @category MCP */
+export function registerSearchUsagesTool(server: McpServer, deps: SearchUsagesDeps): void {
+  const logger = deps.logger ?? createLogger({ tool: 'search_usages' });
+
+  const toolSchema = {
+    symbol: z
+      .string()
+      .min(1)
+      .max(200)
+      .regex(IDENTIFIER_RE, 'symbol must be a single JS identifier')
+      .describe('Identifier to find usages/call-sites of'),
+    path: z.string().min(1).max(500).optional().describe('Restrict to a single source file'),
+    dir: z.string().min(1).max(500).optional().describe('Directory to search (default: cwd)'),
+    lang: z.enum(LANG_VALUES).optional().describe('Language override (default: infer from ext)'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_USAGES_LIMIT)
+      .optional()
+      .describe(`Max matches (default ${String(DEFAULT_USAGES_LIMIT)})`),
+    maxDepth: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_USAGES_MAX_DEPTH)
+      .optional()
+      .describe(`Directory walk depth (default ${String(DEFAULT_USAGES_MAX_DEPTH)})`),
+  };
+
+  const description =
+    'Structural USAGE / call-site search for a symbol via ast-grep (tree-sitter). ' +
+    'Answers "where is X used or called" — finds calls (foo()), member calls (obj.foo()), ' +
+    'new expressions (new Foo()), imports, and bare references, with file:line:column + snippet. ' +
+    'This is the gap `search_codebase` CANNOT fill: that indexes declared symbol NAMES only, ' +
+    'not usages. Excludes the declaration itself (use `search_codebase` for declarations). ' +
+    'Syntactic, not type-aware (a same-named member on an unrelated object may match). ' +
+    `Read-only. Results capped at ${String(DEFAULT_USAGES_LIMIT)} by default (override via limit up to ${String(MAX_USAGES_LIMIT)}); overflow is reported, never silent.`;
+
+  const secureHandler = createSecureHandler(searchUsagesHandler, {
+    toolName: 'search_usages',
+    rateLimiter: deps.rateLimiter,
+    logger,
+  });
+
+  const timeoutMs = getToolTimeout('search_usages', deps.security);
+  const wrapped = wrapToolWithTimeout('search_usages', secureHandler, { timeoutMs, logger });
+
+  server.registerTool(
+    'search_usages',
+    { description, inputSchema: toolSchema, annotations: getToolAnnotations('search_usages') },
+    toSdkCallback(wrapped)
+  );
+  logger.info('Registered search_usages tool');
+}

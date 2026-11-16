@@ -1,0 +1,23 @@
+---
+title: 'MCP Tool: weather_report'
+description: 'Multi-CLI performance weather report'
+diataxis: reference
+audience: user
+tier: 2
+keywords: [mcp, tool, reference, weather_report]
+---
+
+# `weather_report`
+
+> Auto-generated from the registered MCP tool descriptions and input
+> schemas. Do not edit by hand — run `pnpm docs:tools` to regenerate.
+
+Get multi-CLI performance weather report with per-CLI success rates and adaptive routing bonuses. Pipeline join coverage is unmeasured when trace invalid losses are counted or unknown; validated retained logical joins remain visible.
+
+## Parameters
+
+| Parameter | Type | Required | Constraints | Description |
+| --------- | ---- | -------- | ----------- | ----------- |
+| `cli` | enum | no | one of: claude \| gemini \| codex \| opencode | Filter by CLI |
+| `category` | enum | no | one of: architecture \| code_generation \| code_review \| research \| security_review \| planning \| documentation \| testing \| devops \| exploration | Filter by task category |
+| `includeAdaptive` | boolean | no | default true | Include adaptive routing bonuses (default: true) |

@@ -1,0 +1,531 @@
+/**
+ * Tests for consensus_vote's async-mode dispatch envelope (#4362).
+ *
+ * `dispatchAsyncConsensusVote` handed `handleConsensusVote` — which resolves the
+ * `{ ok, error } | { ok: true, value }` shape — straight into `runAsJob`'s `run`
+ * callback with no transform. `runAsJob` records `complete` whenever `run`
+ * RESOLVES, so a vote that failed (`ok: false`) landed as a `complete` job: a
+ * caller polling `get_job_result` saw success and never looked at the payload.
+ * The sync sibling has always converted `ok: false` into a structured error.
+ *
+ * Lives in its own file because reaching the failure path means mocking
+ * `collectRealVotes`, and consensus-vote.test.ts exercises the real collector.
+ *
+ * @module mcp/tools/consensus-vote-async-dispatch.test
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { AgentVoteResult, VoterRole } from '../../cli/vote-types.js';
+
+// The collector is stubbed; adapter discovery must not probe installed CLIs.
+vi.mock('../../cli-adapters/factory.js', () => ({
+  createAllAdapters: () => new Map(),
+  getAvailableClis: () => Promise.resolve([]),
+  isCliAvailable: () => Promise.resolve(false),
+  createCliAdapter: () => {
+    throw new Error('Unexpected real adapter construction');
+  },
+}));
+
+// Every voter errors — the realistic shape of a dead voter panel (expired auth,
+// adapter outage), and the exact input for which `handleConsensusVote` returns
+// `{ ok: false }` rather than manufacturing a "rejected" verdict (#1552).
+const collectRealVotesMock = vi.fn<(opts: { roles: readonly VoterRole[] }) => Promise<unknown>>();
+vi.mock('../../cli/voter-agents.js', () => ({
+  collectRealVotes: (opts: { roles: readonly VoterRole[] }): Promise<unknown> =>
+    collectRealVotesMock(opts),
+}));
+
+const recordingMocks = vi.hoisted(() => ({
+  recordVoteSuccess: vi.fn(),
+  recordAuthenticVote: vi.fn(() => ({
+    persisted: false as const,
+    reason: 'all-simulated' as const,
+    detail: 'test recording disabled',
+  })),
+}));
+vi.mock('./consensus-vote-recording.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./consensus-vote-recording.js')>();
+  return {
+    ...actual,
+    recordVoteSuccess: recordingMocks.recordVoteSuccess,
+    recordAuthenticVote: recordingMocks.recordAuthenticVote,
+  };
+});
+
+// Pass the registered callback through untouched so the test can invoke it.
+vi.mock('../middleware/tool-wrapper.js', () => ({
+  wrapToolWithTimeout: (_name: string, fn: unknown) => fn,
+  toSdkCallback: (fn: unknown) => fn,
+  toSdkCallbackWithTimeoutCheck: (fn: unknown) => fn,
+  getToolTimeout: () => 900_000,
+}));
+vi.mock('../middleware/secure-handler.js', () => ({
+  createSecureHandler:
+    (fn: (args: unknown, ctx: unknown) => unknown) => (args: unknown, ctx: unknown) =>
+      fn(args, ctx),
+}));
+
+import {
+  executeVoting,
+  registerConsensusVoteTool,
+  resetCorrelationTracker,
+  runConsensusForGoal,
+  unwrapVoteOrThrow,
+} from './consensus-vote.js';
+import { DecisionCostStore } from '../../observability/decision-cost-store.js';
+import { readJobResult } from '../jobs/job-result-store.js';
+import { _resetForTests as resetJobConcurrency } from '../jobs/job-concurrency.js';
+import { resetNexusDataDirCache } from '../../config/nexus-data-dir.js';
+import { getCorrelationJsonlPath } from '../../consensus/correlation-persistence.js';
+
+interface CapturedToolResult {
+  isError?: boolean;
+  content: Array<{ type: string; text: string }>;
+  _meta?: Record<string, unknown>;
+}
+
+function erroredVotes(roles: readonly VoterRole[]): AgentVoteResult[] {
+  return roles.map((role) => ({
+    role,
+    vote: { decision: 'abstain' as const, reasoning: 'adapter unauthorized', confidence: 0 },
+    processingTimeMs: 1,
+    source: 'error' as const,
+    error: 'adapter unauthorized',
+  }));
+}
+
+/** Registers the tool against a mock server and returns the captured callback. */
+function captureHandler(): (args: unknown, ctx: unknown) => Promise<CapturedToolResult> {
+  let captured: ((args: unknown, ctx: unknown) => Promise<CapturedToolResult>) | undefined;
+  const mockServer = {
+    registerTool: (_name: string, _schema: unknown, handler: unknown) => {
+      captured = handler as (args: unknown, ctx: unknown) => Promise<CapturedToolResult>;
+    },
+  };
+  registerConsensusVoteTool(mockServer as never, {
+    rateLimiter: { tryConsume: () => ({ allowed: true, remaining: 99 }) } as never,
+  });
+  if (captured === undefined) throw new Error('handler not registered');
+  return captured;
+}
+
+const CTX = {
+  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  requestContext: {},
+};
+
+describe('consensus_vote async dispatch fails closed (#4362)', () => {
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-vote-async-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    resetJobConcurrency();
+    collectRealVotesMock.mockReset();
+    recordingMocks.recordVoteSuccess.mockClear();
+    recordingMocks.recordAuthenticVote.mockClear();
+  });
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    resetJobConcurrency();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function dispatch(): Promise<string> {
+    const handler = captureHandler();
+    const result = await handler(
+      { proposal: 'ship the thing', quickMode: true, dispatch: 'async' },
+      CTX
+    );
+    const env = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+    expect(env['status']).toBe('pending');
+    const jobId = env['jobId'] as string;
+    // The background run is fire-and-forget — poll the sidecar the way a caller
+    // would rather than guessing a settle delay.
+    for (let i = 0; i < 100 && readJobResult(jobId)?.status === 'pending'; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return jobId;
+  }
+
+  it.each(['async', 'sync'] as const)(
+    'records only the actual %s job id on costs (#6858)',
+    async (dispatch) => {
+      collectRealVotesMock.mockImplementation(({ roles }) =>
+        Promise.resolve(
+          roles.map((role) => ({
+            role,
+            vote: { decision: 'approve', reasoning: 'approve fixture', confidence: 0.9 },
+            processingTimeMs: 17,
+            source: 'llm',
+            cli: 'codex',
+            model: 'fixture-model',
+          }))
+        )
+      );
+      const handler = captureHandler();
+      const result = await handler({ proposal: 'job cost seam', quickMode: true, dispatch }, CTX);
+      const envelope = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+      const jobId = envelope['jobId'] as string | undefined;
+      if (dispatch === 'async') {
+        expect(jobId).toMatch(/^job-vote-/);
+        // The default 1s budget flakes when the suite runs under load.
+        await vi.waitFor(
+          () => {
+            expect(readJobResult(jobId!)?.status).toBe('complete');
+          },
+          { timeout: 10_000, interval: 20 }
+        );
+      }
+      const records = new DecisionCostStore().all();
+      expect(records).toHaveLength(1);
+      if (dispatch === 'async') {
+        expect(records[0]?.jobId).toBe(jobId);
+        expect(records[0]?.decisionId).not.toBe(jobId);
+      } else expect(records[0]).not.toHaveProperty('jobId');
+    }
+  );
+
+  it('returns a structured sync error for an empty panel without decision records (#6885)', async () => {
+    collectRealVotesMock.mockResolvedValue([]);
+    const result = await captureHandler()(
+      { proposal: 'Empty panel', strategy: 'simple_majority', quickMode: true, dispatch: 'sync' },
+      CTX
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toMatch(/Voting failed:.*empty panel/i);
+    expect(recordingMocks.recordAuthenticVote).not.toHaveBeenCalled();
+    expect(recordingMocks.recordVoteSuccess).not.toHaveBeenCalled();
+    expect(new DecisionCostStore().all()).toHaveLength(0);
+  });
+
+  it('records a failed async job for an empty panel without decision records (#6885)', async () => {
+    collectRealVotesMock.mockResolvedValue([]);
+    const jobId = await dispatch();
+    await vi.waitFor(
+      () => {
+        expect(readJobResult(jobId)?.status).toBe('failed');
+      },
+      { timeout: 10_000, interval: 20 }
+    );
+    const record = readJobResult(jobId);
+    expect(JSON.stringify(record)).toMatch(/Voting failed:.*empty panel/i);
+    expect(recordingMocks.recordAuthenticVote).not.toHaveBeenCalled();
+    expect(recordingMocks.recordVoteSuccess).not.toHaveBeenCalled();
+    expect(new DecisionCostStore().all()).toHaveLength(0);
+  });
+
+  it('records a failed job when every voter errored', async () => {
+    collectRealVotesMock.mockImplementation((opts: { roles: readonly VoterRole[] }) =>
+      Promise.resolve(erroredVotes(opts.roles))
+    );
+
+    expect(readJobResult(await dispatch())?.status).toBe('failed');
+  });
+
+  it('carries the failure reason into the job record', async () => {
+    collectRealVotesMock.mockImplementation((opts: { roles: readonly VoterRole[] }) =>
+      Promise.resolve(erroredVotes(opts.roles))
+    );
+
+    const record = readJobResult(await dispatch());
+    expect(JSON.stringify(record)).toContain('voters failed');
+  });
+
+  it('records signalAccepted:true on the pending record — the claim follows the runner arity (#5393)', async () => {
+    // `runAsJob` derives this from `run.length >= 3`, so this asserts the
+    // capability and the record together: the runner cannot claim cancellation
+    // it does not take, and cannot take it without the record saying so.
+    //
+    // Before #5393 every adopting tool declared an arity-2 runner, so this was
+    // `false` everywhere and `cancel_job` marked jobs cancelled while every
+    // remaining voter still ran.
+    //
+    // Read on the PENDING record deliberately: that is when the field is
+    // written and when it is actionable — a caller deciding whether cancelling
+    // is worth attempting asks before the job finishes, not after.
+    collectRealVotesMock.mockImplementation((opts: { roles: readonly VoterRole[] }) =>
+      Promise.resolve(erroredVotes(opts.roles))
+    );
+
+    const handler = captureHandler();
+    const result = await handler(
+      { proposal: 'ship the thing', quickMode: true, dispatch: 'async' },
+      CTX
+    );
+    const env = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+    const jobId = env['jobId'] as string;
+
+    expect(readJobResult(jobId)?.signalAccepted).toBe(true);
+  });
+
+  it('actually hands the signal to collectRealVotes (#5393)', async () => {
+    // The seam between "the runner takes a signal" and "the launcher honours
+    // one". Both ends have their own tests, and both stay green if the middle
+    // drops the signal on the floor — which is the shape of the defect this
+    // whole issue is about. Asserted on what the collector RECEIVED.
+    collectRealVotesMock.mockImplementation((opts: { roles: readonly VoterRole[] }) =>
+      Promise.resolve(erroredVotes(opts.roles))
+    );
+
+    await dispatch();
+
+    expect(collectRealVotesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
+  });
+});
+
+describe('consensus_vote dispatch key end to end (#4968)', () => {
+  // The issue's own reproduction: `dispatch: 'async'` used to be stripped as an
+  // unknown key and the vote ran synchronously for 97 seconds. These rows drive
+  // the REAL registered handler with the vote collector canned (no network).
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-vote-dispatch-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    resetJobConcurrency();
+    collectRealVotesMock.mockReset();
+    collectRealVotesMock.mockImplementation((opts: { roles: readonly VoterRole[] }) =>
+      Promise.resolve(erroredVotes(opts.roles))
+    );
+    recordingMocks.recordVoteSuccess.mockClear();
+    recordingMocks.recordAuthenticVote.mockClear();
+  });
+
+  afterEach(async () => {
+    // Let any backgrounded job settle before the data dir goes away.
+    await new Promise((r) => setTimeout(r, 50));
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    resetJobConcurrency();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function envelopeOf(result: CapturedToolResult): Record<string, unknown> {
+    return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+  }
+
+  it('dispatch: async returns a pending envelope with a jobId — no warning', async () => {
+    const result = await captureHandler()(
+      { proposal: 'ship the thing', quickMode: true, dispatch: 'async' },
+      CTX
+    );
+    const env = envelopeOf(result);
+    expect(env['status']).toBe('pending');
+    expect(typeof env['jobId']).toBe('string');
+    expect(result._meta?.['nexus-agents/warnings']).toBeUndefined();
+  });
+
+  it.each(['async', 'sync'] as const)(
+    'removed mode: %s fails validation without dispatch',
+    async (mode) => {
+      const result = await captureHandler()(
+        { proposal: 'ship the thing', quickMode: true, mode },
+        CTX
+      );
+      expect(result.isError).toBe(true);
+      expect(result.content[0]!.text).toContain('dispatch: "async"');
+      expect(result._meta?.['nexus-agents/error']).toBeDefined();
+      expect(result._meta?.['nexus-agents/warnings']).toBeUndefined();
+      expect(collectRealVotesMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['async', 'sync'] as const)(
+    'mode is rejected even alongside dispatch: %s',
+    async (dispatch) => {
+      const result = await captureHandler()(
+        { proposal: 'ship the thing', quickMode: true, dispatch, mode: 'sync' },
+        CTX
+      );
+      expect(result.isError).toBe(true);
+      expect(result.content[0]!.text).toContain('dispatch: "async"');
+      expect(collectRealVotesMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it('dispatch: sync preserves an inline structured error without alias warnings', async () => {
+    const result = await captureHandler()(
+      { proposal: 'ship the thing', quickMode: true, dispatch: 'sync' },
+      CTX
+    );
+    expect(result.isError).toBe(true);
+    expect(result._meta?.['nexus-agents/error']).toBeDefined();
+    expect(result._meta?.['nexus-agents/warnings']).toBeUndefined();
+    expect(collectRealVotesMock).toHaveBeenCalled();
+  });
+});
+
+describe('consensus_vote recording fidelity (#5544)', () => {
+  beforeEach(() => {
+    collectRealVotesMock.mockReset();
+    recordingMocks.recordVoteSuccess.mockClear();
+    recordingMocks.recordAuthenticVote.mockClear();
+  });
+
+  it('records the executed threshold strategy and no_quorum decision', async () => {
+    collectRealVotesMock.mockImplementation((opts: { roles: readonly VoterRole[] }) =>
+      Promise.resolve(
+        opts.roles.map((role, index) =>
+          index === 1
+            ? {
+                role,
+                vote: { decision: 'abstain' as const, reasoning: 'timeout', confidence: 0 },
+                processingTimeMs: 1,
+                source: 'error' as const,
+                error: 'timeout',
+              }
+            : {
+                role,
+                vote: { decision: 'approve' as const, reasoning: 'ready', confidence: 0.9 },
+                processingTimeMs: 1,
+                source: 'llm' as const,
+              }
+        )
+      )
+    );
+
+    const result = await captureHandler()(
+      { proposal: 'require every voter', quickMode: true, threshold: 'unanimous' },
+      CTX
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(recordingMocks.recordVoteSuccess).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proposal: 'require every voter',
+        strategy: 'unanimous',
+        decision: 'no_quorum',
+        durationMs: expect.any(Number),
+        approvalPercentage: 100,
+        votes: expect.any(Array),
+      })
+    );
+    expect(recordingMocks.recordAuthenticVote).toHaveBeenCalledWith(
+      expect.objectContaining({ strategy: 'unanimous', resolvedDecision: 'no_quorum' })
+    );
+  });
+});
+
+describe('consensus_vote correlation model provenance (#5555)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-vote-correlation-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    resetCorrelationTracker();
+    collectRealVotesMock.mockReset();
+  });
+
+  afterEach(() => {
+    delete process.env['NEXUS_DATA_DIR'];
+    resetNexusDataDirCache();
+    resetCorrelationTracker();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('persists the assigned pin when a fallback model answers', async () => {
+    collectRealVotesMock.mockImplementation((opts: { roles: readonly VoterRole[] }) =>
+      Promise.resolve(
+        opts.roles.map((role) => ({
+          role,
+          vote: { decision: 'approve' as const, reasoning: 'fallback answered', confidence: 0.9 },
+          processingTimeMs: 1,
+          source: 'llm' as const,
+          pinnedModel: `${role}-primary`,
+          model: 'fallback-model',
+        }))
+      )
+    );
+
+    await executeVoting(
+      { proposal: 'fallback partition', quickMode: false, simulateVotes: false },
+      CTX.logger as unknown as import('../../core/index.js').ILogger
+    );
+    const saved = JSON.parse(readFileSync(getCorrelationJsonlPath(), 'utf8')) as {
+      votes: Array<{ modelKey?: string; observedModel?: string }>;
+    };
+
+    expect(saved.votes[0]).toMatchObject({
+      modelKey: 'architect-primary',
+      observedModel: 'fallback-model',
+    });
+  });
+});
+
+// The success half of the transform is asserted directly: exercising it through
+// the dispatcher would stand up the whole memory substrate (CompositeRouter and
+// its on-disk backends), which is neither fast nor side-effect-free in a unit
+// test. The failure half is covered end-to-end above.
+describe('unwrapVoteOrThrow (#4362)', () => {
+  type VotePromise = Parameters<typeof unwrapVoteOrThrow>[0];
+
+  it('passes an ok result through untouched, so the job records complete', async () => {
+    const ok = { ok: true as const, value: { proposal: 'p' } };
+
+    await expect(unwrapVoteOrThrow(Promise.resolve(ok) as unknown as VotePromise)).resolves.toBe(
+      ok
+    );
+  });
+
+  it('rejects with the vote error, so runAsJob records failed', async () => {
+    const failed = { ok: false as const, error: 'All 3 voters failed' };
+
+    await expect(
+      unwrapVoteOrThrow(Promise.resolve(failed) as unknown as VotePromise)
+    ).rejects.toThrow('All 3 voters failed');
+  });
+});
+
+describe("runConsensusForGoal hands `run`'s cancel signal to the collector (#6305)", () => {
+  let tmpDir: string;
+  const originalDataDir = process.env['NEXUS_DATA_DIR'];
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nexus-vote-goal-'));
+    process.env['NEXUS_DATA_DIR'] = tmpDir;
+    resetNexusDataDirCache();
+    collectRealVotesMock.mockReset();
+  });
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env['NEXUS_DATA_DIR'];
+    else process.env['NEXUS_DATA_DIR'] = originalDataDir;
+    resetNexusDataDirCache();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('the collector receives the very signal the `run` executor passed', async () => {
+    collectRealVotesMock.mockImplementation((opts: { roles: readonly VoterRole[] }) =>
+      Promise.resolve(erroredVotes(opts.roles))
+    );
+    const controller = new AbortController();
+
+    await runConsensusForGoal(
+      'ship the thing',
+      CTX.logger as never,
+      undefined,
+      undefined,
+      controller.signal
+    ).catch(() => undefined);
+
+    expect(collectRealVotesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ signal: controller.signal })
+    );
+  });
+});

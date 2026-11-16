@@ -1,0 +1,111 @@
+/**
+ * CLI Adapters exports - CLI integration with defensive parsing
+ * Split from index.ts for file size compliance (Issue #285)
+ */
+
+export {
+  // Types
+  type CliName,
+  type CliTransport,
+  type TokenUsage as CliTokenUsage,
+  type CliResponse,
+  type CliError,
+  type CliErrorCode,
+  type VersionStatus,
+  type HealthStatus,
+  type CapacityStatus,
+  type ModelInfo as CliModelInfo,
+  type CapabilityProfile as CliCapabilityProfile,
+  type CliTask,
+  type ExecutionOptions as CliExecutionOptions,
+  type ICliAdapter,
+  type ICliResponseParser,
+  type VersionRequirements,
+  type BaseAdapterOptions,
+  CLI_VERSION_REQUIREMENTS,
+  DEFAULT_CAPABILITIES as CLI_DEFAULT_CAPABILITIES,
+  // Base adapter
+  BaseCliAdapter,
+  SubprocessCliAdapter,
+  // CLI Retry Loop (Issue #1596)
+  executeCliRetryLoop,
+  calculateBackoffDelay as cliCalculateBackoffDelay,
+  isRetryableError as isCliRetryableError,
+  categorizeError as cliCategorizeError,
+  type CliRetryLoopConfig,
+  type CliRetryResult,
+  // Concrete adapters
+  ClaudeCliAdapter,
+  GeminiCliAdapter,
+  CodexCliAdapter,
+  CodexMcpAdapter,
+  OpenCodeCliAdapter,
+  // Parsers
+  ClaudeResponseParser,
+  type ClaudeCliResponse,
+  // eslint-disable-next-line @typescript-eslint/no-deprecated -- public API; removal is breaking (#4389)
+  GeminiResponseParser,
+  type GeminiCliResponse,
+  CodexResponseParser,
+  type CodexCliResponse,
+  // Factory
+  createCliAdapter,
+  createAllAdapters,
+  isCliAvailable,
+  getAvailableClis,
+  type CliAdapterConfig,
+  // CLI Detection Cache (Issue #165)
+  CliDetectionCache,
+  createCliDetectionCache,
+  DEFAULT_CACHE_CONFIG as CLI_DEFAULT_CACHE_CONFIG,
+  CliDetectionCacheConfigSchema,
+  type ICliDetectionCache,
+  type CliDetectionCacheConfig,
+  type CliHealthResult,
+  type CacheStats as CliCacheStats,
+  // CompositeRouter (Issue #166)
+  CompositeRouter,
+  createCompositeRouter,
+  CompositeRouterConfigSchema,
+  DEFAULT_COMPOSITE_CONFIG as CLI_DEFAULT_COMPOSITE_CONFIG,
+  CompositeRoutingError,
+  type ICompositeRouter,
+  type CompositeRouterConfig,
+  type CompositeRoutingDecision,
+  type CompositeRouterStats,
+  // CLI Timeout Profiles (Issue #357, delegates to config/timeouts.ts)
+  getTimeoutForTask,
+  getTimeoutForTaskAuto,
+  estimateTaskComplexity,
+  CLI_TIMEOUT_PROFILES,
+  DEFAULT_TIMEOUT_PROFILE,
+  type TimeoutProfile,
+  type TaskComplexity as CliTaskComplexity,
+  // CLI Circuit Breaker Integration (Issue #359)
+  CliCircuitBreakerIntegration,
+  createCliCircuitBreakerIntegration,
+  type ICliCircuitBreakerIntegration,
+  type CliCircuitBreakerConfig,
+  type CircuitProtectedResult,
+  type CliCircuitHealthStatus,
+  // Circuit Breaker Types — exported for TypeDoc resolution (#1697)
+  type ICircuitBreaker,
+  type FailureCategory as CircuitBreakerFailureCategory,
+  type CircuitState,
+  // PreferenceRouter - Preference-Trained Routing (Issue #148, arXiv:2406.18665)
+  PreferenceRouter,
+  createPreferenceRouter,
+  InMemoryPreferenceStore,
+  QueryFeatureExtractor,
+  DEFAULT_PREFERENCE_ROUTER_CONFIG,
+  PreferenceRouterConfigSchema,
+  type PreferenceDataPoint,
+  type QueryFeatures,
+  type PreferencePrediction,
+  type PreferenceRoutingDecision,
+  type PreferenceRouterConfig,
+  type PreferenceModelStats,
+  type IPreferenceDataStore,
+} from '../cli-adapters/index.js';
+
+export type { IRoutingMemory, RoutingMemoryStats } from '../context/routing-memory.js';
